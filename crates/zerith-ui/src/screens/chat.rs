@@ -446,6 +446,7 @@ pub fn send(s: &mut Shell) {
                 memory: memory.as_ref().map(|m| m as &dyn MemoryBackend),
                 scope: Some(&scope),
                 skills: skills.as_ref(),
+                ..TurnContext::default()
             },
             AgentOptions {
                 tools: policy.is_ok().then_some(&tools),

@@ -21,7 +21,7 @@ use zerith_providers::{Cancel, Client};
 use zerith_sessions::plan::{NewTask, Task, TaskState};
 use zerith_sessions::{SessionSource, Store};
 
-use crate::{run_turn_cancellable, RunError};
+use crate::RunError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PlanError {
@@ -131,6 +131,7 @@ pub struct TaskOutcome {
 /// ```text
 /// title | prompt
 /// title | prompt | after: 1,3     (1-based task line numbers)
+/// @revisor title | prompt          (runs as agent `revisor`)
 /// ```
 ///
 /// Invalid `after:` references are dropped; use [`parse_plan_opts`] to see
@@ -172,6 +173,13 @@ fn parse_lines(plan_id: &str, text: &str, sequential: bool) -> (Vec<NewTask>, Ve
                     parts.pop();
                 }
             }
+            // `@name` before the title picks the agent the task runs as.
+            let mut agent = zerith_core::agents::DEFAULT.to_string();
+            if let Some(rest) = parts[0].strip_prefix('@') {
+                let (name, title) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+                agent = name.to_string();
+                parts[0] = title.trim();
+            }
             let (title, prompt) = match parts.len() {
                 1 => (parts[0].to_string(), parts[0].to_string()),
                 _ => (parts[0].to_string(), parts[1..].join(" | ")),
@@ -197,7 +205,7 @@ fn parse_lines(plan_id: &str, text: &str, sequential: bool) -> (Vec<NewTask>, Ve
             NewTask {
                 title,
                 prompt,
-                agent: "default".to_string(),
+                agent,
                 depends_on,
             }
         })
@@ -452,11 +460,24 @@ fn run_one(
     let session = store.create_session(&task.title, SessionSource::Native)?;
     let client = Client::new(zerith_providers::ProviderConfig::from_env())?;
     let memory = zerith_memory::SqliteMemory::open(db).ok();
-    let r = run_turn_cancellable(
+    // The task's agent: its instructions join the prompt and its preferred
+    // model wins over the plan's. An unknown name runs as the default agent.
+    let paths = zerith_core::Paths::resolve();
+    let cwd = std::env::current_dir().ok();
+    let agent = zerith_core::agents::find(&paths, cwd.as_deref(), &task.agent);
+    let model = agent
+        .as_ref()
+        .and_then(|a| a.model.as_deref())
+        .unwrap_or(model);
+    let r = crate::run_turn_in(
         &store,
         &client,
-        memory.as_ref().map(|m| m as &dyn MemoryBackend),
-        scope,
+        crate::TurnContext {
+            memory: memory.as_ref().map(|m| m as &dyn MemoryBackend),
+            scope,
+            agent: agent.as_ref(),
+            ..crate::TurnContext::default()
+        },
         &session.id,
         model,
         &task.prompt,
@@ -486,6 +507,19 @@ mod tests {
         assert_eq!(tasks[0].title, "alfa");
         assert_eq!(tasks[0].prompt, "faz alfa");
         assert!(tasks[1].depends_on.is_empty());
+    }
+
+    #[test]
+    fn at_name_picks_the_agent() {
+        let t = parse_plan(
+            "p",
+            "@revisor Revisar | olhe o diff
+sem agente | faz",
+        );
+        assert_eq!(t[0].agent, "revisor");
+        assert_eq!(t[0].title, "Revisar");
+        assert_eq!(t[0].prompt, "olhe o diff");
+        assert_eq!(t[1].agent, zerith_core::agents::DEFAULT);
     }
 
     #[test]

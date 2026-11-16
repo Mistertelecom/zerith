@@ -937,6 +937,7 @@ fn chat(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>
             memory: Some(&memory),
             scope: Some(&scope),
             skills: skills.as_ref(),
+            ..TurnContext::default()
         },
         &session_id,
         &model,

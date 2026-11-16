@@ -102,6 +102,9 @@ pub struct TurnContext<'a> {
     pub memory: Option<&'a dyn MemoryBackend>,
     pub scope: Option<&'a Scope>,
     pub skills: Option<&'a zerith_skills::Library>,
+    /// The agent this turn runs as. `None` is the default agent; a named one
+    /// adds its instructions after the project's.
+    pub agent: Option<&'a zerith_core::agents::AgentDef>,
 }
 
 /// The turn's outcome, with the numbers a UI needs to show it honestly.
@@ -175,7 +178,7 @@ pub fn run_turn_cancellable(
         TurnContext {
             memory,
             scope,
-            skills: None,
+            ..TurnContext::default()
         },
         session_id,
         model,
@@ -231,6 +234,9 @@ pub(crate) fn system_prompt(
         ),
         Err(_) => zerith_core::system_prompt(title),
     };
+    if let Some(a) = ctx.agent {
+        prompt_text.push_str(&format!("\n\n# Agente: {}\n\n{}", a.name, a.instructions));
+    }
     if let (Some(mem), Some(scope)) = (ctx.memory, ctx.scope) {
         // A fact the user stated is stored before the answer is asked for, so
         // the same turn can already recall it — and a crash after this point

@@ -15,7 +15,12 @@ zerith-providers = { path = "../zerith-providers" }
 zerith-memory = { path = "../zerith-memory" }
 zerith-skills = { path = "../zerith-skills" }
 zerith-runtime = { path = "../zerith-runtime" }
+zerith-tools = { path = "../zerith-tools" }
+zerith-plugins = { path = "../zerith-plugins" }
+zerith-security = { path = "../zerith-security" }
 rune = { git = "https://github.com/anomalyco/rune", rev = "bc05f817ed19488a10a6f1a928cc0521c1c70c75" }
+# Same pinned revision as `rune`: the kit and the core must come from one commit.
+rune-kit = { git = "https://github.com/anomalyco/rune", rev = "bc05f817ed19488a10a6f1a928cc0521c1c70c75", features = ["markdown"] }
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -10,11 +10,13 @@
 
 mod ui;
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use rune::{
     col, el, icon, row, rule, text, text_input, AppHandle, Cx, El, ScrollSpec, TextEdit, Tx,
 };
+use rune_kit::{Badge, BadgeVariant, Collapsible, Markdown};
 use ui::Ui;
 use zerith_memory::{Fact, MemoryBackend, Scope, SqliteMemory};
 use zerith_providers::{Cancel, Client, ProviderConfig};
@@ -64,6 +66,10 @@ pub struct Shell {
     /// flight, so the stop button cannot exist without something to stop.
     pub cancel: Option<Cancel>,
     pub model: String,
+    /// Dark ladder when true. Flipped by the sidebar toggle.
+    pub dark: bool,
+    /// Transcript lines whose reasoning/tool section is expanded.
+    pub open: HashSet<usize>,
     db: PathBuf,
     me: AppHandle<Shell>,
 }
@@ -87,6 +93,8 @@ impl Shell {
             busy: false,
             cancel: None,
             model: cfg.default_model.clone().unwrap_or_default(),
+            dark: true,
+            open: HashSet::new(),
             db,
             me,
         };
@@ -152,6 +160,7 @@ impl Shell {
 
     fn load_selected(&mut self) {
         self.lines.clear();
+        self.open.clear();
         let Some(s) = self.sessions.get(self.selected) else {
             self.status = String::new();
             return;
@@ -173,6 +182,16 @@ impl Shell {
         };
     }
 
+    pub fn toggle_theme(&mut self) {
+        self.dark = !self.dark;
+    }
+
+    pub fn toggle_open(&mut self, i: usize) {
+        if !self.open.remove(&i) {
+            self.open.insert(i);
+        }
+    }
+
     fn select(&mut self, i: usize) {
         if i < self.sessions.len() && i != self.selected {
             self.selected = i;
@@ -185,6 +204,7 @@ impl Shell {
     /// conversation in the list.
     fn new_chat(&mut self) {
         self.selected = self.sessions.len();
+        self.open.clear();
         self.lines.clear();
         self.draft = TextEdit::new("");
         self.status = String::new();
@@ -386,7 +406,7 @@ fn send(s: &mut Shell) {
 ///
 /// A user turn is a bubble on the right, an answer is plain text on the
 /// sheet: the two read differently at a glance without any colour coding.
-fn line_row(index: usize, line: &Line, u: &Ui) -> El {
+fn line_row(index: usize, line: &Line, u: &Ui, live: bool, open: bool) -> El {
     match line.role {
         "user" => row()
             .key(format!("line-{index}"))
@@ -407,17 +427,25 @@ fn line_row(index: usize, line: &Line, u: &Ui) -> El {
                             .selectable(true),
                     ),
             ),
-        "thinking" => col()
-            .key(format!("line-{index}"))
-            .w_full()
-            .gap(3.0)
-            .child(eyebrow("raciocínio", u))
-            .child(
-                text(line.content.clone())
-                    .wrap()
-                    .font(ui::SMALL)
-                    .color(u.faint),
-            ),
+        "thinking" | "tool" => {
+            let title = if line.role == "thinking" {
+                "raciocínio"
+            } else {
+                "ferramenta"
+            };
+            col().key(format!("line-{index}")).w_full().child(
+                Collapsible::new(title, open)
+                    .on_toggle(move |s: &mut Shell| s.toggle_open(index))
+                    .child(
+                        text(line.content.clone())
+                            .wrap()
+                            .font(ui::SMALL)
+                            .color(u.faint)
+                            .selectable(true),
+                    )
+                    .build(&ui::kit(u)),
+            )
+        }
         "error" => col()
             .key(format!("line-{index}"))
             .w_full()
@@ -438,6 +466,20 @@ fn line_row(index: usize, line: &Line, u: &Ui) -> El {
             } else {
                 line.content.clone()
             };
+            let answer = if line.role == "assistant" {
+                // Answers are Markdown; `streaming` keeps half-written fences
+                // and lists from flickering while deltas arrive.
+                Markdown::new(body)
+                    .streaming(live)
+                    .selectable(true)
+                    .build(&ui::kit(u))
+            } else {
+                text(body)
+                    .wrap()
+                    .font(ui::BODY)
+                    .color(u.content)
+                    .selectable(true)
+            };
             col()
                 .key(format!("line-{index}"))
                 .w_full()
@@ -445,20 +487,12 @@ fn line_row(index: usize, line: &Line, u: &Ui) -> El {
                 .child(eyebrow(
                     if line.role == "assistant" {
                         "zerith"
-                    } else if line.role == "system" {
-                        "sistema"
                     } else {
-                        "ferramenta"
+                        "sistema"
                     },
                     u,
                 ))
-                .child(
-                    text(body)
-                        .wrap()
-                        .font(ui::BODY)
-                        .color(u.content)
-                        .selectable(true),
-                )
+                .child(answer)
         }
     }
 }
@@ -487,7 +521,8 @@ fn icon_button(
         .hover(u.hover)
         .press(u.line_strong)
         .on_press(move |s: &mut Shell| f(s))
-        .child(icon(ic, 16.0).color(u.secondary).center_y())
+        .center()
+        .child(icon(ic, 16.0).color(u.secondary))
 }
 
 /// The one accent control in the window. OpenHuman fills its primary button
@@ -509,7 +544,8 @@ fn primary_button(
         .hover(u.primary_press)
         .press(u.primary_press)
         .on_press(move |s: &mut Shell| f(s))
-        .child(icon(ic, 16.0).color(u.inverted).center_y())
+        .center()
+        .child(icon(ic, 16.0).color(u.inverted))
 }
 
 /// The session column, on the chrome. Header pinned, list scrolls, footer
@@ -564,6 +600,13 @@ fn sidebar(s: &Shell, u: &Ui) -> El {
                         .gap(6.0)
                         .child(text("Zerith").font(ui::TITLE).color(u.content).grow(1.0))
                         .child(icon_button(
+                            "theme",
+                            "Alternar tema claro e escuro".to_string(),
+                            ui::icon_theme(),
+                            u,
+                            |s: &mut Shell| s.toggle_theme(),
+                        ))
+                        .child(icon_button(
                             "new",
                             "Nova conversa".to_string(),
                             ui::icon_new(),
@@ -607,11 +650,12 @@ fn memory_panel(s: &Shell, u: &Ui) -> El {
                         .label(format!("Apagar fato {id}"))
                         .focusable(true)
                         .size(18.0, 18.0)
+                        .center()
                         .radius(6.0)
                         .fill(u.chrome)
                         .hover(u.hover)
                         .on_press(move |s: &mut Shell| s.forget(id))
-                        .child(text("×").font(ui::SMALL).color(u.faint).center_y()),
+                        .child(icon(ui::icon_close(), 12.0).color(u.faint)),
                 ),
         );
     }
@@ -675,13 +719,30 @@ fn plan_panel(s: &Shell, u: &Ui) -> El {
     }
     let mut rows = col().key("plan-rows").w_full().gap(2.0);
     for (i, (state, title, plan)) in s.plan_tasks.iter().enumerate() {
+        let variant = if state == "running" {
+            BadgeVariant::Accent
+        } else {
+            BadgeVariant::Neutral
+        };
         rows = rows.child(
-            text(format!("{state}  {title}"))
+            row()
                 .key(format!("pt-{i}"))
                 .label(format!("{title}, estado {state}, plano {plan}"))
-                .wrap()
-                .font(ui::SMALL)
-                .color(u.secondary),
+                .w_full()
+                .center_y()
+                .gap(6.0)
+                .child(
+                    Badge::new(state.clone())
+                        .variant(variant)
+                        .build(&ui::kit(u)),
+                )
+                .child(
+                    text(title.clone())
+                        .wrap()
+                        .font(ui::SMALL)
+                        .color(u.secondary)
+                        .grow(1.0),
+                ),
         );
     }
     col()
@@ -700,11 +761,12 @@ fn plan_panel(s: &Shell, u: &Ui) -> El {
 }
 
 pub fn view(s: &Shell, _: &mut Cx<Shell>) -> El {
-    let u = ui::dark();
+    let u = ui::pick(s.dark);
 
     let mut transcript = col().key("transcript").w_full().gap(18.0);
     for (i, line) in s.lines.iter().enumerate() {
-        transcript = transcript.child(line_row(i, line, &u));
+        let live = s.busy && i + 1 == s.lines.len();
+        transcript = transcript.child(line_row(i, line, &u, live, s.open.contains(&i)));
     }
     if s.lines.is_empty() {
         transcript = transcript.child(
@@ -786,7 +848,15 @@ pub fn view(s: &Shell, _: &mut Cx<Shell>) -> El {
                     .color(u.faint)
                     .grow(1.0),
                 )
-                .child(text(s.status.clone()).font(ui::LABEL).color(u.faint)),
+                .child(
+                    text(s.status.clone())
+                        .wrap()
+                        .max_lines(1)
+                        .font(ui::LABEL)
+                        .color(u.faint)
+                        .shrink()
+                        .min_w(0.0),
+                ),
         );
 
     // The content sheet: inset on every side, rounded, hairline edge — the
@@ -817,10 +887,13 @@ pub fn view(s: &Shell, _: &mut Cx<Shell>) -> El {
         .child(composer);
 
     col().w_full().h_full().fill(u.canvas).child(
-        row()
-            .w_full()
-            .h_full()
-            .child(sidebar(s, &u))
-            .child(col().grow(1.0).h_full().padding(INSET).child(sheet)),
+        row().w_full().h_full().child(sidebar(s, &u)).child(
+            col()
+                .grow(1.0)
+                .min_w(0.0)
+                .h_full()
+                .padding(INSET)
+                .child(sheet.min_w(0.0)),
+        ),
     )
 }

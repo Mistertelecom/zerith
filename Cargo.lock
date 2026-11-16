@@ -2472,6 +2472,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
 
 [[package]]
+name = "pulldown-cmark"
+version = "0.13.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3db2be46835f013dd3f4fa7f5f7402c537787b54ebb6fe2b94bbdd7e2669bb7b"
+dependencies = [
+ "bitflags 2.13.2",
+ "memchr",
+ "unicase",
+]
+
+[[package]]
 name = "pxfm"
 version = "0.1.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2716,6 +2727,28 @@ dependencies = [
  "xkbcommon",
  "zbus 6.3.0",
  "zeroize",
+]
+
+[[package]]
+name = "rune-highlights"
+version = "0.0.1"
+source = "git+https://github.com/anomalyco/rune?rev=bc05f817ed19488a10a6f1a928cc0521c1c70c75#bc05f817ed19488a10a6f1a928cc0521c1c70c75"
+dependencies = [
+ "unicode-ident",
+ "wasmparser",
+]
+
+[[package]]
+name = "rune-kit"
+version = "0.0.1"
+source = "git+https://github.com/anomalyco/rune?rev=bc05f817ed19488a10a6f1a928cc0521c1c70c75#bc05f817ed19488a10a6f1a928cc0521c1c70c75"
+dependencies = [
+ "icu_normalizer",
+ "pulldown-cmark",
+ "rune",
+ "rune-highlights",
+ "rune-motion",
+ "unicode-segmentation",
 ]
 
 [[package]]
@@ -3497,6 +3530,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "unicase"
+version = "2.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "357cc3acc6a036009fd6c973ed009037c732d60d0b4f6c673e9041497482a28f"
+
+[[package]]
 name = "unicode-ident"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3688,6 +3727,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3b1f9c3798725016c6ee5f2f57869ec0831e8bbc0ab0310a86e787e97f41389e"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "wasmparser"
+version = "0.245.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4f08c9adee0428b7bddf3890fc27e015ac4b761cc608c822667102b8bfd6995e"
+dependencies = [
+ "bitflags 2.13.2",
+ "indexmap",
 ]
 
 [[package]]
@@ -4716,13 +4765,17 @@ name = "zerith-ui"
 version = "0.1.0"
 dependencies = [
  "rune",
+ "rune-kit",
  "tempfile",
  "zerith-core",
  "zerith-memory",
+ "zerith-plugins",
  "zerith-providers",
  "zerith-runtime",
+ "zerith-security",
  "zerith-sessions",
  "zerith-skills",
+ "zerith-tools",
 ]
 
 [[package]]

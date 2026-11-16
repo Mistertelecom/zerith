@@ -114,3 +114,16 @@ fn stop_cancels_the_token_and_does_nothing_without_a_turn() {
     assert_eq!(shell.status, "cancelado");
     assert!(shell.cancel.is_none());
 }
+
+#[test]
+fn theme_and_collapsible_sections_toggle_and_reset_on_new_chat() {
+    let dir = tempdir();
+    let mut shell = shell_at(dir.path());
+    assert!(shell.dark);
+    shell.toggle_theme();
+    assert!(!shell.dark);
+    shell.toggle_open(3);
+    assert!(shell.open.contains(&3));
+    shell.toggle_open(3);
+    assert!(shell.open.is_empty());
+}

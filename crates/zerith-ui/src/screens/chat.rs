@@ -420,6 +420,7 @@ pub fn send(s: &mut Shell) {
     // Resolved on the worker: reading agent files is disk I/O.
     let agent_name = s.chat.agent.clone();
     let root = s.root();
+    let history = crate::wire::profile_limits(s.settings.profile).history_window;
 
     std::thread::spawn(move || {
         let prepared = (|| -> Result<(Store, Client), String> {
@@ -463,6 +464,7 @@ pub fn send(s: &mut Shell) {
                 tools: policy.is_ok().then_some(&tools),
                 policy: policy.as_ref().ok(),
                 approvals: Some(&gate),
+                history,
                 ..AgentOptions::default()
             },
             &session_id,

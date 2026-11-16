@@ -517,3 +517,21 @@ fn agents_come_from_the_core_and_the_chat_can_pick_one() {
     assert!(shell.chat.agent_menu);
     assert!(shell.chat.agent.is_none());
 }
+
+#[test]
+fn the_profile_sets_real_limits_and_persists() {
+    let dir = tempdir();
+    let mut shell = shell_at(dir.path());
+    assert_eq!(shell.settings.profile, zerith_ui::Profile::Balanced);
+    shell.set_profile(zerith_ui::Profile::Economy);
+    let loaded = zerith_core::Settings::load(&zerith_core::Paths::with_root(dir.path()), None);
+    assert_eq!(
+        loaded.settings.profile,
+        zerith_core::settings::Profile::Economy
+    );
+    assert_eq!(loaded.settings.profile.limits().history_window, 20);
+    assert_eq!(
+        shell_at(dir.path()).settings.profile,
+        zerith_ui::Profile::Economy
+    );
+}

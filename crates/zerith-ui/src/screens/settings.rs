@@ -218,18 +218,22 @@ pub fn view(s: &Shell, u: &Ui, system_reduced: bool) -> El {
         Profile::Balanced => 1,
         Profile::Performance => 2,
     };
+    // The real numbers, so the choice says what it changes.
+    let lim = wire::profile_limits(st.profile);
+    let profile_detail = format!(
+        "{} mensagens de histórico por turno, até {} subagentes em planos. Vale para a janela e o CLI.",
+        lim.history_window, lim.max_subagents
+    );
     let profile = section(
         "Perfil de execução",
         vec![setting(
             "Perfil",
-            "Quanto histórico, subagentes e cache um turno pode usar. Salvo em settings.toml; o runtime ainda não aplica.",
+            &profile_detail,
             SegmentedControl::new(&["Economia", "Balanceado", "Desempenho"], Some(prof_idx))
                 .label("Perfil de execução")
                 .fit()
                 .on_pick(|s: &mut Shell, i: usize, _: &mut Tx| {
-                    s.settings.profile =
-                        [Profile::Economy, Profile::Balanced, Profile::Performance][i];
-                    s.save_prefs();
+                    s.set_profile([Profile::Economy, Profile::Balanced, Profile::Performance][i]);
                 })
                 .build(&kit),
             u,

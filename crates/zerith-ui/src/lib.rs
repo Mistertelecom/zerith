@@ -339,6 +339,12 @@ impl Shell {
         self.save_prefs();
     }
 
+    /// Picks an execution profile; the next turn and plan use its limits.
+    pub fn set_profile(&mut self, p: Profile) {
+        self.settings.profile = p;
+        self.save_prefs();
+    }
+
     pub(crate) fn save_prefs(&self) {
         wire::save_prefs(
             &self.root(),

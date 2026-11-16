@@ -182,6 +182,16 @@ pub fn export_session(db: &Path, id: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// The numbers behind an execution profile (history, subagents, caches).
+pub fn profile_limits(p: Profile) -> settings::ProfileLimits {
+    match p {
+        Profile::Economy => settings::Profile::Economy,
+        Profile::Balanced => settings::Profile::Balanced,
+        Profile::Performance => settings::Profile::Performance,
+    }
+    .limits()
+}
+
 /// What the window reads from settings at startup.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct UiPrefs {

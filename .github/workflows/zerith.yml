@@ -1,0 +1,69 @@
+name: Zerith
+
+# The Zerith workspace is the repository root and is a plain Cargo workspace: no
+# pnpm, no Tauri, no Rune build in the default lane (Rune pulls wgpu and winit).
+# Rune is compiled in its own job so a UI regression cannot hide behind a
+# minutes-long build in the main lane.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md']
+  pull_request:
+    paths-ignore: ['**.md']
+
+concurrency:
+  group: zerith-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+      # `zerith-ui` is excluded: it compiles Rune and the workspace tests do not
+      # need a GPU. The `ui` job below builds it.
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --exclude zerith-ui --all-targets -- -D warnings
+      - run: cargo test --workspace --exclude zerith-ui
+
+  ui:
+    name: ui (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+      - name: Linux window dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libxcursor-dev libvulkan-dev
+      - run: cargo build -p zerith-ui
+      # Headless render: proves the window builds a real element tree and
+      # paints without a display, which is the only UI check CI can make.
+      - run: cargo run -p zerith-ui -- --tree tree.json
+      # No ZERITH_HOME: the run creates a throwaway database in the default
+      # location, which on a CI runner is empty.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zerith-tree-${{ runner.os }}
+          path: tree.json
+          if-no-files-found: error

@@ -1,0 +1,74 @@
+name: Zerith release
+
+# Builds a distributable per platform. No signing yet: the artifacts are
+# unsigned and the release notes must say so. `docs/release.md` is the
+# source of truth for install/uninstall and for what is still missing.
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['zerith-v*']
+
+concurrency:
+  group: zerith-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+      - name: Linux window dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libxcursor-dev libvulkan-dev
+      # Not parallel: the workspace members are heavy and CI runners have 7 GB.
+      - run: cargo test --workspace -j 2
+      - run: cargo build --release -p zerith-cli -p zerith-ui -j 2
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p dist
+          case "${{ runner.os }}" in
+            Windows) cp target/release/zerith.exe target/release/zerith-ui.exe dist/ ;;
+            *)       cp target/release/zerith target/release/zerith-ui dist/ ;;
+          esac
+          cp docs/build.md docs/release.md README.md dist/
+          cd dist && sha256sum * > SHA256SUMS.txt 2>/dev/null || shasum -a 256 * > SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zerith-${{ runner.os }}
+          path: dist
+          if-no-files-found: error
+
+  # A release candidate is only a candidate: this job documents the gaps.
+  notes:
+    name: release notes
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Write known limitations
+        run: |
+          {
+            echo "## Zerith ${{ github.ref_name }}"
+            echo
+            echo "Artefatos sem assinatura. Verifique com SHA256SUMS.txt."
+            echo "Limitações conhecidas: ver docs/aceite.md."
+            echo
+            cat docs/aceite.md
+          } > RELEASE_NOTES.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zerith-release-notes
+          path: RELEASE_NOTES.md

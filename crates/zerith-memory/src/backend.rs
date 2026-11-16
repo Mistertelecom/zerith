@@ -22,6 +22,17 @@ impl Scope {
     }
 }
 
+/// The scope CLI and UI both use: `user:$ZERITH_USER`, else `user:local`.
+/// One rule, so a fact stored in one front end is visible in the other.
+pub fn default_scope() -> Scope {
+    let id = std::env::var("ZERITH_USER")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "local".to_string());
+    Scope::user(&id)
+}
+
 /// What kind of memory this is. Kept separate from confidence so an inference
 /// can never be displayed as a confirmed fact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,6 +121,10 @@ pub enum MemoryError {
     NotFound(i64),
     #[error("empty memory text")]
     Empty,
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("linha {line}: {message}")]
+    Import { line: usize, message: String },
 }
 
 pub type Result<T> = std::result::Result<T, MemoryError>;
@@ -144,4 +159,22 @@ pub trait MemoryBackend {
     /// Everything in scope, for export. Includes superseded rows, excludes
     /// deleted ones.
     fn export(&self, scope: &Scope) -> Result<Vec<Fact>>;
+
+    /// Whether automatic extraction may write from this session (not paused,
+    /// not excluded). Backends without the switches always allow it.
+    fn is_extraction_allowed(&self, _session_id: &str) -> Result<bool> {
+        Ok(true)
+    }
+
+    /// Recall across several scopes (e.g. user + project), merged by score.
+    /// bm25 scores from one FTS index are comparable across scopes.
+    fn recall_multi(&self, scopes: &[Scope], query: &str, limit: usize) -> Result<Vec<RecallHit>> {
+        let mut hits = Vec::new();
+        for s in scopes {
+            hits.extend(self.recall(s, query, limit)?);
+        }
+        hits.sort_by(|a, b| a.score.total_cmp(&b.score));
+        hits.truncate(limit);
+        Ok(hits)
+    }
 }

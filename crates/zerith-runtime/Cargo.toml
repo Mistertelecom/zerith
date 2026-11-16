@@ -10,6 +10,8 @@ zerith-sessions = { path = "../zerith-sessions" }
 zerith-providers = { path = "../zerith-providers" }
 zerith-memory = { path = "../zerith-memory" }
 zerith-skills = { path = "../zerith-skills" }
+zerith-tools = { path = "../zerith-tools" }
+zerith-security = { path = "../zerith-security" }
 serde_json.workspace = true
 thiserror.workspace = true
 

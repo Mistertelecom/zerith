@@ -7,8 +7,11 @@ license.workspace = true
 [dependencies]
 zerith-security = { path = "../zerith-security" }
 zerith-memory = { path = "../zerith-memory" }
+# Only for `Cancel`: the token a turn shares between the stream and its tools.
+zerith-providers = { path = "../zerith-providers" }
 serde_json.workspace = true
 thiserror.workspace = true
+walkdir = "2"
 
 [dev-dependencies]
 tempfile.workspace = true

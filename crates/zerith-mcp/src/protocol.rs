@@ -100,9 +100,97 @@ impl CallResult {
         out
     }
 }
+
+/// One resource a server advertises (`resources/list`).
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct ResourceInfo {
+    pub uri: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default, rename = "mimeType")]
+    pub mime_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ResourcesList {
+    #[serde(default)]
+    pub resources: Vec<ResourceInfo>,
+}
+
+/// One block of `resources/read`. Text or base64 blob, never both.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct ResourceContent {
+    pub uri: String,
+    #[serde(default, rename = "mimeType")]
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub blob: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ResourceRead {
+    #[serde(default)]
+    pub contents: Vec<ResourceContent>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct PromptArgument {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub required: Option<bool>,
+}
+
+/// One prompt template a server advertises (`prompts/list`).
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct PromptInfo {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub arguments: Vec<PromptArgument>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PromptsList {
+    #[serde(default)]
+    pub prompts: Vec<PromptInfo>,
+}
+
+/// `prompts/get`: messages stay untyped for the same reason tool content does.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct PromptGet {
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub messages: Vec<Value>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resources_and_prompts_parse_tolerantly() {
+        let r: ResourcesList =
+            serde_json::from_str(r#"{"resources":[{"uri":"file:///a","x":1}]}"#).unwrap();
+        assert_eq!(r.resources[0].uri, "file:///a");
+        let c: ResourceRead =
+            serde_json::from_str(r#"{"contents":[{"uri":"u","text":"oi"}]}"#).unwrap();
+        assert_eq!(c.contents[0].text.as_deref(), Some("oi"));
+        let p: PromptsList = serde_json::from_str(
+            r#"{"prompts":[{"name":"p","arguments":[{"name":"a","required":true}]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(p.prompts[0].arguments[0].required, Some(true));
+        let g: PromptGet = serde_json::from_str(r#"{"messages":[{"role":"user"}]}"#).unwrap();
+        assert_eq!(g.messages.len(), 1);
+    }
 
     #[test]
     fn a_text_result_is_rendered_and_an_image_is_named() {

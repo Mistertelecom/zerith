@@ -9,6 +9,8 @@ pub mod backend;
 pub mod extract;
 pub mod sqlite;
 
-pub use backend::{Confidence, Fact, FactKind, MemoryBackend, RecallHit, Scope};
-pub use extract::{extract, Extracted};
+pub use backend::{
+    default_scope, Confidence, Fact, FactKind, MemoryBackend, MemoryError, RecallHit, Scope,
+};
+pub use extract::{extract, extract_allowed, Extracted};
 pub use sqlite::SqliteMemory;

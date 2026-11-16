@@ -186,3 +186,125 @@ fn memory_survives_reopening_the_file() {
     // live SQLite handle still holds.
     drop(m);
 }
+
+#[test]
+fn default_scope_uses_zerith_user_else_local() {
+    // Single test touches the env var, so no race with other tests.
+    std::env::remove_var("ZERITH_USER");
+    assert_eq!(zerith_memory::default_scope(), Scope::user("local"));
+    std::env::set_var("ZERITH_USER", "ana");
+    assert_eq!(zerith_memory::default_scope(), Scope::user("ana"));
+    std::env::remove_var("ZERITH_USER");
+}
+
+#[test]
+fn recall_multi_merges_user_and_project_scopes() {
+    let m = mem();
+    let u = Scope::user("joao");
+    let p = Scope::project("zerith");
+    let other = Scope::project("outro");
+    m.remember(
+        &u,
+        FactKind::Preference,
+        "prefiro deploy pequeno",
+        Confidence::Confirmed,
+        None,
+    )
+    .unwrap();
+    m.remember(
+        &p,
+        FactKind::Decision,
+        "deploy via script",
+        Confidence::Confirmed,
+        None,
+    )
+    .unwrap();
+    m.remember(
+        &other,
+        FactKind::Fact,
+        "deploy secreto",
+        Confidence::Confirmed,
+        None,
+    )
+    .unwrap();
+    let hits = m.recall_multi(&[u, p], "deploy", 10).unwrap();
+    assert_eq!(hits.len(), 2);
+    assert!(hits.windows(2).all(|w| w[0].score <= w[1].score));
+    assert!(hits.iter().all(|h| h.fact.scope != "project:outro"));
+    assert_eq!(
+        m.recall_multi(&[Scope::user("joao")], "deploy", 1)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn pause_and_session_exclusion_persist() {
+    let dir = tempfile::Builder::new()
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
+    let db = dir.path().join("m.db");
+    {
+        let m = SqliteMemory::open(&db).unwrap();
+        assert!(m.is_extraction_allowed("s1").unwrap());
+        m.exclude_session("s1").unwrap();
+        assert!(!m.is_extraction_allowed("s1").unwrap());
+        assert!(m.is_extraction_allowed("s2").unwrap());
+        m.set_paused(true).unwrap();
+    }
+    let m = SqliteMemory::open(&db).unwrap();
+    assert!(m.is_paused().unwrap());
+    assert!(!m.is_extraction_allowed("s2").unwrap());
+    assert_eq!(
+        zerith_memory::extract_allowed(&m, "s2", "lembre que x"),
+        None
+    );
+    m.set_paused(false).unwrap();
+    assert!(zerith_memory::extract_allowed(&m, "s2", "lembre que x").is_some());
+    assert_eq!(
+        zerith_memory::extract_allowed(&m, "s1", "lembre que x"),
+        None
+    );
+    m.include_session("s1").unwrap();
+    assert!(m.is_extraction_allowed("s1").unwrap());
+}
+
+#[test]
+fn facts_round_trip_through_jsonl() {
+    let a = mem();
+    let u = Scope::user("joao");
+    a.remember(
+        &u,
+        FactKind::Instruction,
+        "sempre testes",
+        Confidence::Confirmed,
+        Some("manual"),
+    )
+    .unwrap();
+    a.remember(
+        &Scope::project("z"),
+        FactKind::Fact,
+        "usa sqlite",
+        Confidence::Inferred,
+        None,
+    )
+    .unwrap();
+    let mut buf = Vec::new();
+    assert_eq!(a.export_jsonl(None, &mut buf).unwrap(), 2);
+
+    let b = mem();
+    assert_eq!(b.import_jsonl(&buf[..]).unwrap(), 2);
+    // Importing again dedupes instead of duplicating.
+    b.import_jsonl(&buf[..]).unwrap();
+    let mine = b.export(&u).unwrap();
+    assert_eq!(mine.len(), 1);
+    assert_eq!(mine[0].kind, FactKind::Instruction);
+    assert_eq!(mine[0].source.as_deref(), Some("manual"));
+    let proj = b.export(&Scope::project("z")).unwrap();
+    assert_eq!(proj[0].confidence, Confidence::Inferred);
+
+    let mut one = Vec::new();
+    assert_eq!(a.export_jsonl(Some(&u), &mut one).unwrap(), 1);
+    assert!(b.import_jsonl(&b"{bad"[..]).is_err());
+}

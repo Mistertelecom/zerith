@@ -38,6 +38,17 @@ impl Paths {
         self.root.join("config.toml")
     }
 
+    /// User settings layer (see `settings`). `config()` is kept for callers
+    /// that already use it; nothing reads `config.toml`.
+    pub fn settings(&self) -> PathBuf {
+        self.root.join("settings.toml")
+    }
+
+    /// User-level project instructions, applied to every project.
+    pub fn instructions(&self) -> PathBuf {
+        self.root.join("AGENTS.md")
+    }
+
     pub fn skills(&self) -> PathBuf {
         self.root.join("skills")
     }

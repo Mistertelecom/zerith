@@ -110,3 +110,36 @@ fn a_missing_database_is_reported_not_panicked() {
     let err = import(&dir.path().join("nope.db"), "default", &store).unwrap_err();
     assert!(matches!(err, ImportError::NotFound(_)));
 }
+
+#[test]
+fn an_interrupted_import_resumes_per_message() {
+    let dir = tmp();
+    let src = fixture(dir.path());
+    let store = Store::open(dir.path().join("zerith.db")).unwrap();
+    import(&src, "default", &store).unwrap();
+    let id = store.list_sessions(1).unwrap()[0].id.clone();
+    // Simulate a crash after the first message was committed.
+    store
+        .conn()
+        .execute(
+            "DELETE FROM messages WHERE id = (SELECT MAX(id) FROM messages WHERE session_id = ?1)",
+            [&id],
+        )
+        .unwrap();
+    // And Hermes kept talking in the meantime.
+    let conn = rusqlite::Connection::open(&src).unwrap();
+    conn.execute(
+        "INSERT INTO messages(session_id, role, content, active) VALUES ('h1', 'user', 'de novo', 1)",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let r = import(&src, "default", &store).unwrap();
+    assert_eq!((r.sessions_resumed, r.messages_imported), (1, 2));
+    let msgs = store.messages(&id, 10, 0).unwrap();
+    let texts: Vec<_> = msgs.iter().map(|m| m.content.as_str()).collect();
+    assert_eq!(texts, ["oi", "olá", "de novo"]);
+    let again = import(&src, "default", &store).unwrap();
+    assert_eq!((again.sessions_skipped, again.messages_imported), (1, 0));
+}

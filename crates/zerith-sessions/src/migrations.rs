@@ -6,10 +6,46 @@
 
 use rusqlite::Connection;
 
-pub const CURRENT_VERSION: i32 = 2;
+pub const CURRENT_VERSION: i32 = 3;
 
 /// Every migration, in order. Index 0 upgrades 0 -> 1.
-const MIGRATIONS: &[&str] = &[V1, V2];
+const MIGRATIONS: &[&str] = &[V1, V2, V3];
+
+const V3: &str = r#"
+-- Full-text search over message content. External content: the text lives
+-- once, in `messages`; the index holds only tokens.
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+    content,
+    content='messages',
+    content_rowid='id',
+    tokenize="unicode61 remove_diacritics 2"
+);
+
+CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
+    INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.id, old.content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE OF content ON messages BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.id, old.content);
+    INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+END;
+
+-- Backfill rows written before this version. `rebuild` re-reads the content
+-- table, so running it twice yields the same index.
+INSERT INTO messages_fts(messages_fts) VALUES('rebuild');
+
+-- Small durable switches (memory pause, per-session exclusion, import
+-- cursors). Key/value on purpose: each is one row, none needs a schema.
+CREATE TABLE IF NOT EXISTS settings (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+"#;
 
 const V1: &str = r#"
 CREATE TABLE sessions (

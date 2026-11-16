@@ -10,13 +10,21 @@
 //!    the question.
 //! 2. **Streaming does not write per delta.** Tokens are shown as they arrive
 //!    and the assistant message is written once, whole, when the turn closes.
+//!
+//! The tool loop is in [`agent`]; the plain turn is that loop with tools off.
 
+pub mod agent;
 pub mod plan;
+
+pub use agent::{
+    approval_channel, run_agent_turn, AgentOptions, Approval, ApprovalGate, ApprovalSender,
+    DEFAULT_MAX_STEPS,
+};
 
 use std::sync::mpsc;
 use zerith_memory::{MemoryBackend, Scope};
-use zerith_providers::{ChatMessage, ChatRequest, Client, Completion, ProviderError, StreamEvent};
-use zerith_sessions::{NewMessage, Role, Store};
+use zerith_providers::{Client, ProviderError};
+use zerith_sessions::Store;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RunError {
@@ -35,12 +43,41 @@ pub type Result<T> = std::result::Result<T, RunError>;
 pub enum RunEvent {
     Delta(String),
     Reasoning(String),
-    Done { stored: Option<i64> },
+    Done {
+        stored: Option<i64>,
+    },
+    /// A model request is about to go out; `n` starts at 1.
+    Step {
+        n: usize,
+    },
+    /// The model asked for a tool. `args` is the raw JSON the model wrote.
+    ToolCall {
+        id: String,
+        name: String,
+        args: String,
+    },
+    /// The call finished (or was refused); the full output is in the store.
+    ToolResult {
+        id: String,
+        name: String,
+        ok: bool,
+        output_preview: String,
+    },
+    /// The turn is blocked until `ApprovalSender::answer(id, ..)` is called.
+    ApprovalNeeded {
+        id: u64,
+        tool: String,
+        summary: String,
+    },
+    /// Token counts of one model request, as the provider reported them.
+    Usage {
+        input: u64,
+        output: u64,
+    },
 }
 
-/// How many past messages are replayed to the model. A cap, not a summary:
-/// compaction arrives with the memory phase, and pretending it exists now
-/// would be worse than a visible limit.
+/// How many past messages are replayed to the model, newest first. Further
+/// trimming to the context window happens in `agent::fit_context`.
 pub const HISTORY_LIMIT: usize = 40;
 
 /// How much of the prompt may be spent on recalled facts. A rough 4 chars per
@@ -148,8 +185,9 @@ pub fn run_turn_cancellable(
     )
 }
 
-/// The turn itself. Every entry point above funnels here so there is exactly
-/// one place that decides what the model sees.
+/// The turn itself, without tools: one request, one stored answer. Every
+/// entry point above funnels here; it is `run_agent_turn` with tools off, so
+/// there is exactly one place that decides what the model sees.
 #[allow(clippy::too_many_arguments)]
 pub fn run_turn_in(
     store: &Store,
@@ -159,26 +197,45 @@ pub fn run_turn_in(
     model: &str,
     prompt: &str,
     cancel: &zerith_providers::Cancel,
-    mut on_event: impl FnMut(RunEvent),
+    on_event: impl FnMut(RunEvent),
 ) -> Result<TurnReport> {
-    let TurnContext {
-        memory,
-        scope,
-        skills,
-    } = ctx;
-    let session = store
-        .session(session_id)?
-        .ok_or_else(|| RunError::NoSession(session_id.to_string()))?;
+    run_agent_turn(
+        store,
+        client,
+        ctx,
+        AgentOptions::default(),
+        session_id,
+        model,
+        prompt,
+        cancel,
+        on_event,
+    )
+}
 
-    store.append(session_id, &NewMessage::new(Role::User, prompt))?;
-
-    let mut messages = Vec::new();
-    let mut prompt_text = zerith_core::system_prompt(&session.title);
-    if let (Some(mem), Some(scope)) = (memory, scope) {
+/// The system prompt: identity, then recalled facts, then skills. Facts land
+/// *after* the static part so the provider's prefix cache stays warm.
+pub(crate) fn system_prompt(
+    title: &str,
+    ctx: TurnContext<'_>,
+    session_id: &str,
+    prompt: &str,
+) -> String {
+    // Project instructions (AGENTS.md / CLAUDE.md) from the working directory
+    // up to the git root, plus the user-level file. Static per project, so it
+    // sits with the identity and keeps the prefix cache warm.
+    let paths = zerith_core::Paths::resolve();
+    let mut prompt_text = match std::env::current_dir() {
+        Ok(cwd) => zerith_core::system_prompt_with_instructions(
+            title,
+            &zerith_core::load_instructions(&paths, &cwd),
+        ),
+        Err(_) => zerith_core::system_prompt(title),
+    };
+    if let (Some(mem), Some(scope)) = (ctx.memory, ctx.scope) {
         // A fact the user stated is stored before the answer is asked for, so
         // the same turn can already recall it — and a crash after this point
         // still keeps what the user said.
-        if let Some(f) = zerith_memory::extract(prompt) {
+        if let Some(f) = zerith_memory::extract_allowed(mem, session_id, prompt) {
             let _ = mem.remember(scope, f.kind, &f.text, f.confidence, Some(session_id));
         }
         let known = recall_block(mem, scope, prompt);
@@ -187,118 +244,14 @@ pub fn run_turn_in(
             prompt_text.push_str(&known);
         }
     }
-    if let Some(lib) = skills {
+    if let Some(lib) = ctx.skills {
         let block = skills_block(lib, prompt, SKILLS_BUDGET_CHARS);
         if !block.is_empty() {
             prompt_text.push_str("\n\n");
             prompt_text.push_str(&block);
         }
     }
-    messages.push(ChatMessage::system(prompt_text));
-
-    let history = store.messages(session_id, HISTORY_LIMIT, 0)?;
-    for m in &history {
-        // Tool rows are not replayed: without the tool call, their answer reads
-        // as an assistant claim nobody made.
-        let role = match m.role {
-            Role::User => zerith_providers::Role::User,
-            Role::Assistant => zerith_providers::Role::Assistant,
-            Role::System => zerith_providers::Role::System,
-            Role::Tool => continue,
-        };
-        if m.content.trim().is_empty() {
-            continue;
-        }
-        messages.push(ChatMessage {
-            role,
-            content: m.content.clone(),
-        });
-    }
-
-    let req = ChatRequest::new(model, messages);
-
-    // Streaming first: the window is the main host, and a turn that only
-    // paints when it finishes reads as a hang. If the endpoint rejects the
-    // stream before sending anything, fall back once to a blocking request —
-    // some OpenAI-compatible servers answer 400 to `stream: true`.
-    let mut text = String::new();
-    let mut reasoning: Option<String> = None;
-    let mut usage = None;
-    let streamed = client.stream(&req, cancel, |event| match event {
-        StreamEvent::Delta(t) => {
-            text.push_str(&t);
-            on_event(RunEvent::Delta(t));
-        }
-        StreamEvent::Reasoning(r) => {
-            reasoning = Some(match reasoning.take() {
-                Some(mut acc) => {
-                    acc.push_str(&r);
-                    acc
-                }
-                None => r.clone(),
-            });
-            on_event(RunEvent::Reasoning(r));
-        }
-        // A trailing `[DONE]` carries no usage; it must not erase the
-        // counts an earlier chunk already reported.
-        StreamEvent::Done { usage: u } => {
-            if u.is_some() {
-                usage = u;
-            }
-        }
-    });
-
-    if let Err(e) = streamed {
-        // Only a stream that produced nothing is retried: repeating a stream
-        // that already painted text would show the answer twice.
-        if !text.is_empty() || matches!(e, ProviderError::Cancelled) {
-            return Err(e.into());
-        }
-        let completion = client.complete(&req, cancel)?;
-        if let Some(r) = &completion.reasoning {
-            on_event(RunEvent::Reasoning(r.clone()));
-        }
-        on_event(RunEvent::Delta(completion.text.clone()));
-        text = completion.text;
-        reasoning = completion.reasoning;
-        usage = completion.usage;
-    }
-
-    let completion = Completion {
-        text,
-        reasoning,
-        usage,
-        finish_reason: None,
-    };
-
-    let message_id = store.append(
-        session_id,
-        &NewMessage {
-            reasoning: completion.reasoning.clone(),
-            token_count: completion
-                .usage
-                .as_ref()
-                .map(|u| u.completion_tokens as i64),
-            ..NewMessage::new(Role::Assistant, completion.text.clone())
-        },
-    )?;
-    on_event(RunEvent::Done {
-        stored: Some(message_id),
-    });
-
-    let (prompt_tokens, completion_tokens) = completion
-        .usage
-        .map(|u| (u.prompt_tokens, u.completion_tokens))
-        .unwrap_or((0, 0));
-
-    Ok(TurnReport {
-        session_id: session_id.to_string(),
-        message_id,
-        text: completion.text,
-        reasoning: completion.reasoning,
-        prompt_tokens,
-        completion_tokens,
-    })
+    prompt_text
 }
 
 /// A helper for hosts that drive a turn on a worker thread and read events on

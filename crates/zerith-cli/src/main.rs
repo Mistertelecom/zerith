@@ -4,14 +4,14 @@
 //! and an agent harness that shells out to itself should start fast.
 
 use std::process::ExitCode;
-use zerith_core::Paths;
+use zerith_core::{secrets, Paths, Settings};
 use zerith_importers::{detect, import, ImportReport};
 use zerith_mcp::Client as McpClient;
-use zerith_memory::{Confidence, FactKind, MemoryBackend, Scope, SqliteMemory};
+use zerith_memory::{default_scope, Confidence, FactKind, MemoryBackend, Scope, SqliteMemory};
 use zerith_plugins::{Library as Plugins, Status as PluginStatus};
 use zerith_providers::{Cancel, ChatMessage, ChatRequest, Client, ProviderConfig};
 use zerith_runtime::plan::{parse_plan, run_plan};
-use zerith_runtime::{run_turn_in, RunEvent, TurnContext};
+use zerith_runtime::{run_turn_cancellable, run_turn_in, RunEvent, TurnContext};
 use zerith_security::{redact, Action, Policy, Verdict, PRESETS};
 use zerith_sessions::{NewMessage, Role, SessionSource, Store, TaskState};
 use zerith_skills::catalog;
@@ -64,6 +64,9 @@ usage:
   zerith mcp call <command and args> -- <tool> [json-args]
   zerith providers [probe|models|chat <model> <prompt>]
   zerith chat [--session <id>] [--model <id>] <prompt>
+  zerith -p <prompt> [--output-format text|json|stream-json] [--model M] [--session ID]
+  zerith config show
+  zerith secret set <name> [value] | get <name> | delete <name>
   zerith import hermes [--profile <name>]
   zerith import detect"
 }
@@ -74,8 +77,13 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     };
     let paths = Paths::resolve();
+    if is_headless(args) {
+        return headless(&paths, args);
+    }
 
     match (cmd, args.get(1).map(String::as_str)) {
+        ("config", _) => config_cmd(&paths, args)?,
+        ("secret", _) => secret_cmd(args)?,
         ("version", _) | ("--version", _) | ("-V", _) => {
             println!(
                 "{} {} — {}",
@@ -266,7 +274,7 @@ fn tools_cmd(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::E
             paths.ensure()?;
             let policy = Policy::from_env(paths.root())?;
             let memory = SqliteMemory::open(paths.db()).ok();
-            let scope = Scope::user(&scope_id());
+            let scope = default_scope();
             let ctx = CallCtx {
                 workspace: paths.root(),
                 policy: &policy,
@@ -559,7 +567,7 @@ fn plan(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>
                 &plan_id,
                 &model,
                 agents,
-                Some(Scope::user(&scope_id())),
+                Some(default_scope()),
                 |task, state| println!("  {}  {}", state.as_str(), task.title),
             )?;
             println!(
@@ -637,17 +645,250 @@ fn memory(paths: &Paths, args: &[String], sub: &str) -> Result<(), Box<dyn std::
     Ok(())
 }
 
-/// Who the memory belongs to. One operator per install for now; a profile id
-/// can override it without changing the schema.
-fn scope_id() -> String {
-    std::env::var("ZERITH_USER").unwrap_or_else(|_| whoami_fallback())
+/// `zerith chat` arguments. `--flag value` pairs are consumed first, so a
+/// model id is never mistaken for the prompt; the rest is user text.
+#[derive(Debug, PartialEq)]
+struct ChatArgs {
+    prompt: String,
+    session: Option<String>,
+    model: Option<String>,
 }
 
-fn whoami_fallback() -> String {
-    std::env::var("USERNAME")
-        .or_else(|_| std::env::var("USER"))
-        .unwrap_or_else(|_| "local".to_string())
-        .to_lowercase()
+fn parse_chat(args: &[String]) -> Result<ChatArgs, String> {
+    let mut positionals: Vec<&str> = Vec::new();
+    let mut out = ChatArgs {
+        prompt: String::new(),
+        session: None,
+        model: None,
+    };
+    let mut i = 1;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--session" || a == "--model" {
+            let value = args.get(i + 1).cloned();
+            if a == "--session" {
+                out.session = value;
+            } else {
+                out.model = value;
+            }
+            i += 2;
+            continue;
+        }
+        if !a.starts_with("--") {
+            positionals.push(a);
+        }
+        i += 1;
+    }
+    if positionals.is_empty() {
+        return Err("chat needs a prompt".into());
+    }
+    out.prompt = positionals.join(" ");
+    Ok(out)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum OutputFormat {
+    Text,
+    Json,
+    StreamJson,
+}
+
+/// `zerith -p <prompt> [--output-format F] [--model M] [--session ID]`.
+#[derive(Debug, PartialEq)]
+struct Headless {
+    prompt: String,
+    format: OutputFormat,
+    model: Option<String>,
+    session: Option<String>,
+}
+
+fn is_headless(args: &[String]) -> bool {
+    args.iter().any(|a| a == "-p" || a == "--print")
+}
+
+fn parse_headless(args: &[String]) -> Result<Headless, String> {
+    let mut out = Headless {
+        prompt: String::new(),
+        format: OutputFormat::Text,
+        model: None,
+        session: None,
+    };
+    let mut prompt = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let mut value = |name: &str| {
+            it.next()
+                .cloned()
+                .ok_or_else(|| format!("{name} precisa de um valor"))
+        };
+        match a.as_str() {
+            "-p" | "--print" => prompt = Some(value(a)?),
+            "--model" => out.model = Some(value(a)?),
+            "--session" => out.session = Some(value(a)?),
+            "--output-format" => {
+                out.format = match value(a)?.as_str() {
+                    "text" => OutputFormat::Text,
+                    "json" => OutputFormat::Json,
+                    "stream-json" => OutputFormat::StreamJson,
+                    other => return Err(format!("--output-format inválido: {other}")),
+                }
+            }
+            other => return Err(format!("argumento desconhecido: {other}")),
+        }
+    }
+    out.prompt = prompt
+        .filter(|p| !p.trim().is_empty())
+        .ok_or("-p precisa de um prompt")?;
+    Ok(out)
+}
+
+/// The provider for this process: env as before, then the merged settings
+/// for the model, then the OS keyring for the key.
+fn provider_config(settings: &Settings) -> Result<ProviderConfig, Box<dyn std::error::Error>> {
+    let mut cfg = ProviderConfig::from_env();
+    if cfg.default_model.is_none() {
+        cfg.default_model = settings.model.clone();
+    }
+    if cfg.api_key.is_none() && cfg.kind.needs_key() {
+        let key_ref = settings
+            .provider_entry(&cfg.name)
+            .and_then(|p| p.api_key_ref.as_deref());
+        cfg.api_key = secrets::resolve_api_key(&cfg.name, key_ref)?;
+    }
+    Ok(cfg)
+}
+
+fn load_settings(paths: &Paths) -> Settings {
+    let cwd = std::env::current_dir().ok();
+    let loaded = Settings::load(paths, cwd.as_deref());
+    for e in &loaded.errors {
+        eprintln!("zerith: {e}");
+    }
+    loaded.settings
+}
+
+/// One turn without a REPL, for scripts and CI. Exit 0 on success, 1 on any
+/// error (handled by `main`).
+fn headless(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let h = parse_headless(args)?;
+    let settings = load_settings(paths);
+    let cfg = provider_config(&settings)?;
+    let model = h
+        .model
+        .or_else(|| cfg.default_model.clone())
+        .or_else(|| cfg.known_models.first().cloned())
+        .ok_or("sem modelo: use --model ou ZERITH_MODEL")?;
+    let client = Client::new(cfg)?;
+    paths.ensure()?;
+    let store = Store::open(paths.db())?;
+    let session_id = match h.session {
+        Some(id) => id,
+        None => {
+            let title: String = h.prompt.chars().take(48).collect();
+            store.create_session(&title, SessionSource::Native)?.id
+        }
+    };
+    let memory = SqliteMemory::open(paths.db())?;
+    let scope = default_scope();
+    let memory = (!settings.memory.paused).then_some(&memory as &dyn MemoryBackend);
+    let format = h.format;
+    let report = run_turn_cancellable(
+        &store,
+        &client,
+        memory,
+        Some(&scope),
+        &session_id,
+        &model,
+        &h.prompt,
+        &Cancel::default(),
+        |e| {
+            if format != OutputFormat::StreamJson {
+                return;
+            }
+            let line = match e {
+                RunEvent::Delta(t) => serde_json::json!({"type": "delta", "text": t}),
+                RunEvent::Reasoning(t) => serde_json::json!({"type": "reasoning", "text": t}),
+                RunEvent::Done { stored } => {
+                    serde_json::json!({"type": "done", "message_id": stored})
+                }
+                RunEvent::Usage { input, output } => {
+                    serde_json::json!({"type": "usage", "input": input, "output": output})
+                }
+                // Tool events need tools enabled; this path runs without them.
+                _ => return,
+            };
+            println!("{line}");
+        },
+    )?;
+    let usage = serde_json::json!({
+        "prompt_tokens": report.prompt_tokens,
+        "completion_tokens": report.completion_tokens,
+    });
+    match format {
+        OutputFormat::Text => println!("{}", report.text),
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::json!({"session_id": report.session_id, "result": report.text, "usage": usage})
+        ),
+        OutputFormat::StreamJson => println!(
+            "{}",
+            serde_json::json!({"type": "result", "session_id": report.session_id, "result": report.text, "usage": usage})
+        ),
+    }
+    Ok(())
+}
+
+/// `zerith config show`: every merged key with the layer it came from.
+fn config_cmd(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    match args.get(1).map(String::as_str) {
+        None | Some("show") => {
+            let cwd = std::env::current_dir().ok();
+            let loaded = Settings::load(paths, cwd.as_deref());
+            println!("# usuário  {}", paths.settings().display());
+            if let Some(d) = &cwd {
+                println!("# projeto  {}", d.join(".zerith").display());
+            }
+            for (k, v, src) in loaded.entries() {
+                println!("{k:<36} {v:<32} [{src}]");
+            }
+            for e in &loaded.errors {
+                eprintln!("zerith: {e}");
+            }
+        }
+        Some(other) => return Err(format!("unknown config command: {other}").into()),
+    }
+    Ok(())
+}
+
+/// `zerith secret set|get|delete <name>`. `set` reads the value from stdin
+/// when not given, so it stays out of shell history.
+fn secret_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let sub = args.get(1).map(String::as_str);
+    let name = args.get(2).ok_or("secret needs a name")?;
+    match sub {
+        Some("set") => {
+            let value = match args.get(3) {
+                Some(v) => v.clone(),
+                None => {
+                    let mut line = String::new();
+                    std::io::stdin().read_line(&mut line)?;
+                    line.trim_end_matches(['\r', '\n']).to_string()
+                }
+            };
+            if value.is_empty() {
+                return Err("valor vazio; nada gravado".into());
+            }
+            secrets::set_secret(name, &value)?;
+            println!("{name} gravado no cofre do sistema");
+        }
+        Some("get") => println!("{name} {}", secrets::mask(&secrets::get_secret(name)?)),
+        Some("delete") => {
+            secrets::delete_secret(name)?;
+            println!("{name} removido");
+        }
+        _ => return Err("usage: zerith secret set|get|delete <name>".into()),
+    }
+    Ok(())
 }
 
 /// One turn: resolve the session, stream the answer, persist it whole.
@@ -655,37 +896,14 @@ fn whoami_fallback() -> String {
 /// The turn runs on this thread. A CLI has nothing else to do while it waits,
 /// so the extra thread `run_turn_async` exists for the window, not here.
 fn chat(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    // `--flag value` pairs are consumed first, so a model id is never
-    // mistaken for the prompt. Everything left is user text, joined back.
-    let mut positionals: Vec<&str> = Vec::new();
-    let mut session_flag = None;
-    let mut model_flag = None;
-    let mut i = 1;
-    while i < args.len() {
-        let a = args[i].as_str();
-        if a == "--session" || a == "--model" {
-            let value = args.get(i + 1).cloned();
-            if a == "--session" {
-                session_flag = value;
-            } else {
-                model_flag = value;
-            }
-            i += 2;
-            continue;
-        }
-        if a.starts_with("--") {
-            i += 1;
-            continue;
-        }
-        positionals.push(a);
-        i += 1;
-    }
-    if positionals.is_empty() {
-        return Err("chat needs a prompt".into());
-    }
-    let prompt = positionals.join(" ");
+    let ChatArgs {
+        prompt,
+        session: session_flag,
+        model: model_flag,
+    } = parse_chat(args)?;
 
-    let cfg = ProviderConfig::from_env();
+    let settings = load_settings(paths);
+    let cfg = provider_config(&settings)?;
     let model = model_flag
         .or_else(|| cfg.default_model.clone())
         .or_else(|| cfg.known_models.first().cloned())
@@ -705,7 +923,7 @@ fn chat(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>
     // Memory shares the same database file: one store, one schema, no second
     // source of truth to keep in sync.
     let memory = SqliteMemory::open(paths.db())?;
-    let scope = Scope::user(&scope_id());
+    let scope = default_scope();
 
     // Installed skills are consulted, but only their names and descriptions
     // reach the prompt unless the user named one.
@@ -730,7 +948,7 @@ fn chat(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>
                 println!("{text}");
             }
             RunEvent::Reasoning(r) => eprintln!("[reasoning] {r}"),
-            RunEvent::Done { .. } => {}
+            _ => {}
         },
     )?;
     if !streamed {
@@ -947,4 +1165,77 @@ fn skills(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Erro
         other => return Err(format!("unknown skills command: {other}").into()),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn v(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn chat_flags_never_become_the_prompt() {
+        let a = parse_chat(&v(&[
+            "chat",
+            "--model",
+            "m1",
+            "oi",
+            "--session",
+            "s",
+            "mundo",
+        ]))
+        .unwrap();
+        assert_eq!(
+            a,
+            ChatArgs {
+                prompt: "oi mundo".into(),
+                session: Some("s".into()),
+                model: Some("m1".into())
+            }
+        );
+        assert!(parse_chat(&v(&["chat", "--model", "m1"])).is_err());
+    }
+
+    #[test]
+    fn headless_parses_every_flag_in_any_order() {
+        let args = v(&[
+            "--output-format",
+            "stream-json",
+            "-p",
+            "olá",
+            "--model",
+            "m",
+            "--session",
+            "s1",
+        ]);
+        assert!(is_headless(&args));
+        let h = parse_headless(&args).unwrap();
+        assert_eq!(h.prompt, "olá");
+        assert_eq!(h.format, OutputFormat::StreamJson);
+        assert_eq!(h.model.as_deref(), Some("m"));
+        assert_eq!(h.session.as_deref(), Some("s1"));
+        assert_eq!(
+            parse_headless(&v(&["-p", "x"])).unwrap().format,
+            OutputFormat::Text
+        );
+    }
+
+    #[test]
+    fn headless_rejects_bad_input() {
+        assert!(parse_headless(&v(&["-p"])).is_err());
+        assert!(parse_headless(&v(&["-p", " "])).is_err());
+        assert!(parse_headless(&v(&["-p", "x", "--output-format", "xml"])).is_err());
+        assert!(parse_headless(&v(&["-p", "x", "--bogus"])).is_err());
+        assert!(!is_headless(&v(&["chat", "oi"])));
+    }
+
+    #[test]
+    fn flag_helpers() {
+        let args = v(&["session", "list", "--limit", "7", "--to", "f"]);
+        assert_eq!(flag_usize(&args, "--limit"), Some(7));
+        assert_eq!(flag_value(&args, "--to").as_deref(), Some("f"));
+        assert_eq!(flag_usize(&args, "--missing"), None);
+    }
 }

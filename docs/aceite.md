@@ -21,7 +21,7 @@ evidência executada, não código escrito. Onde falta, está dito o que falta.
 | Usuário configura um provider | Feito | `ZERITH_PROVIDER`, `ZERITH_BASE_URL`, `ZERITH_API_KEY`, `ZERITH_MODEL`; `zerith providers probe` |
 | 9Router via API local OpenAI-compatible | Feito | `providers probe` → `http 200, 59 models` em `localhost:20128/v1` |
 | Streaming funciona | Feito | turno real com `DEEPSEEKV4.1`: `[turn] tokens 2878→83`; SSE com `reasoning_content` |
-| Cancelamento funciona | Feito | botão "parar" com `Cancel`; teste `stop_cancels_the_token_and_does_nothing_without_a_turn` |
+| Cancelamento funciona | Parcial — em correção | botão "parar" com `Cancel`; teste `stop_cancels_the_token_and_does_nothing_without_a_turn`. **O token só é checado entre linhas SSE**: um servidor que não envia nada (conexão presa, primeiro byte lento) não é interrompido até o timeout |
 | Erros de rede úteis | Feito | `ProviderError::Http{status,body}`; `main()` imprime com `redact` |
 | Conversas persistidas | Feito | dois turnos na mesma sessão, `session show` com 4 mensagens |
 
@@ -60,9 +60,9 @@ evidência executada, não código escrito. Onde falta, está dito o que falta.
 
 | Item | Estado | Evidência |
 | --- | --- | --- |
-| Permissões respeitadas | Feito | `Policy::check` antes do filesystem; teste de escape de workspace |
-| Segredos não aparecem em logs | Feito | `redact` e `redact_headers`; erros do `main()` passam por `redact` |
-| Operações arriscadas exigem confirmação | Feito | `Verdict::Ask` para escrita fora do workspace; `shell` recusada |
+| Permissões respeitadas | Parcial — em correção | `Policy::check` antes de escrita e shell; teste de escape de workspace. **Leituras (`read_file`, `list_dir`) não passavam pela política**; regras `allow/ask/deny` de `settings.toml` existem só como biblioteca |
+| Segredos não aparecem em logs | Feito | `redact` e `redact_headers`; erros do `main()` passam por `redact`; chaves no cofre do SO (`zerith secret`), `config show`/`secret get` mascaram |
+| Operações arriscadas exigem confirmação | Parcial — em correção | `Verdict::Ask` para escrita fora do workspace; `shell` recusada. **`Ask` é tratado como recusa: não há caminho de aprovação** — o usuário nunca é perguntado |
 | Plugins e Skills tratados como não confiáveis | Feito | instalar = `disabled` + `unreviewed`; `trust` separado; scripts nunca executados |
 | Sandbox não anunciada como garantia | Feito | `Enforcement::Partial` impresso por `zerith policy` |
 
@@ -87,9 +87,10 @@ evidência executada, não código escrito. Onde falta, está dito o que falta.
 
 ## Resumo
 
-- Feito com evidência: 31 de 37 itens.
-- Parcial: 5 (cursor de import, CPU-time, instalador, matriz de release,
-  entrada de menu).
+- Feito com evidência: 28 de 37 itens.
+- Parcial: 8 (cursor de import, CPU-time, instalador, matriz de release,
+  entrada de menu; e, rebaixados após revisão: permissões em leitura,
+  confirmação de operação arriscada, cancelamento).
 - Pendente: 1 (builds nas três plataformas).
 
 Nenhum destes "parcial" foi escrito como se estivesse pronto: o spec proíbe

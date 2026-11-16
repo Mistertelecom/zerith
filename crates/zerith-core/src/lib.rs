@@ -3,9 +3,15 @@
 //! No UI, no provider, no database. Everything here is the small set of
 //! facts every other Zerith crate needs.
 
+pub mod hooks;
+pub mod instructions;
 pub mod paths;
+pub mod secrets;
+pub mod settings;
 
+pub use instructions::{load_instructions, system_prompt_with_instructions};
 pub use paths::Paths;
+pub use settings::Settings;
 
 /// Product identity. One place, so a rename never means a grep.
 pub const NAME: &str = "Zerith";

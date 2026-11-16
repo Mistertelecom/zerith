@@ -14,6 +14,10 @@
 //!          display_metadata, message_uid, ...)
 //! ```
 //!
+//! Resume: a session already imported is not skipped blindly; messages with a
+//! source id above the last one copied are appended. An interrupted run
+//! therefore finishes the session it stopped in.
+//!
 //! Only `id`, `title` and `profile_name` are required from `sessions`; every
 //! other column is read when present and skipped when a Hermes version does not
 //! have it. That tolerance is the whole point of not pinning one schema.
@@ -41,6 +45,9 @@ pub struct ImportReport {
     pub sessions_seen: usize,
     pub sessions_imported: usize,
     pub sessions_skipped: usize,
+    /// Already-known sessions that got new messages this run (an interrupted
+    /// import finishing, or a conversation that continued in Hermes).
+    pub sessions_resumed: usize,
     pub messages_imported: usize,
     pub messages_skipped: usize,
     /// Sessions whose source rows could not be decoded; the run continues.
@@ -209,16 +216,35 @@ pub fn import(path: &Path, profile: &str, store: &Store) -> Result<ImportReport>
         };
 
         let (local_id, created_now) = store.upsert_imported(&session)?;
-        if !created_now {
-            report.sessions_skipped += 1;
-            continue;
-        }
-        report.sessions_imported += 1;
-
-        report.messages_imported += import_messages(&src, &mcols, &source_id, &local_id, store)?;
+        let n = import_messages(&src, &mcols, &source_id, &local_id, store)?;
+        report.messages_imported += n;
+        tally(&mut report, created_now, n);
     }
 
     Ok(report)
+}
+
+/// New session, resumed session (a previous run stopped mid-way, or Hermes
+/// added messages since), or nothing to do.
+pub(crate) fn tally(report: &mut ImportReport, created_now: bool, appended: usize) {
+    if created_now {
+        report.sessions_imported += 1;
+    } else if appended > 0 {
+        report.sessions_resumed += 1;
+    } else {
+        report.sessions_skipped += 1;
+    }
+}
+
+/// Per-message resume cursor: the highest source message id already copied.
+/// It is read back from `raw`, which is written in the same transaction as
+/// the message, so the cursor can never disagree with the data.
+fn cursor(store: &Store, local_session: &str) -> Result<i64> {
+    Ok(store.conn().query_row(
+        "SELECT COALESCE(MAX(CAST(json_extract(raw, '$.id') AS INTEGER)), 0) FROM messages WHERE session_id = ?1",
+        [local_session],
+        |r| r.get(0),
+    )?)
 }
 
 fn import_messages(
@@ -240,9 +266,12 @@ fn import_messages(
 
     // `SELECT *` on purpose: the row is preserved verbatim in `raw`, so a
     // column this importer does not know about yet is still carried across.
-    let sql = format!("SELECT * FROM messages WHERE session_id = ?1{where_active} ORDER BY id");
+    let sql = format!(
+        "SELECT * FROM messages WHERE session_id = ?1 AND id > ?2{where_active} ORDER BY id"
+    );
+    let after = cursor(store, local_session)?;
     let mut st = src.prepare(&sql)?;
-    let mut rows = st.query([source_session])?;
+    let mut rows = st.query(rusqlite::params![source_session, after])?;
     let mut n = 0;
     while let Some(row) = rows.next()? {
         let mut raw = serde_json::Map::new();
@@ -288,7 +317,7 @@ fn sql_value_to_json(v: &rusqlite::types::Value) -> serde_json::Value {
 }
 
 /// Hermes stores seconds as REAL; Zerith stores milliseconds as i64.
-fn to_ms(secs: f64) -> i64 {
+pub(crate) fn to_ms(secs: f64) -> i64 {
     if secs <= 0.0 {
         return 0;
     }

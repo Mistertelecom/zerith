@@ -88,6 +88,19 @@ pub fn extract(message: &str) -> Option<Extracted> {
     })
 }
 
+/// `extract`, gated by the backend's pause/exclusion switches. This is what a
+/// turn should call instead of `extract` directly.
+pub fn extract_allowed(
+    mem: &dyn crate::MemoryBackend,
+    session_id: &str,
+    message: &str,
+) -> Option<Extracted> {
+    match mem.is_extraction_allowed(session_id) {
+        Ok(true) => extract(message),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

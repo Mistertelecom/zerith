@@ -31,6 +31,17 @@ pub enum FrontmatterError {
     Unknown(String),
 }
 
+impl Frontmatter {
+    /// `allowed-tools` split on whitespace, as the spec defines it
+    /// (`Bash(git:*) Read`). `None` means the skill declared nothing, which is
+    /// different from an empty list.
+    pub fn allowed_tools_list(&self) -> Option<Vec<String>> {
+        self.allowed_tools
+            .as_ref()
+            .map(|s| s.split_whitespace().map(str::to_string).collect())
+    }
+}
+
 /// Splits a document into its frontmatter lines and its body.
 fn split(text: &str) -> Result<(Vec<&str>, &str), FrontmatterError> {
     let mut lines = text.lines();
@@ -187,6 +198,11 @@ mod tests {
             ]
         );
         assert_eq!(fm.allowed_tools.as_deref(), Some("Bash(git:*) Read"));
+        assert_eq!(
+            fm.allowed_tools_list(),
+            Some(vec!["Bash(git:*)".to_string(), "Read".to_string()])
+        );
+        assert_eq!(parse(MINIMAL).unwrap().0.allowed_tools_list(), None);
     }
 
     #[test]

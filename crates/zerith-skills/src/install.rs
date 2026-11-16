@@ -258,6 +258,29 @@ impl Library {
             self.root.join(&row.dir).join("SKILL.md"),
         )?)
     }
+
+    /// Parsed header of one installed skill, read from disk on each call.
+    pub fn frontmatter(&self, name: &str) -> Result<crate::Frontmatter> {
+        let text = self.load_body(name)?;
+        Ok(crate::parse(&text).map_err(SkillError::from)?.0)
+    }
+
+    /// The instruction body (frontmatter stripped) of an *enabled* skill, for
+    /// progressive disclosure: the catalog carries descriptions, this carries
+    /// the rest only when asked. `None` when missing, disabled or unreadable.
+    pub fn skill_body(&self, name: &str) -> Option<String> {
+        if !self.enabled().ok()?.iter().any(|s| s.name == name) {
+            return None;
+        }
+        let text = self.load_body(name).ok()?;
+        Some(crate::parse(&text).ok()?.1.trim_start().to_string())
+    }
+
+    /// The tools an installed skill declares in `allowed-tools`, for the
+    /// runtime to enforce. `Ok(None)` when the skill declares none.
+    pub fn allowed_tools(&self, name: &str) -> Result<Option<Vec<String>>> {
+        Ok(self.frontmatter(name)?.allowed_tools_list())
+    }
 }
 
 /// A directory name is the skill name; anything that could escape the root is
@@ -384,6 +407,28 @@ mod tests {
         assert!(body.contains("versao dois"));
         lib.rollback("demo").unwrap();
         assert!(lib.load_body("demo").unwrap().contains("versao um"));
+    }
+
+    #[test]
+    fn body_and_allowed_tools_load_on_demand() {
+        let tmp = tempfile::tempdir_in(scratch()).unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("SKILL.md"),
+            "---\nname: demo\ndescription: d\nallowed-tools: Read Bash(git:*)\n---\n\n# Corpo\n",
+        )
+        .unwrap();
+        let lib = Library::open(tmp.path().join("skills")).unwrap();
+        lib.install(&src, "a").unwrap();
+        assert_eq!(lib.skill_body("demo").as_deref(), Some("# Corpo\n"));
+        assert_eq!(
+            lib.allowed_tools("demo").unwrap(),
+            Some(vec!["Read".to_string(), "Bash(git:*)".to_string()])
+        );
+        assert_eq!(lib.skill_body("nope"), None);
+        lib.set_status("demo", Status::Disabled).unwrap();
+        assert_eq!(lib.skill_body("demo"), None);
     }
 
     #[test]

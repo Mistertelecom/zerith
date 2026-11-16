@@ -2,18 +2,21 @@
 //!
 //! The rule that shapes this crate: **do not pretend two APIs are the same**.
 //! OpenAI-compatible endpoints share one wire format; Anthropic's Messages API
-//! does not, and is a separate `Protocol` rather than a pile of special cases
-//! inside the OpenAI path.
+//! does not, and lives in its own module rather than as a pile of special
+//! cases inside the OpenAI path.
 //!
 //! Security: an API key lives in this struct in memory and is written to a
 //! request header, never to a log or an error message.
 
+mod anthropic;
 mod config;
 mod openai;
+mod retry;
 pub mod stream;
 
 pub use config::{Protocol, ProviderConfig, ProviderKind};
 pub use openai::{Client, Completion, Probe, Usage};
+pub use retry::RetryPolicy;
 
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,10 +30,20 @@ pub enum ProviderError {
     NoKey,
     #[error("http {status}: {body}")]
     Http { status: u16, body: String },
+    /// 429 after the retries ran out. Separate from `Http` so a host can say
+    /// "wait" instead of "broken".
+    #[error("rate limited (429): {body}")]
+    RateLimited {
+        retry_after_ms: Option<u64>,
+        body: String,
+    },
     #[error("transport: {0}")]
     Transport(String),
     #[error("endpoint returned invalid json: {0}")]
     Json(#[from] serde_json::Error),
+    /// The endpoint answered 200 with something that is not a completion.
+    #[error("malformed response: {0}")]
+    Malformed(String),
     #[error("cancelled")]
     Cancelled,
     #[error("unsupported: {0}")]
@@ -60,26 +73,69 @@ pub enum Role {
     System,
     User,
     Assistant,
+    /// A tool result; `ChatMessage::tool_call_id` names the call it answers.
+    Tool,
+}
+
+/// A tool call the model asked for. `arguments` is the raw JSON string the
+/// model wrote: parsing is the caller's job, so a malformed one can be
+/// reported back to the model instead of failing the turn.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+/// A tool offered to the model: name, description, JSON schema.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolDef {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: Role,
     pub content: String,
+    /// Assistant only: the calls this message made.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCall>,
+    /// Tool only: the call this message answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 impl ChatMessage {
-    pub fn user(content: impl Into<String>) -> Self {
+    pub fn new(role: Role, content: impl Into<String>) -> Self {
         Self {
-            role: Role::User,
+            role,
             content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
         }
     }
 
+    pub fn user(content: impl Into<String>) -> Self {
+        Self::new(Role::User, content)
+    }
+
     pub fn system(content: impl Into<String>) -> Self {
+        Self::new(Role::System, content)
+    }
+
+    pub fn assistant(content: impl Into<String>, tool_calls: Vec<ToolCall>) -> Self {
         Self {
-            role: Role::System,
-            content: content.into(),
+            tool_calls,
+            ..Self::new(Role::Assistant, content)
+        }
+    }
+
+    pub fn tool(call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            tool_call_id: Some(call_id.into()),
+            ..Self::new(Role::Tool, content)
         }
     }
 }
@@ -93,6 +149,10 @@ pub struct ChatRequest {
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
     pub reasoning_effort: Option<String>,
+    /// Empty means no tools are offered.
+    pub tools: Vec<ToolDef>,
+    /// `auto`, `none`, `required`, or a tool name.
+    pub tool_choice: Option<String>,
 }
 
 impl ChatRequest {
@@ -103,6 +163,8 @@ impl ChatRequest {
             max_tokens: None,
             temperature: None,
             reasoning_effort: None,
+            tools: Vec::new(),
+            tool_choice: None,
         }
     }
 
@@ -120,6 +182,16 @@ impl ChatRequest {
         self.reasoning_effort = Some(e.into());
         self
     }
+
+    pub fn tools(mut self, tools: Vec<ToolDef>) -> Self {
+        self.tools = tools;
+        self
+    }
+
+    pub fn tool_choice(mut self, choice: impl Into<String>) -> Self {
+        self.tool_choice = Some(choice.into());
+        self
+    }
 }
 
 /// A piece of a streamed answer.
@@ -129,6 +201,10 @@ pub enum StreamEvent {
     Delta(String),
     /// Reasoning/thinking text, when the provider sends it separately.
     Reasoning(String),
+    /// The complete tool calls of this answer, emitted once before `Done`:
+    /// fragments are assembled in the client so no caller sees half an
+    /// argument.
+    ToolCalls(Vec<ToolCall>),
     /// The stream finished; carries usage if the provider reported it.
     Done { usage: Option<Usage> },
 }

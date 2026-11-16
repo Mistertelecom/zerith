@@ -29,6 +29,11 @@ anyhow = "1"
 thiserror = "2"
 tempfile = "3"
 ureq = { version = "2", features = ["json"] }
+# Settings files. Same major the OpenHuman root already locks (1.1.x).
+toml = "1"
+# OS credential store (Credential Manager / Keychain / kernel keyutils). Same
+# version and native features as openhuman-rpc in the root lock.
+keyring = { version = "3.6", features = ["apple-native", "windows-native", "linux-native"] }
 # No yaml crate: the Agent Skills frontmatter is small enough to parse by hand
 # (see zerith-skills/frontmatter.rs), and one less dependency is one less CVE.
 

@@ -10,6 +10,9 @@ use crate::backend::{
 use rusqlite::{params, Connection, OptionalExtension};
 use zerith_sessions::migrations::now_ms;
 
+const PAUSED_KEY: &str = "memory.paused";
+const EXCLUDE_PREFIX: &str = "memory.exclude:";
+
 pub struct SqliteMemory {
     conn: Connection,
 }
@@ -52,6 +55,106 @@ impl SqliteMemory {
             updated_at: r.get(8)?,
             superseded_by: r.get(9)?,
         })
+    }
+
+    fn setting(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![key],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    fn set_setting(&self, key: &str, value: Option<&str>) -> Result<()> {
+        match value {
+            Some(v) => self.conn.execute(
+                "INSERT INTO settings(key, value, updated_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                params![key, v, now_ms()],
+            )?,
+            None => self
+                .conn
+                .execute("DELETE FROM settings WHERE key = ?1", params![key])?,
+        };
+        Ok(())
+    }
+
+    /// Pauses automatic extraction everywhere. Persisted; explicit
+    /// `remember` calls still work.
+    pub fn set_paused(&self, paused: bool) -> Result<()> {
+        self.set_setting(PAUSED_KEY, paused.then_some("1"))
+    }
+
+    pub fn is_paused(&self) -> Result<bool> {
+        Ok(self.setting(PAUSED_KEY)?.is_some())
+    }
+
+    /// Stops extraction from one session (e.g. a private chat).
+    pub fn exclude_session(&self, session_id: &str) -> Result<()> {
+        self.set_setting(&format!("{EXCLUDE_PREFIX}{session_id}"), Some("1"))
+    }
+
+    pub fn include_session(&self, session_id: &str) -> Result<()> {
+        self.set_setting(&format!("{EXCLUDE_PREFIX}{session_id}"), None)
+    }
+
+    /// What the runtime checks before calling `extract` + `remember`.
+    pub fn is_extraction_allowed(&self, session_id: &str) -> Result<bool> {
+        Ok(!self.is_paused()?
+            && self
+                .setting(&format!("{EXCLUDE_PREFIX}{session_id}"))?
+                .is_none())
+    }
+
+    /// Writes live facts (all scopes when `None`) as one JSON object per line.
+    pub fn export_jsonl(&self, scope: Option<&Scope>, mut w: impl std::io::Write) -> Result<usize> {
+        let facts = match scope {
+            Some(s) => self.export(s)?,
+            None => self.select_where(
+                &format!("SELECT {COLUMNS} FROM memory_facts WHERE deleted = 0 ORDER BY id"),
+                &[],
+            )?,
+        };
+        for f in &facts {
+            serde_json::to_writer(&mut w, f).map_err(std::io::Error::from)?;
+            w.write_all(b"\n")?;
+        }
+        Ok(facts.len())
+    }
+
+    /// Reads what `export_jsonl` wrote. Ids are reassigned; scope, kind,
+    /// confidence, source and session survive. A fact already present is
+    /// deduped, not duplicated. Returns how many lines were applied.
+    pub fn import_jsonl(&self, r: impl std::io::BufRead) -> Result<usize> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut n = 0;
+        for (i, line) in r.lines().enumerate() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let f: Fact = serde_json::from_str(&line).map_err(|e| MemoryError::Import {
+                line: i + 1,
+                message: e.to_string(),
+            })?;
+            let id = self.remember(
+                &Scope(f.scope.clone()),
+                f.kind,
+                &f.text,
+                f.confidence,
+                f.source.as_deref(),
+            )?;
+            self.conn.execute(
+                "UPDATE memory_facts SET session_id = COALESCE(session_id, ?1) WHERE id = ?2",
+                params![f.session_id, id],
+            )?;
+            n += 1;
+        }
+        tx.commit()?;
+        Ok(n)
     }
 
     fn select_where(&self, sql: &str, args: &[&dyn rusqlite::ToSql]) -> Result<Vec<Fact>> {
@@ -171,6 +274,10 @@ impl MemoryBackend for SqliteMemory {
             params![by, now_ms(), old_id],
         )?;
         Ok(())
+    }
+
+    fn is_extraction_allowed(&self, session_id: &str) -> Result<bool> {
+        SqliteMemory::is_extraction_allowed(self, session_id)
     }
 
     fn export(&self, scope: &Scope) -> Result<Vec<Fact>> {

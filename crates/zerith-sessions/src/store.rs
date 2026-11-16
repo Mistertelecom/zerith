@@ -14,6 +14,8 @@ pub enum StoreError {
     Db(#[from] rusqlite::Error),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    #[error("not found: {0}")]
+    NotFound(String),
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -169,6 +171,15 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// The newest `limit` messages, oldest first: what a turn replays.
+    pub fn recent_messages(&self, session_id: &str, limit: usize) -> Result<Vec<Message>> {
+        let mut st = self.conn.prepare(
+            "SELECT * FROM (SELECT id, session_id, role, content, tool_name, tool_calls, reasoning, token_count, created_at, raw FROM messages WHERE session_id = ?1 ORDER BY id DESC LIMIT ?2) ORDER BY id",
+        )?;
+        let rows = st.query_map(params![session_id, limit as i64], row_to_message)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn message_count(&self, session_id: &str) -> Result<i64> {
         Ok(self.conn.query_row(
             "SELECT COUNT(*) FROM messages WHERE session_id = ?1",
@@ -195,7 +206,7 @@ impl Store {
     }
 }
 
-fn row_to_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
+pub(crate) fn row_to_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
     let src: String = r.get(2)?;
     Ok(Session {
         id: r.get(0)?,
@@ -211,7 +222,7 @@ fn row_to_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
     })
 }
 
-fn row_to_message(r: &rusqlite::Row) -> rusqlite::Result<Message> {
+pub(crate) fn row_to_message(r: &rusqlite::Row) -> rusqlite::Result<Message> {
     let role: String = r.get(2)?;
     let tool_calls: Option<String> = r.get(5)?;
     let raw: Option<String> = r.get(9)?;
@@ -231,7 +242,7 @@ fn row_to_message(r: &rusqlite::Row) -> rusqlite::Result<Message> {
 
 /// Random-enough id without a uuid dependency: two hashes of the clock. Not
 /// time-ordered; ordering is the rowid.
-fn new_id() -> String {
+pub(crate) fn new_id() -> String {
     use std::hash::{BuildHasher, Hasher};
     let mut h = std::collections::hash_map::RandomState::new().build_hasher();
     h.write_u128(

@@ -13,8 +13,10 @@
 //! upgrade must not lose data this crate has not learned about yet.
 
 mod hermes;
+mod hermes_jsonl;
 
 pub use hermes::{detect, import, ImportReport, SourceLayout};
+pub use hermes_jsonl::{import_jsonl, import_jsonl_from};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ImportError {

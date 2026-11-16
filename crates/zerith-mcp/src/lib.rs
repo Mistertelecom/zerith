@@ -1,19 +1,29 @@
-//! MCP client over stdio.
+//! MCP client over stdio or Streamable HTTP.
 //!
-//! A server is a child process speaking JSON-RPC, one object per line. The
-//! client owns the handshake and the request/response pairing; nothing here
-//! decides whether a tool call is allowed — that belongs to the permission
-//! layer, and putting it here would hide it from the user.
+//! A stdio server is a child process speaking JSON-RPC, one object per line.
+//! An HTTP server takes one POST per message and answers with a JSON body or a
+//! short SSE stream. The client owns the handshake and the request/response
+//! pairing; nothing here decides whether a tool call is allowed — that belongs
+//! to the permission layer, and putting it here would hide it from the user.
 
 pub mod protocol;
 
-pub use protocol::{CallResult, RpcError, ToolInfo, ToolsList, PROTOCOL_VERSION};
+pub use protocol::{
+    CallResult, PromptArgument, PromptGet, PromptInfo, ResourceContent, ResourceInfo, RpcError,
+    ToolInfo, ToolsList, PROTOCOL_VERSION,
+};
 
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
+
+/// How long one request may wait for its answer before the server is
+/// considered hung.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, thiserror::Error)]
 pub enum McpError {
@@ -33,17 +43,34 @@ pub enum McpError {
     Rpc { code: i64, message: String },
     #[error("server closed the connection")]
     Closed,
+    #[error("server did not answer within {0:?}")]
+    Timeout(Duration),
+    #[error("http: {0}")]
+    Http(String),
 }
 
 pub type Result<T> = std::result::Result<T, McpError>;
 
-/// A live server. Dropping it kills the child: a leaked MCP process would
+enum Transport {
+    Stdio {
+        child: Child,
+        stdin: ChildStdin,
+        /// Lines from a reader thread, so a silent server cannot block us.
+        lines: Receiver<String>,
+    },
+    Http {
+        agent: ureq::Agent,
+        url: String,
+        session: Option<String>,
+    },
+}
+
+/// A live server. Dropping it kills a stdio child: a leaked MCP process would
 /// outlive the window it serves.
 pub struct Client {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    transport: Transport,
     next_id: AtomicU64,
+    timeout: Duration,
     pub name: String,
 }
 
@@ -54,6 +81,15 @@ impl Client {
     /// user configured them. No shell is involved, so a config value cannot
     /// become a shell command by accident.
     pub fn connect(name: &str, command: &str, args: &[String]) -> Result<Self> {
+        Self::connect_with_timeout(name, command, args, DEFAULT_TIMEOUT)
+    }
+
+    pub fn connect_with_timeout(
+        name: &str,
+        command: &str,
+        args: &[String],
+        timeout: Duration,
+    ) -> Result<Self> {
         let mut child = Command::new(command)
             .args(args)
             .stdin(Stdio::piped())
@@ -64,21 +100,50 @@ impl Client {
                 cmd: command.to_string(),
                 source: e,
             })?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| McpError::Protocol("no stdin".into()))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| McpError::Protocol("no stdout".into()))?;
-        let mut client = Self {
-            child,
-            stdin,
-            stdout: BufReader::new(stdout),
-            next_id: AtomicU64::new(1),
-            name: name.to_string(),
+        let (stdin, stdout) = match (child.stdin.take(), child.stdout.take()) {
+            (Some(i), Some(o)) => (i, o),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(McpError::Protocol("no stdio pipes".into()));
+            }
         };
+        let (tx, lines) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        Self::handshake(Self {
+            transport: Transport::Stdio {
+                child,
+                stdin,
+                lines,
+            },
+            next_id: AtomicU64::new(1),
+            timeout,
+            name: name.to_string(),
+        })
+    }
+
+    /// Connects to a Streamable HTTP endpoint (one URL, POST per message).
+    pub fn connect_http(name: &str, url: &str) -> Result<Self> {
+        Self::handshake(Self {
+            transport: Transport::Http {
+                agent: ureq::AgentBuilder::new().build(),
+                url: url.to_string(),
+                session: None,
+            },
+            next_id: AtomicU64::new(1),
+            timeout: DEFAULT_TIMEOUT,
+            name: name.to_string(),
+        })
+    }
+
+    fn handshake(mut client: Self) -> Result<Self> {
         client.request(
             "initialize",
             Some(json!({
@@ -91,52 +156,97 @@ impl Client {
         Ok(client)
     }
 
-    fn send(&mut self, msg: &Value) -> Result<()> {
-        let line = serde_json::to_string(msg)?;
-        self.stdin.write_all(line.as_bytes())?;
-        self.stdin.write_all(b"\n")?;
-        self.stdin.flush()?;
-        Ok(())
+    pub fn set_timeout(&mut self, timeout: Duration) {
+        self.timeout = timeout;
     }
 
     fn notify(&mut self, method: &str) -> Result<()> {
-        self.send(&json!({ "jsonrpc": "2.0", "method": method }))
+        let msg = json!({ "jsonrpc": "2.0", "method": method });
+        match &mut self.transport {
+            Transport::Stdio { stdin, .. } => write_line(stdin, &msg),
+            // The spec answers a notification with 202 and no body.
+            Transport::Http { .. } => self.post(&msg).map(|_| ()),
+        }
     }
 
-    /// Sends one request and reads until its answer arrives. A notification or
+    /// Sends one request and waits until its answer arrives. A notification or
     /// a server-initiated request in between is skipped, not mistaken for the
-    /// answer.
+    /// answer. A server that stays silent past the timeout is killed.
     pub fn request(&mut self, method: &str, params: Option<Value>) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let req = protocol::Request::new(id, method, params);
-        self.send(&serde_json::to_value(&req)?)?;
-        loop {
-            let mut line = String::new();
-            if self.stdout.read_line(&mut line)? == 0 {
-                return Err(McpError::Closed);
+        let req = serde_json::to_value(protocol::Request::new(id, method, params))?;
+        let timeout = self.timeout;
+        match &mut self.transport {
+            Transport::Stdio {
+                child,
+                stdin,
+                lines,
+            } => {
+                write_line(stdin, &req)?;
+                let deadline = Instant::now() + timeout;
+                loop {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    match lines.recv_timeout(left) {
+                        Ok(line) => {
+                            if let Some(r) = match_response(&line, id) {
+                                return r;
+                            }
+                        }
+                        Err(RecvTimeoutError::Timeout) => {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            return Err(McpError::Timeout(timeout));
+                        }
+                        Err(RecvTimeoutError::Disconnected) => return Err(McpError::Closed),
+                    }
+                }
             }
-            if line.trim().is_empty() {
-                continue;
+            Transport::Http { .. } => {
+                let resp = self.post(&req)?;
+                let is_sse = resp.content_type() == "text/event-stream";
+                let found = if is_sse {
+                    read_sse(BufReader::new(resp.into_reader()), id)
+                } else {
+                    match_response(&resp.into_string()?, id)
+                };
+                found.unwrap_or_else(|| {
+                    Err(McpError::Protocol(format!("no response for request {id}")))
+                })
             }
-            let v: Value = match serde_json::from_str(&line) {
-                Ok(v) => v,
-                // A server that writes a log line to stdout violates the
-                // transport. Skipping keeps the session alive; hiding it would
-                // make a broken server look healthy.
-                Err(_) => continue,
-            };
-            if v.get("id").and_then(Value::as_u64) != Some(id) {
-                continue;
-            }
-            let resp: protocol::Response = serde_json::from_value(v)?;
-            if let Some(e) = resp.error {
-                return Err(McpError::Rpc {
-                    code: e.code,
-                    message: e.message,
-                });
-            }
-            return Ok(resp.result.unwrap_or(Value::Null));
         }
+    }
+
+    /// One POST. Captures `Mcp-Session-Id` from the server and resends it.
+    fn post(&mut self, msg: &Value) -> Result<ureq::Response> {
+        let timeout = self.timeout;
+        let Transport::Http {
+            agent,
+            url,
+            session,
+        } = &mut self.transport
+        else {
+            return Err(McpError::Protocol("not an http transport".into()));
+        };
+        let mut req = agent
+            .post(url)
+            .timeout(timeout)
+            .set("Content-Type", "application/json")
+            .set("Accept", "application/json, text/event-stream");
+        if let Some(s) = session.as_deref() {
+            req = req.set("Mcp-Session-Id", s);
+        }
+        let resp = match req.send_string(&serde_json::to_string(msg)?) {
+            Ok(r) => r,
+            Err(ureq::Error::Status(code, r)) => {
+                let body = r.into_string().unwrap_or_default();
+                return Err(McpError::Http(format!("status {code}: {body}")));
+            }
+            Err(e) => return Err(McpError::Http(e.to_string())),
+        };
+        if let Some(s) = resp.header("Mcp-Session-Id") {
+            *session = Some(s.to_string());
+        }
+        Ok(resp)
     }
 
     pub fn tools(&mut self) -> Result<Vec<ToolInfo>> {
@@ -153,14 +263,135 @@ impl Client {
         Ok(serde_json::from_value(result)?)
     }
 
+    pub fn resources_list(&mut self) -> Result<Vec<ResourceInfo>> {
+        let result = self.request("resources/list", None)?;
+        let list: protocol::ResourcesList = serde_json::from_value(result)?;
+        Ok(list.resources)
+    }
+
+    pub fn resources_read(&mut self, uri: &str) -> Result<Vec<ResourceContent>> {
+        let result = self.request("resources/read", Some(json!({ "uri": uri })))?;
+        let read: protocol::ResourceRead = serde_json::from_value(result)?;
+        Ok(read.contents)
+    }
+
+    pub fn prompts_list(&mut self) -> Result<Vec<PromptInfo>> {
+        let result = self.request("prompts/list", None)?;
+        let list: protocol::PromptsList = serde_json::from_value(result)?;
+        Ok(list.prompts)
+    }
+
+    pub fn prompts_get(&mut self, name: &str, arguments: Value) -> Result<PromptGet> {
+        let result = self.request(
+            "prompts/get",
+            Some(json!({ "name": name, "arguments": arguments })),
+        )?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    /// Child pid for stdio; 0 for HTTP, which has no local process.
     pub fn pid(&self) -> u32 {
-        self.child.id()
+        match &self.transport {
+            Transport::Stdio { child, .. } => child.id(),
+            Transport::Http { .. } => 0,
+        }
     }
 }
 
 impl Drop for Client {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Transport::Stdio { child, .. } = &mut self.transport {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn write_line(w: &mut impl Write, msg: &Value) -> Result<()> {
+    let line = serde_json::to_string(msg)?;
+    w.write_all(line.as_bytes())?;
+    w.write_all(b"\n")?;
+    w.flush()?;
+    Ok(())
+}
+
+/// The answer to request `id`, if `line` is one. Blank lines, log lines a
+/// server wrongly prints to stdout, notifications and other ids are `None`:
+/// skipping keeps the session alive.
+pub fn match_response(line: &str, id: u64) -> Option<Result<Value>> {
+    let v: Value = serde_json::from_str(line.trim()).ok()?;
+    if v.get("id").and_then(Value::as_u64) != Some(id) {
+        return None;
+    }
+    let resp: protocol::Response = match serde_json::from_value(v) {
+        Ok(r) => r,
+        Err(e) => return Some(Err(e.into())),
+    };
+    Some(match resp.error {
+        Some(e) => Err(McpError::Rpc {
+            code: e.code,
+            message: e.message,
+        }),
+        None => Ok(resp.result.unwrap_or(Value::Null)),
+    })
+}
+
+/// Reads an SSE stream until the event answering `id` arrives. Stops there,
+/// so a server that keeps the stream open does not hang the request.
+pub fn read_sse(r: impl BufRead, id: u64) -> Option<Result<Value>> {
+    let mut data = String::new();
+    for line in r
+        .lines()
+        .map_while(std::result::Result::ok)
+        .chain(Some(String::new()))
+    {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            if !data.is_empty() {
+                if let Some(found) = match_response(&data, id) {
+                    return Some(found);
+                }
+                data.clear();
+            }
+        } else if let Some(d) = line.strip_prefix("data:") {
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(d.strip_prefix(' ').unwrap_or(d));
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_matching_id_is_an_answer() {
+        assert!(match_response("", 1).is_none());
+        assert!(match_response("starting server...", 1).is_none());
+        assert!(match_response(r#"{"jsonrpc":"2.0","method":"notifications/x"}"#, 1).is_none());
+        assert!(match_response(r#"{"jsonrpc":"2.0","id":2,"result":{}}"#, 1).is_none());
+        let ok = match_response(r#"{"jsonrpc":"2.0","id":1,"result":{"a":1}}"#, 1).unwrap();
+        assert_eq!(ok.unwrap()["a"], 1);
+        let err = match_response(
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"nope"}}"#,
+            1,
+        )
+        .unwrap();
+        assert!(matches!(err, Err(McpError::Rpc { code: -32601, .. })));
+    }
+
+    #[test]
+    fn sse_skips_other_events_and_joins_data_lines() {
+        let body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"n\"}\n\n\
+                    : comment\r\ndata: {\"jsonrpc\":\"2.0\",\r\ndata: \"id\":7,\"result\":{\"ok\":true}}\r\n\r\n";
+        let v = read_sse(body.as_bytes(), 7).unwrap().unwrap();
+        assert_eq!(v["ok"], true);
+        // Last event without a trailing blank line still counts.
+        let tail = "data: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":1}";
+        assert_eq!(read_sse(tail.as_bytes(), 3).unwrap().unwrap(), 1);
+        assert!(read_sse("data: {}\n\n".as_bytes(), 3).is_none());
     }
 }

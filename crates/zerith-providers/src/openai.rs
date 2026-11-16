@@ -1,12 +1,17 @@
-//! The OpenAI-compatible path, which is what 9Router speaks.
+//! The OpenAI-compatible path, which is what 9Router speaks, and the `Client`
+//! that routes to the Anthropic module when the protocol says so.
 //!
 //! `ureq` is blocking on purpose: the CLI probes an endpoint synchronously and
-//! the agent loop will call this from a worker thread. No async runtime in a
+//! the agent loop calls this from a worker thread. No async runtime in a
 //! harness that does not need one.
 
 use crate::config::{Protocol, ProviderConfig};
-use crate::{Cancel, ChatRequest, ProviderError, Result, StreamEvent};
+use crate::retry::{self, map_err, RetryPolicy};
+use crate::stream::OpenAiStream;
+use crate::{Cancel, ChatRequest, ProviderError, Result, Role, StreamEvent, ToolCall};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::time::Duration;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
@@ -32,34 +37,7 @@ pub struct Probe {
 pub struct Client {
     cfg: ProviderConfig,
     agent: ureq::Agent,
-}
-
-#[derive(Serialize)]
-struct ChatBody<'a> {
-    model: &'a str,
-    messages: Vec<WireMessage<'a>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    temperature: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_effort: Option<&'a str>,
-    stream: bool,
-    /// OpenAI-compatible servers only report usage on a stream when asked;
-    /// without this the window shows no token counts at all.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    stream_options: Option<StreamOptions>,
-}
-
-#[derive(Serialize)]
-struct StreamOptions {
-    include_usage: bool,
-}
-
-#[derive(Serialize)]
-struct WireMessage<'a> {
-    role: &'a str,
-    content: &'a str,
+    retry: RetryPolicy,
 }
 
 #[derive(Deserialize)]
@@ -73,34 +51,13 @@ struct ModelEntry {
     id: String,
 }
 
-#[derive(Deserialize)]
-struct ChatResponse {
-    choices: Vec<Choice>,
-    #[serde(default)]
-    usage: Option<Usage>,
-}
-
-#[derive(Deserialize)]
-struct Choice {
-    message: ChoiceMessage,
-    #[serde(default)]
-    finish_reason: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ChoiceMessage {
-    #[serde(default)]
-    content: String,
-    #[serde(default)]
-    reasoning_content: Option<String>,
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct Completion {
     pub text: String,
     pub reasoning: Option<String>,
     pub usage: Option<Usage>,
     pub finish_reason: Option<String>,
+    pub tool_calls: Vec<ToolCall>,
 }
 
 impl Client {
@@ -111,17 +68,33 @@ impl Client {
         if cfg.base_url.trim().is_empty() {
             return Err(ProviderError::NoEndpoint);
         }
+        // Connect and per-read timeouts, never a total one: in ureq 2 a total
+        // timeout covers the body too, and would cut a long stream that is
+        // still producing tokens. A read that stalls this long is a dead peer.
+        let t = Duration::from_millis(cfg.timeout_ms);
         let agent = ureq::AgentBuilder::new()
-            .timeout(std::time::Duration::from_millis(cfg.timeout_ms))
+            .timeout_connect(t.min(Duration::from_secs(30)))
+            .timeout_read(t)
+            .timeout_write(t)
             .build();
-        Ok(Self { cfg, agent })
+        Ok(Self {
+            cfg,
+            agent,
+            retry: RetryPolicy::default(),
+        })
+    }
+
+    /// Replaces the retry policy (tests use a fast one, hosts may disable it).
+    pub fn with_retry(mut self, retry: RetryPolicy) -> Self {
+        self.retry = retry;
+        self
     }
 
     pub fn config(&self) -> &ProviderConfig {
         &self.cfg
     }
 
-    fn endpoint(&self, path: &str) -> String {
+    pub(crate) fn endpoint(&self, path: &str) -> String {
         format!("{}/{}", self.cfg.base_url.trim_end_matches('/'), path)
     }
 
@@ -132,15 +105,29 @@ impl Client {
     /// Applies whichever credential the protocol expects. The key never reaches
     /// a log or an error string.
     fn authored(&self, mut req: ureq::Request) -> ureq::Request {
+        if self.cfg.protocol == Protocol::Anthropic {
+            req = req.set("anthropic-version", "2023-06-01");
+        }
         if let Some(key) = &self.cfg.api_key {
             req = match self.cfg.protocol {
                 Protocol::OpenAi => req.set("Authorization", &format!("Bearer {key}")),
-                Protocol::Anthropic => req
-                    .set("x-api-key", key)
-                    .set("anthropic-version", "2023-06-01"),
+                Protocol::Anthropic => req.set("x-api-key", key),
             };
         }
         req
+    }
+
+    /// POSTs JSON with bounded retry. Only the send is retried: by the time
+    /// this returns, no byte of the answer has been shown to anyone.
+    // `ureq::Error` is large by its own design; boxing it here buys nothing.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn post(&self, path: &str, body: &Value, cancel: &Cancel) -> Result<ureq::Response> {
+        let url = self.endpoint(path);
+        retry::send(&self.retry, cancel, || {
+            self.authored(self.agent.post(&url))
+                .set("Content-Type", "application/json")
+                .send_json(body)
+        })
     }
 
     /// Fails before the request when the provider needs a key it does not have.
@@ -212,51 +199,21 @@ impl Client {
         if cancel.is_cancelled() {
             return Err(ProviderError::Cancelled);
         }
-        let body = ChatBody {
-            model: &req.model,
-            messages: req
-                .messages
-                .iter()
-                .map(|m| WireMessage {
-                    role: role_str(m.role),
-                    content: &m.content,
-                })
-                .collect(),
-            max_tokens: req.max_tokens,
-            temperature: req.temperature,
-            reasoning_effort: req.reasoning_effort.as_deref(),
-            stream: false,
-            stream_options: None,
-        };
-        let url = self.endpoint("chat/completions");
-        let resp = self
-            .authored(
-                self.agent
-                    .post(&url)
-                    .set("Content-Type", "application/json"),
-            )
-            .send_json(&body)
-            .map_err(map_err)?;
-        let parsed: ChatResponse = serde_json::from_str(
-            &resp
-                .into_string()
-                .map_err(|e| ProviderError::Transport(e.to_string()))?,
-        )?;
-        let choice = parsed
-            .choices
-            .into_iter()
-            .next()
-            .ok_or(ProviderError::Unsupported("empty choices"))?;
-        Ok(Completion {
-            text: choice.message.content,
-            reasoning: choice.message.reasoning_content,
-            usage: parsed.usage,
-            finish_reason: choice.finish_reason,
-        })
+        if self.cfg.protocol == Protocol::Anthropic {
+            return crate::anthropic::complete(self, req, cancel);
+        }
+        let resp = self.post("chat/completions", &body(req, false), cancel)?;
+        let text = resp
+            .into_string()
+            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+        parse_completion(&text)
     }
 
     /// Streams a completion, calling `on_event` per chunk. Cancellation is
     /// checked between chunks; the response is dropped, which closes the socket.
+    ///
+    /// Tool calls arrive as one `StreamEvent::ToolCalls` before the final
+    /// `Done`, already assembled from their fragments.
     pub fn stream(
         &self,
         req: &ChatRequest,
@@ -264,85 +221,194 @@ impl Client {
         mut on_event: impl FnMut(StreamEvent),
     ) -> Result<()> {
         self.ensure_key()?;
-        let body = ChatBody {
-            model: &req.model,
-            messages: req
-                .messages
-                .iter()
-                .map(|m| WireMessage {
-                    role: role_str(m.role),
-                    content: &m.content,
-                })
-                .collect(),
-            max_tokens: req.max_tokens,
-            temperature: req.temperature,
-            reasoning_effort: req.reasoning_effort.as_deref(),
-            stream: true,
-            stream_options: Some(StreamOptions {
-                include_usage: true,
-            }),
-        };
-        let url = self.endpoint("chat/completions");
-        let resp = self
-            .authored(
-                self.agent
-                    .post(&url)
-                    .set("Content-Type", "application/json"),
-            )
-            .send_json(&body)
-            .map_err(map_err)?;
-
-        let reader = std::io::BufReader::new(resp.into_reader());
-        for line in std::io::BufRead::lines(reader) {
-            if cancel.is_cancelled() {
-                return Err(ProviderError::Cancelled);
-            }
-            let Ok(line) = line else { break };
-            let Some(data) = line.strip_prefix("data:") else {
-                continue;
-            };
-            let data = data.trim();
-            if data.is_empty() {
-                continue;
-            }
-            if data == "[DONE]" {
-                on_event(StreamEvent::Done { usage: None });
-                return Ok(());
-            }
-            if let Some(event) = crate::stream::parse_data_line(&line) {
-                on_event(event);
-            }
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
-                continue;
-            };
-            if let Some(usage) = v.get("usage") {
-                if let Ok(u) = serde_json::from_value::<Usage>(usage.clone()) {
-                    if u.total_tokens > 0 {
-                        on_event(StreamEvent::Done { usage: Some(u) });
-                    }
-                }
-            }
+        if self.cfg.protocol == Protocol::Anthropic {
+            return crate::anthropic::stream(self, req, cancel, &mut on_event);
         }
-        Ok(())
+        let resp = self.post("chat/completions", &body(req, true), cancel)?;
+        let mut state = OpenAiStream::default();
+        crate::stream::for_each_data(resp, cancel, |data| state.feed(data, &mut on_event))?;
+        state.finish(&mut on_event)
     }
 }
 
-fn role_str(r: crate::Role) -> &'static str {
+pub(crate) fn role_str(r: Role) -> &'static str {
     match r {
-        crate::Role::System => "system",
-        crate::Role::User => "user",
-        crate::Role::Assistant => "assistant",
+        Role::System => "system",
+        Role::User => "user",
+        Role::Assistant => "assistant",
+        Role::Tool => "tool",
     }
 }
 
-/// A 4xx/5xx is a provider answer, not a transport bug: keep the body so the
-/// caller can show what the endpoint actually said.
-fn map_err(e: ureq::Error) -> ProviderError {
-    match e {
-        ureq::Error::Status(status, r) => ProviderError::Http {
-            status,
-            body: r.into_string().unwrap_or_default(),
-        },
-        other => ProviderError::Transport(other.to_string()),
+/// The request body. Built as a `Value` because the optional fields differ by
+/// message role, and a struct per role would be more code than the JSON.
+fn body(req: &ChatRequest, stream: bool) -> Value {
+    let messages: Vec<Value> = req
+        .messages
+        .iter()
+        .map(|m| {
+            let mut v = json!({"role": role_str(m.role), "content": m.content});
+            if !m.tool_calls.is_empty() {
+                // `null` content beside tool calls: some servers reject "".
+                if m.content.is_empty() {
+                    v["content"] = Value::Null;
+                }
+                v["tool_calls"] = m
+                    .tool_calls
+                    .iter()
+                    .map(|c| {
+                        json!({
+                            "id": c.id,
+                            "type": "function",
+                            "function": {"name": c.name, "arguments": c.arguments}
+                        })
+                    })
+                    .collect();
+            }
+            if let Some(id) = &m.tool_call_id {
+                v["tool_call_id"] = json!(id);
+            }
+            v
+        })
+        .collect();
+    let mut b = json!({"model": req.model, "messages": messages, "stream": stream});
+    if let Some(n) = req.max_tokens {
+        b["max_tokens"] = json!(n);
+    }
+    if let Some(t) = req.temperature {
+        b["temperature"] = json!(t);
+    }
+    if let Some(e) = &req.reasoning_effort {
+        b["reasoning_effort"] = json!(e);
+    }
+    if stream {
+        // OpenAI-compatible servers only report usage on a stream when asked;
+        // without this the window shows no token counts at all.
+        b["stream_options"] = json!({"include_usage": true});
+    }
+    if !req.tools.is_empty() {
+        b["tools"] = req
+            .tools
+            .iter()
+            .map(|t| {
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.parameters
+                    }
+                })
+            })
+            .collect();
+        if let Some(choice) = &req.tool_choice {
+            b["tool_choice"] = match choice.as_str() {
+                "auto" | "none" | "required" => json!(choice),
+                name => json!({"type": "function", "function": {"name": name}}),
+            };
+        }
+    }
+    b
+}
+
+fn parse_completion(text: &str) -> Result<Completion> {
+    let v: Value = serde_json::from_str(text)?;
+    if let Some(e) = v.get("error") {
+        return Err(ProviderError::Malformed(error_message(e)));
+    }
+    let choice = v
+        .pointer("/choices/0")
+        .ok_or_else(|| ProviderError::Malformed("resposta sem choices".into()))?;
+    let msg = &choice["message"];
+    let str_at = |v: &Value| v.as_str().map(str::to_string);
+    let tool_calls = msg["tool_calls"]
+        .as_array()
+        .map(|calls| {
+            calls
+                .iter()
+                .enumerate()
+                .map(|(i, c)| ToolCall {
+                    id: str_at(&c["id"]).unwrap_or_else(|| format!("call_{i}")),
+                    name: str_at(&c["function"]["name"]).unwrap_or_default(),
+                    arguments: str_at(&c["function"]["arguments"]).unwrap_or_default(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(Completion {
+        text: str_at(&msg["content"]).unwrap_or_default(),
+        reasoning: str_at(&msg["reasoning_content"]),
+        usage: v
+            .get("usage")
+            .and_then(|u| serde_json::from_value(u.clone()).ok()),
+        finish_reason: str_at(&choice["finish_reason"]),
+        tool_calls,
+    })
+}
+
+pub(crate) fn error_message(e: &Value) -> String {
+    e.get("message")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ChatMessage, ToolDef};
+
+    #[test]
+    fn a_tool_round_trip_is_serialized_in_openai_shape() {
+        let req = ChatRequest::new(
+            "m",
+            vec![
+                ChatMessage::user("oi"),
+                ChatMessage::assistant(
+                    "",
+                    vec![ToolCall {
+                        id: "c1".into(),
+                        name: "read_file".into(),
+                        arguments: "{\"path\":\"a\"}".into(),
+                    }],
+                ),
+                ChatMessage::tool("c1", "conteudo"),
+            ],
+        )
+        .tools(vec![ToolDef {
+            name: "read_file".into(),
+            description: "d".into(),
+            parameters: json!({"type": "object"}),
+        }])
+        .tool_choice("auto");
+        let b = body(&req, true);
+        assert_eq!(b["messages"][1]["content"], Value::Null);
+        assert_eq!(
+            b["messages"][1]["tool_calls"][0]["function"]["name"],
+            "read_file"
+        );
+        assert_eq!(b["messages"][2]["role"], "tool");
+        assert_eq!(b["messages"][2]["tool_call_id"], "c1");
+        assert_eq!(b["tools"][0]["type"], "function");
+        assert_eq!(b["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn a_blocking_answer_with_tool_calls_is_parsed() {
+        let c = parse_completion(
+            r#"{"choices":[{"message":{"content":null,"tool_calls":[{"id":"x","type":"function","function":{"name":"glob","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(c.text, "");
+        assert_eq!(c.tool_calls[0].name, "glob");
+        assert_eq!(c.finish_reason.as_deref(), Some("tool_calls"));
+    }
+
+    #[test]
+    fn an_answer_without_choices_is_malformed_not_a_panic() {
+        assert!(matches!(
+            parse_completion("{}"),
+            Err(ProviderError::Malformed(_))
+        ));
     }
 }

@@ -63,8 +63,15 @@ budget_chars = 2000
 | `balanced` | 2 | 40 | 256 |
 | `performance` | 8 | 80 | 1024 |
 
-`Profile::limits()` devolve esses números. **Planejado:** runtime e planos
-ainda usam as constantes próprias (`HISTORY_LIMIT = 40`, `--agents`).
+`Profile::limits()` devolve esses números, e eles valem de verdade:
+
+- **Histórico:** mensagens reenviadas ao modelo por turno
+  (`AgentOptions::history`), na janela, em `zerith chat` e `zerith -p`.
+- **Subagentes:** concorrência padrão de `zerith plan run`; `--agents N`
+  ainda sobrepõe.
+- **Cache:** reservado; nenhum cache em memória lê esse número ainda.
+
+O perfil é relido a cada turno, então trocar na janela vale já no próximo.
 
 ## O que já é usado
 
@@ -73,7 +80,8 @@ ainda usam as constantes próprias (`HISTORY_LIMIT = 40`, `--agents`).
 | `model` | `zerith chat`, `zerith -p` (quando `ZERITH_MODEL` não está definido) |
 | `providers[].api_key_ref` | `zerith chat`, `zerith -p` (busca no cofre) |
 | `memory.paused` | `zerith -p` |
-| `ui.*` | `Settings::save_user` grava; a janela ainda não lê (**planejado**) |
+| `profile` | turnos (histórico) e `zerith plan run` (subagentes) |
+| `ui.*` | a janela lê e grava (tema, movimento reduzido) |
 | `permissions.*`, `hooks.*` | só biblioteca (**planejado** no runtime) |
 | `provider`, `base_url` | o provider ainda vem de `ProviderConfig::from_env` (mesmas variáveis) |
 

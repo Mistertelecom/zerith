@@ -3,20 +3,27 @@
 //! Arguments are parsed by hand: six subcommands do not justify a dependency,
 //! and an agent harness that shells out to itself should start fast.
 
+mod args;
+mod cmds;
+mod headless;
+mod schema;
+mod signals;
+
 use std::process::ExitCode;
 use zerith_core::{secrets, Paths, Settings};
-use zerith_importers::{detect, import, ImportReport};
-use zerith_mcp::Client as McpClient;
+use zerith_importers::{detect, import, import_jsonl, ImportReport};
 use zerith_memory::{default_scope, Confidence, FactKind, MemoryBackend, Scope, SqliteMemory};
-use zerith_plugins::{Library as Plugins, Status as PluginStatus};
 use zerith_providers::{Cancel, ChatMessage, ChatRequest, Client, ProviderConfig};
 use zerith_runtime::plan::{parse_plan, run_plan};
-use zerith_runtime::{run_turn_cancellable, run_turn_in, RunEvent, TurnContext};
+use zerith_runtime::{run_turn_in, RunEvent, TurnContext};
 use zerith_security::{redact, Action, Policy, Verdict, PRESETS};
 use zerith_sessions::{NewMessage, Role, SessionSource, Store, TaskState};
 use zerith_skills::catalog;
 use zerith_skills::{discover, scan, Library, Status};
 use zerith_tools::{CallCtx, Registry};
+
+use crate::args::{parse_chat, parse_import_hermes, parse_rename, select_session, SessionArgs};
+use crate::headless::{load_settings, provider_config, ExitWith};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -26,7 +33,9 @@ fn main() -> ExitCode {
             // An error string can carry a response body, and a response body
             // can carry the key that was sent. Redact on the way out.
             eprintln!("zerith: {}", redact(&e.to_string()));
-            ExitCode::FAILURE
+            // A signal that stopped the run decides the exit code (130/143).
+            let code = e.downcast_ref::<ExitWith>().map_or(1, |x| x.0);
+            ExitCode::from(code)
         }
     }
 }
@@ -44,30 +53,44 @@ usage:
   zerith restore <file>
   zerith session list [--limit N]
   zerith session new <title>
-  zerith session show <id>
+  zerith session show <id|name>
+  zerith session rename <id|name> <new title>
+  zerith export <id|name> [--format md|jsonl] [--out FILE]
+  zerith search <query> [--limit N]
+  zerith checkpoints <id|name>
+  zerith rewind <id|name> [--turn N] [--code|--conversation|--both] [--purge]
   zerith memory remember <scope> <text> [--inferred]
   zerith memory recall <scope> <query>
   zerith memory list <scope>
   zerith memory forget <id>
   zerith memory edit <id> <text>
-  zerith memory export <scope>
+  zerith memory export [scope]
+  zerith memory import <file.jsonl>
+  zerith memory pause|resume|status
   zerith skills list|installed|catalog [--refresh]
   zerith skills install <dir> | remove <name> | enable|disable <name>
   zerith skills update <name> <dir> | rollback <name>
   zerith skills validate <dir>
   zerith tools [list|call <tool> [json-args]]
-  zerith plugins [list|install <dir>|remove <name>|enable|disable <name>]
-  zerith plugins trust <name> | tools <name>
+  zerith agents list
+  zerith plugin list|show <name>|install <dir>|remove|enable|disable|untrust <name>
+  zerith plugin trust <name> --yes | tools <name>
   zerith plan run <file|-> [--agents N] [--model id]
   zerith plan list
-  zerith mcp tools <command and args>
-  zerith mcp call <command and args> -- <tool> [json-args]
+  zerith mcp list|add <name> (-- <cmd..> | --url <url>)|remove <name>
+  zerith mcp approve <name> --yes
+  zerith mcp tools <server> | call <server> <tool> [json-args]
+  zerith mcp tools <command and args>            (raw server, no config)
   zerith providers [probe|models|chat <model> <prompt>]
-  zerith chat [--session <id>] [--model <id>] <prompt>
-  zerith -p <prompt> [--output-format text|json|stream-json] [--model M] [--session ID]
+  zerith chat [--session <id>|--resume [id|name]|--continue] [--fork] [--model <id>] <prompt>
+  zerith -p <prompt> [--output-format text|json|stream-json] [--model M]
+        [--session ID | --resume [id|name] | --continue] [--fork]
+        [--max-turns N] [--max-budget-usd X --price-in P --price-out P]
+        [--allowed-tools a,b] [--disallowed-tools a,b] [--permission-mode MODE]
+        [--json-schema <json|file>] [--no-tools]
   zerith config show
   zerith secret set <name> [value] | get <name> | delete <name>
-  zerith import hermes [--profile <name>]
+  zerith import hermes [--profile <name>] [--jsonl <file>]
   zerith import detect"
 }
 
@@ -77,8 +100,8 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     };
     let paths = Paths::resolve();
-    if is_headless(args) {
-        return headless(&paths, args);
+    if args::is_headless(args) {
+        return headless::run(&paths, args);
     }
 
     match (cmd, args.get(1).map(String::as_str)) {
@@ -101,27 +124,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         ("bench", _) => bench()?,
         ("backup", _) => backup(&paths, args)?,
         ("restore", _) => restore(&paths, args)?,
-        ("doctor", _) => {
-            paths.ensure()?;
-            let store = Store::open(paths.db())?;
-            println!("db            {}", paths.db().display());
-            println!("schema        v{}", store.schema_version()?);
-            println!(
-                "integrity     {}",
-                if store.integrity_ok()? {
-                    "ok"
-                } else {
-                    "FAILED"
-                }
-            );
-            println!(
-                "sessions      {}",
-                store
-                    .list_sessions(usize::MAX)
-                    .map(|v| v.len())
-                    .unwrap_or(0)
-            );
-        }
+        ("doctor", _) => cmds::doctor(&paths, args)?,
         ("session", Some("list")) => {
             let limit = flag_usize(args, "--limit").unwrap_or(50);
             let store = Store::open(paths.db())?;
@@ -139,12 +142,18 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let s = store.create_session(&title, SessionSource::Native)?;
             println!("{}", s.id);
         }
-        ("session", Some("show")) => {
-            let id = args.get(2).ok_or("session show needs an id")?;
+        ("session", Some("rename")) => {
+            let (key, title) = parse_rename(args)?;
             let store = Store::open(paths.db())?;
-            let Some(s) = store.session(id)? else {
-                return Err(format!("no session {id}").into());
-            };
+            let s = store.resolve_session(&key)?;
+            store.rename_session(&s.id, &title)?;
+            println!("{} agora se chama {:?}", s.id, title.trim());
+        }
+        ("session", Some("show")) => {
+            let key = args.get(2).ok_or("session show needs an id or name")?;
+            let store = Store::open(paths.db())?;
+            let s = store.resolve_session(key)?;
+            let id = &s.id;
             println!("# {} ({})", s.title, s.id);
             println!("source      {}", s.source.as_str());
             println!("created_at  {}", s.created_at);
@@ -156,6 +165,11 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         ("providers", _) => providers(args)?,
         ("chat", _) => chat(&paths, args)?,
         ("import", Some("hermes")) => import_hermes(&paths, args)?,
+        ("export", _) => cmds::export_cmd(&paths, args)?,
+        ("search", _) => cmds::search_cmd(&paths, args)?,
+        ("checkpoints", _) => cmds::checkpoints_cmd(&paths, args)?,
+        ("rewind", _) => cmds::rewind_cmd(&paths, args)?,
+        ("agents", _) => cmds::agents_cmd(&paths, args)?,
         ("import", Some("detect")) => {
             let found = detect();
             if found.is_empty() {
@@ -174,8 +188,8 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         ("memory", Some(sub)) => memory(&paths, args, sub)?,
         ("skills", _) => skills(&paths, args)?,
         ("tools", _) => tools_cmd(&paths, args)?,
-        ("plugins", _) => plugins_cmd(&paths, args)?,
-        ("mcp", _) => mcp(args)?,
+        ("plugin", _) | ("plugins", _) => cmds::plugin_cmd(&paths, args)?,
+        ("mcp", _) => cmds::mcp_cmd(&paths, args)?,
         ("plan", _) => plan(&paths, args)?,
         _ => {
             println!("{}", usage());
@@ -185,67 +199,6 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Plugin metadata only. Nothing here spawns a process except `tools`, which
-/// still requires the plugin to be enabled *and* reviewed.
-fn plugins_cmd(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    paths.ensure()?;
-    let lib = Plugins::open(&paths.root().join("plugins"))?;
-    match args.get(1).map(String::as_str) {
-        None | Some("list") => {
-            let all = lib.plugins()?;
-            if all.is_empty() {
-                println!("(no plugins installed)");
-            }
-            for p in all {
-                println!(
-                    "{:<16} {:<8} {:<9} {} {}",
-                    p.manifest.name,
-                    p.manifest.version,
-                    p.status.as_str(),
-                    if p.trusted { "trusted" } else { "unreviewed" },
-                    p.manifest.description
-                );
-            }
-        }
-        Some("install") => {
-            let dir = args.get(2).ok_or("plugins install needs a directory")?;
-            let p = lib.install(std::path::Path::new(dir))?;
-            println!(
-                "installed {} {} (disabled, unreviewed)",
-                p.manifest.name, p.manifest.version
-            );
-        }
-        Some("remove") => {
-            let name = args.get(2).ok_or("plugins remove needs a name")?;
-            lib.remove(name)?;
-            println!("removed {name}");
-        }
-        Some("enable") => {
-            let name = args.get(2).ok_or("plugins enable needs a name")?;
-            lib.set_status(name, PluginStatus::Enabled)?;
-            println!("enabled {name}");
-        }
-        Some("disable") => {
-            let name = args.get(2).ok_or("plugins disable needs a name")?;
-            lib.set_status(name, PluginStatus::Disabled)?;
-            println!("disabled {name}");
-        }
-        Some("trust") => {
-            let name = args.get(2).ok_or("plugins trust needs a name")?;
-            lib.trust(name)?;
-            println!("{name} marked as reviewed");
-        }
-        Some("tools") => {
-            let name = args.get(2).ok_or("plugins tools needs a name")?;
-            let mut client = lib.launch(name)?;
-            for t in client.tools()? {
-                println!("{}  {}", t.name, t.description.unwrap_or_default());
-            }
-        }
-        Some(other) => return Err(format!("unknown plugins command: {other}").into()),
-    }
-    Ok(())
-}
 /// Lists the built-in tools, or runs one against the current workspace.
 ///
 /// The catalogue prints every field the spec requires a tool to declare, so a
@@ -287,46 +240,6 @@ fn tools_cmd(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::E
     }
     Ok(())
 }
-/// Speaks to one MCP server and prints what it advertises.
-///
-/// The command is split on whitespace so no shell is involved: a config value
-/// that came from outside cannot become an extra command.
-fn mcp(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let sub = args.get(1).ok_or("mcp needs a subcommand: tools | call")?;
-    let rest = &args[2..];
-    let (cmdline, tail) = match rest.iter().position(|a| a == "--") {
-        Some(i) => (&rest[..i], &rest[i + 1..]),
-        None => (rest, &rest[rest.len()..]),
-    };
-    let mut parts = cmdline.iter();
-    let command = parts.next().ok_or("mcp needs a server command")?;
-    let sargs: Vec<String> = parts.cloned().collect();
-    let mut client = McpClient::connect("cli", command, &sargs)?;
-    match sub.as_str() {
-        "tools" => {
-            let tools = client.tools()?;
-            if tools.is_empty() {
-                println!("(server advertises no tools)");
-            }
-            for t in tools {
-                println!("{}  {}", t.name, t.description.unwrap_or_default());
-            }
-        }
-        "call" => {
-            let tool = tail.first().ok_or("mcp call needs a tool name after --")?;
-            let raw = tail.get(1).map(String::as_str).unwrap_or("{}");
-            let arguments: serde_json::Value = serde_json::from_str(raw)?;
-            let result = client.call(tool, arguments)?;
-            if result.is_error == Some(true) {
-                eprintln!("zerith: the server reported the call as an error");
-            }
-            println!("{}", result.text());
-        }
-        other => return Err(format!("unknown mcp command: {other}").into()),
-    }
-    Ok(())
-}
-
 /// Plan mode: a list of tasks, run in dependency order with a bounded number
 /// of workers. Each task becomes its own session, so the transcript of what a
 /// subagent did is a conversation the user can read.
@@ -337,6 +250,14 @@ fn policy(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Erro
     println!("preset        {}", policy.preset.name);
     println!("sandbox       {}", policy.preset.sandbox.as_str());
     println!("enforcement   {}", policy.enforcement.as_str());
+    let jail = zerith_security::jail::report(policy.preset.sandbox);
+    println!("plataforma    {}", jail.platform);
+    for i in &jail.isolated {
+        println!("isolado       {i}");
+    }
+    for n in &jail.not_isolated {
+        println!("NÃO isolado   {n}");
+    }
     println!("workspace     {}", policy.workspace.display());
     println!("description   {}", policy.preset.description);
     if args.get(1).map(String::as_str) == Some("check") {
@@ -585,6 +506,9 @@ fn plan(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>
 }
 
 fn memory(paths: &Paths, args: &[String], sub: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if cmds::memory_admin(paths, args)? {
+        return Ok(());
+    }
     let mem = SqliteMemory::open(paths.db())?;
     match sub {
         "remember" => {
@@ -642,199 +566,6 @@ fn memory(paths: &Paths, args: &[String], sub: &str) -> Result<(), Box<dyn std::
             println!("{}", serde_json::to_string_pretty(&facts)?);
         }
         _ => return Err(format!("unknown memory command: {sub}").into()),
-    }
-    Ok(())
-}
-
-/// `zerith chat` arguments. `--flag value` pairs are consumed first, so a
-/// model id is never mistaken for the prompt; the rest is user text.
-#[derive(Debug, PartialEq)]
-struct ChatArgs {
-    prompt: String,
-    session: Option<String>,
-    model: Option<String>,
-}
-
-fn parse_chat(args: &[String]) -> Result<ChatArgs, String> {
-    let mut positionals: Vec<&str> = Vec::new();
-    let mut out = ChatArgs {
-        prompt: String::new(),
-        session: None,
-        model: None,
-    };
-    let mut i = 1;
-    while i < args.len() {
-        let a = args[i].as_str();
-        if a == "--session" || a == "--model" {
-            let value = args.get(i + 1).cloned();
-            if a == "--session" {
-                out.session = value;
-            } else {
-                out.model = value;
-            }
-            i += 2;
-            continue;
-        }
-        if !a.starts_with("--") {
-            positionals.push(a);
-        }
-        i += 1;
-    }
-    if positionals.is_empty() {
-        return Err("chat needs a prompt".into());
-    }
-    out.prompt = positionals.join(" ");
-    Ok(out)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum OutputFormat {
-    Text,
-    Json,
-    StreamJson,
-}
-
-/// `zerith -p <prompt> [--output-format F] [--model M] [--session ID]`.
-#[derive(Debug, PartialEq)]
-struct Headless {
-    prompt: String,
-    format: OutputFormat,
-    model: Option<String>,
-    session: Option<String>,
-}
-
-fn is_headless(args: &[String]) -> bool {
-    args.iter().any(|a| a == "-p" || a == "--print")
-}
-
-fn parse_headless(args: &[String]) -> Result<Headless, String> {
-    let mut out = Headless {
-        prompt: String::new(),
-        format: OutputFormat::Text,
-        model: None,
-        session: None,
-    };
-    let mut prompt = None;
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        let mut value = |name: &str| {
-            it.next()
-                .cloned()
-                .ok_or_else(|| format!("{name} precisa de um valor"))
-        };
-        match a.as_str() {
-            "-p" | "--print" => prompt = Some(value(a)?),
-            "--model" => out.model = Some(value(a)?),
-            "--session" => out.session = Some(value(a)?),
-            "--output-format" => {
-                out.format = match value(a)?.as_str() {
-                    "text" => OutputFormat::Text,
-                    "json" => OutputFormat::Json,
-                    "stream-json" => OutputFormat::StreamJson,
-                    other => return Err(format!("--output-format inválido: {other}")),
-                }
-            }
-            other => return Err(format!("argumento desconhecido: {other}")),
-        }
-    }
-    out.prompt = prompt
-        .filter(|p| !p.trim().is_empty())
-        .ok_or("-p precisa de um prompt")?;
-    Ok(out)
-}
-
-/// The provider for this process: env as before, then the merged settings
-/// for the model, then the OS keyring for the key.
-fn provider_config(settings: &Settings) -> Result<ProviderConfig, Box<dyn std::error::Error>> {
-    let mut cfg = ProviderConfig::from_env();
-    if cfg.default_model.is_none() {
-        cfg.default_model = settings.model.clone();
-    }
-    if cfg.api_key.is_none() && cfg.kind.needs_key() {
-        let key_ref = settings
-            .provider_entry(&cfg.name)
-            .and_then(|p| p.api_key_ref.as_deref());
-        cfg.api_key = secrets::resolve_api_key(&cfg.name, key_ref)?;
-    }
-    Ok(cfg)
-}
-
-fn load_settings(paths: &Paths) -> Settings {
-    let cwd = std::env::current_dir().ok();
-    let loaded = Settings::load(paths, cwd.as_deref());
-    for e in &loaded.errors {
-        eprintln!("zerith: {e}");
-    }
-    loaded.settings
-}
-
-/// One turn without a REPL, for scripts and CI. Exit 0 on success, 1 on any
-/// error (handled by `main`).
-fn headless(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let h = parse_headless(args)?;
-    let settings = load_settings(paths);
-    let cfg = provider_config(&settings)?;
-    let model = h
-        .model
-        .or_else(|| cfg.default_model.clone())
-        .or_else(|| cfg.known_models.first().cloned())
-        .ok_or("sem modelo: use --model ou ZERITH_MODEL")?;
-    let client = Client::new(cfg)?;
-    paths.ensure()?;
-    let store = Store::open(paths.db())?;
-    let session_id = match h.session {
-        Some(id) => id,
-        None => {
-            let title: String = h.prompt.chars().take(48).collect();
-            store.create_session(&title, SessionSource::Native)?.id
-        }
-    };
-    let memory = SqliteMemory::open(paths.db())?;
-    let scope = default_scope();
-    let memory = (!settings.memory.paused).then_some(&memory as &dyn MemoryBackend);
-    let format = h.format;
-    let report = run_turn_cancellable(
-        &store,
-        &client,
-        memory,
-        Some(&scope),
-        &session_id,
-        &model,
-        &h.prompt,
-        &Cancel::default(),
-        |e| {
-            if format != OutputFormat::StreamJson {
-                return;
-            }
-            let line = match e {
-                RunEvent::Delta(t) => serde_json::json!({"type": "delta", "text": t}),
-                RunEvent::Reasoning(t) => serde_json::json!({"type": "reasoning", "text": t}),
-                RunEvent::Done { stored } => {
-                    serde_json::json!({"type": "done", "message_id": stored})
-                }
-                RunEvent::Usage { input, output } => {
-                    serde_json::json!({"type": "usage", "input": input, "output": output})
-                }
-                // Tool events need tools enabled; this path runs without them.
-                _ => return,
-            };
-            println!("{line}");
-        },
-    )?;
-    let usage = serde_json::json!({
-        "prompt_tokens": report.prompt_tokens,
-        "completion_tokens": report.completion_tokens,
-    });
-    match format {
-        OutputFormat::Text => println!("{}", report.text),
-        OutputFormat::Json => println!(
-            "{}",
-            serde_json::json!({"session_id": report.session_id, "result": report.text, "usage": usage})
-        ),
-        OutputFormat::StreamJson => println!(
-            "{}",
-            serde_json::json!({"type": "result", "session_id": report.session_id, "result": report.text, "usage": usage})
-        ),
     }
     Ok(())
 }
@@ -897,7 +628,7 @@ fn secret_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 /// The turn runs on this thread. A CLI has nothing else to do while it waits,
 /// so the extra thread `run_turn_async` exists for the window, not here.
 fn chat(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let ChatArgs {
+    let args::ChatArgs {
         prompt,
         session: session_flag,
         model: model_flag,
@@ -913,13 +644,8 @@ fn chat(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>
 
     paths.ensure()?;
     let store = Store::open(paths.db())?;
-    let session_id = match session_flag {
-        Some(id) => id,
-        None => {
-            let title: String = prompt.chars().take(48).collect();
-            store.create_session(&title, SessionSource::Native)?.id
-        }
-    };
+    let session_id = select_session(&store, &session_flag, &prompt)?;
+    let _: &SessionArgs = &session_flag;
 
     // Memory shares the same database file: one store, one schema, no second
     // source of truth to keep in sync.
@@ -1011,30 +737,38 @@ fn providers(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn import_hermes(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let profile = args
-        .iter()
-        .position(|a| a == "--profile")
-        .and_then(|i| args.get(i + 1))
-        .cloned();
-    let sources = detect();
-    let Some(first) = sources.first() else {
-        return Err("no Hermes database found (~/.hermes/state.db)".into());
-    };
-    let picked = match &profile {
-        Some(p) => sources
-            .iter()
-            .find(|s| &s.profile == p)
-            .ok_or_else(|| format!("no Hermes profile named {p}"))?,
-        None => first,
-    };
+    let a = parse_import_hermes(args)?;
     paths.ensure()?;
     let store = Store::open(paths.db())?;
-    let report: ImportReport = import(&picked.path, &picked.profile, &store)?;
+    let report: ImportReport = match &a.jsonl {
+        Some(file) => import_jsonl(
+            std::path::Path::new(file),
+            a.profile.as_deref().unwrap_or("jsonl"),
+            &store,
+        )?,
+        None => {
+            let sources = detect();
+            let Some(first) = sources.first() else {
+                return Err("no Hermes database found (~/.hermes/state.db); \
+                            use --jsonl <file> for an export"
+                    .into());
+            };
+            let picked = match &a.profile {
+                Some(p) => sources
+                    .iter()
+                    .find(|s| &s.profile == p)
+                    .ok_or_else(|| format!("no Hermes profile named {p}"))?,
+                None => first,
+            };
+            import(&picked.path, &picked.profile, &store)?
+        }
+    };
     println!(
-        "sessions seen {}  imported {}  skipped {}  messages {}  skipped {}  failed {}",
+        "sessions seen {}  imported {}  skipped {}  resumed {}  messages {}  skipped {}  failed {}",
         report.sessions_seen,
         report.sessions_imported,
         report.sessions_skipped,
+        report.sessions_resumed,
         report.messages_imported,
         report.messages_skipped,
         report.failed.len()
@@ -1116,12 +850,29 @@ fn skills(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Erro
             println!("{name} {}", status.as_str());
         }
         "update" => {
-            let name = args.get(2).ok_or("skills update needs a name")?;
-            let from = args.get(3).ok_or("skills update needs a directory")?;
+            let (name, from) = args::parse_skills_update(args)?;
             paths.ensure()?;
-            let fresh = Library::open(paths.skills())?.update(name, std::path::Path::new(from))?;
+            let lib = Library::open(paths.skills())?;
+            let from = match from {
+                Some(f) => f,
+                // Without a directory, re-read where it was installed from.
+                None => lib
+                    .manifest()?
+                    .skills
+                    .into_iter()
+                    .find(|r| r.name == name)
+                    .map(|r| r.source)
+                    .ok_or_else(|| format!("skill {name} não está instalada"))?,
+            };
+            if !std::path::Path::new(&from).is_dir() {
+                return Err(format!(
+                    "{from} não é uma pasta; informe de onde atualizar: skills update {name} <pasta>"
+                )
+                .into());
+            }
+            let fresh = lib.update(&name, std::path::Path::new(&from))?;
             println!(
-                "updated {name} to {} file(s)",
+                "updated {name} from {from} to {} file(s)",
                 fresh.inventory.values().sum::<usize>()
             );
             for f in &fresh.findings {
@@ -1175,62 +926,6 @@ mod tests {
 
     fn v(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn chat_flags_never_become_the_prompt() {
-        let a = parse_chat(&v(&[
-            "chat",
-            "--model",
-            "m1",
-            "oi",
-            "--session",
-            "s",
-            "mundo",
-        ]))
-        .unwrap();
-        assert_eq!(
-            a,
-            ChatArgs {
-                prompt: "oi mundo".into(),
-                session: Some("s".into()),
-                model: Some("m1".into())
-            }
-        );
-        assert!(parse_chat(&v(&["chat", "--model", "m1"])).is_err());
-    }
-
-    #[test]
-    fn headless_parses_every_flag_in_any_order() {
-        let args = v(&[
-            "--output-format",
-            "stream-json",
-            "-p",
-            "olá",
-            "--model",
-            "m",
-            "--session",
-            "s1",
-        ]);
-        assert!(is_headless(&args));
-        let h = parse_headless(&args).unwrap();
-        assert_eq!(h.prompt, "olá");
-        assert_eq!(h.format, OutputFormat::StreamJson);
-        assert_eq!(h.model.as_deref(), Some("m"));
-        assert_eq!(h.session.as_deref(), Some("s1"));
-        assert_eq!(
-            parse_headless(&v(&["-p", "x"])).unwrap().format,
-            OutputFormat::Text
-        );
-    }
-
-    #[test]
-    fn headless_rejects_bad_input() {
-        assert!(parse_headless(&v(&["-p"])).is_err());
-        assert!(parse_headless(&v(&["-p", " "])).is_err());
-        assert!(parse_headless(&v(&["-p", "x", "--output-format", "xml"])).is_err());
-        assert!(parse_headless(&v(&["-p", "x", "--bogus"])).is_err());
-        assert!(!is_headless(&v(&["chat", "oi"])));
     }
 
     #[test]

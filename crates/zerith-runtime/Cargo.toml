@@ -9,5 +9,9 @@ zerith-core = { path = "../zerith-core" }
 zerith-sessions = { path = "../zerith-sessions" }
 zerith-providers = { path = "../zerith-providers" }
 zerith-memory = { path = "../zerith-memory" }
+zerith-skills = { path = "../zerith-skills" }
 serde_json.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

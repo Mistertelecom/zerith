@@ -193,13 +193,29 @@ impl Policy {
         let Ok(base) = self.workspace.canonicalize() else {
             return false;
         };
-        // The target may not exist yet; resolve its parent instead.
-        let resolved = match path.canonicalize() {
-            Ok(p) => p,
-            Err(_) => match path.parent().and_then(|p| p.canonicalize().ok()) {
-                Some(parent) => parent.join(path.file_name().unwrap_or_default()),
+        // The target, and possibly its parents, may not exist yet. Walk up to
+        // the first ancestor that does, resolve *that*, then re-append the
+        // missing tail. A missing directory must not turn into "outside".
+        let mut tail = Vec::new();
+        let mut probe = path;
+        let resolved = loop {
+            if let Ok(p) = probe.canonicalize() {
+                let mut out = p;
+                for part in tail.iter().rev() {
+                    out.push(part);
+                }
+                break out;
+            }
+            match probe.file_name() {
+                Some(name) => {
+                    tail.push(name.to_os_string());
+                    match probe.parent() {
+                        Some(parent) => probe = parent,
+                        None => return false,
+                    }
+                }
                 None => return false,
-            },
+            }
         };
         resolved.starts_with(&base)
     }

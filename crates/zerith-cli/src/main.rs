@@ -8,12 +8,14 @@ use zerith_core::Paths;
 use zerith_importers::{detect, import, ImportReport};
 use zerith_mcp::Client as McpClient;
 use zerith_memory::{Confidence, FactKind, MemoryBackend, Scope, SqliteMemory};
-use zerith_providers::{ChatMessage, ChatRequest, Client, ProviderConfig};
+use zerith_providers::{Cancel, ChatMessage, ChatRequest, Client, ProviderConfig};
 use zerith_runtime::plan::{parse_plan, run_plan};
-use zerith_runtime::{run_turn_with_memory, RunEvent};
+use zerith_runtime::{run_turn_in, RunEvent, TurnContext};
 use zerith_security::{redact, Action, Policy, Verdict, PRESETS};
 use zerith_sessions::{NewMessage, Role, SessionSource, Store, TaskState};
-use zerith_skills::{discover, scan};
+use zerith_skills::catalog;
+use zerith_skills::{discover, scan, Library, Status};
+use zerith_tools::{CallCtx, Registry};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -46,8 +48,11 @@ usage:
   zerith memory recall <scope> <query>
   zerith memory list <scope>
   zerith memory forget <id>
-  zerith skills list
+  zerith skills list|installed|catalog [--refresh]
+  zerith skills install <dir> | remove <name> | enable|disable <name>
+  zerith skills update <name> <dir> | rollback <name>
   zerith skills validate <dir>
+  zerith tools [list|call <tool> [json-args]]
   zerith plan run <file|-> [--agents N] [--model id]
   zerith plan list
   zerith mcp tools <command and args>
@@ -155,6 +160,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
         ("memory", Some(sub)) => memory(&paths, args, sub)?,
         ("skills", _) => skills(&paths, args)?,
+        ("tools", _) => tools_cmd(&paths, args)?,
         ("mcp", _) => mcp(args)?,
         ("plan", _) => plan(&paths, args)?,
         _ => {
@@ -165,6 +171,47 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Lists the built-in tools, or runs one against the current workspace.
+///
+/// The catalogue prints every field the spec requires a tool to declare, so a
+/// tool that hides its timeout or its permissions stands out immediately.
+fn tools_cmd(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let reg = Registry::new();
+    match args.get(1).map(String::as_str) {
+        None | Some("list") => {
+            for t in reg.specs() {
+                println!(
+                    "{:<14} {:<8} {:<6} {:?}  {}",
+                    t.name,
+                    t.permission.as_str(),
+                    if t.cancellable { "cancel" } else { "block" },
+                    t.timeout,
+                    t.description
+                );
+                println!("               returns {}", t.returns);
+                println!("               origin  {}  local {}", t.source, t.local);
+            }
+        }
+        Some("call") => {
+            let name = args.get(2).ok_or("tools call needs a tool name")?;
+            let raw = args.get(3).cloned().unwrap_or_else(|| "{}".to_string());
+            let json: serde_json::Value = serde_json::from_str(&raw)?;
+            paths.ensure()?;
+            let policy = Policy::from_env(paths.root())?;
+            let memory = SqliteMemory::open(paths.db()).ok();
+            let scope = Scope::user(&scope_id());
+            let ctx = CallCtx {
+                workspace: paths.root(),
+                policy: &policy,
+                memory: memory.as_ref().map(|m| m as &dyn MemoryBackend),
+                scope: Some(&scope),
+            };
+            println!("{}", reg.call(name, &json, &ctx)?);
+        }
+        Some(other) => return Err(format!("unknown tools command: {other}").into()),
+    }
+    Ok(())
+}
 /// Speaks to one MCP server and prints what it advertises.
 ///
 /// The command is split on whitespace so no shell is involved: a config value
@@ -549,15 +596,23 @@ fn chat(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>
     let memory = SqliteMemory::open(paths.db())?;
     let scope = Scope::user(&scope_id());
 
+    // Installed skills are consulted, but only their names and descriptions
+    // reach the prompt unless the user named one.
+    let skills = Library::open(paths.skills()).ok();
+
     let mut streamed = false;
-    let report = run_turn_with_memory(
+    let report = run_turn_in(
         &store,
         &client,
-        Some(&memory),
-        Some(&scope),
+        TurnContext {
+            memory: Some(&memory),
+            scope: Some(&scope),
+            skills: skills.as_ref(),
+        },
         &session_id,
         &model,
         &prompt,
+        &Cancel::default(),
         |e| match e {
             RunEvent::Delta(text) => {
                 streamed = true;
@@ -703,6 +758,79 @@ fn skills(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Erro
             }
             for f in &s.findings {
                 println!("finding       {}  {}", f.severity.as_str(), f.message);
+            }
+        }
+        "install" => {
+            let dir = args.get(2).ok_or("skills install needs a directory")?;
+            paths.ensure()?;
+            let lib = Library::open(paths.skills())?;
+            let row = lib.install(std::path::Path::new(dir), dir)?;
+            println!("installed {} ({})", row.name, row.status.as_str());
+        }
+        "remove" => {
+            let name = args.get(2).ok_or("skills remove needs a name")?;
+            paths.ensure()?;
+            Library::open(paths.skills())?.remove(name)?;
+            println!("removed {name}");
+        }
+        "enable" | "disable" => {
+            let name = args.get(2).ok_or("skills enable/disable needs a name")?;
+            paths.ensure()?;
+            let status = if sub == "enable" {
+                Status::Enabled
+            } else {
+                Status::Disabled
+            };
+            Library::open(paths.skills())?.set_status(name, status)?;
+            println!("{name} {}", status.as_str());
+        }
+        "update" => {
+            let name = args.get(2).ok_or("skills update needs a name")?;
+            let from = args.get(3).ok_or("skills update needs a directory")?;
+            paths.ensure()?;
+            let fresh = Library::open(paths.skills())?.update(name, std::path::Path::new(from))?;
+            println!(
+                "updated {name} to {} file(s)",
+                fresh.inventory.values().sum::<usize>()
+            );
+            for f in &fresh.findings {
+                println!("finding       {}  {}", f.severity.as_str(), f.message);
+            }
+        }
+        "rollback" => {
+            let name = args.get(2).ok_or("skills rollback needs a name")?;
+            paths.ensure()?;
+            Library::open(paths.skills())?.rollback(name)?;
+            println!("rolled back {name}");
+        }
+        "installed" => {
+            paths.ensure()?;
+            let lib = Library::open(paths.skills())?;
+            let rows = lib.manifest()?.skills;
+            if rows.is_empty() {
+                println!("(nothing installed)");
+            }
+            for r in rows {
+                println!(
+                    "{}  {:<9} {}  {}",
+                    r.name,
+                    r.status.as_str(),
+                    r.license,
+                    r.source
+                );
+            }
+        }
+        "catalog" => {
+            paths.ensure()?;
+            let force = args.iter().any(|a| a == "--refresh");
+            let token = std::env::var("GITHUB_TOKEN").ok();
+            let cat = catalog::load(&paths.root(), token.as_deref(), force)?;
+            println!("fetched_at    {}", cat.fetched_at);
+            for e in cat.entries {
+                println!(
+                    "{:<38} {:>7} stars  {:<12} {}  {}",
+                    e.repo, e.stars, e.license, e.updated_at, e.description
+                );
             }
         }
         other => return Err(format!("unknown skills command: {other}").into()),

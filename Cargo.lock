@@ -4587,6 +4587,7 @@ dependencies = [
  "zerith-security",
  "zerith-sessions",
  "zerith-skills",
+ "zerith-tools",
 ]
 
 [[package]]
@@ -4648,11 +4649,13 @@ name = "zerith-runtime"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
  "zerith-core",
  "zerith-memory",
  "zerith-providers",
  "zerith-sessions",
+ "zerith-skills",
 ]
 
 [[package]]
@@ -4679,7 +4682,21 @@ name = "zerith-skills"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
+ "ureq",
+]
+
+[[package]]
+name = "zerith-tools"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "zerith-memory",
+ "zerith-security",
 ]
 
 [[package]]

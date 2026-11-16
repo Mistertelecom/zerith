@@ -51,6 +51,22 @@ pub const MEMORY_BUDGET_CHARS: usize = 2000;
 /// dump; the budget trims what the ranking offered.
 pub const MEMORY_HITS: usize = 12;
 
+/// How much of the prompt skills may occupy. Metadata for many, bodies for
+/// the few the user named.
+pub const SKILLS_BUDGET_CHARS: usize = 3000;
+
+/// Everything a turn may consult besides the conversation itself.
+///
+/// Grouped rather than passed one by one: the turn already took seven
+/// arguments, and each new capability (memory, skills, later tools) would add
+/// another.
+#[derive(Default, Clone, Copy)]
+pub struct TurnContext<'a> {
+    pub memory: Option<&'a dyn MemoryBackend>,
+    pub scope: Option<&'a Scope>,
+    pub skills: Option<&'a zerith_skills::Library>,
+}
+
 /// The turn's outcome, with the numbers a UI needs to show it honestly.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TurnReport {
@@ -114,8 +130,42 @@ pub fn run_turn_cancellable(
     model: &str,
     prompt: &str,
     cancel: &zerith_providers::Cancel,
+    on_event: impl FnMut(RunEvent),
+) -> Result<TurnReport> {
+    run_turn_in(
+        store,
+        client,
+        TurnContext {
+            memory,
+            scope,
+            skills: None,
+        },
+        session_id,
+        model,
+        prompt,
+        cancel,
+        on_event,
+    )
+}
+
+/// The turn itself. Every entry point above funnels here so there is exactly
+/// one place that decides what the model sees.
+#[allow(clippy::too_many_arguments)]
+pub fn run_turn_in(
+    store: &Store,
+    client: &Client,
+    ctx: TurnContext<'_>,
+    session_id: &str,
+    model: &str,
+    prompt: &str,
+    cancel: &zerith_providers::Cancel,
     mut on_event: impl FnMut(RunEvent),
 ) -> Result<TurnReport> {
+    let TurnContext {
+        memory,
+        scope,
+        skills,
+    } = ctx;
     let session = store
         .session(session_id)?
         .ok_or_else(|| RunError::NoSession(session_id.to_string()))?;
@@ -135,6 +185,13 @@ pub fn run_turn_cancellable(
         if !known.is_empty() {
             prompt_text.push_str("\n\n");
             prompt_text.push_str(&known);
+        }
+    }
+    if let Some(lib) = skills {
+        let block = skills_block(lib, prompt, SKILLS_BUDGET_CHARS);
+        if !block.is_empty() {
+            prompt_text.push_str("\n\n");
+            prompt_text.push_str(&block);
         }
     }
     messages.push(ChatMessage::system(prompt_text));
@@ -383,5 +440,103 @@ mod tests {
         let mem = Fixed(vec![big; 20]);
         let block = recall_block(&mem, &Scope::user("t"), "x");
         assert!(block.len() <= MEMORY_BUDGET_CHARS + 128, "{}", block.len());
+    }
+}
+
+/// The skills section of the system prompt.
+///
+/// The spec is specific: do not load every skill body into context. So this
+/// lists name and description for enabled skills only, and inlines the body
+/// of a skill only when the user named it. Until the tool loop exists that is
+/// the only honest reading of "load on demand".
+pub fn skills_block(lib: &zerith_skills::Library, prompt: &str, budget: usize) -> String {
+    let catalog = match lib.catalog() {
+        Ok(c) => c,
+        Err(_) => return String::new(),
+    };
+    if catalog.is_empty() {
+        return String::new();
+    }
+    let lower = prompt.to_ascii_lowercase();
+    let mut out = String::from("# Skills disponíveis");
+    let mut spent = 0usize;
+    for (name, description) in &catalog {
+        let line = format!("\n- {name}: {description}");
+        if spent + line.len() > budget {
+            break;
+        }
+        spent += line.len();
+        out.push_str(&line);
+        // Named in the request: the body is what the user is asking for.
+        if lower.contains(&name.to_ascii_lowercase()) {
+            if let Ok(body) = lib.load_body(name) {
+                let room = budget.saturating_sub(spent);
+                let take: String = body.chars().take(room).collect();
+                if !take.is_empty() {
+                    out.push_str("\n\n## ");
+                    out.push_str(name);
+                    out.push_str("\n");
+                    out.push_str(&take);
+                    spent += take.len();
+                }
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod skills_tests {
+    use super::*;
+
+    fn scratch() -> std::path::PathBuf {
+        let p =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-scratch");
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn skill(dir: &std::path::Path, name: &str, body: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: d-{name}\nlicense: MIT\n---\n\n{body}\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn only_names_and_descriptions_are_listed_by_default() {
+        let tmp = tempfile::tempdir_in(scratch()).unwrap();
+        let src = tmp.path().join("src");
+        skill(&src, "demo", "CORPO-SECRETO");
+        let lib = zerith_skills::Library::open(tmp.path().join("skills")).unwrap();
+        lib.install(&src, "t").unwrap();
+        let block = skills_block(&lib, "nada a ver", 2000);
+        assert!(block.contains("demo: d-demo"));
+        assert!(!block.contains("CORPO-SECRETO"));
+    }
+
+    #[test]
+    fn naming_the_skill_inlines_its_body() {
+        let tmp = tempfile::tempdir_in(scratch()).unwrap();
+        let src = tmp.path().join("src");
+        skill(&src, "demo", "CORPO-SECRETO");
+        let lib = zerith_skills::Library::open(tmp.path().join("skills")).unwrap();
+        lib.install(&src, "t").unwrap();
+        let block = skills_block(&lib, "use a skill demo agora", 2000);
+        assert!(block.contains("CORPO-SECRETO"));
+    }
+
+    #[test]
+    fn disabled_skills_do_not_reach_the_prompt() {
+        let tmp = tempfile::tempdir_in(scratch()).unwrap();
+        let src = tmp.path().join("src");
+        skill(&src, "demo", "x");
+        let lib = zerith_skills::Library::open(tmp.path().join("skills")).unwrap();
+        lib.install(&src, "t").unwrap();
+        lib.set_status("demo", zerith_skills::Status::Disabled)
+            .unwrap();
+        assert!(skills_block(&lib, "demo", 2000).is_empty());
     }
 }

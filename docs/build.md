@@ -47,9 +47,28 @@ verificada em CI.
 | `ZERITH_BASE_URL` | URL do endpoint |
 | `ZERITH_API_KEY` | Chave do provider |
 | `ZERITH_MODEL` | Modelo padrão do chat |
+| `ZERITH_USER` | Identidade do escopo de memória (`user:<id>`) |
+| `ZERITH_SANDBOX` | `read-only`, `workspace-write` (padrão) ou `danger-full-access` |
 
 No Windows, `ZERITH_HOME` precisa ser caminho Windows (`C:\...`), não MSYS
 (`/c/...`): o SQLite devolve `Acesso negado (os error 5)` no caminho MSYS.
+
+## Uso
+
+```bash
+zerith doctor                     # banco, schema, integrity_check, contagens
+zerith chat "pergunta"            # turno com streaming, memória e persistência
+zerith session list               # conversas
+zerith memory list user:joao      # fatos confirmados e inferidos
+zerith skills list                # SKILL.md encontradas, nada executado
+zerith mcp tools <cmd...>         # handshake MCP e lista de ferramentas
+zerith plan run plano.txt --agents 2
+zerith policy check <caminho>     # veredito do preset ativo
+zerith bench                      # números em banco descartável
+zerith backup                     # cópia consistente via API do SQLite
+zerith restore <arquivo>
+zerith import hermes              # read-only, idempotente
+```
 
 ## Artefatos
 

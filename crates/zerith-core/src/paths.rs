@@ -49,6 +49,11 @@ impl Paths {
         self.root.join("AGENTS.md")
     }
 
+    /// User-level agent definitions (`*.md`); see `agents`.
+    pub fn agents(&self) -> PathBuf {
+        self.root.join("agents")
+    }
+
     pub fn skills(&self) -> PathBuf {
         self.root.join("skills")
     }

@@ -3,6 +3,7 @@
 //! No UI, no provider, no database. Everything here is the small set of
 //! facts every other Zerith crate needs.
 
+pub mod agents;
 pub mod hooks;
 pub mod instructions;
 pub mod paths;

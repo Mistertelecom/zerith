@@ -93,6 +93,27 @@ pub fn run_turn_with_memory(
     session_id: &str,
     model: &str,
     prompt: &str,
+    on_event: impl FnMut(RunEvent),
+) -> Result<TurnReport> {
+    let cancel = zerith_providers::Cancel::default();
+    run_turn_cancellable(
+        store, client, memory, scope, session_id, model, prompt, &cancel, on_event,
+    )
+}
+
+/// The same turn, with a cancel token the host can pull from another thread —
+/// a window needs a stop button, and the only honest stop is the one that
+/// reaches the network loop.
+#[allow(clippy::too_many_arguments)]
+pub fn run_turn_cancellable(
+    store: &Store,
+    client: &Client,
+    memory: Option<&dyn MemoryBackend>,
+    scope: Option<&Scope>,
+    session_id: &str,
+    model: &str,
+    prompt: &str,
+    cancel: &zerith_providers::Cancel,
     mut on_event: impl FnMut(RunEvent),
 ) -> Result<TurnReport> {
     let session = store
@@ -138,7 +159,6 @@ pub fn run_turn_with_memory(
     }
 
     let req = ChatRequest::new(model, messages);
-    let cancel = zerith_providers::Cancel::default();
 
     // Streaming first: the window is the main host, and a turn that only
     // paints when it finishes reads as a hang. If the endpoint rejects the
@@ -147,7 +167,7 @@ pub fn run_turn_with_memory(
     let mut text = String::new();
     let mut reasoning: Option<String> = None;
     let mut usage = None;
-    let streamed = client.stream(&req, &cancel, |event| match event {
+    let streamed = client.stream(&req, cancel, |event| match event {
         StreamEvent::Delta(t) => {
             text.push_str(&t);
             on_event(RunEvent::Delta(t));
@@ -177,7 +197,7 @@ pub fn run_turn_with_memory(
         if !text.is_empty() || matches!(e, ProviderError::Cancelled) {
             return Err(e.into());
         }
-        let completion = client.complete(&req, &cancel)?;
+        let completion = client.complete(&req, cancel)?;
         if let Some(r) = &completion.reasoning {
             on_event(RunEvent::Reasoning(r.clone()));
         }

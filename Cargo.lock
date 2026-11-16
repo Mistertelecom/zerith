@@ -4584,6 +4584,7 @@ dependencies = [
  "zerith-memory",
  "zerith-providers",
  "zerith-runtime",
+ "zerith-security",
  "zerith-sessions",
  "zerith-skills",
 ]
@@ -4652,6 +4653,13 @@ dependencies = [
  "zerith-memory",
  "zerith-providers",
  "zerith-sessions",
+]
+
+[[package]]
+name = "zerith-security"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
 ]
 
 [[package]]

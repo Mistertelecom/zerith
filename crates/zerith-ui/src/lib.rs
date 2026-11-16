@@ -12,8 +12,8 @@ use std::path::PathBuf;
 use rune::tok::{self, radius, type_};
 use rune::{col, el, row, text, text_input, AppHandle, Cx, El, ScrollSpec, TextEdit, Tx};
 use zerith_memory::{Fact, MemoryBackend, Scope, SqliteMemory};
-use zerith_providers::{Client, ProviderConfig};
-use zerith_runtime::{run_turn_with_memory, RunEvent};
+use zerith_providers::{Cancel, Client, ProviderConfig};
+use zerith_runtime::{run_turn_cancellable, RunEvent};
 use zerith_sessions::{Session, Store};
 use zerith_skills::discover;
 
@@ -48,6 +48,9 @@ pub struct Shell {
     pub draft: TextEdit,
     pub status: String,
     pub busy: bool,
+    /// The token the worker thread is watching. `None` when no turn is in
+    /// flight, so the stop button cannot exist without something to stop.
+    pub cancel: Option<Cancel>,
     pub model: String,
     db: PathBuf,
     me: AppHandle<Shell>,
@@ -70,6 +73,7 @@ impl Shell {
             draft: TextEdit::new(""),
             status: String::new(),
             busy: false,
+            cancel: None,
             model: cfg.default_model.clone().unwrap_or_default(),
             db,
             me,
@@ -181,13 +185,24 @@ impl Shell {
             }),
             RunEvent::Done { .. } => {
                 self.busy = false;
+                self.cancel = None;
                 self.reload();
             }
         }
     }
 
+    /// Stops the turn at the next network read. The partial answer is not
+    /// stored: a half-sentence committed as an answer is worse than nothing.
+    pub fn stop(&mut self) {
+        if let Some(c) = self.cancel.take() {
+            c.cancel();
+            self.status = "cancelado".to_string();
+        }
+    }
+
     fn fail(&mut self, error: String) {
         self.busy = false;
+        self.cancel = None;
         self.status = error.clone();
         self.lines.push(Line {
             role: "error",
@@ -261,6 +276,8 @@ fn send(s: &mut Shell) {
     let model = s.model.clone();
     let handle = s.me.clone();
 
+    let cancel = Cancel::default();
+    s.cancel = Some(cancel.clone());
     s.draft = TextEdit::new("");
     s.busy = true;
     s.status = "pensando…".into();
@@ -296,7 +313,7 @@ fn send(s: &mut Shell) {
         let scope =
             Scope::user(&std::env::var("ZERITH_USER").unwrap_or_else(|_| "local".to_string()));
         let reporter = handle.clone();
-        let result = run_turn_with_memory(
+        let result = run_turn_cancellable(
             &store,
             &client,
             memory.as_ref().map(|m| m as &dyn MemoryBackend),
@@ -304,6 +321,7 @@ fn send(s: &mut Shell) {
             &session_id,
             &model,
             &prompt,
+            &cancel,
             move |event| {
                 reporter.update(move |s: &mut Shell, _| s.apply(event));
             },
@@ -565,12 +583,21 @@ pub fn view(s: &Shell, _: &mut Cx<Shell>) -> El {
                         .fill(t.card)
                         .border(1.0, t.separator)
                         .child(field)
-                        .child(
+                        .child(if s.busy {
+                            text("parar")
+                                .key("stop")
+                                .label("Parar o turno")
+                                .font(type_::LABEL)
+                                .color(tok::accent(3, true))
+                                .on_press(|s: &mut Shell| s.stop())
+                        } else {
                             text("enviar")
+                                .key("send")
+                                .label("Enviar a mensagem")
                                 .font(type_::LABEL)
                                 .color(tok::accent(0, true))
-                                .on_press(|s: &mut Shell| send(s)),
-                        ),
+                                .on_press(|s: &mut Shell| send(s))
+                        }),
                 ),
         ),
     )

@@ -77,6 +77,20 @@ A escolha do endpoint vem do ambiente, um leitor só
 (LM Studio, Ollama, 9Router) que lista modelos não deve ser escondido por falta
 de credencial que ele nem pede.
 
+## Permissões, segurança e benchmark
+
+`zerith policy` mostra preset (`read-only`, `workspace-write`,
+`danger-full-access`), nível de enforcement e o veredito para um caminho
+(`zerith policy check <path>`). O enforcement é reportado como `partial`
+porque o host ainda não tem jail próprio: preset não é garantia. Erros são
+redigidos antes de ir para stderr (chaves, headers, hex longo).
+
+`zerith bench` mede abertura+migração, 1000 appends, paginação de 50 e recall
+FTS5 sobre 200 fatos, num banco descartável. `zerith backup` usa a API de
+backup do SQLite (nunca cópia de arquivo WAL vivo) e `zerith restore` valida
+`integrity_check` e guarda o banco atual antes de substituir. O turno pode ser
+cancelado: a janela troca "enviar" por "parar" e o token chega ao loop de rede.
+
 ## Planos e subagentes
 
 Um plano é uma lista de tarefas (`título | prompt`, uma por linha) gravada em

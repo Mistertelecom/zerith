@@ -11,7 +11,8 @@ use zerith_memory::{Confidence, FactKind, MemoryBackend, Scope, SqliteMemory};
 use zerith_providers::{ChatMessage, ChatRequest, Client, ProviderConfig};
 use zerith_runtime::plan::{parse_plan, run_plan};
 use zerith_runtime::{run_turn_with_memory, RunEvent};
-use zerith_sessions::{SessionSource, Store, TaskState};
+use zerith_security::{redact, Action, Policy, Verdict, PRESETS};
+use zerith_sessions::{NewMessage, Role, SessionSource, Store, TaskState};
 use zerith_skills::{discover, scan};
 
 fn main() -> ExitCode {
@@ -19,7 +20,9 @@ fn main() -> ExitCode {
     match run(&args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("zerith: {e}");
+            // An error string can carry a response body, and a response body
+            // can carry the key that was sent. Redact on the way out.
+            eprintln!("zerith: {}", redact(&e.to_string()));
             ExitCode::FAILURE
         }
     }
@@ -32,6 +35,10 @@ usage:
   zerith version
   zerith paths
   zerith doctor
+  zerith policy [check <path>]
+  zerith bench
+  zerith backup [--to <file>]
+  zerith restore <file>
   zerith session list [--limit N]
   zerith session new <title>
   zerith session show <id>
@@ -72,6 +79,10 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             println!("db    {}", paths.db().display());
             println!("skills {}", paths.skills().display());
         }
+        ("policy", _) => policy(&paths, args)?,
+        ("bench", _) => bench()?,
+        ("backup", _) => backup(&paths, args)?,
+        ("restore", _) => restore(&paths, args)?,
         ("doctor", _) => {
             paths.ensure()?;
             let store = Store::open(paths.db())?;
@@ -197,6 +208,151 @@ fn mcp(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 /// Plan mode: a list of tasks, run in dependency order with a bounded number
 /// of workers. Each task becomes its own session, so the transcript of what a
 /// subagent did is a conversation the user can read.
+/// Shows what the current preset permits, and what it cannot enforce. The
+/// second half is the point: a preset that hides its limits is a lie.
+fn policy(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let policy = Policy::from_env(paths.root())?;
+    println!("preset        {}", policy.preset.name);
+    println!("sandbox       {}", policy.preset.sandbox.as_str());
+    println!("enforcement   {}", policy.enforcement.as_str());
+    println!("workspace     {}", policy.workspace.display());
+    println!("description   {}", policy.preset.description);
+    if args.get(1).map(String::as_str) == Some("check") {
+        let path = std::path::PathBuf::from(args.get(2).ok_or("policy check needs a path")?);
+        match policy.check(&Action::Write(path)) {
+            Verdict::Allow => println!("write         allow"),
+            Verdict::Ask(why) => println!("write         ask ({why})"),
+            Verdict::Deny(why) => println!("write         deny ({why})"),
+        }
+    }
+    println!(
+        "presets       {}",
+        PRESETS
+            .iter()
+            .map(|p| p.name)
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    Ok(())
+}
+
+/// Numbers the user can check, not a claim. Everything runs against a
+/// throwaway database, so a benchmark never touches real data.
+fn bench() -> Result<(), Box<dyn std::error::Error>> {
+    use std::time::Instant;
+    // Not the OS temp dir: on this machine it is ACL-restricted and a
+    // benchmark that fails on permissions measures nothing.
+    let dir = Paths::resolve()
+        .root()
+        .join(format!("bench-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    let db = dir.join("bench.db");
+
+    let t = Instant::now();
+    let store = Store::open(&db)?;
+    println!(
+        "db_open_and_migrate   {:>8.2} ms",
+        t.elapsed().as_secs_f64() * 1e3
+    );
+
+    let session = store.create_session("bench", SessionSource::Native)?;
+    let t = Instant::now();
+    for i in 0..1000 {
+        store.append(
+            &session.id,
+            &NewMessage::new(Role::User, format!("mensagem {i}")),
+        )?;
+    }
+    let insert = t.elapsed().as_secs_f64() * 1e3;
+    println!(
+        "append_1000_messages  {insert:>8.2} ms  ({:.2} ms each)",
+        insert / 1000.0
+    );
+
+    let t = Instant::now();
+    let page = store.messages(&session.id, 50, 0)?;
+    println!(
+        "page_50_messages      {:>8.2} ms  ({} rows)",
+        t.elapsed().as_secs_f64() * 1e3,
+        page.len()
+    );
+
+    let mem = SqliteMemory::open(&db)?;
+    let scope = Scope::user("bench");
+    for i in 0..200 {
+        mem.remember(
+            &scope,
+            FactKind::Fact,
+            &format!("fato {i}"),
+            Confidence::Confirmed,
+            None,
+        )?;
+    }
+    let t = Instant::now();
+    let hits = mem.recall(&scope, "fato", 12)?;
+    println!(
+        "recall_200_facts      {:>8.2} ms  ({} hits)",
+        t.elapsed().as_secs_f64() * 1e3,
+        hits.len()
+    );
+
+    // The whole file, so the number is about the data and not about caching
+    // one row.
+    let bytes = std::fs::metadata(&db)?.len();
+    println!("db_size               {:>8} bytes", bytes);
+    drop(store);
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+/// Consistent copy through the SQLite backup API. Copying a live WAL file with
+/// the filesystem would produce a database that only sometimes opens.
+fn backup(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    paths.ensure()?;
+    let target = match flag_value(args, "--to") {
+        Some(p) => std::path::PathBuf::from(p),
+        None => {
+            let stamp = zerith_sessions::migrations::now_ms();
+            paths.backups().join(format!("zerith-{stamp}.db"))
+        }
+    };
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let store = Store::open(paths.db())?;
+    store.backup_to(&target)?;
+    println!("{}", target.display());
+    Ok(())
+}
+
+/// Replaces the database with a backup, after checking the backup opens and
+/// passes `integrity_check`. The current database is copied aside first, so a
+/// bad restore is a mistake the user can undo.
+fn restore(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let from = args.get(1).ok_or("restore needs a backup file")?;
+    paths.ensure()?;
+    let candidate = Store::open(from)?;
+    if !candidate.integrity_ok()? {
+        return Err("the backup failed integrity_check; nothing was replaced".into());
+    }
+    if paths.db().exists() {
+        let stamp = zerith_sessions::migrations::now_ms();
+        Store::open(paths.db())?
+            .backup_to(paths.backups().join(format!("before-restore-{stamp}.db")))?;
+    }
+    drop(candidate);
+    std::fs::copy(from, paths.db())?;
+    println!("restored {} into {}", from, paths.db().display());
+    Ok(())
+}
+
+fn flag_value(args: &[String], name: &str) -> Option<String> {
+    args.iter()
+        .position(|a| a == name)
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+}
+
 fn plan(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let sub = args.get(1).map(String::as_str).unwrap_or("list");
     paths.ensure()?;

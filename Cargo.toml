@@ -11,6 +11,7 @@ members = [
     "crates/zerith-ui",
     "crates/zerith-skills",
     "crates/zerith-mcp",
+    "crates/zerith-security",
 ]
 
 [workspace.package]

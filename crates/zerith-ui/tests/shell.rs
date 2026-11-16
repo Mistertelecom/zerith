@@ -98,3 +98,19 @@ fn an_unfinished_plan_shows_up_in_the_window() {
     assert_eq!(shell.plan_tasks[0].1, "um");
     assert_eq!(shell.plan_tasks[0].0, "pending");
 }
+
+#[test]
+fn stop_cancels_the_token_and_does_nothing_without_a_turn() {
+    let dir = tempdir();
+    let mut shell = shell_at(dir.path());
+    // No turn in flight: pressing stop must not pretend something happened.
+    shell.stop();
+    assert!(!shell.busy);
+    let token = zerith_providers::Cancel::default();
+    shell.cancel = Some(token.clone());
+    shell.busy = true;
+    shell.stop();
+    assert!(token.is_cancelled());
+    assert_eq!(shell.status, "cancelado");
+    assert!(shell.cancel.is_none());
+}

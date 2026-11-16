@@ -55,7 +55,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libxcursor-dev libvulkan-dev
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libxcursor-dev libvulkan-dev mesa-vulkan-drivers
       - run: cargo build -p zerith-ui
       # Headless render: proves the window builds a real element tree and
       # paints without a display, which is the only UI check CI can make.

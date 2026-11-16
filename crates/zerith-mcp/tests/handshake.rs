@@ -1,6 +1,7 @@
 //! The handshake is proven against a script that answers like a server, so the
 //! suite needs no network and no installed MCP server.
 
+#[cfg(windows)]
 use zerith_mcp::Client;
 
 #[cfg(windows)]

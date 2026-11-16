@@ -1,6 +1,7 @@
 //! The shell's own logic, without a GPU: `App::new` builds the state container
 //! but no window, so these run beside the rest of the workspace.
 
+use zerith_memory::{Confidence, FactKind, MemoryBackend, Scope, SqliteMemory};
 use zerith_sessions::{NewMessage, Role, SessionSource, Store};
 use zerith_ui::{view, Shell};
 
@@ -49,4 +50,29 @@ fn opening_the_window_loads_sessions_and_their_messages() {
     let roles: Vec<&str> = shell.lines.iter().map(|l| l.role).collect();
     assert_eq!(roles, vec!["user", "assistant"]);
     assert_eq!(shell.lines[1].content, "olá");
+}
+
+#[test]
+fn the_window_shows_the_facts_the_turn_would_recall() {
+    let dir = tempdir();
+    let db = dir.path().join("zerith.db");
+    let mem = SqliteMemory::open(&db).expect("memory");
+    let scope = Scope::user("local");
+    mem.remember(
+        &scope,
+        FactKind::Fact,
+        "usa Rust",
+        Confidence::Confirmed,
+        None,
+    )
+    .expect("remember");
+
+    let mut shell = shell_at(dir.path());
+    assert_eq!(shell.facts.len(), 1);
+    assert_eq!(shell.facts[0].text, "usa Rust");
+
+    let id = shell.facts[0].id;
+    shell.forget(id);
+    assert!(shell.facts.is_empty());
+    assert!(mem.list(&scope, 10).expect("list").is_empty());
 }

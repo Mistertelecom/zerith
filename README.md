@@ -11,7 +11,7 @@ de patch de terceiros.
 | --- | --- |
 | `zerith-core` | Identidade, `Paths` (por SO), erros |
 | `zerith-sessions` | SQLite, migrações versionadas, sessões e mensagens |
-| `zerith-memory` | `MemoryBackend` + `SqliteMemory` (FTS5) |
+| `zerith-memory` | `MemoryBackend` + `SqliteMemory` (FTS5) + extração determinística |
 | `zerith-providers` | Endpoints OpenAI-compatible e Anthropic (9Router, Ollama, LM Studio) |
 | `zerith-runtime` | Um turno de agente: histórico → provider → mensagem gravada |
 | `zerith-importers` | Import read-only do Hermes (`~/.hermes/state.db`) |
@@ -71,10 +71,31 @@ A escolha do endpoint vem do ambiente, um leitor só
 | `ZERITH_BASE_URL` | Sobrescreve a URL do endpoint |
 | `ZERITH_API_KEY` | Chave; exigida só no chat, não em `probe`/`models` |
 | `ZERITH_MODEL` | Modelo padrão do chat |
+| `ZERITH_USER` | Dono do escopo de memória (padrão: usuário do SO) |
 
 `probe` e `models` funcionam sem chave de propósito: um servidor local
 (LM Studio, Ollama, 9Router) que lista modelos não deve ser escondido por falta
 de credencial que ele nem pede.
+
+## Memória
+
+Fatos vivem no mesmo banco das sessões, com escopo (`user:<id>`), tipo
+(`fact`, `preference`, `decision`, `instruction`, `entity`, `project`) e
+confiança (`confirmed` = o usuário disse; `inferred` = o sistema concluiu).
+Os dois nunca são exibidos como se fossem o mesmo.
+
+Captura: só o que o usuário pede explicitamente — `lembre que …`,
+`lembre-se que …`, `remember that …`. Sem marcador, nada é gravado; adivinhar
+seria transformar inferência em memória confirmada.
+
+Recall: uma vez por turno, contra o texto do usuário, com orçamento de
+`MEMORY_BUDGET_CHARS = 2000` caracteres e no máximo `MEMORY_HITS = 12` fatos. O
+bloco entra **depois** do prompt fixo do sistema, preservando o prefix cache do
+provider. Falha de recall não derruba o turno.
+
+Administração: `zerith memory list|recall|forget` no CLI e o painel **Memória**
+na janela, onde o botão `x` apaga o fato (tombstone: o texto é zerado e a chave
+de dedupe não o ressuscita).
 
 ## Janela
 

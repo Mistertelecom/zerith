@@ -8,7 +8,7 @@ use zerith_core::Paths;
 use zerith_importers::{detect, import, ImportReport};
 use zerith_memory::{Confidence, FactKind, MemoryBackend, Scope, SqliteMemory};
 use zerith_providers::{ChatMessage, ChatRequest, Client, ProviderConfig};
-use zerith_runtime::{run_turn, RunEvent};
+use zerith_runtime::{run_turn_with_memory, RunEvent};
 use zerith_sessions::{SessionSource, Store};
 
 fn main() -> ExitCode {
@@ -193,6 +193,19 @@ fn memory(paths: &Paths, args: &[String], sub: &str) -> Result<(), Box<dyn std::
     Ok(())
 }
 
+/// Who the memory belongs to. One operator per install for now; a profile id
+/// can override it without changing the schema.
+fn scope_id() -> String {
+    std::env::var("ZERITH_USER").unwrap_or_else(|_| whoami_fallback())
+}
+
+fn whoami_fallback() -> String {
+    std::env::var("USERNAME")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| "local".to_string())
+        .to_lowercase()
+}
+
 /// One turn: resolve the session, stream the answer, persist it whole.
 ///
 /// The turn runs on this thread. A CLI has nothing else to do while it waits,
@@ -245,15 +258,29 @@ fn chat(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>
         }
     };
 
+    // Memory shares the same database file: one store, one schema, no second
+    // source of truth to keep in sync.
+    let memory = SqliteMemory::open(paths.db())?;
+    let scope = Scope::user(&scope_id());
+
     let mut streamed = false;
-    let report = run_turn(&store, &client, &session_id, &model, &prompt, |e| match e {
-        RunEvent::Delta(text) => {
-            streamed = true;
-            println!("{text}");
-        }
-        RunEvent::Reasoning(r) => eprintln!("[reasoning] {r}"),
-        RunEvent::Done { .. } => {}
-    })?;
+    let report = run_turn_with_memory(
+        &store,
+        &client,
+        Some(&memory),
+        Some(&scope),
+        &session_id,
+        &model,
+        &prompt,
+        |e| match e {
+            RunEvent::Delta(text) => {
+                streamed = true;
+                println!("{text}");
+            }
+            RunEvent::Reasoning(r) => eprintln!("[reasoning] {r}"),
+            RunEvent::Done { .. } => {}
+        },
+    )?;
     if !streamed {
         println!("{}", report.text);
     }

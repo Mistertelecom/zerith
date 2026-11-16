@@ -11,8 +11,9 @@ use std::path::PathBuf;
 
 use rune::tok::{self, radius, type_};
 use rune::{col, el, row, text, text_input, AppHandle, Cx, El, ScrollSpec, TextEdit, Tx};
+use zerith_memory::{Fact, MemoryBackend, Scope, SqliteMemory};
 use zerith_providers::{Client, ProviderConfig};
-use zerith_runtime::{run_turn, RunEvent};
+use zerith_runtime::{run_turn_with_memory, RunEvent};
 use zerith_sessions::{Session, Store};
 
 /// One conversation in the sidebar.
@@ -34,6 +35,9 @@ pub struct Shell {
     pub sessions: Vec<Row>,
     pub selected: usize,
     pub lines: Vec<Line>,
+    /// Confirmed facts the user can see and delete. The same rows the turn
+    /// recalls, read straight from the shared database.
+    pub facts: Vec<Fact>,
     pub draft: TextEdit,
     pub status: String,
     pub busy: bool,
@@ -53,6 +57,7 @@ impl Shell {
             sessions: Vec::new(),
             selected: 0,
             lines: Vec::new(),
+            facts: Vec::new(),
             draft: TextEdit::new(""),
             status: String::new(),
             busy: false,
@@ -78,7 +83,27 @@ impl Shell {
         if self.selected >= self.sessions.len() {
             self.selected = 0;
         }
+        self.facts = SqliteMemory::open(&self.db)
+            .and_then(|m| m.list(&self.scope(), 50))
+            .unwrap_or_default();
         self.load_selected();
+    }
+
+    /// The memory scope of this install. One operator, one scope.
+    fn scope(&self) -> Scope {
+        Scope::user(&std::env::var("ZERITH_USER").unwrap_or_else(|_| "local".to_string()))
+    }
+
+    /// Deletes a fact permanently. The backend keeps a tombstone so the dedupe
+    /// key cannot resurrect the deleted text.
+    pub fn forget(&mut self, id: i64) {
+        match SqliteMemory::open(&self.db).and_then(|m| m.forget(id)) {
+            Ok(()) => {
+                self.facts.retain(|f| f.id != id);
+                self.status = format!("Fato {id} apagado");
+            }
+            Err(e) => self.status = format!("Não consegui apagar: {e}"),
+        }
     }
 
     fn load_selected(&mut self) {
@@ -241,10 +266,16 @@ fn send(s: &mut Shell) {
 
         // run_turn calls back for every delta on this worker thread; each
         // callback hops to the UI thread through the handle.
+        // Memory shares the database: one file, one schema, one truth.
+        let memory = SqliteMemory::open(&db).ok();
+        let scope =
+            Scope::user(&std::env::var("ZERITH_USER").unwrap_or_else(|_| "local".to_string()));
         let reporter = handle.clone();
-        let result = run_turn(
+        let result = run_turn_with_memory(
             &store,
             &client,
+            memory.as_ref().map(|m| m as &dyn MemoryBackend),
+            Some(&scope),
             &session_id,
             &model,
             &prompt,
@@ -336,6 +367,68 @@ fn sidebar(s: &Shell, t: &tok::Theme) -> El {
         )
         .child(
             list.scroll(ScrollSpec {
+                stick_bottom: false,
+            })
+            .shrink()
+            .min_h(0.0),
+        )
+        .child(memory_panel(s, t))
+}
+
+/// What the user is allowed to see and delete about their own memory. A fact
+/// shown here is one the turn really recalls — no separate preview store.
+fn memory_panel(s: &Shell, t: &tok::Theme) -> El {
+    let mut rows = col().key("memory-rows").w_full().gap(2.0);
+    for f in &s.facts {
+        let id = f.id;
+        rows = rows.child(
+            row()
+                .key(format!("m-{id}"))
+                .w_full()
+                .gap(6.0)
+                .center_y()
+                .child(
+                    text(f.text.clone())
+                        .font(type_::LABEL)
+                        .color(t.text)
+                        .grow(1.0),
+                )
+                .child(
+                    el().role("button")
+                        .label(format!("Apagar fato {id}"))
+                        .focusable(true)
+                        .size(20.0, 20.0)
+                        .radius(radius::SM)
+                        .fill(t.bg)
+                        .on_press(move |s: &mut Shell| s.forget(id))
+                        .child(
+                            text("x")
+                                .font(type_::LABEL)
+                                .color(t.text_secondary)
+                                .center_y(),
+                        ),
+                ),
+        );
+    }
+    if s.facts.is_empty() {
+        rows = rows.child(
+            text("Digite \"lembre que …\" para guardar um fato.")
+                .font(type_::LABEL)
+                .color(t.text_secondary),
+        );
+    }
+    col()
+        .key("memory")
+        .w_full()
+        .gap(6.0)
+        .child(
+            row()
+                .w_full()
+                .center_y()
+                .child(text("Memória").font(type_::TITLE).color(t.text).grow(1.0)),
+        )
+        .child(
+            rows.scroll(ScrollSpec {
                 stick_bottom: false,
             })
             .shrink()

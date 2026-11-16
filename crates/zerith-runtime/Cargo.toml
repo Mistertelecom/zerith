@@ -8,5 +8,6 @@ license.workspace = true
 zerith-core = { path = "../zerith-core" }
 zerith-sessions = { path = "../zerith-sessions" }
 zerith-providers = { path = "../zerith-providers" }
+zerith-memory = { path = "../zerith-memory" }
 serde_json.workspace = true
 thiserror.workspace = true

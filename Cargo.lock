@@ -4637,6 +4637,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "zerith-core",
+ "zerith-memory",
  "zerith-providers",
  "zerith-sessions",
 ]
@@ -4660,6 +4661,7 @@ dependencies = [
  "rune",
  "tempfile",
  "zerith-core",
+ "zerith-memory",
  "zerith-providers",
  "zerith-runtime",
  "zerith-sessions",

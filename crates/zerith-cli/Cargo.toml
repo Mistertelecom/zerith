@@ -1,0 +1,15 @@
+[package]
+name = "zerith-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "zerith"
+path = "src/main.rs"
+
+[dependencies]
+zerith-core = { path = "../zerith-core" }
+zerith-sessions = { path = "../zerith-sessions" }
+zerith-memory = { path = "../zerith-memory" }
+serde_json.workspace = true

@@ -1,0 +1,15 @@
+[package]
+name = "zerith-sessions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+zerith-core = { path = "../zerith-core" }
+serde.workspace = true
+serde_json.workspace = true
+rusqlite.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

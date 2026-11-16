@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/zerith-core",
+    "crates/zerith-sessions",
+    "crates/zerith-memory",
+    "crates/zerith-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
+anyhow = "1"
+thiserror = "2"
+tempfile = "3"
+
+# The pinned MSVC toolset on this machine rejects /Z7 for the bundled SQLite
+# build (cl.exe D8050). Debug info is not needed for the library/tests we ship,
+# so dev builds compile without it. Remove when the toolset is fixed.
+[profile.dev]
+debug = false

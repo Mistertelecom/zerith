@@ -1,0 +1,245 @@
+//! The SQLite store. One connection, WAL, foreign keys on.
+//!
+//! Keep one per process and pass `&Store`. Writes are explicit transactions
+//! so a crash never leaves a session with half a turn.
+
+use crate::migrations::{self, now_ms};
+use crate::types::{Message, NewMessage, Role, Session, SessionSource};
+use rusqlite::{params, Connection, OptionalExtension};
+use std::path::Path;
+
+#[derive(Debug, thiserror::Error)]
+pub enum StoreError {
+    #[error("database: {0}")]
+    Db(#[from] rusqlite::Error),
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+pub type Result<T> = std::result::Result<T, StoreError>;
+
+pub struct Store {
+    conn: Connection,
+}
+
+impl Store {
+    /// Opens (creating if needed) the database and runs migrations.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let conn = Connection::open(path)?;
+        Self::prepare(conn)
+    }
+
+    pub fn open_in_memory() -> Result<Self> {
+        Self::prepare(Connection::open_in_memory()?)
+    }
+
+    fn prepare(mut conn: Connection) -> Result<Self> {
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        migrations::run(&mut conn)?;
+        Ok(Self { conn })
+    }
+
+    pub fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
+    /// Hands the connection to another crate that shares this schema
+    /// (`zerith-memory`). The store stops existing afterwards.
+    pub fn into_conn(self) -> Connection {
+        self.conn
+    }
+
+    pub fn schema_version(&self) -> Result<i32> {
+        Ok(self.conn.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub fn create_session(&self, title: &str, source: SessionSource) -> Result<Session> {
+        let id = new_id();
+        let ts = now_ms();
+        self.conn.execute(
+            "INSERT INTO sessions(id, title, source, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4)",
+            params![id, title, source.as_str(), ts],
+        )?;
+        Ok(Session {
+            id,
+            title: title.to_string(),
+            source,
+            source_id: None,
+            source_profile: None,
+            model: None,
+            provider: None,
+            created_at: ts,
+            updated_at: ts,
+            archived: false,
+        })
+    }
+
+    /// Inserts a session that came from another system, or returns the id of
+    /// the one already imported under the same (source, source_id, profile).
+    /// This is what makes an interrupted import resumable and repeatable.
+    pub fn upsert_imported(&self, s: &Session) -> Result<(String, bool)> {
+        let existing: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT id FROM sessions WHERE source = ?1 AND source_id = ?2 AND source_profile IS ?3",
+                params![s.source.as_str(), s.source_id, s.source_profile],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(id) = existing {
+            return Ok((id, false));
+        }
+        self.conn.execute(
+            "INSERT INTO sessions(id, title, source, source_id, source_profile, model, provider, created_at, updated_at, archived) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                s.id,
+                s.title,
+                s.source.as_str(),
+                s.source_id,
+                s.source_profile,
+                s.model,
+                s.provider,
+                s.created_at,
+                s.updated_at,
+                s.archived as i64
+            ],
+        )?;
+        Ok((s.id.clone(), true))
+    }
+
+    pub fn session(&self, id: &str) -> Result<Option<Session>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, title, source, source_id, source_profile, model, provider, created_at, updated_at, archived FROM sessions WHERE id = ?1",
+                params![id],
+                row_to_session,
+            )
+            .optional()?)
+    }
+
+    pub fn list_sessions(&self, limit: usize) -> Result<Vec<Session>> {
+        let mut st = self.conn.prepare(
+            "SELECT id, title, source, source_id, source_profile, model, provider, created_at, updated_at, archived FROM sessions ORDER BY updated_at DESC LIMIT ?1",
+        )?;
+        let rows = st.query_map(params![limit as i64], row_to_session)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Appends one message in its own transaction and bumps the session clock.
+    pub fn append(&self, session_id: &str, m: &NewMessage) -> Result<i64> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO messages(session_id, role, content, tool_name, tool_calls, reasoning, token_count, created_at, raw) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                session_id,
+                m.role.as_str(),
+                m.content,
+                m.tool_name,
+                m.tool_calls.as_ref().map(|v| v.to_string()),
+                m.reasoning,
+                m.token_count,
+                now_ms(),
+                m.raw.as_ref().map(|v| v.to_string())
+            ],
+        )?;
+        let id = tx.last_insert_rowid();
+        tx.execute(
+            "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
+            params![now_ms(), session_id],
+        )?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    pub fn messages(&self, session_id: &str, limit: usize, offset: usize) -> Result<Vec<Message>> {
+        let mut st = self.conn.prepare(
+            "SELECT id, session_id, role, content, tool_name, tool_calls, reasoning, token_count, created_at, raw FROM messages WHERE session_id = ?1 ORDER BY id LIMIT ?2 OFFSET ?3",
+        )?;
+        let rows = st.query_map(
+            params![session_id, limit as i64, offset as i64],
+            row_to_message,
+        )?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn message_count(&self, session_id: &str) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE session_id = ?1",
+            params![session_id],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// PRAGMA integrity_check, run at startup and after a restore.
+    pub fn integrity_ok(&self) -> Result<bool> {
+        let v: String = self
+            .conn
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+        Ok(v == "ok")
+    }
+
+    /// Consistent copy through SQLite backup API, never a raw file copy of a
+    /// live WAL database.
+    pub fn backup_to(&self, path: impl AsRef<Path>) -> Result<()> {
+        let mut dst = Connection::open(path)?;
+        let backup = rusqlite::backup::Backup::new(&self.conn, &mut dst)?;
+        backup.run_to_completion(64, std::time::Duration::from_millis(20), None)?;
+        Ok(())
+    }
+}
+
+fn row_to_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
+    let src: String = r.get(2)?;
+    Ok(Session {
+        id: r.get(0)?,
+        title: r.get(1)?,
+        source: SessionSource::parse(&src).unwrap_or(SessionSource::Native),
+        source_id: r.get(3)?,
+        source_profile: r.get(4)?,
+        model: r.get(5)?,
+        provider: r.get(6)?,
+        created_at: r.get(7)?,
+        updated_at: r.get(8)?,
+        archived: r.get::<_, i64>(9)? != 0,
+    })
+}
+
+fn row_to_message(r: &rusqlite::Row) -> rusqlite::Result<Message> {
+    let role: String = r.get(2)?;
+    let tool_calls: Option<String> = r.get(5)?;
+    let raw: Option<String> = r.get(9)?;
+    Ok(Message {
+        id: r.get(0)?,
+        session_id: r.get(1)?,
+        role: Role::parse(&role).unwrap_or(Role::User),
+        content: r.get(3)?,
+        tool_name: r.get(4)?,
+        tool_calls: tool_calls.and_then(|s| serde_json::from_str(&s).ok()),
+        reasoning: r.get(6)?,
+        token_count: r.get(7)?,
+        created_at: r.get(8)?,
+        raw: raw.and_then(|s| serde_json::from_str(&s).ok()),
+    })
+}
+
+/// Random-enough id without a uuid dependency: two hashes of the clock. Not
+/// time-ordered; ordering is the rowid.
+fn new_id() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    );
+    let a = h.finish();
+    format!("{:016x}{:016x}", a, a.rotate_left(17))
+}

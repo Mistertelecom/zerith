@@ -1,0 +1,147 @@
+//! The `MemoryBackend` contract and its data types.
+
+use serde::{Deserialize, Serialize};
+
+/// Memory is scoped, never global by accident. The scope is an opaque string
+/// the caller builds (`user:joao`, `project:zerith`); the backend never guesses
+/// which scope a write belongs to.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Scope(pub String);
+
+impl Scope {
+    pub fn user(id: &str) -> Self {
+        Scope(format!("user:{id}"))
+    }
+
+    pub fn project(id: &str) -> Self {
+        Scope(format!("project:{id}"))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// What kind of memory this is. Kept separate from confidence so an inference
+/// can never be displayed as a confirmed fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FactKind {
+    Preference,
+    Fact,
+    Decision,
+    Project,
+    Instruction,
+    Entity,
+}
+
+impl FactKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FactKind::Preference => "preference",
+            FactKind::Fact => "fact",
+            FactKind::Decision => "decision",
+            FactKind::Project => "project",
+            FactKind::Instruction => "instruction",
+            FactKind::Entity => "entity",
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "preference" => FactKind::Preference,
+            "decision" => FactKind::Decision,
+            "project" => FactKind::Project,
+            "instruction" => FactKind::Instruction,
+            "entity" => FactKind::Entity,
+            _ => FactKind::Fact,
+        }
+    }
+}
+
+/// `confirmed` is something the user said; `inferred` is something the system
+/// concluded. They are stored with the same shape and never merged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Confidence {
+    Confirmed,
+    Inferred,
+}
+
+impl Confidence {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Confidence::Confirmed => "confirmed",
+            Confidence::Inferred => "inferred",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Fact {
+    pub id: i64,
+    pub scope: String,
+    pub kind: FactKind,
+    pub text: String,
+    /// Where this came from: a session id, `manual`, an importer.
+    pub source: Option<String>,
+    pub session_id: Option<String>,
+    pub confidence: Confidence,
+    pub created_at: i64,
+    pub updated_at: i64,
+    /// Set when a later fact replaced this one. The row stays for history.
+    pub superseded_by: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecallHit {
+    pub fact: Fact,
+    /// FTS5 bm25 score; lower is a better match.
+    pub score: f64,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum MemoryError {
+    #[error("database: {0}")]
+    Db(#[from] rusqlite::Error),
+    #[error("store: {0}")]
+    Store(#[from] zerith_sessions::store::StoreError),
+    #[error("fact not found: {0}")]
+    NotFound(i64),
+    #[error("empty memory text")]
+    Empty,
+}
+
+pub type Result<T> = std::result::Result<T, MemoryError>;
+
+/// What a backend must do. `recall` returns ranked rows and never the whole
+/// store: the caller applies the token budget.
+pub trait MemoryBackend {
+    fn remember(
+        &self,
+        scope: &Scope,
+        kind: FactKind,
+        text: &str,
+        confidence: Confidence,
+        source: Option<&str>,
+    ) -> Result<i64>;
+
+    fn recall(&self, scope: &Scope, query: &str, limit: usize) -> Result<Vec<RecallHit>>;
+
+    fn list(&self, scope: &Scope, limit: usize) -> Result<Vec<Fact>>;
+
+    fn get(&self, id: i64) -> Result<Fact>;
+
+    fn update(&self, id: i64, text: &str) -> Result<()>;
+
+    /// Permanent deletion: the text is wiped and the row becomes a tombstone so
+    /// the dedupe key cannot resurrect it.
+    fn forget(&self, id: i64) -> Result<()>;
+
+    /// Marks a contradicting fact as replaced by `by`, keeping the history.
+    fn supersede(&self, old_id: i64, by: i64) -> Result<()>;
+
+    /// Everything in scope, for export. Includes superseded rows, excludes
+    /// deleted ones.
+    fn export(&self, scope: &Scope) -> Result<Vec<Fact>>;
+}

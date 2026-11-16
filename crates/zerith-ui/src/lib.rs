@@ -15,6 +15,7 @@ use zerith_memory::{Fact, MemoryBackend, Scope, SqliteMemory};
 use zerith_providers::{Client, ProviderConfig};
 use zerith_runtime::{run_turn_with_memory, RunEvent};
 use zerith_sessions::{Session, Store};
+use zerith_skills::discover;
 
 /// One conversation in the sidebar.
 #[derive(Clone, PartialEq)]
@@ -38,6 +39,9 @@ pub struct Shell {
     /// Confirmed facts the user can see and delete. The same rows the turn
     /// recalls, read straight from the shared database.
     pub facts: Vec<Fact>,
+    /// Skills found on disk. Listed, never executed: enabling one is a user
+    /// action, and no code runs merely because a window opened.
+    pub skills: Vec<String>,
     pub draft: TextEdit,
     pub status: String,
     pub busy: bool,
@@ -58,6 +62,7 @@ impl Shell {
             selected: 0,
             lines: Vec::new(),
             facts: Vec::new(),
+            skills: Vec::new(),
             draft: TextEdit::new(""),
             status: String::new(),
             busy: false,
@@ -82,6 +87,13 @@ impl Shell {
             .collect();
         if self.selected >= self.sessions.len() {
             self.selected = 0;
+        }
+        if let Some(root) = self.db.parent() {
+            self.skills = discover(&root.join("skills"))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|s| s.frontmatter.name)
+                .collect();
         }
         self.facts = SqliteMemory::open(&self.db)
             .and_then(|m| m.list(&self.scope(), 50))
@@ -373,6 +385,39 @@ fn sidebar(s: &Shell, t: &tok::Theme) -> El {
             .min_h(0.0),
         )
         .child(memory_panel(s, t))
+        .child(skills_panel(s, t))
+}
+
+/// What is installed. A name here means the directory parsed; it says nothing
+/// about trust, which is why the window never enables one by itself.
+fn skills_panel(s: &Shell, t: &tok::Theme) -> El {
+    let mut rows = col().key("skill-rows").w_full().gap(2.0);
+    if s.skills.is_empty() {
+        rows = rows.child(
+            text("Nenhuma skill instalada.")
+                .font(type_::LABEL)
+                .color(t.text_secondary),
+        );
+    }
+    for (i, name) in s.skills.iter().enumerate() {
+        rows = rows.child(
+            text(name.clone())
+                .key(format!("sk-{i}"))
+                .font(type_::LABEL)
+                .color(t.text),
+        );
+    }
+    col()
+        .key("skills")
+        .w_full()
+        .gap(6.0)
+        .child(
+            row()
+                .w_full()
+                .center_y()
+                .child(text("Skills").font(type_::TITLE).color(t.text).grow(1.0)),
+        )
+        .child(rows.shrink().min_h(0.0))
 }
 
 /// What the user is allowed to see and delete about their own memory. A fact

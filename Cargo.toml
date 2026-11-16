@@ -9,6 +9,8 @@ members = [
     "crates/zerith-runtime",
     "crates/zerith-importers",
     "crates/zerith-ui",
+    "crates/zerith-skills",
+    "crates/zerith-mcp",
 ]
 
 [workspace.package]
@@ -24,6 +26,8 @@ anyhow = "1"
 thiserror = "2"
 tempfile = "3"
 ureq = { version = "2", features = ["json"] }
+# No yaml crate: the Agent Skills frontmatter is small enough to parse by hand
+# (see zerith-skills/frontmatter.rs), and one less dependency is one less CVE.
 
 # The pinned MSVC toolset on this machine rejects /Z7 for the bundled SQLite
 # build (cl.exe D8050). Debug info is not needed for the library/tests we ship,

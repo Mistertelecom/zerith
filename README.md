@@ -77,6 +77,22 @@ A escolha do endpoint vem do ambiente, um leitor só
 (LM Studio, Ollama, 9Router) que lista modelos não deve ser escondido por falta
 de credencial que ele nem pede.
 
+## Skills e MCP
+
+### Skills
+
+Formato Agent Skills (`SKILL.md` com frontmatter YAML). O Zerith **lê e
+valida**, nunca executa nada na instalação: `zerith skills validate <dir>`
+mostra inventário, scripts encontrados e flags (`curl`, `| sh`, `rm -rf`,
+`Invoke-Expression`). A janela lista o que está em `<root>/skills`.
+
+### MCP
+
+Cliente stdio, um objeto JSON-RPC por linha, sem shell na linha de comando
+do servidor. `zerith mcp tools <cmd...>` completa o handshake e lista as
+ferramentas; `zerith mcp call <cmd...> -- <tool> <json>` executa uma. O
+processo filho é morto quando o cliente sai.
+
 ## Memória
 
 Fatos vivem no mesmo banco das sessões, com escopo (`user:<id>`), tipo

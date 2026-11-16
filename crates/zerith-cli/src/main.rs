@@ -6,10 +6,12 @@
 use std::process::ExitCode;
 use zerith_core::Paths;
 use zerith_importers::{detect, import, ImportReport};
+use zerith_mcp::Client as McpClient;
 use zerith_memory::{Confidence, FactKind, MemoryBackend, Scope, SqliteMemory};
 use zerith_providers::{ChatMessage, ChatRequest, Client, ProviderConfig};
 use zerith_runtime::{run_turn_with_memory, RunEvent};
 use zerith_sessions::{SessionSource, Store};
+use zerith_skills::{discover, scan};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -36,6 +38,10 @@ usage:
   zerith memory recall <scope> <query>
   zerith memory list <scope>
   zerith memory forget <id>
+  zerith skills list
+  zerith skills validate <dir>
+  zerith mcp tools <command and args>
+  zerith mcp call <command and args> -- <tool> [json-args]
   zerith providers [probe|models|chat <model> <prompt>]
   zerith chat [--session <id>] [--model <id>] <prompt>
   zerith import hermes [--profile <name>]
@@ -134,10 +140,52 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         ("memory", Some(sub)) => memory(&paths, args, sub)?,
+        ("skills", _) => skills(&paths, args)?,
+        ("mcp", _) => mcp(args)?,
         _ => {
             println!("{}", usage());
             return Err(format!("unknown command: {cmd}").into());
         }
+    }
+    Ok(())
+}
+
+/// Speaks to one MCP server and prints what it advertises.
+///
+/// The command is split on whitespace so no shell is involved: a config value
+/// that came from outside cannot become an extra command.
+fn mcp(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let sub = args.get(1).ok_or("mcp needs a subcommand: tools | call")?;
+    let rest = &args[2..];
+    let (cmdline, tail) = match rest.iter().position(|a| a == "--") {
+        Some(i) => (&rest[..i], &rest[i + 1..]),
+        None => (rest, &rest[rest.len()..]),
+    };
+    let mut parts = cmdline.iter();
+    let command = parts.next().ok_or("mcp needs a server command")?;
+    let sargs: Vec<String> = parts.cloned().collect();
+    let mut client = McpClient::connect("cli", command, &sargs)?;
+    match sub.as_str() {
+        "tools" => {
+            let tools = client.tools()?;
+            if tools.is_empty() {
+                println!("(server advertises no tools)");
+            }
+            for t in tools {
+                println!("{}  {}", t.name, t.description.unwrap_or_default());
+            }
+        }
+        "call" => {
+            let tool = tail.first().ok_or("mcp call needs a tool name after --")?;
+            let raw = tail.get(1).map(String::as_str).unwrap_or("{}");
+            let arguments: serde_json::Value = serde_json::from_str(raw)?;
+            let result = client.call(tool, arguments)?;
+            if result.is_error == Some(true) {
+                eprintln!("zerith: the server reported the call as an error");
+            }
+            println!("{}", result.text());
+        }
+        other => return Err(format!("unknown mcp command: {other}").into()),
     }
     Ok(())
 }
@@ -376,4 +424,50 @@ fn import_hermes(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::erro
 fn flag_usize(args: &[String], name: &str) -> Option<usize> {
     let i = args.iter().position(|a| a == name)?;
     args.get(i + 1)?.parse().ok()
+}
+
+/// Reads `SKILL.md` files. Nothing here runs a skill: `validate` reports facts
+/// and exits, which is exactly what an install decision needs.
+fn skills(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let sub = args.get(1).map(String::as_str).unwrap_or("list");
+    match sub {
+        "list" => {
+            paths.ensure()?;
+            let found = discover(&paths.skills())?;
+            if found.is_empty() {
+                println!("(no skills in {})", paths.skills().display());
+            }
+            for s in found {
+                println!(
+                    "{}  scripts:{}  findings:{}",
+                    s.frontmatter.name,
+                    s.scripts.len(),
+                    s.findings.len()
+                );
+            }
+        }
+        "validate" | "show" => {
+            let dir = args.get(2).ok_or("skills validate needs a directory")?;
+            let s = scan(std::path::Path::new(dir))?;
+            println!("name          {}", s.frontmatter.name);
+            println!("description   {}", s.frontmatter.description);
+            if let Some(l) = &s.frontmatter.license {
+                println!("license       {l}");
+            }
+            if let Some(c) = &s.frontmatter.compatibility {
+                println!("compatibility {c}");
+            }
+            for (ext, n) in &s.inventory {
+                println!("file          {n} x {ext}");
+            }
+            for script in &s.scripts {
+                println!("script        {script}  (not executed)");
+            }
+            for f in &s.findings {
+                println!("finding       {}  {}", f.severity.as_str(), f.message);
+            }
+        }
+        other => return Err(format!("unknown skills command: {other}").into()),
+    }
+    Ok(())
 }

@@ -4580,10 +4580,12 @@ dependencies = [
  "serde_json",
  "zerith-core",
  "zerith-importers",
+ "zerith-mcp",
  "zerith-memory",
  "zerith-providers",
  "zerith-runtime",
  "zerith-sessions",
+ "zerith-skills",
 ]
 
 [[package]]
@@ -4606,6 +4608,16 @@ dependencies = [
  "thiserror 2.0.21",
  "zerith-core",
  "zerith-sessions",
+]
+
+[[package]]
+name = "zerith-mcp"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "zerith-core",
 ]
 
 [[package]]
@@ -4655,6 +4667,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "zerith-skills"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "zerith-ui"
 version = "0.1.0"
 dependencies = [
@@ -4665,6 +4685,7 @@ dependencies = [
  "zerith-providers",
  "zerith-runtime",
  "zerith-sessions",
+ "zerith-skills",
 ]
 
 [[package]]

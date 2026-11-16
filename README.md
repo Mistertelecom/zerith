@@ -1,9 +1,13 @@
-# Zerith — núcleo Rust
+# Zerith
 
-Workspace Rust do Zerith. Fica **separado** do workspace do OpenHuman (a raiz
-do repositório) de propósito: o fork usa `[patch]` apontando para `vendor/` e é
-um pnpm workspace na raiz; misturar crates novos nele obrigaria a editar tabelas
-de patch de terceiros.
+Harness de agentes de IA nativo, escrito em Rust: chat com ferramentas e
+aprovação humana, memória local, skills, MCP, planos com subagentes e uma
+janela desktop desenhada pela GPU (Rune), sem webview, Electron ou Tauri.
+
+O Zerith é um projeto próprio. Estudou ideias de outros harnesses (OpenHuman,
+Claude Code, DeepSeek Harness, Hermes) e reimplementou em Rust o que fazia
+sentido; nenhum deles é dependência em tempo de execução. As referências e o
+que veio de cada uma estão em [UPSTREAMS.md](UPSTREAMS.md).
 
 ## Crates
 
@@ -21,7 +25,7 @@ de patch de terceiros.
 | `zerith-plugins` | Manifestos de plugin, ativação e revisão explícita |
 | `zerith-security` | Presets de sandbox, vereditos, redação de segredos |
 | `zerith-cli` | Binário `zerith` |
-| `zerith-ui` | Janela nativa em Rune (chat + lista de sessões) |
+| `zerith-ui` | Janela nativa em Rune: chat, histórico, agentes, skills, memória, provedores, configurações |
 
 Um banco só: `zerith-sessions` é dono do schema; `zerith-memory` usa o mesmo
 arquivo e as mesmas migrações.
@@ -29,7 +33,6 @@ arquivo e as mesmas migrações.
 ## Comandos
 
 ```bash
-cd zerith
 cargo test
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check

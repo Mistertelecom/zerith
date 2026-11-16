@@ -243,8 +243,8 @@ pub fn view(s: &Shell, u: &Ui, system_reduced: bool) -> El {
             setting("Versão", env!("CARGO_PKG_VERSION"), col(), u),
             setting("Licença", "GPL-3.0-only", col(), u),
             setting(
-                "Baseado em",
-                "OpenHuman (design e shell), Hermes (importação de sessões), Rune (interface nativa), Agent Skills (formato de skills).",
+                "Créditos",
+                "Rune (interface nativa), Agent Skills (formato de skills), Hermes (importação de sessões). Design inspirado no OpenHuman.",
                 col(),
                 u,
             ),

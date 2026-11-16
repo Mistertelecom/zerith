@@ -1,13 +1,12 @@
 # Build e execução
 
-Tudo abaixo roda de `zerith/`, a raiz do workspace Rust. O workspace do
-OpenHuman na raiz do repositório não é tocado por estes comandos.
+Tudo abaixo roda da raiz do repositório, que é o workspace Cargo.
 
 ## Requisitos
 
 | Item | Versão |
 | --- | --- |
-| Rust | 1.99.1 (`rust-toolchain` do upstream) |
+| Rust | 1.99.1 (`rust-toolchain.toml`) |
 | Toolchain | MSVC no Windows; GNU precisa de MinGW binutils |
 | SQLite | embutido (`rusqlite` com `bundled`) — nada a instalar |
 | GPU | Vulkan/DX12/Metal via wgpu, só para a janela |
@@ -80,8 +79,8 @@ zerith import hermes              # read-only, idempotente
 
 | Saída | Caminho |
 | --- | --- |
-| CLI | `zerith/target/debug/zerith.exe` |
-| Janela | `zerith/target/debug/zerith-ui.exe` |
+| CLI | `target/debug/zerith.exe` |
+| Janela | `target/debug/zerith-ui.exe` |
 | Banco | `%APPDATA%\Zerith\zerith.db` |
 
 O banco é criado no primeiro comando. `zerith doctor` abre, roda
@@ -91,5 +90,5 @@ O banco é criado no primeiro comando. `zerith doctor` abre, roda
 
 Ainda não há pipeline de release. O caminho pretendido é `cargo build
 --release -p zerith-cli -p zerith-ui -j 1` por plataforma, com as mesmas
-`[patch]` de `zerith/vendor/` — um `[patch]` de dependência não se aplica ao
-workspace que depende dela, então os forks do Rune precisam continuar aqui.
+`[patch]` de `vendor/` — um `[patch]` de dependência não se aplica ao
+workspace que depende dela, então as cópias corrigidas do Rune precisam ficar aqui.

@@ -7,11 +7,10 @@ evidência executada, não código escrito. Onde falta, está dito o que falta.
 
 | Item | Estado | Evidência |
 | --- | --- | --- |
-| Fork preserva histórico e origem upstream | Feito | repositório git com `upstream` = clone completo do OpenHuman (HEAD `5e6d98d433`); branch de trabalho `zerith/fase-0-auditoria` |
-| Código reutilizado documentado | Feito | `docs/audit/initial-audit.md` §2 e §11 |
-| Licenças auditadas e avisos incluídos | Feito | §9 do mesmo documento; GPL-3.0-only no `license` do workspace |
+| Código de terceiros documentado | Feito | `UPSTREAMS.md`, `THIRD_PARTY_NOTICES.md`, `DEPENDENCY_LICENSES.md` |
+| Licenças auditadas e avisos incluídos | Feito | `THIRD_PARTY_NOTICES.md`; GPL-3.0-only em `LICENSE` e no `license` do workspace |
 | Rune é a interface desktop principal | Feito | `zerith-ui` usa `rune`; provado headless com `--tree` e `--snap` |
-| Sem Electron, Tauri ou Chromium | Feito | nenhuma dependência dessas no `zerith/Cargo.toml`; a UI é `rune` |
+| Sem Electron, Tauri ou Chromium | Feito | nenhuma dependência dessas no `Cargo.toml`; a UI é `rune` |
 | Núcleo Rust e UI separados | Feito | `zerith-core`/`-runtime` não dependem de `rune` |
 
 ## Chat e providers

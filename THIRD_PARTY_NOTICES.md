@@ -1,12 +1,11 @@
 # Avisos de terceiros
 
-O Zerith é distribuído sob **GPL-3.0-only**, herdada do fork do OpenHuman.
+O Zerith é distribuído sob **GPL-3.0-only** (texto em [LICENSE](LICENSE)).
 
 ## Código incorporado
 
 | Componente | Licença | Onde | Aviso |
 | --- | --- | --- | --- |
-| OpenHuman | GPL-3.0-only | repositório inteiro (fork) | `../LICENSE` |
 | Rune — crates vendorizados (`accesskit_macos`, `accesskit_windows`, `parley_engine`, `wgpu-hal`, `winit`) | ver o `Cargo.toml` / `LICENSE*` de cada diretório em `vendor/` (MIT/Apache-2.0 nos originais) | `vendor/` | mantido em cada diretório |
 
 ## Dependências
@@ -26,7 +25,9 @@ Licenças com obrigação além de "manter o aviso":
 ## Formatos e APIs usados sem código
 
 Agent Skills (Apache-2.0, formato), Hermes Agent (MIT, schema), 9Router
-(MIT, API HTTP). Claude Code e DeepSeek Harness: só conceitos, ver
+(MIT, API HTTP). OpenHuman (GPL-3.0-only): referência de design, tokens
+reproduzidos sem copiar arquivos. Claude Code e DeepSeek Harness: só
+conceitos, ver
 [UPSTREAMS.md](UPSTREAMS.md).
 
 ## Pendente

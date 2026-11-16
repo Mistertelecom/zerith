@@ -3,7 +3,6 @@
 ## Antes do push
 
 ```bash
-cd zerith
 cargo fmt --all --check
 cargo clippy --workspace --exclude zerith-ui --all-targets -- -D warnings
 cargo test --workspace --exclude zerith-ui

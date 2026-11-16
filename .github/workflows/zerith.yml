@@ -1,7 +1,7 @@
 name: Zerith
 
 # The Zerith workspace is the repository root and is a plain Cargo workspace: no
-# pnpm, no Tauri, no Rune build in the default lane (Rune pulls wgpu and winit).
+# Node, no Tauri, no Rune build in the default lane (Rune pulls wgpu and winit).
 # Rune is compiled in its own job so a UI regression cannot hide behind a
 # minutes-long build in the main lane.
 

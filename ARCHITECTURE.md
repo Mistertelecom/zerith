@@ -1,7 +1,6 @@
 # Arquitetura
 
-Workspace Rust em `zerith/`, separado do workspace do OpenHuman na raiz do
-repositório. Sem tokio, sem reqwest: I/O bloqueante em threads, HTTP via
+Um workspace Cargo na raiz do repositório. Sem tokio, sem reqwest: I/O bloqueante em threads, HTTP via
 `ureq`, um banco SQLite.
 
 ## Crates e dependências

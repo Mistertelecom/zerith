@@ -82,3 +82,65 @@ fn removing_takes_the_directory_with_it() {
     assert!(!p.dir.exists());
     assert!(lib.plugins().unwrap().is_empty());
 }
+
+fn bundle_dir(root: &std::path::Path) -> PathBuf {
+    let d = plugin_dir(
+        root,
+        "bundle-src",
+        r#"{"name":"pack","version":"1.0.0","skills":["skills/review"],"agents":["agents/rev.md"],
+            "hooks":[{"event":"SessionStart","command":"echo oi"}],
+            "mcp":[{"name":"docs","command":"docs-mcp","args":["--stdio"]}]}"#,
+    );
+    std::fs::create_dir_all(d.join("skills/review")).unwrap();
+    std::fs::write(d.join("skills/review/SKILL.md"), "---\nname: review\n---\n").unwrap();
+    std::fs::create_dir_all(d.join("agents")).unwrap();
+    std::fs::write(d.join("agents/rev.md"), "revisa").unwrap();
+    d
+}
+
+#[test]
+fn a_bundle_contributes_nothing_until_enabled_and_reviewed() {
+    let t = tempfile::Builder::new().tempdir_in(scratch()).unwrap();
+    let lib = Library::open(&t.path().join("plugins")).unwrap();
+    lib.install(&bundle_dir(t.path())).unwrap();
+    assert!(lib.contributions().unwrap().skills.is_empty());
+    lib.set_status("pack", Status::Enabled).unwrap();
+    // Enabled but unreviewed is still nothing: hooks are shell commands.
+    assert!(lib.contributions().unwrap().hooks.is_empty());
+    lib.trust("pack").unwrap();
+    let c = lib.contributions().unwrap();
+    assert_eq!(c.skills.len(), 1);
+    assert!(c.skills[0].1.join("SKILL.md").exists());
+    assert_eq!(c.agents.len(), 1);
+    assert_eq!(c.hooks[0].1.event, "SessionStart");
+    assert_eq!(c.mcp[0].1.name, "pack-docs");
+    // No `command`: nothing to launch, and it says why.
+    assert!(matches!(
+        lib.launch("pack").err(),
+        Some(PluginError::Invalid(_))
+    ));
+    // Untrusting withdraws everything again.
+    lib.untrust("pack").unwrap();
+    assert!(lib.contributions().unwrap().mcp.is_empty());
+}
+
+#[test]
+fn bundle_paths_cannot_escape_or_point_at_nothing() {
+    let t = tempfile::Builder::new().tempdir_in(scratch()).unwrap();
+    let lib = Library::open(&t.path().join("plugins")).unwrap();
+    for (i, manifest) in [
+        r#"{"name":"a","version":"1","skills":["../outside"]}"#,
+        r#"{"name":"b","version":"1","agents":["missing.md"]}"#,
+        r#"{"name":"c","version":"1","hooks":[{"event":"","command":"x"}]}"#,
+        r#"{"name":"d","version":"1","mcp":[{"name":"s"}]}"#,
+        r#"{"name":"e","version":"1","skills":["/abs"]}"#,
+    ]
+    .iter()
+    .enumerate()
+    {
+        let src = plugin_dir(t.path(), &format!("bad{i}"), manifest);
+        let err = lib.install(&src).unwrap_err();
+        assert!(matches!(err, PluginError::Invalid(_)), "{manifest}: {err}");
+    }
+    assert!(lib.plugins().unwrap().is_empty());
+}

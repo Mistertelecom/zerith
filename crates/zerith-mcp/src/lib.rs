@@ -6,12 +6,16 @@
 //! pairing; nothing here decides whether a tool call is allowed — that belongs
 //! to the permission layer, and putting it here would hide it from the user.
 
+pub mod config;
 pub mod protocol;
+pub mod tools;
 
+pub use config::{load_servers, Loaded, Origin, ServerConfig};
 pub use protocol::{
     CallResult, PromptArgument, PromptGet, PromptInfo, ResourceContent, ResourceInfo, RpcError,
     ToolInfo, ToolsList, PROTOCOL_VERSION,
 };
+pub use tools::{parse_mentions, McpRegistry, Mention, PromptCommand};
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};

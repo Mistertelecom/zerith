@@ -71,7 +71,8 @@ pub struct ToolsList {
 pub struct CallResult {
     #[serde(default)]
     pub content: Vec<Value>,
-    #[serde(default)]
+    /// The wire name is `isError`; the snake_case alias keeps older fixtures.
+    #[serde(default, rename = "isError", alias = "is_error")]
     pub is_error: Option<bool>,
 }
 
@@ -197,6 +198,12 @@ mod tests {
         let raw = r#"{"content":[{"type":"text","text":"ok"},{"type":"image","data":"x","mimeType":"image/png"}]}"#;
         let r: CallResult = serde_json::from_str(raw).unwrap();
         assert_eq!(r.text(), "ok[image image/png omitted]");
+    }
+
+    #[test]
+    fn the_wire_name_is_iserror() {
+        let r: CallResult = serde_json::from_str(r#"{"content":[],"isError":true}"#).unwrap();
+        assert_eq!(r.is_error, Some(true));
     }
 
     #[test]

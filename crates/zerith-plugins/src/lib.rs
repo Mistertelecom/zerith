@@ -8,6 +8,11 @@
 //!
 //! That is the whole isolation story, and it is reported as such rather than
 //! claimed as sandboxing: a plugin runs with the user's privileges.
+//!
+//! A plugin may also be a *bundle* (the Claude Code plugin idea): `skills`,
+//! `agents`, `hooks` and `mcp` entries in the manifest. Nothing in a bundle is
+//! active until the plugin is enabled **and** reviewed; [`Library::contributions`]
+//! returns only what such plugins declare, and the host decides what to load.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -28,6 +33,8 @@ pub struct Manifest {
     pub license: Option<String>,
     /// The program to spawn. No shell, so the string is argv, not a command
     /// line a reviewer has to parse.
+    /// May be empty for a bundle that has no process of its own.
+    #[serde(default)]
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
@@ -35,6 +42,55 @@ pub struct Manifest {
     /// these until the plugin is launched and answers `tools/list`.
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// Directories (relative to the plugin) that hold a `SKILL.md`.
+    #[serde(default)]
+    pub skills: Vec<String>,
+    /// Agent definition files (relative `*.md`), as in `zerith-core::agents`.
+    #[serde(default)]
+    pub agents: Vec<String>,
+    /// Shell hooks the plugin asks for. Run with the user's privileges.
+    #[serde(default)]
+    pub hooks: Vec<HookEntry>,
+    /// MCP servers the plugin ships.
+    #[serde(default)]
+    pub mcp: Vec<McpEntry>,
+}
+
+/// One hook, in the shape of a `[[hooks.<Event>]]` settings entry.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HookEntry {
+    /// `SessionStart`, `PreToolUse`, ... (validated by the host that loads it).
+    pub event: String,
+    #[serde(default)]
+    pub matcher: Option<String>,
+    pub command: String,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct McpEntry {
+    pub name: String,
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
+/// What enabled, reviewed plugins add. Paths are absolute, inside the
+/// plugin's installed directory.
+#[derive(Debug, Default, Clone)]
+pub struct Contributions {
+    /// `(plugin, skill directory)`
+    pub skills: Vec<(String, PathBuf)>,
+    /// `(plugin, agent file)`
+    pub agents: Vec<(String, PathBuf)>,
+    /// `(plugin, hook)`
+    pub hooks: Vec<(String, HookEntry)>,
+    /// Named `<plugin>-<server>` so two plugins cannot collide.
+    pub mcp: Vec<(String, zerith_mcp::ServerConfig)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,6 +131,8 @@ pub enum PluginError {
     Disabled(String),
     #[error("plugin {0} was not reviewed: run `zerith plugins trust {0}` first")]
     NotTrusted(String),
+    #[error("manifesto inválido: {0}")]
+    Invalid(String),
     #[error("{0}")]
     Io(#[from] std::io::Error),
     #[error("{0}")]
@@ -131,6 +189,7 @@ impl Library {
     pub fn install(&self, from: &Path) -> Result<Plugin> {
         let manifest = read_manifest(&from.join(MANIFEST))?;
         validate_name(&manifest.name)?;
+        validate_bundle(&manifest, from)?;
         let mut plugins = self.plugins()?;
         if plugins.iter().any(|p| p.manifest.name == manifest.name) {
             return Err(PluginError::Exists(manifest.name));
@@ -175,6 +234,58 @@ impl Library {
         self.save(&plugins)
     }
 
+    /// Reverses [`Library::trust`]: the plugin stays installed but stops
+    /// contributing and cannot launch.
+    pub fn untrust(&self, name: &str) -> Result<()> {
+        let mut plugins = self.plugins()?;
+        let p = plugins
+            .iter_mut()
+            .find(|p| p.manifest.name == name)
+            .ok_or_else(|| PluginError::Missing(name.into()))?;
+        p.trusted = false;
+        self.save(&plugins)
+    }
+
+    pub fn get(&self, name: &str) -> Result<Plugin> {
+        self.plugins()?
+            .into_iter()
+            .find(|p| p.manifest.name == name)
+            .ok_or_else(|| PluginError::Missing(name.into()))
+    }
+
+    /// Skills, agents, hooks and MCP servers declared by plugins that are
+    /// enabled **and** reviewed. Nothing is read from disk beyond the index and
+    /// nothing is started: loading what this returns is the host's decision.
+    pub fn contributions(&self) -> Result<Contributions> {
+        let mut out = Contributions::default();
+        for p in self.plugins()? {
+            if p.status != Status::Enabled || !p.trusted {
+                continue;
+            }
+            let m = &p.manifest;
+            out.skills
+                .extend(m.skills.iter().map(|s| (m.name.clone(), p.dir.join(s))));
+            out.agents
+                .extend(m.agents.iter().map(|a| (m.name.clone(), p.dir.join(a))));
+            out.hooks
+                .extend(m.hooks.iter().map(|h| (m.name.clone(), h.clone())));
+            for e in &m.mcp {
+                out.mcp.push((
+                    m.name.clone(),
+                    zerith_mcp::ServerConfig {
+                        name: format!("{}-{}", m.name, e.name),
+                        command: e.command.clone(),
+                        args: e.args.clone(),
+                        url: e.url.clone(),
+                        timeout_ms: None,
+                        origin: zerith_mcp::Origin::User,
+                    },
+                ));
+            }
+        }
+        Ok(out)
+    }
+
     /// Marks a plugin as reviewed. Kept separate from `install` so no install
     /// path can silently grant execution.
     pub fn trust(&self, name: &str) -> Result<()> {
@@ -201,6 +312,11 @@ impl Library {
         if !plugin.trusted {
             return Err(PluginError::NotTrusted(name.into()));
         }
+        if plugin.manifest.command.trim().is_empty() {
+            return Err(PluginError::Invalid(format!(
+                "{name} não declara `command`: é só um pacote de skills/agentes/hooks/mcp"
+            )));
+        }
         Ok(Client::connect(
             &plugin.manifest.name,
             &plugin.manifest.command,
@@ -221,6 +337,59 @@ fn read_manifest(path: &Path) -> Result<Manifest> {
         }
     })?;
     Ok(serde_json::from_str(&text)?)
+}
+
+/// Bundle entries must be relative paths that stay inside the plugin and point
+/// at something that exists; hooks and MCP entries must be usable.
+fn validate_bundle(m: &Manifest, root: &Path) -> Result<()> {
+    let bad = |what: &str, why: String| PluginError::Invalid(format!("{what}: {why}"));
+    let inside = |rel: &str, want_dir: bool| -> Result<()> {
+        let p = Path::new(rel);
+        let clean = !rel.is_empty()
+            && p.is_relative()
+            && p.components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)));
+        if !clean {
+            return Err(bad(rel, "use um caminho relativo sem `..`".into()));
+        }
+        let full = root.join(p);
+        let ok = if want_dir {
+            full.is_dir()
+        } else {
+            full.is_file()
+        };
+        if !ok {
+            return Err(bad(rel, "não existe no plugin".into()));
+        }
+        Ok(())
+    };
+    for s in &m.skills {
+        inside(s, true)?;
+        inside(&format!("{s}/SKILL.md"), false)?;
+    }
+    for a in &m.agents {
+        inside(a, false)?;
+    }
+    for h in &m.hooks {
+        if h.event.trim().is_empty() || h.command.trim().is_empty() {
+            return Err(bad(
+                "hooks",
+                "cada hook precisa de `event` e `command`".into(),
+            ));
+        }
+    }
+    for e in &m.mcp {
+        let cfg = zerith_mcp::ServerConfig {
+            name: e.name.clone(),
+            command: e.command.clone(),
+            args: e.args.clone(),
+            url: e.url.clone(),
+            timeout_ms: None,
+            origin: zerith_mcp::Origin::User,
+        };
+        cfg.validate().map_err(|why| bad("mcp", why))?;
+    }
+    Ok(())
 }
 
 fn validate_name(name: &str) -> Result<()> {

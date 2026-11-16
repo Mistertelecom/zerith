@@ -1,25 +1,38 @@
-//! The tool loop: request → stream → tool calls → policy → approval → run →
-//! persist → request again, until the model answers without calling a tool,
-//! the user cancels, or `max_steps` runs out.
+//! The tool loop: request → stream → tool calls → pipeline → persist →
+//! request again, until the model answers without calling a tool, the user
+//! cancels, or `max_steps` runs out.
 //!
 //! Durable records are written once each: one assistant row per step (with
 //! its tool calls as JSON), one tool row per result. Deltas are never written.
+//! Alongside the rows, every turn writes an audit trail to the `events` table
+//! (see [`crate::events`]); a turn with no `turn/end` is a crash.
+//!
+//! The pieces live in their own files: [`crate::pipeline`] (what happens to
+//! one tool call), [`crate::compact`] (keeping the history inside the context
+//! window) and [`crate::spill`] (outputs too big for the model).
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::PathBuf;
 use std::sync::{mpsc, Mutex};
 use std::time::Duration;
 
 use serde_json::{json, Value};
 use zerith_providers::{
-    Cancel, ChatMessage, ChatRequest, Client, ProviderError, Role as PRole, StreamEvent, ToolCall,
-    ToolDef, Usage,
+    Cancel, ChatMessage, ChatRequest, Client, ProviderError, StreamEvent, ToolCall, ToolDef, Usage,
 };
-use zerith_security::{Policy, Verdict};
-use zerith_sessions::{Message, NewMessage, Role, Store};
-use zerith_tools::{CallCtx, Registry};
+use zerith_security::Policy;
+use zerith_sessions::{checkpoints, NewMessage, Role, Store};
+use zerith_tools::Registry;
 
+use crate::compact::{replay_items, ClientSummarizer, History, Summarizer};
+use crate::events::{CancelCause, CauseSlot, TurnLog};
+use crate::pipeline::{Middleware, Pipeline};
+use crate::question::{self, QuestionGate};
+use crate::spill::{self, SPILL_MAX_AGE};
+use crate::subagent::{self, SubagentOptions};
 use crate::{Result, RunError, RunEvent, TurnContext, TurnReport, HISTORY_LIMIT};
+
+pub use crate::compact::{estimate_tokens, fit_context, replay, DROPPED};
 
 /// The user's answer to an `ApprovalNeeded` event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,7 +76,7 @@ pub fn approval_channel() -> (ApprovalSender, ApprovalGate) {
 impl ApprovalGate {
     /// Blocks until the answer for `id` arrives. Fails closed: a cancel, or a
     /// sender that went away, is a Deny.
-    fn wait(&self, id: u64, cancel: &Cancel) -> Approval {
+    pub(crate) fn wait(&self, id: u64, cancel: &Cancel) -> Approval {
         let Ok(rx) = self.rx.lock() else {
             return Approval::Deny;
         };
@@ -82,18 +95,49 @@ impl ApprovalGate {
 
     // ponytail: grants are per tool name ("allow shell for the session"), not
     // per command prefix. Key on (tool, pattern) if users want finer grants.
-    fn granted(&self, tool: &str) -> bool {
+    pub(crate) fn granted(&self, tool: &str) -> bool {
         self.granted
             .lock()
             .map(|g| g.contains(tool))
             .unwrap_or(false)
     }
 
-    fn grant(&self, tool: &str) {
+    pub(crate) fn grant(&self, tool: &str) {
         if let Ok(mut g) = self.granted.lock() {
             g.insert(tool.to_string());
         }
     }
+}
+
+/// The UI's half of the steering channel: say something to the agent while
+/// it works.
+#[derive(Clone)]
+pub struct InboxSender(mpsc::Sender<String>);
+
+impl InboxSender {
+    /// Returns false when the receiver is gone.
+    pub fn send(&self, text: impl Into<String>) -> bool {
+        self.0.send(text.into()).is_ok()
+    }
+}
+
+/// The turn's half. Messages sent while a turn runs are drained at the next
+/// step boundary (before the next model request, or before the turn would
+/// end) and appended as user messages, stored and logged like any other.
+pub struct InboxReceiver(Mutex<mpsc::Receiver<String>>);
+
+impl InboxReceiver {
+    fn drain(&self) -> Vec<String> {
+        let Ok(rx) = self.0.lock() else {
+            return Vec::new();
+        };
+        rx.try_iter().filter(|s| !s.trim().is_empty()).collect()
+    }
+}
+
+pub fn inbox_channel() -> (InboxSender, InboxReceiver) {
+    let (tx, rx) = mpsc::channel();
+    (InboxSender(tx), InboxReceiver(Mutex::new(rx)))
 }
 
 /// What the loop may use besides the conversation. `Default` is "no tools":
@@ -108,9 +152,29 @@ pub struct AgentOptions<'a> {
     /// Past messages replayed to the model. The execution profile sets it
     /// (`Profile::limits().history_window`); the default is `HISTORY_LIMIT`.
     pub history: usize,
+    /// Run around every tool call, in order. The host puts hooks and
+    /// permission rules here (see [`Middleware`]).
+    pub middleware: Vec<Box<dyn Middleware + Send + Sync>>,
+    /// Safe calls of one step that may run at once; 1 is serial.
+    pub max_parallel_tools: usize,
+    /// Where outputs over `OUTPUT_CAP_CHARS` are written
+    /// (`<dir>/<session>/<call>.txt`). `None` truncates instead.
+    pub spill_dir: Option<PathBuf>,
+    /// Writes compaction summaries. `None`: the turn's own client and model.
+    pub summarizer: Option<&'a dyn Summarizer>,
+    /// Messages from the user, sent while the turn runs.
+    pub inbox: Option<&'a InboxReceiver>,
+    /// Where `cancel_with` recorded why; read into `turn/end`.
+    pub cancel_cause: Option<&'a CauseSlot>,
+    /// Where `ask_user` questions are answered. Without one the call fails
+    /// closed ("o usuário não respondeu").
+    pub questions: Option<&'a QuestionGate>,
+    /// Depth and concurrency of the subagents this turn may start.
+    pub subagents: SubagentOptions,
 }
 
 pub const DEFAULT_MAX_STEPS: usize = 25;
+pub const DEFAULT_MAX_PARALLEL_TOOLS: usize = 4;
 
 impl Default for AgentOptions<'_> {
     fn default() -> Self {
@@ -120,6 +184,14 @@ impl Default for AgentOptions<'_> {
             approvals: None,
             max_steps: DEFAULT_MAX_STEPS,
             history: HISTORY_LIMIT,
+            middleware: Vec::new(),
+            max_parallel_tools: DEFAULT_MAX_PARALLEL_TOOLS,
+            spill_dir: None,
+            summarizer: None,
+            inbox: None,
+            cancel_cause: None,
+            questions: None,
+            subagents: SubagentOptions::default(),
         }
     }
 }
@@ -134,14 +206,9 @@ impl AgentOptions<'_> {
     }
 }
 
-/// Replaces a tool result dropped to fit the context window.
-pub const DROPPED: &str = "[saída removida para caber no contexto]";
-/// Stands in for a result that was never recorded (crash or cancel mid-step):
-/// the API rejects a tool call without an answer.
-const INTERRUPTED: &str = "[sem resultado: o turno foi interrompido]";
 const PREVIEW_CHARS: usize = 200;
-
-static NEXT_APPROVAL: AtomicU64 = AtomicU64::new(1);
+/// Of a failed attempt's partial text, how much the audit log keeps.
+const ATTEMPT_CHARS: usize = 2000;
 
 /// Runs one agent turn with tools. See the module docs for the loop.
 #[allow(clippy::too_many_arguments)]
@@ -160,19 +227,102 @@ pub fn run_agent_turn(
     let session = store
         .session(session_id)?
         .ok_or_else(|| RunError::NoSession(session_id.to_string()))?;
+    let log = TurnLog::new(store, session_id);
+    log.emit(
+        "turn/start",
+        json!({"model": model, "prompt_chars": prompt.chars().count()}),
+    );
 
+    let result = turn_body(
+        store,
+        client,
+        ctx,
+        &agent,
+        &session.title,
+        session_id,
+        model,
+        prompt,
+        cancel,
+        on_event,
+        &log,
+    );
+    match &result {
+        Ok((_, reason)) => log.end(reason, None, None),
+        Err(RunError::Provider(ProviderError::Cancelled)) => {
+            let cause = agent
+                .cancel_cause
+                .and_then(|s| s.get())
+                .unwrap_or(CancelCause::User);
+            log.end("cancelled", Some(cause), None);
+        }
+        Err(e) => log.end("error", None, Some(e.to_string())),
+    }
+    result.map(|(report, _)| report)
+}
+
+/// The loop proper. Returns the report and why it stopped (`done` or
+/// `max_steps`); errors are classified by the caller.
+#[allow(clippy::too_many_arguments)]
+fn turn_body(
+    store: &Store,
+    client: &Client,
+    ctx: TurnContext<'_>,
+    agent: &AgentOptions<'_>,
+    title: &str,
+    session_id: &str,
+    model: &str,
+    prompt: &str,
+    cancel: &Cancel,
+    on_event: &mut dyn FnMut(RunEvent),
+    log: &TurnLog<'_>,
+) -> Result<(TurnReport, &'static str)> {
+    if let Some(dir) = &agent.spill_dir {
+        spill::prune(dir, SPILL_MAX_AGE);
+    }
+    // Checkpoint first: its boundary is the newest message *before* this
+    // prompt, so a conversation rewind removes the prompt too. A failure only
+    // disables rewind for this turn; it never stops the turn.
+    if let (Some(r), Some(root)) = (
+        agent.tools,
+        store.conn().path().filter(|p| !p.is_empty()).and_then(|p| {
+            std::path::Path::new(p)
+                .parent()
+                .map(std::path::Path::to_path_buf)
+        }),
+    ) {
+        let opened = checkpoints::next_turn(store, session_id)
+            .and_then(|turn| checkpoints::Checkpoint::begin(store, &root, session_id, turn));
+        match opened {
+            Ok(cp) => r
+                .host()
+                .on_before_write(move |p| cp.record_file(p).map_err(|e| e.to_string())),
+            Err(e) => eprintln!("zerith: checkpoint indisponível: {e}"),
+        }
+    }
     store.append(session_id, &NewMessage::new(Role::User, prompt))?;
 
-    let mut messages = vec![ChatMessage::system(crate::system_prompt(
-        &session.title,
-        ctx,
-        session_id,
-        prompt,
-    ))];
+    // The model has the skill tool exactly when the registry offers it.
+    let skill_tool = agent.tools.is_some_and(|r| r.get("skill").is_some());
+    let mut system_text = crate::system_prompt(title, ctx, skill_tool, session_id, prompt);
+    if let Some(r) = agent.tools {
+        system_text.push_str(&crate::tool_guidance(r));
+    }
+    let system = vec![ChatMessage::system(system_text)];
+    if let (Some(r), Some(p)) = (agent.tools, agent.policy) {
+        subagent::bind(
+            r,
+            p,
+            store,
+            client,
+            &ctx,
+            model,
+            session_id,
+            &agent.subagents,
+        );
+    }
     // The newest rows, which include the prompt just appended.
-    messages.extend(replay(
-        &store.recent_messages(session_id, agent.history.max(1))?,
-    ));
+    let rows = store.recent_messages(session_id, agent.history.max(1))?;
+    let mut hist = History::new(system, replay_items(&rows));
 
     let defs: Vec<ToolDef> = agent
         .tools
@@ -188,21 +338,62 @@ pub fn run_agent_turn(
         })
         .unwrap_or_default();
     let budget = client.config().context_limit.map(|l| l as usize * 8 / 10);
+    let default_summarizer = ClientSummarizer { client, model };
+    let summarizer: &dyn Summarizer = agent.summarizer.unwrap_or(&default_summarizer);
+    let mut summary_failed = false;
+
+    let pipe = Pipeline {
+        core: agent.tools.zip(agent.policy),
+        memory: ctx.memory,
+        scope: ctx.scope,
+        middleware: &agent.middleware,
+        approvals: agent.approvals,
+        spill_dir: agent.spill_dir.as_deref(),
+        session_id,
+        cancel,
+    };
 
     let (mut prompt_tokens, mut completion_tokens) = (0, 0);
     let mut last = (0i64, String::new(), None::<String>);
     let max_steps = agent.max_steps.max(1);
+    let mut reason = "done";
 
     for step in 1..=max_steps {
         on_event(RunEvent::Step { n: step });
+        steer(store, session_id, agent, &mut hist, log)?;
+
         if let Some(b) = budget {
-            fit_context(&mut messages, b);
+            if hist.tokens() > b {
+                shrink(
+                    store,
+                    session_id,
+                    &mut hist,
+                    b,
+                    summarizer,
+                    &mut summary_failed,
+                    cancel,
+                    log,
+                    on_event,
+                );
+            }
         }
-        let mut req = ChatRequest::new(model, messages.clone());
+
+        log.emit(
+            "step/start",
+            json!({"n": step, "tokens_estimate": hist.tokens()}),
+        );
+        let mut req = ChatRequest::new(model, hist.chat());
         if !defs.is_empty() {
             req = req.tools(defs.clone()).tool_choice("auto");
         }
-        let out = request(client, &req, cancel, on_event)?;
+        let mut failed = Vec::new();
+        let out = request(client, &req, cancel, on_event, &mut failed);
+        // A failed or abandoned attempt is evidence, not history: it goes to
+        // the log and never to `messages`.
+        for f in failed {
+            log.emit("assistant/attempt", json!({"step": step, "attempt": f}));
+        }
+        let out = out?;
         if let Some(u) = &out.usage {
             prompt_tokens += u.prompt_tokens;
             completion_tokens += u.completion_tokens;
@@ -221,33 +412,109 @@ pub fn run_agent_turn(
                 ..NewMessage::new(Role::Assistant, out.text.clone())
             },
         )?;
+        log.emit(
+            "step/end",
+            json!({"n": step, "message_id": id, "tool_calls": out.calls.len(),
+                   "prompt_tokens": out.usage.as_ref().map(|u| u.prompt_tokens),
+                   "completion_tokens": out.usage.as_ref().map(|u| u.completion_tokens)}),
+        );
         last = (id, out.text.clone(), out.reasoning.clone());
-        messages.push(ChatMessage::assistant(out.text, out.calls.clone()));
+        hist.push(ChatMessage::assistant(out.text, out.calls.clone()), id);
         if out.calls.is_empty() {
+            // Told something while the answer streamed: the turn is not over.
+            if step < max_steps && steer(store, session_id, agent, &mut hist, log)? > 0 {
+                continue;
+            }
             break;
         }
 
-        for (i, call) in out.calls.iter().enumerate() {
+        let mut context: Vec<String> = Vec::new();
+        let mut i = 0;
+        while i < out.calls.len() {
             if cancel.is_cancelled() {
                 // Close every open call so the stored history stays paired.
-                for c in &out.calls[i..] {
-                    record(store, session_id, c, "[cancelado]", &mut messages)?;
-                }
+                close_cancelled(store, session_id, &out.calls[i..], &mut hist, log)?;
                 return Err(ProviderError::Cancelled.into());
             }
-            on_event(RunEvent::ToolCall {
-                id: call.id.clone(),
-                name: call.name.clone(),
-                args: call.arguments.clone(),
-            });
-            let (ok, output) = execute(call, ctx, &agent, cancel, on_event);
-            record(store, session_id, call, &output, &mut messages)?;
-            on_event(RunEvent::ToolResult {
-                id: call.id.clone(),
-                name: call.name.clone(),
-                ok,
-                output_preview: output.chars().take(PREVIEW_CHARS).collect(),
-            });
+            // Consecutive safe calls form a group; anything else stands alone
+            // and is a barrier.
+            let mut j = i + 1;
+            if pipe.is_safe(&out.calls[i]) {
+                while j < out.calls.len() && pipe.is_safe(&out.calls[j]) {
+                    j += 1;
+                }
+            }
+            let group = &out.calls[i..j];
+            let mut prepared = Vec::with_capacity(group.len());
+            for call in group {
+                on_event(RunEvent::ToolCall {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    args: call.arguments.clone(),
+                });
+                log.emit(
+                    "tool/call",
+                    json!({"id": call.id, "name": call.name, "args": call.arguments}),
+                );
+                prepared.push(pipe.prepare(call, on_event));
+            }
+            // `ask_user` blocks on the person, so the loop answers it itself,
+            // on this thread, before the rest of the group runs.
+            for p in prepared.iter_mut() {
+                if p.settled.is_none() && p.inv.name == "ask_user" {
+                    let (ok, text) =
+                        question::settle(agent.questions, &p.inv.args, cancel, on_event);
+                    p.settled = Some(crate::pipeline::ToolOutcome::new(ok, text));
+                }
+            }
+            let ran = if cancel.is_cancelled() {
+                vec![None; prepared.len()]
+            } else {
+                pipe.run_group(&prepared, agent.max_parallel_tools.max(1))
+            };
+            subagent::flush(store, session_id, agent.tools, on_event);
+            // Commit in the model's order, whatever order they finished in.
+            for ((call, p), ran) in group.iter().zip(prepared).zip(ran) {
+                let ran = ran.or_else(|| {
+                    cancel
+                        .is_cancelled()
+                        .then(|| (false, "[cancelado]".to_string()))
+                });
+                let (outcome, spilled) = pipe.finish(p, ran);
+                record(store, session_id, call, &outcome.output, &mut hist)?;
+                let preview: String = outcome.output.chars().take(PREVIEW_CHARS).collect();
+                log.emit(
+                    "tool/result",
+                    json!({"id": call.id, "name": call.name, "ok": outcome.ok,
+                           "chars": outcome.output.chars().count(),
+                           "spill": spilled.as_ref().map(|p| p.display().to_string()),
+                           "preview": preview}),
+                );
+                on_event(RunEvent::ToolResult {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    ok: outcome.ok,
+                    output_preview: preview,
+                });
+                context.extend(outcome.context);
+            }
+            i = j;
+        }
+        // Extra context comes after every result of the step: a user message
+        // between two tool results would break their pairing.
+        for text in context {
+            let id = store.append(
+                session_id,
+                &NewMessage {
+                    raw: Some(json!({"tool_context": true})),
+                    ..NewMessage::new(Role::User, text.clone())
+                },
+            )?;
+            log.emit(
+                "tool/context",
+                json!({"message_id": id, "chars": text.chars().count()}),
+            );
+            hist.push(ChatMessage::user(text), id);
         }
         if cancel.is_cancelled() {
             return Err(ProviderError::Cancelled.into());
@@ -259,20 +526,100 @@ pub fn run_agent_turn(
             on_event(RunEvent::Delta(note.clone()));
             let id = store.append(session_id, &NewMessage::new(Role::Assistant, note.clone()))?;
             last = (id, note, None);
+            reason = "max_steps";
         }
     }
 
     on_event(RunEvent::Done {
         stored: Some(last.0),
     });
-    Ok(TurnReport {
-        session_id: session_id.to_string(),
-        message_id: last.0,
-        text: last.1,
-        reasoning: last.2,
-        prompt_tokens,
-        completion_tokens,
-    })
+    Ok((
+        TurnReport {
+            session_id: session_id.to_string(),
+            message_id: last.0,
+            text: last.1,
+            reasoning: last.2,
+            prompt_tokens,
+            completion_tokens,
+        },
+        reason,
+    ))
+}
+
+/// Brings the history under `budget`: prune tool bodies, then summarize the
+/// oldest span, then drop whole old turns. Never fails the turn.
+#[allow(clippy::too_many_arguments)]
+fn shrink(
+    store: &Store,
+    session_id: &str,
+    hist: &mut History,
+    budget: usize,
+    summarizer: &dyn Summarizer,
+    summary_failed: &mut bool,
+    cancel: &Cancel,
+    log: &TurnLog<'_>,
+    on_event: &mut dyn FnMut(RunEvent),
+) {
+    let before = hist.tokens();
+    hist.prune_tools(budget);
+    if hist.tokens() > budget && !*summary_failed {
+        match crate::compact::summarize_into(
+            store,
+            session_id,
+            hist,
+            budget / 2,
+            summarizer,
+            cancel,
+            log,
+            "pressure",
+        ) {
+            Ok(Some(r)) => on_event(RunEvent::Compacted {
+                before: r.tokens_before,
+                after: r.tokens_after,
+            }),
+            Ok(None) => {}
+            // A failed summary must not fail the turn: drop instead, and do
+            // not retry it on every step.
+            Err(_) => *summary_failed = true,
+        }
+    }
+    let dropped = hist.drop_oldest(budget);
+    if dropped > 0 {
+        log.emit(
+            "compaction/fallback",
+            json!({"dropped_items": dropped, "tokens_before": before,
+                   "tokens_after": hist.tokens()}),
+        );
+    }
+}
+
+/// Appends what the user said while the turn ran. Returns how many messages.
+fn steer(
+    store: &Store,
+    session_id: &str,
+    agent: &AgentOptions<'_>,
+    hist: &mut History,
+    log: &TurnLog<'_>,
+) -> Result<usize> {
+    let Some(inbox) = agent.inbox else {
+        return Ok(0);
+    };
+    let msgs = inbox.drain();
+    for text in &msgs {
+        let id = store.append(
+            session_id,
+            &NewMessage {
+                raw: Some(json!({"steer": true})),
+                ..NewMessage::new(Role::User, text.clone())
+            },
+        )?;
+        log.emit(
+            "user/steer",
+            json!({"message_id": id, "chars": text.chars().count()}),
+        );
+        hist.push(ChatMessage::user(text.clone()), id);
+    }
+    Ok(msgs.len())
 }
 
 fn record(
@@ -280,9 +627,9 @@ fn record(
     session_id: &str,
     call: &ToolCall,
     output: &str,
-    messages: &mut Vec<ChatMessage>,
+    hist: &mut History,
 ) -> Result<()> {
-    store.append(
+    let id = store.append(
         session_id,
         &NewMessage {
             tool_name: Some(call.name.clone()),
@@ -290,69 +637,25 @@ fn record(
             ..NewMessage::new(Role::Tool, output)
         },
     )?;
-    messages.push(ChatMessage::tool(call.id.clone(), output));
+    hist.push(ChatMessage::tool(call.id.clone(), output), id);
     Ok(())
 }
 
-/// Policy, approval, run. Every failure becomes text for the model: a refused
-/// or broken call is information, not a reason to end the turn.
-fn execute(
-    call: &ToolCall,
-    ctx: TurnContext<'_>,
-    agent: &AgentOptions<'_>,
-    cancel: &Cancel,
-    on_event: &mut dyn FnMut(RunEvent),
-) -> (bool, String) {
-    let (Some(tools), Some(policy)) = (agent.tools, agent.policy) else {
-        return (false, "erro: ferramentas desativadas neste turno".into());
-    };
-    let args: Value = match serde_json::from_str(if call.arguments.trim().is_empty() {
-        "{}"
-    } else {
-        &call.arguments
-    }) {
-        Ok(v) => v,
-        Err(e) => return (false, format!("erro: argumentos não são JSON válido: {e}")),
-    };
-    let cctx = CallCtx {
-        workspace: &policy.workspace,
-        policy,
-        memory: ctx.memory,
-        scope: ctx.scope,
-    };
-    let verdict = match tools.authorize(&call.name, &args, &cctx) {
-        Ok((v, _)) => v,
-        Err(e) => return (false, format!("erro: {e}")),
-    };
-    match verdict {
-        Verdict::Allow => {}
-        Verdict::Deny(why) => return (false, format!("negado: {why}")),
-        Verdict::Ask(why) => {
-            let Some(gate) = agent.approvals else {
-                return (
-                    false,
-                    format!("negado: precisa de aprovação ({why}) e não há quem aprove"),
-                );
-            };
-            if !gate.granted(&call.name) {
-                let id = NEXT_APPROVAL.fetch_add(1, Ordering::Relaxed);
-                on_event(RunEvent::ApprovalNeeded {
-                    id,
-                    tool: call.name.clone(),
-                    summary: why,
-                });
-                match gate.wait(id, cancel) {
-                    Approval::AllowOnce => {}
-                    Approval::AllowSession => gate.grant(&call.name),
-                    Approval::Deny => return (false, "negado pelo usuário".into()),
-                }
-            }
-        }
+fn close_cancelled(
+    store: &Store,
+    session_id: &str,
+    calls: &[ToolCall],
+    hist: &mut History,
+    log: &TurnLog<'_>,
+) -> Result<()> {
+    for c in calls {
+        record(store, session_id, c, "[cancelado]", hist)?;
+        log.emit(
+            "tool/result",
+            json!({"id": c.id, "name": c.name, "ok": false, "cancelled": true}),
+        );
     }
-    match tools.run_approved(&call.name, &args, &cctx, cancel) {
-        Ok(out) => (true, out),
-        Err(e) => (false, format!("erro: {e}")),
-    }
+    Ok(())
 }
 
 #[derive(Default)]
@@ -366,12 +669,14 @@ struct StepOut {
 /// One model request. Streaming first: a turn that only paints when it
 /// finishes reads as a hang. If the stream fails before anything was shown,
 /// fall back once to a blocking request — some OpenAI-compatible servers
-/// answer 400 to `stream: true`.
+/// answer 400 to `stream: true`. Every attempt that did not become the answer
+/// is described in `failed`, for the audit log.
 fn request(
     client: &Client,
     req: &ChatRequest,
     cancel: &Cancel,
     on_event: &mut dyn FnMut(RunEvent),
+    failed: &mut Vec<Value>,
 ) -> Result<StepOut> {
     let mut out = StepOut::default();
     let mut painted = false;
@@ -397,6 +702,14 @@ fn request(
     let Err(e) = streamed else {
         return Ok(out);
     };
+    if !matches!(e, ProviderError::Cancelled) {
+        failed.push(json!({
+            "mode": "stream",
+            "error": e.to_string(),
+            "partial": out.text.chars().take(ATTEMPT_CHARS).collect::<String>(),
+            "partial_chars": out.text.chars().count(),
+        }));
+    }
     // Repeating a stream that already painted would show the answer twice;
     // a 429 already went through its retries; a cancel is final.
     if painted
@@ -407,7 +720,15 @@ fn request(
     {
         return Err(e.into());
     }
-    let c = client.complete(req, cancel)?;
+    let c = match client.complete(req, cancel) {
+        Ok(c) => c,
+        Err(e2) => {
+            if !matches!(e2, ProviderError::Cancelled) {
+                failed.push(json!({"mode": "complete", "error": e2.to_string()}));
+            }
+            return Err(e2.into());
+        }
+    };
     if let Some(r) = &c.reasoning {
         on_event(RunEvent::Reasoning(r.clone()));
     }
@@ -420,187 +741,4 @@ fn request(
         calls: c.tool_calls,
         usage: c.usage,
     })
-}
-
-/// Stored rows as provider messages, with tool calls and results paired.
-pub fn replay(rows: &[Message]) -> Vec<ChatMessage> {
-    let mut out = Vec::new();
-    for m in rows {
-        match m.role {
-            Role::User | Role::System => {
-                if m.content.trim().is_empty() {
-                    continue;
-                }
-                let role = if m.role == Role::User {
-                    PRole::User
-                } else {
-                    PRole::System
-                };
-                out.push(ChatMessage::new(role, m.content.clone()));
-            }
-            Role::Assistant => {
-                let calls: Vec<ToolCall> = m
-                    .tool_calls
-                    .clone()
-                    .and_then(|v| serde_json::from_value(v).ok())
-                    .unwrap_or_default();
-                if m.content.trim().is_empty() && calls.is_empty() {
-                    continue;
-                }
-                out.push(ChatMessage::assistant(m.content.clone(), calls));
-            }
-            // A tool row without its call id (imported, or pre-tool-loop)
-            // cannot be paired, and unpaired it reads as a claim nobody made.
-            Role::Tool => {
-                if let Some(id) = m
-                    .tool_calls
-                    .as_ref()
-                    .and_then(|v| v["tool_call_id"].as_str())
-                {
-                    out.push(ChatMessage::tool(id, m.content.clone()));
-                }
-            }
-        }
-    }
-    pair(out)
-}
-
-/// Every assistant tool call gets exactly one result right after it; results
-/// without a call (the call fell outside the history window) are dropped.
-fn pair(msgs: Vec<ChatMessage>) -> Vec<ChatMessage> {
-    fn close(out: &mut Vec<ChatMessage>, open: &mut Vec<String>) {
-        for id in open.drain(..) {
-            out.push(ChatMessage::tool(id, INTERRUPTED));
-        }
-    }
-    let mut out = Vec::with_capacity(msgs.len());
-    let mut open: Vec<String> = Vec::new();
-    for m in msgs {
-        if m.role == PRole::Tool {
-            let id = m.tool_call_id.as_deref().unwrap_or("");
-            if let Some(pos) = open.iter().position(|o| o == id) {
-                open.remove(pos);
-                out.push(m);
-            }
-            continue;
-        }
-        close(&mut out, &mut open);
-        if m.role == PRole::Assistant {
-            open = m.tool_calls.iter().map(|c| c.id.clone()).collect();
-        }
-        out.push(m);
-    }
-    close(&mut out, &mut open);
-    out
-}
-
-/// A rough 4 chars per token, plus a little per message for the framing.
-pub fn estimate_tokens(msgs: &[ChatMessage]) -> usize {
-    msgs.iter()
-        .map(|m| {
-            let calls: usize = m
-                .tool_calls
-                .iter()
-                .map(|c| c.name.len() + c.arguments.len())
-                .sum();
-            (m.content.len() + calls) / 4 + 4
-        })
-        .sum()
-}
-
-/// Shrinks the history to `budget` tokens: oldest tool results lose their
-/// body first, then whole oldest turns go. The system prompt (index 0) and
-/// everything from the latest user message on are always kept.
-pub fn fit_context(msgs: &mut Vec<ChatMessage>, budget: usize) {
-    for i in 0..msgs.len() {
-        if estimate_tokens(msgs) <= budget {
-            return;
-        }
-        if msgs[i].role == PRole::Tool && msgs[i].content != DROPPED {
-            msgs[i].content = DROPPED.into();
-        }
-    }
-    let mut last_user = msgs
-        .iter()
-        .rposition(|m| m.role == PRole::User)
-        .unwrap_or(0);
-    while estimate_tokens(msgs) > budget {
-        let Some(start) = msgs.iter().position(|m| m.role != PRole::System) else {
-            return;
-        };
-        if start >= last_user {
-            return;
-        }
-        // A turn runs to the next user message, so a tool call never loses
-        // its result to the cut.
-        let end = msgs[start + 1..]
-            .iter()
-            .position(|m| m.role == PRole::User)
-            .map(|p| start + 1 + p)
-            .unwrap_or(msgs.len())
-            .min(last_user);
-        msgs.drain(start..end);
-        last_user -= end - start;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn call(id: &str) -> ToolCall {
-        ToolCall {
-            id: id.into(),
-            name: "t".into(),
-            arguments: "{}".into(),
-        }
-    }
-
-    #[test]
-    fn pairing_fills_missing_results_and_drops_orphans() {
-        let msgs = pair(vec![
-            ChatMessage::tool("orphan", "x"),
-            ChatMessage::user("u"),
-            ChatMessage::assistant("", vec![call("a"), call("b")]),
-            ChatMessage::tool("a", "ra"),
-            ChatMessage::user("u2"),
-        ]);
-        let roles: Vec<_> = msgs
-            .iter()
-            .map(|m| (m.role, m.tool_call_id.clone()))
-            .collect();
-        assert_eq!(
-            roles,
-            vec![
-                (PRole::User, None),
-                (PRole::Assistant, None),
-                (PRole::Tool, Some("a".into())),
-                (PRole::Tool, Some("b".into())),
-                (PRole::User, None),
-            ]
-        );
-        assert_eq!(msgs[3].content, INTERRUPTED);
-    }
-
-    #[test]
-    fn context_drops_tool_bodies_first_then_old_turns_but_keeps_the_prompt() {
-        let big = "x".repeat(4000);
-        let mut msgs = vec![
-            ChatMessage::system("sys"),
-            ChatMessage::user("velho"),
-            ChatMessage::assistant("", vec![call("a")]),
-            ChatMessage::tool("a", big.clone()),
-            ChatMessage::assistant(big.clone(), vec![]),
-            ChatMessage::user("atual"),
-        ];
-        let mut one = msgs.clone();
-        fit_context(&mut one, 1100);
-        assert_eq!(one[3].content, DROPPED);
-        assert_eq!(one.len(), 6, "a tool body alone was enough");
-
-        fit_context(&mut msgs, 50);
-        assert_eq!(msgs.len(), 2);
-        assert_eq!(msgs[0].content, "sys");
-        assert_eq!(msgs[1].content, "atual");
-    }
 }

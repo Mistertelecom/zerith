@@ -14,12 +14,25 @@
 //! The tool loop is in [`agent`]; the plain turn is that loop with tools off.
 
 pub mod agent;
+pub mod compact;
+pub mod events;
+pub mod guards;
+pub mod pipeline;
 pub mod plan;
+pub mod question;
+pub mod spill;
+pub mod subagent;
+mod tasks;
 
 pub use agent::{
-    approval_channel, run_agent_turn, AgentOptions, Approval, ApprovalGate, ApprovalSender,
-    DEFAULT_MAX_STEPS,
+    approval_channel, inbox_channel, run_agent_turn, AgentOptions, Approval, ApprovalGate,
+    ApprovalSender, InboxReceiver, InboxSender, DEFAULT_MAX_PARALLEL_TOOLS, DEFAULT_MAX_STEPS,
 };
+pub use compact::{compact_now, CompactReport, Summarizer};
+pub use events::{cancel_with, CancelCause, CauseSlot};
+pub use pipeline::{Flow, Middleware, NoopMiddleware, ToolInvocation, ToolOutcome};
+pub use question::{question_channel, QuestionGate, QuestionSender};
+pub use subagent::{Gate, SubagentOptions};
 
 use std::sync::mpsc;
 use zerith_memory::{MemoryBackend, Scope};
@@ -73,6 +86,29 @@ pub enum RunEvent {
     Usage {
         input: u64,
         output: u64,
+    },
+    /// The history was summarized to fit the context window (token estimates).
+    Compacted {
+        before: usize,
+        after: usize,
+    },
+    /// The session's task list changed; `items` is the whole live list (the
+    /// UI replaces its checklist, it does not merge).
+    Tasks {
+        items: Vec<zerith_sessions::Todo>,
+    },
+    /// A subagent started, finished or failed. `state` is `running`, `done`,
+    /// `failed` or `cancelled`; `summary` is one line (the task, or the result).
+    Subagent {
+        id: String,
+        name: String,
+        state: String,
+        summary: String,
+    },
+    /// The turn is blocked until `QuestionSender::answer(id, ..)` is called.
+    Question {
+        id: u64,
+        questions: Vec<zerith_tools::Question>,
     },
 }
 
@@ -227,9 +263,15 @@ pub fn run_turn_in(
 
 /// The system prompt: identity, then recalled facts, then skills. Facts land
 /// *after* the static part so the provider's prefix cache stays warm.
+///
+/// `skill_tool` says whether the model has the `skill` tool this turn. With it
+/// the prompt lists skills by name and description and the model loads a body
+/// on demand; without it (a plain turn) a skill named in the request is
+/// inlined, the only way a tool-less turn can use one.
 pub(crate) fn system_prompt(
     title: &str,
     ctx: TurnContext<'_>,
+    skill_tool: bool,
     session_id: &str,
     prompt: &str,
 ) -> String {
@@ -261,7 +303,11 @@ pub(crate) fn system_prompt(
         }
     }
     if let Some(lib) = ctx.skills {
-        let block = skills_block(lib, prompt, SKILLS_BUDGET_CHARS);
+        let block = if skill_tool {
+            skills_index(lib, SKILLS_BUDGET_CHARS)
+        } else {
+            skills_block(lib, prompt, SKILLS_BUDGET_CHARS)
+        };
         if !block.is_empty() {
             prompt_text.push_str("\n\n");
             prompt_text.push_str(&block);
@@ -410,6 +456,62 @@ mod tests {
         let block = recall_block(&mem, &Scope::user("t"), "x");
         assert!(block.len() <= MEMORY_BUDGET_CHARS + 128, "{}", block.len());
     }
+}
+
+/// What to tell the model about the working-method tools it was given. Only
+/// the tools present are mentioned; static text, so the prompt cache stays warm.
+pub(crate) fn tool_guidance(tools: &zerith_tools::Registry) -> String {
+    let has = |n: &str| tools.get(n).is_some();
+    let mut out = String::new();
+    if has("task_create") {
+        out.push_str(
+            "\n\n# Lista de tarefas\nEm trabalho com vários passos, crie as tarefas com `task_create` antes de começar e atualize-as com `task_update` conforme avança. Mantenha exatamente uma tarefa `in_progress` por vez; marque `completed` assim que terminar, sem acumular.",
+        );
+    }
+    if has("agent") {
+        out.push_str(
+            "\n\n# Subagentes\nUse `agent` para explorar o código ou pesquisar sem encher o seu contexto: só a resposta final volta. Para trabalho independente, chame vários `agent` na mesma mensagem. O prompt precisa bastar sozinho.",
+        );
+    }
+    if has("ask_user") {
+        out.push_str(
+            "\n\n# Perguntas\nSe falta uma decisão que só o usuário pode tomar, use `ask_user` em vez de adivinhar.",
+        );
+    }
+    if has("edit_file") {
+        out.push_str(
+            "\n\n# Edição\nLeia um arquivo com `read_file` antes de alterá-lo com `edit_file` ou `write_file`.",
+        );
+    }
+    out
+}
+
+/// The skills index for a turn with the `skill` tool: name and description of
+/// each enabled skill, capped at `budget`, and how to load one. Bodies are never
+/// inlined; that is what the tool is for.
+pub fn skills_index(lib: &zerith_skills::Library, budget: usize) -> String {
+    let Ok(catalog) = lib.catalog() else {
+        return String::new();
+    };
+    if catalog.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "# Skills disponíveis\nPara usar uma, chame a ferramenta `skill` com o nome e siga as instruções que ela devolver.",
+    );
+    let mut cut = 0;
+    for (name, description) in &catalog {
+        let line = format!("\n- {name}: {description}");
+        if out.len() + line.len() > budget {
+            cut = catalog.len() - out.matches("\n- ").count();
+            break;
+        }
+        out.push_str(&line);
+    }
+    if cut > 0 {
+        out.push_str(&format!("\n[+{cut} skills omitidas pelo limite do prompt]"));
+    }
+    out
 }
 
 /// The skills section of the system prompt.

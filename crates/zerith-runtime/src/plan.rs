@@ -1,4 +1,10 @@
-//! Plan mode and subagents: many turns, bounded concurrency, durable state.
+//! Plan mode: many subagent runs, bounded concurrency, durable state.
+//!
+//! A task runs as a subagent (`crate::subagent::run_child`): its own session
+//! (source `subagent`, linked to the plan id), the agent's tool allowlist, a
+//! step budget and a wall-clock budget, and a permit on the process-wide
+//! subagent gate. `after:` dependencies decide *when* a task may start; the
+//! machinery below decides *how* it runs.
 //!
 //! The coordinator claims tasks; workers run them. Both go through the same
 //! `Store` schema, so a crash mid-plan leaves rows a resume can read. The
@@ -16,12 +22,12 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use zerith_memory::{MemoryBackend, Scope};
-use zerith_providers::{Cancel, Client};
+use zerith_memory::Scope;
+use zerith_providers::Cancel;
 use zerith_sessions::plan::{NewTask, Task, TaskState};
-use zerith_sessions::{SessionSource, Store};
+use zerith_sessions::Store;
 
-use crate::RunError;
+use crate::subagent;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PlanError {
@@ -50,8 +56,8 @@ pub struct PlanReport {
 /// Limits for one task. `None` means unlimited.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TaskBudget {
-    /// How many model steps a task may take. Today a task is one turn, so this
-    /// only bites at 0; it is here so a multi-step loop has a place to check.
+    /// How many model steps a task's subagent may take (`None`: the subagent
+    /// default). Reaching it without an answer fails the task.
     pub max_steps: Option<u32>,
     /// Wall-clock limit. Enforced by pulling the task's cancel token, so a
     /// streaming turn stops at its next network read.
@@ -243,11 +249,11 @@ pub fn run_plan_opts(
     let model = model.to_string();
     let runner = move |task: &Task, ctx: &TaskCtx| {
         ctx.step()?;
-        run_one(&db_buf, &model, scope.as_ref(), task, &ctx.cancel).map_err(|e| {
+        run_one(&db_buf, &model, scope.as_ref(), task, ctx).map_err(|e| {
             if ctx.timed_out() {
                 "tempo esgotado".to_string()
             } else {
-                e.to_string()
+                e
             }
         })
     };
@@ -453,40 +459,53 @@ fn run_one(
     model: &str,
     scope: Option<&Scope>,
     task: &Task,
-    cancel: &Cancel,
-) -> std::result::Result<TaskOutcome, RunError> {
-    // One connection per task: SQLite connections do not cross threads.
-    let store = Store::open(db)?;
-    let session = store.create_session(&task.title, SessionSource::Native)?;
-    let client = Client::new(zerith_providers::ProviderConfig::from_env())?;
-    let memory = zerith_memory::SqliteMemory::open(db).ok();
-    // The task's agent: its instructions join the prompt and its preferred
-    // model wins over the plan's. An unknown name runs as the default agent.
+    ctx: &TaskCtx,
+) -> std::result::Result<TaskOutcome, String> {
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    let policy = zerith_security::Policy::from_env(&cwd)?;
+    // An unknown agent name runs as the default agent, as it always did.
+    let resolved = subagent::resolve_agent(&cwd, Some(&task.agent))
+        .or_else(|_| subagent::resolve_agent(&cwd, None))?;
+    let registry = subagent::child_registry(&zerith_tools::Registry::new(), &resolved, 1);
     let paths = zerith_core::Paths::resolve();
-    let cwd = std::env::current_dir().ok();
-    let agent = zerith_core::agents::find(&paths, cwd.as_deref(), &task.agent);
-    let model = agent
-        .as_ref()
-        .and_then(|a| a.model.as_deref())
-        .unwrap_or(model);
-    let r = crate::run_turn_in(
-        &store,
-        &client,
-        crate::TurnContext {
-            memory: memory.as_ref().map(|m| m as &dyn MemoryBackend),
-            scope,
-            agent: agent.as_ref(),
-            ..crate::TurnContext::default()
-        },
-        &session.id,
+    let model = resolved
+        .def
+        .model
+        .clone()
+        .unwrap_or_else(|| model.to_string());
+    let steps = ctx
+        .budget
+        .max_steps
+        .map(|n| n as usize)
+        .or(resolved.def.max_turns.map(|n| n as usize))
+        .unwrap_or(subagent::DEFAULT_CHILD_STEPS);
+    let gate = subagent::Gate::global();
+    let limit = crate::active_profile().limits().max_subagents;
+    let deadline = ctx.budget.max_time.map(|t| Instant::now() + t);
+    let _permit = gate.acquire(limit, &ctx.cancel, deadline)?;
+    let out = subagent::run_child(subagent::ChildSpec {
+        db: db.to_path_buf(),
+        cfg: zerith_providers::ProviderConfig::from_env(),
+        policy,
+        registry,
+        parent: task.plan_id.clone(),
+        title: task.title.clone(),
+        prompt: task.prompt.clone(),
         model,
-        &task.prompt,
-        cancel,
-        |_| {},
-    )?;
+        def: Some(resolved.def),
+        skills_root: Some(paths.skills()),
+        scope: scope.cloned(),
+        max_steps: steps,
+        depth: 1,
+        gate: Some(gate.clone()),
+        cancel: ctx.cancel.clone(),
+        deadline,
+        sink: None,
+    })
+    .map_err(|e| e.to_string())?;
     Ok(TaskOutcome {
-        text: r.text,
-        session_id: Some(r.session_id),
+        text: out.text,
+        session_id: Some(out.session_id),
     })
 }
 

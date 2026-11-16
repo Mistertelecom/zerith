@@ -353,7 +353,7 @@ fn a_denied_write_does_not_touch_the_disk_and_tells_the_model() {
 fn without_an_approval_gate_ask_fails_closed() {
     let dir = workspace();
     let fake = serve(vec![
-        calls(&[("s", "shell", json!({"command": "echo hi"}))]),
+        calls(&[("s", "shell", json!({"command": "rm -rf alvo"}))]),
         text("ok"),
     ]);
     let store = Store::open_in_memory().unwrap();

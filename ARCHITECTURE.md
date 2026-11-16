@@ -18,41 +18,81 @@ zerith-ui  ── Rune (git, rev bc05f817) + os mesmos crates de núcleo
 
 | Crate | Responsabilidade |
 | --- | --- |
-| `zerith-core` | Identidade, `Paths`, prompt de sistema, configuração em camadas (`settings`), instruções de projeto (`instructions`), segredos no cofre do SO (`secrets`), runner de hooks (`hooks`) |
-| `zerith-sessions` | Schema, migrações, sessões, mensagens, planos |
+| `zerith-core` | Identidade, `Paths`, prompt de sistema, configuração em camadas (`settings`, incluindo `[[accounts]]`, `[routing]`, `[token_saver]`), instruções de projeto (`instructions`), agentes em Markdown (`agents`), segredos no cofre do SO (`secrets`), runner de hooks (`hooks`) |
+| `zerith-sessions` | Schema, migrações (até `V7` com `usage_records` e `account_cooldowns`), sessões, mensagens, planos, checkpoints e estatísticas de cota/economia |
 | `zerith-memory` | `MemoryBackend`, `SqliteMemory`, extração explícita |
-| `zerith-providers` | Clientes OpenAI-compatible e Anthropic, SSE, `Cancel` |
-| `zerith-runtime` | Um turno: histórico → prompt → provider → mensagem gravada; planos |
-| `zerith-tools` | Registry de ferramentas com permissão, timeout e política |
-| `zerith-security` | Presets de sandbox, `Verdict`, redação de segredos |
+| `zerith-providers` | Clientes OpenAI-compatible e Anthropic, presets nativos (`ProviderKind::PRESETS`), `ModelSpec`, SSE, `Cancel` e `Gateway` multi-conta com failover antes do primeiro token |
+| `zerith-runtime` | Um turno: histórico → gateway nativo → Token Saver (`ponytail`, `caveman`, `rtk`) → provider → ferramentas → mensagem gravada e contabilizada; delegação multi-modelo de subagentes, planos, compactação, hooks e checkpoints |
+| `zerith-tools` | Registry de ferramentas com permissão, timeout, política e `Host` (`before_write`) |
+| `zerith-security` | Presets de sandbox, modos, regras (`allow`/`ask`/`deny`), `Verdict`, redação de segredos |
 | `zerith-skills` | Formato Agent Skills, catálogo, instalação com rollback |
-| `zerith-mcp` | Cliente MCP (JSON-RPC 2.0 sobre stdio) |
-| `zerith-plugins` | Manifestos, ativação, revisão explícita |
-| `zerith-importers` | Import read-only do Hermes |
+| `zerith-mcp` | Cliente MCP (JSON-RPC 2.0 sobre stdio e Streamable HTTP) e registro no laço |
+| `zerith-plugins` | Manifestos, ativação, revisão explícita e contribuições de pacote (`skills`, `agents`, `hooks`, `mcp`) |
+| `zerith-importers` | Import read-only do Hermes (SQLite e JSONL), pré-visualização e retomada incremental por mensagem |
 | `zerith-cli` | Binário `zerith` |
 | `zerith-ui` | Janela nativa em Rune |
 
 ## Fluxo de um turno
 
-1. O host (CLI ou janela) resolve provider e modelo (env, depois
-   `settings.toml`, depois chave no cofre do SO).
-2. `zerith-runtime` grava a mensagem do usuário, monta o prompt fixo
-   (`zerith_core::system_prompt`), anexa memória e skills **depois** dele
-   (preserva o prefix cache do provider) e replays até `HISTORY_LIMIT`
-   mensagens.
-3. O provider faz streaming; deltas vão ao host por `RunEvent`.
-4. A resposta inteira é gravada; nada parcial é persistido.
+1. O host (CLI `-p`/`chat` ou janela `zerith-ui`) resolve provider/contas e
+   modelo (`--model`, `ZERITH_MODEL`, `[routing] main_model`, `model`,
+   `[[accounts]]`), carrega as contribuições de plugins habilitados e
+   revisados (`skills`, `agents`, `hooks`, `mcp`) e conecta o `McpRegistry`.
+2. `zerith-runtime` dispara `SessionStart` (na 1ª mensagem da sessão) e
+   `UserPromptSubmit` (que pode bloquear ou injetar contexto), abre o
+   checkpoint do turno (`Checkpoint::begin` ligado a `write_file`/`edit_file`
+   via `Host::on_before_write`), grava a mensagem do usuário, monta o prompt
+   fixo (`zerith_core::system_prompt_with_instructions`), anexa instruções do
+   agente, instruções do Token Saver (`Ponytail` + `Caveman`), memória e
+   skills **depois** dele (preservando o prefix cache do provider) e reenvia
+   até `Profile::limits().history_window` mensagens.
+3. O gateway nativo (`resolve_gateway` / `zerith-providers::Gateway`) filtra
+   contas em cooldown (`account_cooldowns`) ou com cota esgotada
+   (`usage_records`), seleciona a conta elegível por prioridade (ou modelo
+   delegado de subagente via `RoutingSettings::resolve_subagent_model`) e faz
+   streaming com failover automático em falhas antes do primeiro token; deltas
+   vão ao host por `RunEvent` (incluindo `RunEvent::Route` e
+   `RunEvent::TokenSaved`). Saídas grandes ou verbosas de ferramentas passam
+   pelo filtro determinístico `RTK` (`tokensaver.rs`) antes de voltar ao modelo.
+   Chamadas de ferramenta passam pelo pipeline e pelo middleware `Guards`
+   (regras de permissão, `PreToolUse`, `PermissionRequest`, aprovação
+   interativa via `ApprovalGate`, `PostToolUse`/`PostToolUseFailure`), com
+   `PreCompact` antes da compactação por pressão de contexto e `Stop` ao
+   encerrar sem chamadas de ferramenta.
+4. Ao final de cada chamada de modelo, o consumo e os tokens economizados por
+   protocolo (`saved_rtk_tokens`, `saved_ponytail_tokens`,
+   `saved_caveman_tokens`) são persistidos em `usage_records`; a resposta
+   inteira é gravada; nada parcial é persistido. Nos hosts CLI (`headless` e
+   `chat`), `SessionEnd` roda ao encerrar.
+
+## Interface desktop (`zerith-ui`)
+
+A janela em Rune renderiza o transcript com números de linha reais (1-based) no
+diff inline, resumo de arquivos e linhas alteradas no turno junto ao botão
+**Rebobinar**, preview em andamento de ferramentas em execução, comandos
+`/rewind` e `/mode` no composer, borda semântica de modo no composer (`Plano`
+e `Livre` destacados), rota ativa e pill de tokens economizados no chat,
+painel **Provedores & Gateway Local** (presets nativos, múltiplas contas,
+delegação `[routing]` e painel **Quota & Uso (24h)**), seção **Token Saver**
+em **Configurações** com detalhamento por protocolo e painel visual
+**Importar Hermes** na tela **Histórico**.
 
 ## Configuração
 
 Ver [docs/settings.md](docs/settings.md). Camadas: padrão < usuário <
 projeto < projeto-local < env.
 
-## O que existe só como biblioteca (planejado no runtime)
+## Limites e lacunas em aberto
 
-- `zerith_core::hooks::run_hooks` — o runtime ainda **não** chama hooks.
-- `Settings::permissions` (`allow`/`ask`/`deny`) — `zerith-tools` ainda usa
-  só o preset de `zerith-security`; as regras ainda não são aplicadas.
-- `system_prompt_with_instructions` — o runtime ainda usa `system_prompt`.
-- `Profile::limits()` — os números existem; `run_plan` e o histórico ainda
-  usam constantes próprias.
+- **Confirmação de hooks de projeto:** hooks de camada de projeto já rodam
+  durante o ciclo do turno com os privilégios do usuário; confirmação explícita
+  antes de executá-los permanece planejada ([docs/hooks.md](docs/hooks.md)).
+- **`Profile::limits().cache_entries`:** o valor é definido por perfil, mas
+  nenhum cache em memória o lê ainda (`history_window` e `max_subagents` já
+  são aplicados pelo runtime e pelo `plan run`).
+- **Sandbox e `shell`:** a política é checada no processo; não há jaula de SO
+  completa em todas as plataformas ([docs/sandbox.md](docs/sandbox.md)), e
+  edições feitas por `shell` ficam fora do rastreamento de checkpoints.
+- **`tools call` e `policy` no CLI:** esses subcomandos avulsos ainda usam
+  `Policy::from_env` (os fluxos de agente `-p`, `chat` e `zerith-ui` usam
+  `Policy::from_settings` + `Guards`).

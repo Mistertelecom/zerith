@@ -549,11 +549,7 @@ fn shell_runs_jailed_and_a_timeout_kills_the_tree() {
     let dir = tempfile::Builder::new()
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
         .unwrap();
-    let policy = Policy::new(
-        &PRESETS[2],
-        zerith_security::Mode::Bypass,
-        dir.path(),
-    );
+    let policy = Policy::new(&PRESETS[2], zerith_security::Mode::Bypass, dir.path());
     let reg = zerith_tools::Registry::new();
     let ctx = zerith_tools::CallCtx {
         workspace: dir.path(),

@@ -144,3 +144,73 @@ fn bundle_paths_cannot_escape_or_point_at_nothing() {
     }
     assert!(lib.plugins().unwrap().is_empty());
 }
+
+#[test]
+fn contributions_helpers_expose_skills_agents_and_hooks() {
+    let t = tempfile::Builder::new().tempdir_in(scratch()).unwrap();
+    let lib = Library::open(&t.path().join("plugins")).unwrap();
+    let src = plugin_dir(
+        t.path(),
+        "helper-pack",
+        r#"{"name":"helper-pack","version":"1.0.0",
+            "skills":["skills/review"],
+            "agents":["agents/rev.md"],
+            "hooks":[
+                {"event":"SessionStart","command":"echo start"},
+                {"event":"UserPromptSubmit","command":"echo prompt"},
+                {"event":"PreToolUse","matcher":"shell","command":"echo pre","timeout_ms":1500},
+                {"event":"PostToolUse","command":"echo post"},
+                {"event":"PostToolUseFailure","command":"echo fail"},
+                {"event":"PermissionRequest","command":"echo perm"},
+                {"event":"Stop","command":"echo stop"},
+                {"event":"PreCompact","command":"echo compact"},
+                {"event":"SessionEnd","command":"echo end"},
+                {"event":"UnknownEvent","command":"echo ignored"}
+            ]}"#,
+    );
+    std::fs::create_dir_all(src.join("skills/review")).unwrap();
+    std::fs::write(
+        src.join("skills/review/SKILL.md"),
+        "---\nname: review\ndescription: review skill\n---\n\nbody\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(src.join("agents")).unwrap();
+    std::fs::write(
+        src.join("agents/rev.md"),
+        "---\ndescription: revisa\n---\nrevisa codigo\n",
+    )
+    .unwrap();
+
+    lib.install(&src).unwrap();
+    lib.set_status("helper-pack", Status::Enabled).unwrap();
+    lib.trust("helper-pack").unwrap();
+
+    let c = lib.contributions().unwrap();
+    let skill_dirs = c.skill_dirs();
+    assert_eq!(skill_dirs.len(), 1);
+    assert!(skill_dirs[0].join("SKILL.md").exists());
+
+    let agents = c.agent_defs();
+    assert_eq!(agents.len(), 1);
+    assert_eq!(agents[0].name, "rev");
+    assert_eq!(agents[0].layer, "plugin");
+    assert_eq!(agents[0].instructions, "revisa codigo");
+
+    let mut settings = zerith_core::Settings::default();
+    c.apply_hooks(&mut settings);
+    assert_eq!(settings.hooks.session_start.len(), 1);
+    assert_eq!(settings.hooks.user_prompt_submit.len(), 1);
+    assert_eq!(settings.hooks.pre_tool_use.len(), 1);
+    assert_eq!(
+        settings.hooks.pre_tool_use[0].matcher.as_deref(),
+        Some("shell")
+    );
+    assert_eq!(settings.hooks.pre_tool_use[0].timeout_ms, 1500);
+    assert_eq!(settings.hooks.post_tool_use.len(), 1);
+    assert_eq!(settings.hooks.post_tool_use_failure.len(), 1);
+    assert_eq!(settings.hooks.permission_request.len(), 1);
+    assert_eq!(settings.hooks.stop.len(), 1);
+    assert_eq!(settings.hooks.stop[0].timeout_ms, 60_000);
+    assert_eq!(settings.hooks.pre_compact.len(), 1);
+    assert_eq!(settings.hooks.session_end.len(), 1);
+}

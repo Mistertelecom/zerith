@@ -191,8 +191,32 @@ pub fn apply(s: &mut Shell, event: RunEvent) {
             );
         }
         RunEvent::Compacted { .. } => apply_work(s, WorkEvent::Compaction { running: false }),
+        RunEvent::Route {
+            account_id, model, ..
+        } => {
+            c.active_route = Some((account_id, model));
+        }
+        RunEvent::TokenSaved {
+            before_bytes,
+            after_bytes,
+            ..
+        } => {
+            c.saved_tokens += ((before_bytes.saturating_sub(after_bytes)) / 4) as u64;
+        }
         #[allow(unreachable_patterns)]
         _ => {}
+    }
+}
+
+/// Applies final usage, token savings, and active route from a completed [`TurnReport`].
+pub fn apply_report(s: &mut Shell, r: &zerith_runtime::TurnReport) {
+    let usage = (r.prompt_tokens, r.completion_tokens);
+    s.chat.usage = (usage != (0, 0)).then_some(usage);
+    if r.saved_tokens > 0 {
+        s.chat.saved_tokens = r.saved_tokens;
+    }
+    if let (Some(acc), Some(model)) = (&r.account_id, &r.model_used) {
+        s.chat.active_route = Some((acc.clone(), model.clone()));
     }
 }
 

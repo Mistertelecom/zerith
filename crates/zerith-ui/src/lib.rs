@@ -189,9 +189,23 @@ impl Shell {
         let root = db.parent().map(Path::to_path_buf).unwrap_or_default();
         let prefs = wire::load_prefs(&root);
         let providers = wire::configured_providers(&root);
-        let model = providers
-            .first()
-            .and_then(|p| p.default_model.clone())
+        let accounts = wire::configured_accounts(&root);
+        let routing = wire::load_routing(&root);
+        let token_saver = wire::load_token_saver(&root);
+        let env_model = std::env::var("ZERITH_MODEL")
+            .ok()
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty());
+        let model = env_model
+            .or_else(|| {
+                routing
+                    .main_model
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            })
+            .or_else(|| providers.first().and_then(|p| p.default_model.clone()))
             .unwrap_or_default();
         let mut shell = Self {
             screen: Screen::Chat,
@@ -201,8 +215,8 @@ impl Shell {
             history: HistoryState::default(),
             memory: MemoryState::new(wire::memory_paused(&db)),
             skills: SkillsState::default(),
-            providers: ProvidersState::new(providers),
-            settings: SettingsState::new(prefs.profile),
+            providers: ProvidersState::with_gateway(providers, accounts, routing),
+            settings: SettingsState::new(prefs.profile, token_saver),
             agents: AgentsState::default(),
             plan_tasks: Vec::new(),
             theme: prefs.theme,
@@ -315,7 +329,13 @@ impl Shell {
             Screen::Memory if self.memory.facts.is_idle() => self.load_facts(),
             Screen::Skills if self.skills.installed.is_idle() => self.load_skills(),
             Screen::Agents if self.agents.list.is_idle() => self.load_agents(),
-            Screen::Settings if self.settings.storage.is_idle() => self.load_storage(),
+            Screen::Providers => screens::providers::load_usage(self),
+            Screen::Settings => {
+                if self.settings.storage.is_idle() {
+                    self.load_storage();
+                }
+                screens::settings::load_usage(self);
+            }
             _ => {}
         }
     }

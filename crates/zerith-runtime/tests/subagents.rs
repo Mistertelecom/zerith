@@ -1123,3 +1123,173 @@ fn plan_step_budget_fails_a_task_that_never_answers() {
     let err = r.tasks[0].error.clone().unwrap();
     assert!(err.contains("limite de 2 passos"), "{err}");
 }
+
+// ---- multi-model delegation ------------------------------------------------
+
+fn anthropic_tool_sse(id: &str, name: &str, input: &Value) -> Reply {
+    let events = [
+        json!({"type":"message_start","message":{"usage":{"input_tokens":12}}}),
+        json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":id,"name":name,"input":{}}}),
+        json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":input.to_string()}}),
+        json!({"type":"content_block_stop","index":0}),
+        json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":8}}),
+        json!({"type":"message_stop"}),
+    ];
+    let mut s = String::from(HEAD);
+    for e in events {
+        s.push_str(&format!(
+            "event: {}\ndata: {e}\n\n",
+            e["type"].as_str().unwrap()
+        ));
+    }
+    Reply::Whole(s)
+}
+
+fn anthropic_text_sse(txt: &str) -> Reply {
+    let events = [
+        json!({"type":"message_start","message":{"usage":{"input_tokens":20}}}),
+        json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+        json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":txt}}),
+        json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":4}}),
+        json!({"type":"message_stop"}),
+    ];
+    let mut s = String::from(HEAD);
+    for e in events {
+        s.push_str(&format!(
+            "event: {}\ndata: {e}\n\n",
+            e["type"].as_str().unwrap()
+        ));
+    }
+    Reply::Whole(s)
+}
+
+#[test]
+fn multi_model_delegation_routes_subagent_to_deepseek_and_tracks_roles() {
+    static KEY_ONCE: Once = Once::new();
+    KEY_ONCE.call_once(|| {
+        std::env::set_var("ZERITH_API_KEY", "k");
+    });
+
+    let seen_a: Arc<Mutex<Vec<Value>>> = Default::default();
+    let seen_b: Arc<Mutex<Vec<Value>>> = Default::default();
+
+    let sa = seen_a.clone();
+    let url_a = serve(move |b| {
+        sa.lock().unwrap().push(b.clone());
+        let has_tool_result = b["messages"].as_array().is_some_and(|ms| {
+            ms.iter().any(|m| {
+                m["content"]
+                    .as_array()
+                    .is_some_and(|arr| arr.iter().any(|blk| blk["type"] == "tool_result"))
+            })
+        });
+        if !has_tool_result {
+            anthropic_tool_sse(
+                "tu1",
+                "agent",
+                &json!({"description": "check", "prompt": "SUB-DEEPSEEK", "agent": "explore"}),
+            )
+        } else {
+            let reply = b["messages"]
+                .as_array()
+                .and_then(|ms| ms.last())
+                .and_then(|m| m["content"].as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|blk| blk["content"].as_str())
+                .unwrap_or("");
+            anthropic_text_sse(&format!("pai concluiu: {reply}"))
+        }
+    });
+
+    let sb = seen_b.clone();
+    let url_b = serve(move |b| {
+        sb.lock().unwrap().push(b.clone());
+        text("achado-deepseek")
+    });
+
+    let e = env(Mode::Default);
+    let reg = Registry::new();
+
+    let mut settings = zerith_core::Settings {
+        accounts: vec![
+            zerith_core::AccountEntry {
+                id: "acc-anth".into(),
+                provider: "anthropic".into(),
+                base_url: Some(url_a.clone()),
+                priority: 0,
+                enabled: true,
+                ..Default::default()
+            },
+            zerith_core::AccountEntry {
+                id: "acc-ds".into(),
+                provider: "deepseek".into(),
+                base_url: Some(url_b.clone()),
+                priority: 0,
+                enabled: true,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    settings.routing.subagent_model = Some("deepseek/deepseek-4.1-flash".into());
+
+    let mut parent_cfg = ProviderConfig::new(ProviderKind::Anthropic).with_key("k");
+    parent_cfg.base_url = url_a;
+    parent_cfg.timeout_ms = 10_000;
+    let parent_client = Client::new(parent_cfg).unwrap();
+
+    let report = run_agent_turn(
+        &e.store,
+        &parent_client,
+        TurnContext {
+            settings: Some(&settings),
+            ..TurnContext::default()
+        },
+        AgentOptions {
+            tools: Some(&reg),
+            policy: Some(&e.policy),
+            subagents: subs(2),
+            ..AgentOptions::default()
+        },
+        &e.sid,
+        "claude-opus-5-5",
+        "delegue",
+        &Cancel::default(),
+        |_| {},
+    )
+    .unwrap();
+
+    assert_eq!(report.text, "pai concluiu: achado-deepseek");
+    assert_eq!(report.account_id.as_deref(), Some("acc-anth"));
+    assert_eq!(report.model_used.as_deref(), Some("claude-opus-5-5"));
+
+    let sa = seen_a.lock().unwrap();
+    assert_eq!(sa.len(), 2);
+    assert!(sa.iter().all(|r| r["model"] == "claude-opus-5-5"));
+
+    let sb = seen_b.lock().unwrap();
+    assert_eq!(sb.len(), 1);
+    assert_eq!(sb[0]["model"], "deepseek-4.1-flash");
+
+    let summary = e.store.usage_summary(24).unwrap();
+    assert!(
+        summary.models.iter().any(|m| {
+            m.model == "claude-opus-5-5"
+                && m.provider == "anthropic"
+                && m.role_kind == "main"
+                && m.requests == 2
+        }),
+        "{:?}",
+        summary.models
+    );
+    assert!(
+        summary.models.iter().any(|m| {
+            m.model == "deepseek-4.1-flash"
+                && m.provider == "deepseek"
+                && m.role_kind == "subagent"
+                && m.requests == 1
+        }),
+        "{:?}",
+        summary.models
+    );
+}

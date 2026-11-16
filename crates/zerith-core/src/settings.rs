@@ -23,7 +23,8 @@ use toml::{Table, Value};
 #[serde(default)]
 pub struct Settings {
     /// Name of the provider to use; matches `providers[].name` or a built-in
-    /// kind (`9router`, `openai`, ...). Env: `ZERITH_PROVIDER`.
+    /// kind (`openai`, `anthropic`, `deepseek`, `gemini`, `openrouter`, `ollama`,
+    /// `lmstudio`). Env: `ZERITH_PROVIDER`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
     /// Endpoint override for the active provider. Env: `ZERITH_BASE_URL`.
@@ -36,11 +37,218 @@ pub struct Settings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
     pub providers: Vec<ProviderEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accounts: Vec<AccountEntry>,
+    #[serde(default)]
+    pub routing: RoutingSettings,
+    #[serde(default)]
+    pub token_saver: TokenSaverSettings,
     pub permissions: Permissions,
     pub hooks: Hooks,
     pub ui: Ui,
     pub profile: Profile,
     pub memory: MemorySettings,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_window_hours() -> u32 {
+    5
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AccountEntry {
+    pub id: String,
+    pub provider: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<WireProtocol>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
+    /// Name of the keyring entry holding the key. Never the key itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key_ref: Option<String>,
+    pub priority: i32,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quota_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quota_requests: Option<u64>,
+    #[serde(default = "default_window_hours")]
+    pub window_hours: u32,
+}
+
+impl Default for AccountEntry {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            provider: String::new(),
+            label: None,
+            protocol: None,
+            base_url: None,
+            default_model: None,
+            api_key_ref: None,
+            priority: 0,
+            enabled: true,
+            quota_tokens: None,
+            quota_requests: None,
+            window_hours: 5,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ComboEntry {
+    pub name: String,
+    #[serde(default)]
+    pub models: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RoutingSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub main_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subagent_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explore_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_model: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub role_models: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub combos: Vec<ComboEntry>,
+}
+
+fn non_empty(v: Option<&str>) -> Option<&str> {
+    v.map(str::trim).filter(|s| !s.is_empty())
+}
+
+impl RoutingSettings {
+    /// Resolves which model a subagent should use.
+    ///
+    /// Precedence: `explicit` -> `def_model` -> `role_models[agent_name]` ->
+    /// `explore_model` / `plan_model` -> `subagent_model` -> `parent_model`.
+    /// Empty or whitespace-only values are treated as absent.
+    pub fn resolve_subagent_model(
+        &self,
+        agent_name: &str,
+        explicit: Option<&str>,
+        def_model: Option<&str>,
+        parent_model: &str,
+    ) -> String {
+        let role_specific = match agent_name {
+            "explore" => self.explore_model.as_deref(),
+            "plan" => self.plan_model.as_deref(),
+            _ => None,
+        };
+        non_empty(explicit)
+            .or_else(|| non_empty(def_model))
+            .or_else(|| non_empty(self.role_models.get(agent_name).map(String::as_str)))
+            .or_else(|| non_empty(role_specific))
+            .or_else(|| non_empty(self.subagent_model.as_deref()))
+            .unwrap_or(parent_model)
+            .to_string()
+    }
+
+    /// The last combo with this name: a project can redefine a combo the user
+    /// layer declared.
+    pub fn combo(&self, name: &str) -> Option<&ComboEntry> {
+        self.combos.iter().rev().find(|c| c.name == name)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PonytailLevel {
+    #[default]
+    Off,
+    Lite,
+    Full,
+    Ultra,
+}
+
+impl PonytailLevel {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" => Some(Self::Off),
+            "lite" => Some(Self::Lite),
+            "full" => Some(Self::Full),
+            "ultra" => Some(Self::Ultra),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Lite => "lite",
+            Self::Full => "full",
+            Self::Ultra => "ultra",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CavemanLevel {
+    #[default]
+    Off,
+    Lite,
+    Full,
+    Ultra,
+    Wenyan,
+}
+
+impl CavemanLevel {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" => Some(Self::Off),
+            "lite" => Some(Self::Lite),
+            "full" => Some(Self::Full),
+            "ultra" => Some(Self::Ultra),
+            "wenyan" => Some(Self::Wenyan),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Lite => "lite",
+            Self::Full => "full",
+            Self::Ultra => "ultra",
+            Self::Wenyan => "wenyan",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TokenSaverSettings {
+    pub ponytail: PonytailLevel,
+    pub caveman: CavemanLevel,
+    #[serde(default = "default_true")]
+    pub rtk_enabled: bool,
+}
+
+impl Default for TokenSaverSettings {
+    fn default() -> Self {
+        Self {
+            ponytail: PonytailLevel::Off,
+            caveman: CavemanLevel::Off,
+            rtk_enabled: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -273,6 +481,9 @@ pub const ENV_KEYS: &[(&str, &str)] = &[
     ("ZERITH_SANDBOX", "permissions.mode"),
     ("ZERITH_MODE", "permissions.default_mode"),
     ("ZERITH_PROFILE", "profile"),
+    ("ZERITH_SUBAGENT_MODEL", "routing.subagent_model"),
+    ("ZERITH_PONYTAIL", "token_saver.ponytail"),
+    ("ZERITH_CAVEMAN", "token_saver.caveman"),
 ];
 
 /// Merged settings plus where each value came from and what was skipped.
@@ -393,6 +604,12 @@ impl Settings {
     /// provider the user layer declared.
     pub fn provider_entry(&self, name: &str) -> Option<&ProviderEntry> {
         self.providers.iter().rev().find(|p| p.name == name)
+    }
+
+    /// The last account entry with this id: a project can redefine an
+    /// account the user layer declared.
+    pub fn account(&self, id: &str) -> Option<&AccountEntry> {
+        self.accounts.iter().rev().find(|a| a.id == id)
     }
 
     /// Edits the user layer only and writes it back.
@@ -611,5 +828,283 @@ mod tests {
         assert!(rule_matches("shell(git *)", "shell", "git log"));
         assert!(!rule_matches("shell(git *)", "shell", "rm -rf /"));
         assert_eq!(Profile::Performance.limits().max_subagents, 8);
+    }
+
+    #[test]
+    fn accounts_routing_combos_and_token_saver_parse_and_merge() {
+        let dir = scratch();
+        let paths = Paths::with_root(dir.path().join("data"));
+        let project = dir.path().join("proj");
+
+        write(
+            &paths.settings(),
+            "\
+[[accounts]]
+id = \"openai-work\"
+provider = \"openai\"
+label = \"Work\"
+protocol = \"openai\"
+base_url = \"https://api.openai.com/v1\"
+default_model = \"gpt-4o\"
+api_key_ref = \"openai_work\"
+priority = 10
+quota_tokens = 100000
+quota_requests = 500
+
+[routing]
+main_model = \"gpt-4o\"
+subagent_model = \"gpt-4o-mini\"
+explore_model = \"haiku\"
+
+[routing.role_models]
+reviewer = \"sonnet\"
+
+[[routing.combos]]
+name = \"fast\"
+models = [\"gpt-4o-mini\", \"haiku\"]
+
+[token_saver]
+ponytail = \"lite\"
+caveman = \"full\"
+rtk_enabled = false
+",
+        );
+        write(
+            &project.join(".zerith/settings.toml"),
+            "\
+[[accounts]]
+id = \"anthropic-dev\"
+provider = \"anthropic\"
+enabled = false
+window_hours = 24
+
+[routing]
+plan_model = \"opus\"
+
+[routing.role_models]
+coder = \"sonnet-4\"
+
+[[routing.combos]]
+name = \"smart\"
+models = [\"opus\", \"gpt-4o\"]
+
+[token_saver]
+ponytail = \"ultra\"
+",
+        );
+        write(
+            &project.join(".zerith/settings.local.toml"),
+            "\
+[[accounts]]
+id = \"openai-work\"
+provider = \"openai\"
+priority = 20
+
+[[routing.combos]]
+name = \"fast\"
+models = [\"gemini-flash\"]
+",
+        );
+
+        let l = Settings::load_with_env(&paths, Some(&project), |_| None);
+        assert!(l.errors.is_empty(), "{:?}", l.errors);
+        let s = &l.settings;
+
+        assert_eq!(s.accounts.len(), 3);
+        let a0 = &s.accounts[0];
+        assert_eq!(a0.id, "openai-work");
+        assert_eq!(a0.provider, "openai");
+        assert_eq!(a0.label.as_deref(), Some("Work"));
+        assert_eq!(a0.protocol, Some(WireProtocol::OpenAi));
+        assert_eq!(a0.base_url.as_deref(), Some("https://api.openai.com/v1"));
+        assert_eq!(a0.default_model.as_deref(), Some("gpt-4o"));
+        assert_eq!(a0.api_key_ref.as_deref(), Some("openai_work"));
+        assert_eq!(a0.priority, 10);
+        assert!(a0.enabled);
+        assert_eq!(a0.quota_tokens, Some(100_000));
+        assert_eq!(a0.quota_requests, Some(500));
+        assert_eq!(a0.window_hours, 5);
+
+        let a1 = &s.accounts[1];
+        assert_eq!(a1.id, "anthropic-dev");
+        assert!(!a1.enabled);
+        assert_eq!(a1.window_hours, 24);
+        assert_eq!(a1.priority, 0);
+        assert_eq!(a1.label, None);
+
+        assert_eq!(s.account("openai-work").map(|a| a.priority), Some(20));
+        assert_eq!(s.account("anthropic-dev").map(|a| a.enabled), Some(false));
+        assert!(s.account("missing").is_none());
+
+        assert_eq!(s.routing.main_model.as_deref(), Some("gpt-4o"));
+        assert_eq!(s.routing.subagent_model.as_deref(), Some("gpt-4o-mini"));
+        assert_eq!(s.routing.explore_model.as_deref(), Some("haiku"));
+        assert_eq!(s.routing.plan_model.as_deref(), Some("opus"));
+        assert_eq!(
+            s.routing.role_models.get("reviewer").map(String::as_str),
+            Some("sonnet")
+        );
+        assert_eq!(
+            s.routing.role_models.get("coder").map(String::as_str),
+            Some("sonnet-4")
+        );
+        assert_eq!(s.routing.combos.len(), 3);
+        assert_eq!(
+            s.routing.combo("fast").unwrap().models,
+            vec!["gemini-flash"]
+        );
+        assert_eq!(
+            s.routing.combo("smart").unwrap().models,
+            vec!["opus", "gpt-4o"]
+        );
+        assert!(s.routing.combo("missing").is_none());
+
+        assert_eq!(s.token_saver.ponytail, PonytailLevel::Ultra);
+        assert_eq!(s.token_saver.caveman, CavemanLevel::Full);
+        assert!(!s.token_saver.rtk_enabled);
+
+        let defaults = TokenSaverSettings::default();
+        assert_eq!(defaults.ponytail, PonytailLevel::Off);
+        assert_eq!(defaults.caveman, CavemanLevel::Off);
+        assert!(defaults.rtk_enabled);
+
+        let entries = l.entries();
+        let src = |k: &str| entries.iter().find(|e| e.0 == k).map(|e| e.2.clone());
+        assert_eq!(src("accounts[0].id").as_deref(), Some("user"));
+        assert_eq!(src("accounts[1].id").as_deref(), Some("project"));
+        assert_eq!(src("accounts[2].id").as_deref(), Some("local"));
+        assert_eq!(src("routing.combos[0].name").as_deref(), Some("user"));
+        assert_eq!(src("routing.combos[1].name").as_deref(), Some("project"));
+        assert_eq!(src("routing.combos[2].name").as_deref(), Some("local"));
+        assert_eq!(src("token_saver.ponytail").as_deref(), Some("project"));
+        assert_eq!(src("token_saver.caveman").as_deref(), Some("user"));
+        assert_eq!(src("token_saver.rtk_enabled").as_deref(), Some("user"));
+    }
+
+    #[test]
+    fn routing_resolve_subagent_model_precedence() {
+        let mut r = RoutingSettings {
+            main_model: Some("main".into()),
+            subagent_model: Some("sub-default".into()),
+            explore_model: Some("explore-default".into()),
+            plan_model: Some("plan-default".into()),
+            role_models: BTreeMap::from([
+                ("explore".into(), "role-explore".into()),
+                ("custom".into(), "role-custom".into()),
+                ("empty-role".into(), "   ".into()),
+            ]),
+            combos: Vec::new(),
+        };
+
+        assert_eq!(
+            r.resolve_subagent_model("explore", Some("exp"), Some("def"), "parent"),
+            "exp"
+        );
+        assert_eq!(
+            r.resolve_subagent_model("explore", Some("  "), Some("def"), "parent"),
+            "def"
+        );
+        assert_eq!(
+            r.resolve_subagent_model("explore", Some(""), Some(""), "parent"),
+            "role-explore"
+        );
+        assert_eq!(
+            r.resolve_subagent_model("custom", None, None, "parent"),
+            "role-custom"
+        );
+
+        r.role_models.remove("explore");
+        assert_eq!(
+            r.resolve_subagent_model("explore", None, None, "parent"),
+            "explore-default"
+        );
+        assert_eq!(
+            r.resolve_subagent_model("plan", None, None, "parent"),
+            "plan-default"
+        );
+        assert_eq!(
+            r.resolve_subagent_model("other", None, None, "parent"),
+            "sub-default"
+        );
+        assert_eq!(
+            r.resolve_subagent_model("empty-role", None, None, "parent"),
+            "sub-default"
+        );
+
+        r.explore_model = Some("".into());
+        assert_eq!(
+            r.resolve_subagent_model("explore", None, None, "parent"),
+            "sub-default"
+        );
+
+        r.subagent_model = Some(" ".into());
+        assert_eq!(
+            r.resolve_subagent_model("other", None, None, "parent"),
+            "parent"
+        );
+
+        r.subagent_model = None;
+        assert_eq!(
+            r.resolve_subagent_model("other", None, None, "parent"),
+            "parent"
+        );
+    }
+
+    #[test]
+    fn env_vars_override_subagent_model_and_token_saver() {
+        let dir = scratch();
+        let paths = Paths::with_root(dir.path().join("data"));
+        write(
+            &paths.settings(),
+            "[routing]\nsubagent_model = \"from-file\"\n[token_saver]\nponytail = \"lite\"\ncaveman = \"lite\"\n",
+        );
+        let env = |k: &str| match k {
+            "ZERITH_SUBAGENT_MODEL" => Some("from-env".to_string()),
+            "ZERITH_PONYTAIL" => Some("ultra".to_string()),
+            "ZERITH_CAVEMAN" => Some("wenyan".to_string()),
+            _ => None,
+        };
+        let l = Settings::load_with_env(&paths, None, env);
+        assert!(l.errors.is_empty(), "{:?}", l.errors);
+        assert_eq!(
+            l.settings.routing.subagent_model.as_deref(),
+            Some("from-env")
+        );
+        assert_eq!(l.settings.token_saver.ponytail, PonytailLevel::Ultra);
+        assert_eq!(l.settings.token_saver.caveman, CavemanLevel::Wenyan);
+        assert!(l.settings.token_saver.rtk_enabled);
+
+        let entries = l.entries();
+        let src = |k: &str| entries.iter().find(|e| e.0 == k).map(|e| e.2.clone());
+        assert_eq!(src("routing.subagent_model").as_deref(), Some("env"));
+        assert_eq!(src("token_saver.ponytail").as_deref(), Some("env"));
+        assert_eq!(src("token_saver.caveman").as_deref(), Some("env"));
+        assert_eq!(src("token_saver.rtk_enabled").as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn token_saver_levels_round_trip() {
+        for level in [
+            PonytailLevel::Off,
+            PonytailLevel::Lite,
+            PonytailLevel::Full,
+            PonytailLevel::Ultra,
+        ] {
+            assert_eq!(PonytailLevel::parse(level.as_str()), Some(level));
+        }
+        assert_eq!(PonytailLevel::parse(" FULL "), Some(PonytailLevel::Full));
+        assert_eq!(PonytailLevel::parse("invalid"), None);
+
+        for level in [
+            CavemanLevel::Off,
+            CavemanLevel::Lite,
+            CavemanLevel::Full,
+            CavemanLevel::Ultra,
+            CavemanLevel::Wenyan,
+        ] {
+            assert_eq!(CavemanLevel::parse(level.as_str()), Some(level));
+        }
+        assert_eq!(CavemanLevel::parse(" WenYan "), Some(CavemanLevel::Wenyan));
+        assert_eq!(CavemanLevel::parse("invalid"), None);
     }
 }

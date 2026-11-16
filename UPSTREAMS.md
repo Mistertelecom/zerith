@@ -10,7 +10,7 @@ O Zerith é um projeto próprio. Os projetos abaixo foram estudados; a coluna
 | Claude Code | Proprietária | **Só conceitos** (hooks, camadas de settings, regras `Tool(pattern)`, modo `-p`). Nenhum código copiado | — |
 | DeepSeek Harness | MIT | Conceitos de arquitetura reimplementados em Rust. Nenhum código copiado | — |
 | Hermes Agent | MIT | Importador read-only do banco `~/.hermes/state.db` (schema lido, não código) | schema verificado na rev `4162ecf1` |
-| 9Router | MIT | Integração só por API HTTP OpenAI-compatible (`localhost:20128/v1`) | — |
+| 9Router | MIT | **Só conceitos** (gateway multi-conta por prioridade, combos, cooldown e failover). A dependência de runtime externa (`localhost:20128/v1`) foi removida e substituída pelo gateway nativo em Rust | — |
 | Agent Skills (spec) | Apache-2.0 | Formato `SKILL.md` adotado | — |
 
 ## Atualizar

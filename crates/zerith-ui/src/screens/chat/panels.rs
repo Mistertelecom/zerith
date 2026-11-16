@@ -288,6 +288,7 @@ pub fn plan_card(s: &Shell, a: &Approval, u: &Ui) -> El {
         ),
         u,
     )
+    .border(1.0, u.accent.alpha(0.35))
     .child(
         row()
             .w_full()

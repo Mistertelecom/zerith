@@ -9,14 +9,14 @@ use rusqlite::Connection;
 /// Highest version this build knows. Migrations are applied by version number,
 /// not by "everything above the maximum", so a gap (v6 present, v5 not yet) is
 /// filled in later instead of being skipped forever.
-pub const CURRENT_VERSION: i32 = 6;
+pub const CURRENT_VERSION: i32 = 7;
 
 /// Sequential migrations. Index 0 is version 1.
 const MIGRATIONS: &[&str] = &[V1, V2, V3, V4];
 
 /// Migrations with an explicit version, applied after the sequential ones.
-/// Task list owns v5, checkpoints v6.
-const VERSIONED: &[(i32, &str)] = &[(5, V5), (6, V6)];
+/// Task list owns v5, checkpoints v6, usage/cooldowns v7.
+const VERSIONED: &[(i32, &str)] = &[(5, V5), (6, V6), (7, V7)];
 
 const V5: &str = r#"
 -- The agent's own checklist (task_create / task_update / task_list), one list
@@ -52,6 +52,36 @@ CREATE TABLE checkpoints (
     created_at          INTEGER NOT NULL,
     rewound             INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (session_id, turn)
+);
+"#;
+
+const V7: &str = r#"
+-- Persistent usage tracking, Token Saver savings, and per-account cooldowns.
+CREATE TABLE usage_records (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id        TEXT REFERENCES sessions(id) ON DELETE SET NULL,
+    account_id        TEXT NOT NULL,
+    provider          TEXT NOT NULL,
+    model             TEXT NOT NULL,
+    role_kind         TEXT NOT NULL DEFAULT 'main',
+    prompt_tokens         INTEGER NOT NULL DEFAULT 0,
+    completion_tokens     INTEGER NOT NULL DEFAULT 0,
+    saved_rtk_tokens      INTEGER NOT NULL DEFAULT 0,
+    saved_ponytail_tokens INTEGER NOT NULL DEFAULT 0,
+    saved_caveman_tokens  INTEGER NOT NULL DEFAULT 0,
+    saved_tokens          INTEGER NOT NULL DEFAULT 0,
+    status                TEXT NOT NULL DEFAULT 'ok',
+    latency_ms        INTEGER NOT NULL DEFAULT 0,
+    created_at        INTEGER NOT NULL
+);
+CREATE INDEX usage_by_account_time ON usage_records(account_id, created_at);
+CREATE INDEX usage_by_model_time ON usage_records(model, created_at);
+
+CREATE TABLE account_cooldowns (
+    account_id     TEXT PRIMARY KEY,
+    cooldown_until INTEGER NOT NULL DEFAULT 0,
+    last_error     TEXT,
+    updated_at     INTEGER NOT NULL
 );
 "#;
 

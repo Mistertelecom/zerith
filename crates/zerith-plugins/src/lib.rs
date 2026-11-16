@@ -93,6 +93,41 @@ pub struct Contributions {
     pub mcp: Vec<(String, zerith_mcp::ServerConfig)>,
 }
 
+impl Contributions {
+    pub fn skill_dirs(&self) -> Vec<PathBuf> {
+        self.skills.iter().map(|(_, p)| p.clone()).collect()
+    }
+
+    pub fn agent_defs(&self) -> Vec<zerith_core::agents::AgentDef> {
+        self.agents
+            .iter()
+            .filter_map(|(_, path)| zerith_core::agents::load_file(path, "plugin"))
+            .collect()
+    }
+
+    pub fn apply_hooks(&self, settings: &mut zerith_core::Settings) {
+        for (_, h) in &self.hooks {
+            let slot = match h.event.as_str() {
+                "SessionStart" => &mut settings.hooks.session_start,
+                "UserPromptSubmit" => &mut settings.hooks.user_prompt_submit,
+                "PreToolUse" => &mut settings.hooks.pre_tool_use,
+                "PostToolUse" => &mut settings.hooks.post_tool_use,
+                "PostToolUseFailure" => &mut settings.hooks.post_tool_use_failure,
+                "PermissionRequest" => &mut settings.hooks.permission_request,
+                "Stop" => &mut settings.hooks.stop,
+                "PreCompact" => &mut settings.hooks.pre_compact,
+                "SessionEnd" => &mut settings.hooks.session_end,
+                _ => continue,
+            };
+            slot.push(zerith_core::settings::HookSpec {
+                matcher: h.matcher.clone(),
+                command: h.command.clone(),
+                timeout_ms: h.timeout_ms.unwrap_or(60_000),
+            });
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Status {

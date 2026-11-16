@@ -50,7 +50,7 @@ pub struct AgentDef {
     pub model: Option<String>,
     pub instructions: String,
     pub path: PathBuf,
-    /// `user` or `project`: which layer the definition came from.
+    /// `plugin`, `user` or `project`: which layer the definition came from.
     pub layer: &'static str,
     /// Allowlist (`tools:`); `None` inherits every tool.
     pub tools: Option<Vec<String>>,
@@ -131,8 +131,34 @@ pub fn list(paths: &Paths, project_dir: Option<&Path>) -> Vec<AgentDef> {
 /// same name (`a.md`, and `name: a` inside `b.md`) keep the first in
 /// file-name order and warn, so the outcome never depends on directory order.
 pub fn list_checked(paths: &Paths, project_dir: Option<&Path>) -> (Vec<AgentDef>, Vec<String>) {
+    collect_with_extra(paths, project_dir, &[])
+}
+
+/// Every agent visible from `project_dir`, including plugin-contributed files.
+/// Plugin definitions load first (keeping the first on internal clashes); user
+/// and project layers then overwrite plugins on name collisions.
+pub fn list_with_extra(
+    paths: &Paths,
+    project_dir: Option<&Path>,
+    extra_files: &[(String, PathBuf)],
+) -> Vec<AgentDef> {
+    collect_with_extra(paths, project_dir, extra_files).0
+}
+
+fn collect_with_extra(
+    paths: &Paths,
+    project_dir: Option<&Path>,
+    extra_files: &[(String, PathBuf)],
+) -> (Vec<AgentDef>, Vec<String>) {
     let mut out: Vec<AgentDef> = Vec::new();
     let mut warnings = Vec::new();
+    for (_, path) in extra_files {
+        if let Some(def) = load_file(path, "plugin") {
+            if !out.iter().any(|a| a.name == def.name) {
+                out.push(def);
+            }
+        }
+    }
     let mut layers = vec![(paths.agents(), "user")];
     if let Some(dir) = project_dir {
         layers.push((dir.join(".zerith").join("agents"), "project"));
@@ -169,6 +195,29 @@ pub fn find(paths: &Paths, project_dir: Option<&Path>, name: &str) -> Option<Age
         .find(|a| a.name == name)
 }
 
+/// Like [`find`], also consulting plugin-contributed agent files.
+pub fn find_with_extra(
+    paths: &Paths,
+    project_dir: Option<&Path>,
+    extra_files: &[(String, PathBuf)],
+    name: &str,
+) -> Option<AgentDef> {
+    if name.is_empty() || name == DEFAULT {
+        return None;
+    }
+    list_with_extra(paths, project_dir, extra_files)
+        .into_iter()
+        .find(|a| a.name == name)
+}
+
+/// Loads one `.md` agent definition, using the file stem as initial name.
+pub fn load_file(path: &Path, layer: &'static str) -> Option<AgentDef> {
+    let name = path.file_stem()?.to_string_lossy().into_owned();
+    let text = std::fs::read_to_string(path).ok()?;
+    let def = parse(name, &text, path.to_path_buf(), layer);
+    (def.name != DEFAULT).then_some(def)
+}
+
 fn read_dir(dir: &Path, layer: &'static str) -> Vec<AgentDef> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -181,12 +230,7 @@ fn read_dir(dir: &Path, layer: &'static str) -> Vec<AgentDef> {
     files.sort();
     files
         .into_iter()
-        .filter_map(|path| {
-            let name = path.file_stem()?.to_string_lossy().into_owned();
-            let text = std::fs::read_to_string(&path).ok()?;
-            let def = parse(name, &text, path, layer);
-            (def.name != DEFAULT).then_some(def)
-        })
+        .filter_map(|path| load_file(&path, layer))
         .collect()
 }
 
@@ -446,5 +490,49 @@ mod tests {
         assert_eq!(all[0].instructions, "primeiro");
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("repetido"));
+    }
+
+    #[test]
+    fn extra_files_load_as_plugin_and_user_wins_on_collision() {
+        let tmp = scratch();
+        let paths = Paths::with_root(tmp.path().join("home"));
+        let project = tmp.path().join("proj");
+        std::fs::create_dir_all(paths.agents()).unwrap();
+        std::fs::create_dir_all(project.join(".zerith/agents")).unwrap();
+
+        let pdir = tmp.path().join("plugin");
+        std::fs::create_dir_all(&pdir).unwrap();
+        let p_rev = pdir.join("rev.md");
+        let p_dup = pdir.join("dup.md");
+        let p_only = pdir.join("only-plugin.md");
+        let p_default = pdir.join("default.md");
+        std::fs::write(&p_rev, "do plugin").unwrap();
+        std::fs::write(&p_dup, "---\nname: only-plugin\n---\nsegundo plugin").unwrap();
+        std::fs::write(&p_only, "primeiro plugin").unwrap();
+        std::fs::write(&p_default, "ignorado").unwrap();
+
+        std::fs::write(paths.agents().join("rev.md"), "do usuario").unwrap();
+
+        let extra = vec![
+            ("p1".to_string(), p_rev),
+            ("p1".to_string(), p_only),
+            ("p2".to_string(), p_dup),
+            ("p2".to_string(), p_default),
+        ];
+
+        let all = list_with_extra(&paths, Some(&project), &extra);
+        let names: Vec<&str> = all.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["only-plugin", "rev"]);
+
+        let rev = find_with_extra(&paths, Some(&project), &extra, "rev").unwrap();
+        assert_eq!(rev.layer, "user");
+        assert_eq!(rev.instructions, "do usuario");
+
+        let only = find_with_extra(&paths, Some(&project), &extra, "only-plugin").unwrap();
+        assert_eq!(only.layer, "plugin");
+        assert_eq!(only.instructions, "primeiro plugin");
+
+        assert!(find_with_extra(&paths, Some(&project), &extra, DEFAULT).is_none());
+        assert!(find_with_extra(&paths, Some(&project), &extra, "").is_none());
     }
 }

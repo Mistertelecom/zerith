@@ -53,11 +53,20 @@ zerith plugin tools revisao           # só se tiver `command`
 
 `zerith plugins …` continua aceito.
 
-## O que é carregado hoje
+## O que é carregado pelos hosts
 
-- **MCP de plugin**: `zerith -p` junta os servidores de plugins ativos e
-  revisados aos do `settings.toml` (o arquivo de configuração vence em colisão
-  de nome).
-- **Skills, agentes e hooks de plugin**: o plugin os **declara e valida**, e
-  `contributions()` os entrega; o runtime ainda **não** os carrega
-  (planejado). `zerith agents list` mostra os agentes declarados e diz isso.
+`Library::contributions()` entrega as contribuições apenas de plugins
+habilitados e revisados (`enabled` + `trusted`), por meio de `Contributions`:
+
+- `skill_dirs()` — pastas com `SKILL.md` empacotadas no plugin;
+- `agent_defs()` — definições `.md` carregadas com camada `"plugin"`;
+- `apply_hooks(&mut settings)` — anexa os hooks declarados ao `Settings` do turno;
+- `mcp` — servidores `ServerConfig` nomeados `<plugin>-<nome>`.
+
+Tanto o CLI (`zerith -p`, `zerith chat`, `zerith agents list`) quanto a janela
+(`zerith-ui`, no envio do chat e na tela **Agentes**) carregam skills, agentes,
+hooks e servidores MCP de plugins habilitados e revisados.
+
+Precedência em colisão de nomes: servidores MCP do `settings.toml` / `mcp.toml`
+vencem os de plugin; agentes das camadas `user` e `project` têm precedência
+sobre agentes de camada `plugin`.

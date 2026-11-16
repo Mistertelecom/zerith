@@ -3,24 +3,31 @@
 Comandos do usuário executados em pontos fixos da sessão. Contrato
 inspirado no do Claude Code (só o conceito; nenhum código copiado).
 
-**Estado:** biblioteca pronta e testada (`zerith_core::hooks::run_hooks`).
-Ligado ao runtime **só** para `PreToolUse`, `PermissionRequest`, `PostToolUse` e
-`PostToolUseFailure`, via `zerith_runtime::guards::Guards` (middleware que o host
-precisa colocar em `AgentOptions.middleware`). Os demais eventos são funções de
-biblioteca: o host as chama (pontos de chamada abaixo); nada os dispara sozinho.
+**Estado:** todos os 9 eventos estão ligados.
+`PreToolUse`, `PermissionRequest`, `PostToolUse` e `PostToolUseFailure` rodam
+por chamada de ferramenta via `zerith_runtime::guards::Guards` (middleware em
+`AgentOptions.middleware`). No turno (`zerith-runtime/src/agent.rs`), quando
+`TurnContext.settings` está presente, o runtime dispara `SessionStart` (na 1ª
+mensagem da sessão), `UserPromptSubmit` (antes de gravar o prompt),
+`PreCompact` (antes de sumarizar) e `Stop` (quando o modelo termina sem chamadas
+de ferramenta). `SessionEnd` é disparado ao encerrar pelos hosts CLI
+(`headless` e `chat`). Os hosts (`zerith -p`, `zerith chat` e `zerith-ui`)
+também aplicam os hooks de plugins habilitados e revisados no `Settings` do
+turno.
 
 ## Eventos
 
 | Evento | Quando | Quem chama |
 | --- | --- | --- |
-| `SessionStart` / `SessionEnd` | sessão abre / fecha | host (CLI, UI) |
-| `UserPromptSubmit` | antes de gravar o prompt; bloqueio descarta, contexto entra no turno | host |
+| `SessionStart` | sessão abre (1ª mensagem do turno) | runtime (`agent::turn_body`) |
+| `SessionEnd` | execução encerra | host CLI (`headless`, `chat`) |
+| `UserPromptSubmit` | antes de gravar o prompt; bloqueio descarta, contexto entra no turno | runtime (`agent::turn_body`) |
 | `PreToolUse` | antes da chamada; pode negar, perguntar, reescrever `tool_input`, injetar contexto | `Guards::before` |
 | `PermissionRequest` | quando a chamada ia perguntar ao usuário; um hook pode **negar** (aprovar por hook não existe: o middleware só endurece) | `Guards::before` |
 | `PostToolUse` | depois de uma chamada bem-sucedida; o contexto vai ao modelo | `Guards::after` |
 | `PostToolUseFailure` | depois de uma chamada que falhou ou foi recusada | `Guards::after` |
-| `Stop` | o modelo termina o turno; `continue:false`/deny pede ao host que continue | host |
-| `PreCompact` | antes de compactar o contexto | host |
+| `Stop` | o modelo termina o turno; `continue:false`/deny pede ao runtime que continue | runtime (`agent::turn_body`) |
+| `PreCompact` | antes de compactar o contexto (bloqueio pula a sumarização) | runtime (`agent::shrink`) |
 
 ## Configuração
 

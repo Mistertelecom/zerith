@@ -666,3 +666,165 @@ fn anthropic_streams_tool_use_and_gets_tool_results_back() {
         .unwrap()
         .contains("dados"));
 }
+
+#[cfg(not(windows))]
+const HOOK_EXIT2: &str = "echo proibido pelo hook 1>&2; exit 2";
+#[cfg(windows)]
+const HOOK_EXIT2: &str = "echo proibido pelo hook 1>&2 & exit /b 2";
+
+#[cfg(not(windows))]
+const HOOK_DENY: &str = r#"echo '{"decision":"deny","reason":"recusado json"}'"#;
+#[cfg(windows)]
+const HOOK_DENY: &str = r#"echo {"decision":"deny","reason":"recusado json"}"#;
+
+#[cfg(not(windows))]
+const HOOK_CONTEXT: &str = r#"echo '{"additional_context":"lembrete do hook"}'"#;
+#[cfg(windows)]
+const HOOK_CONTEXT: &str = r#"echo {"additional_context":"lembrete do hook"}"#;
+
+#[cfg(not(windows))]
+fn stop_once_cmd(marker: &std::path::Path, reason: &str) -> String {
+    let p = marker.display().to_string().replace('\'', "'\\''");
+    format!(
+        "if [ ! -f '{p}' ]; then : > '{p}' && printf '%s\\n' '{{\"continue\":false,\"reason\":\"{reason}\"}}'; fi"
+    )
+}
+
+#[cfg(windows)]
+fn stop_once_cmd(marker: &std::path::Path, reason: &str) -> String {
+    format!(
+        "if not exist \"{p}\" (break > \"{p}\" & echo {{\"continue\":false,\"reason\":\"{reason}\"}})",
+        p = marker.display()
+    )
+}
+
+#[test]
+fn user_prompt_submit_hook_blocks_without_persisting_prompt() {
+    for (cmd, expected) in [(HOOK_EXIT2, "proibido"), (HOOK_DENY, "recusado json")] {
+        let fake = serve(vec![]);
+        let store = Store::open_in_memory().unwrap();
+        let sid = session(&store);
+        let mut settings = zerith_core::Settings::default();
+        settings
+            .hooks
+            .user_prompt_submit
+            .push(zerith_core::settings::HookSpec {
+                matcher: None,
+                command: cmd.into(),
+                timeout_ms: 5_000,
+            });
+        let err = run_agent_turn(
+            &store,
+            &client(&fake.url, Protocol::OpenAi),
+            TurnContext {
+                settings: Some(&settings),
+                ..TurnContext::default()
+            },
+            AgentOptions::default(),
+            &sid,
+            "m",
+            "oi",
+            &Cancel::default(),
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, RunError::Blocked(ref r) if r.contains(expected)),
+            "unexpected error: {err:?}"
+        );
+        assert!(rows(&store, &sid).is_empty(), "prompt should not persist");
+        assert!(fake.seen.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn user_prompt_submit_hook_injects_additional_context() {
+    let fake = serve(vec![text("ok")]);
+    let store = Store::open_in_memory().unwrap();
+    let sid = session(&store);
+    let mut settings = zerith_core::Settings::default();
+    settings
+        .hooks
+        .user_prompt_submit
+        .push(zerith_core::settings::HookSpec {
+            matcher: None,
+            command: HOOK_CONTEXT.into(),
+            timeout_ms: 5_000,
+        });
+    let report = run_agent_turn(
+        &store,
+        &client(&fake.url, Protocol::OpenAi),
+        TurnContext {
+            settings: Some(&settings),
+            ..TurnContext::default()
+        },
+        AgentOptions::default(),
+        &sid,
+        "m",
+        "oi",
+        &Cancel::default(),
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(report.text, "ok");
+
+    let seen = fake.seen.lock().unwrap();
+    let msgs = seen[0].1["messages"].as_array().unwrap();
+    let contents: Vec<&str> = msgs.iter().filter_map(|m| m["content"].as_str()).collect();
+    assert!(contents.contains(&"oi"), "{contents:?}");
+    assert!(contents.contains(&"lembrete do hook"), "{contents:?}");
+
+    let stored = store.messages(&sid, 100, 0).unwrap();
+    assert!(stored.iter().any(|m| {
+        m.role == Role::User
+            && m.content == "lembrete do hook"
+            && m.raw == Some(json!({"hook_context": true}))
+    }));
+}
+
+#[test]
+fn stop_hook_continue_false_runs_another_step_with_reason() {
+    let dir = workspace();
+    let marker = dir.path().join("stop.once");
+    let fake = serve(vec![text("rascunho"), text("finalizado")]);
+    let store = Store::open_in_memory().unwrap();
+    let sid = session(&store);
+    let mut settings = zerith_core::Settings::default();
+    settings.hooks.stop.push(zerith_core::settings::HookSpec {
+        matcher: None,
+        command: stop_once_cmd(&marker, "rode os testes"),
+        timeout_ms: 5_000,
+    });
+    let mut events = Vec::new();
+    let report = run_agent_turn(
+        &store,
+        &client(&fake.url, Protocol::OpenAi),
+        TurnContext {
+            settings: Some(&settings),
+            ..TurnContext::default()
+        },
+        AgentOptions::default(),
+        &sid,
+        "m",
+        "oi",
+        &Cancel::default(),
+        |e| events.push(e),
+    )
+    .unwrap();
+    assert_eq!(report.text, "finalizado");
+    assert!(events.contains(&RunEvent::Step { n: 2 }));
+
+    let seen = fake.seen.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    let second_msgs = seen[1].1["messages"].as_array().unwrap();
+    let last = second_msgs.last().unwrap();
+    assert_eq!(last["role"], "user");
+    assert_eq!(last["content"], "rode os testes");
+
+    let stored = store.messages(&sid, 100, 0).unwrap();
+    assert!(stored.iter().any(|m| {
+        m.role == Role::User
+            && m.content == "rode os testes"
+            && m.raw == Some(json!({"hook_stop": true}))
+    }));
+}

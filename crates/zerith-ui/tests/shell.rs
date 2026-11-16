@@ -99,7 +99,9 @@ fn navigation_switches_screens_and_loads_each_on_first_open() {
     assert_eq!(shell.memory.facts.ready().map(Vec::len), Some(1));
     assert!(shell.skills.installed.ready().is_some());
     assert!(shell.agents.list.ready().is_some());
+    assert!(shell.providers.usage.ready().is_some());
     assert!(shell.settings.storage.ready().is_some());
+    assert!(shell.settings.savings.ready().is_some());
     // New chat always returns to Chat.
     shell.new_chat();
     assert_eq!(shell.screen, Screen::Chat);
@@ -360,13 +362,31 @@ fn the_memory_screen_lists_edits_searches_and_forgets() {
 }
 
 #[test]
-fn provider_form_validates_and_presets_9router() {
+fn provider_form_validates_and_presets_native() {
     let dir = tempdir();
     let mut shell = shell_at(dir.path());
     shell.providers.form.url = rune::TextEdit::new("ftp://x");
     assert!(shell.providers.from_form().is_err());
     zerith_ui::screens::providers::apply_preset(&mut shell);
-    assert_eq!(shell.providers.form.url.text, "http://localhost:20128/v1");
+    assert_eq!(shell.providers.form.name.text, "anthropic");
+    assert_eq!(
+        shell.providers.form.url.text,
+        "https://api.anthropic.com/v1"
+    );
+    assert_eq!(
+        shell.providers.form.protocol,
+        zerith_providers::Protocol::Anthropic
+    );
+    zerith_ui::screens::providers::apply_kind_preset(
+        &mut shell,
+        zerith_providers::ProviderKind::DeepSeek,
+    );
+    assert_eq!(shell.providers.form.name.text, "deepseek");
+    assert_eq!(shell.providers.form.url.text, "https://api.deepseek.com/v1");
+    assert_eq!(
+        shell.providers.form.protocol,
+        zerith_providers::Protocol::OpenAi
+    );
     shell.providers.form.timeout = rune::TextEdit::new("5");
     assert!(shell.providers.from_form().is_err(), "timeout out of range");
     shell.providers.form.timeout = rune::TextEdit::new("30000");
@@ -374,6 +394,7 @@ fn provider_form_validates_and_presets_9router() {
     let cfg = shell.providers.from_form().expect("valid");
     assert_eq!(cfg.timeout_ms, 30_000);
     assert_eq!(cfg.default_model.as_deref(), Some("m1"));
+    assert_eq!(cfg.protocol, zerith_providers::Protocol::OpenAi);
     assert!(
         shell.providers.form.key.is_secure(),
         "the key field is masked"
@@ -538,4 +559,281 @@ fn the_profile_sets_real_limits_and_persists() {
         shell_at(dir.path()).settings.profile,
         zerith_ui::Profile::Economy
     );
+}
+
+#[test]
+fn hermes_import_panel_previews_and_imports_selected_sessions() {
+    let dir = tempdir();
+    let hermes_db = dir.path().join("state.db");
+    let conn = rusqlite::Connection::open(&hermes_db).expect("open hermes db");
+    conn.execute_batch(
+        "CREATE TABLE sessions (
+            id TEXT PRIMARY KEY, model TEXT, started_at REAL, ended_at REAL,
+            title TEXT, profile_name TEXT, archived INTEGER
+         );
+         CREATE TABLE messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT,
+            content TEXT, timestamp REAL, active INTEGER
+         );
+         INSERT INTO sessions(id, model, started_at, ended_at, title, profile_name, archived)
+            VALUES ('h1', 'hermes-3', 1700000000.0, 1700000050.0, 'Sessão ativa', 'default', 0),
+                   ('h2', 'hermes-3', 1700000100.0, 1700000200.0, 'Sessão arquivada', 'default', 1);
+         INSERT INTO messages(session_id, role, content, timestamp, active)
+            VALUES ('h1', 'user', 'oi', 1700000001.0, 1),
+                   ('h1', 'assistant', 'olá', 1700000002.0, 1),
+                   ('h2', 'user', 'antiga', 1700000150.0, 1);",
+    )
+    .expect("seed hermes db");
+    drop(conn);
+
+    let mut shell = shell_at(dir.path());
+    shell.navigate(Screen::History);
+    assert!(shell.history.import_include_archived);
+    zerith_ui::screens::history::toggle_import(&mut shell);
+    assert!(shell.history.import_open);
+
+    shell.history.import_path = rune::TextEdit::new(hermes_db.display().to_string());
+    zerith_ui::screens::history::preview_custom_path(&mut shell);
+    match &shell.history.import_preview {
+        Load::Ready(sources) => {
+            assert_eq!(sources.len(), 1);
+            assert_eq!(sources[0].sessions.len(), 2);
+            assert_eq!(sources[0].total_messages, 3);
+        }
+        other => panic!("preview did not land: {other:?}"),
+    }
+    assert_eq!(shell.history.import_picked.len(), 2);
+
+    zerith_ui::screens::history::toggle_import_session(&mut shell, "h2");
+    assert_eq!(shell.history.import_picked.len(), 1);
+    assert!(shell.history.import_picked.contains("h1"));
+
+    zerith_ui::screens::history::run_import(&mut shell);
+    assert!(!shell.history.import_running);
+    match &shell.history.import_report {
+        Some(Ok(report)) => {
+            assert_eq!(report.sessions_imported, 1);
+            assert_eq!(report.messages_imported, 2);
+        }
+        other => panic!("import did not succeed: {other:?}"),
+    }
+    assert!(shell
+        .sessions
+        .iter()
+        .any(|r| r.source == "hermes" && r.title == "Sessão ativa"));
+    assert!(!shell.sessions.iter().any(|r| r.title == "Sessão arquivada"));
+}
+
+#[test]
+fn token_saver_and_multi_model_routing_persist_and_load_usage() {
+    use zerith_core::{CavemanLevel, Paths, PonytailLevel, Settings};
+    use zerith_runtime::{RunEvent, TurnReport};
+    use zerith_sessions::NewUsageRecord;
+    use zerith_ui::screens::{chat, providers, settings};
+
+    let dir = tempdir();
+    let mut shell = shell_at(dir.path());
+
+    // 1. Token Saver defaults and persistence in settings.toml.
+    assert_eq!(shell.settings.token_saver.ponytail, PonytailLevel::Off);
+    assert_eq!(shell.settings.token_saver.caveman, CavemanLevel::Off);
+    assert!(shell.settings.token_saver.rtk_enabled);
+    settings::set_ponytail(&mut shell, PonytailLevel::Full);
+    settings::set_caveman(&mut shell, CavemanLevel::Lite);
+    settings::set_rtk_enabled(&mut shell, false);
+
+    // 2. Gateway accounts (multi-account for the same provider) & multi-model routing.
+    providers::new_account(&mut shell);
+    shell.providers.account_form.id = rune::TextEdit::new("ant-1");
+    shell.providers.account_form.provider = rune::TextEdit::new("anthropic");
+    shell.providers.account_form.priority = rune::TextEdit::new("1");
+    shell.providers.account_form.quota_tokens = rune::TextEdit::new("100000");
+    shell.providers.account_form.window_hours = rune::TextEdit::new("5");
+    shell.providers.account_form.default_model = rune::TextEdit::new("claude-sonnet-4");
+    providers::save_account(&mut shell);
+    assert!(matches!(shell.providers.account_notice, Some(Ok(_))));
+
+    providers::new_account(&mut shell);
+    shell.providers.account_form.id = rune::TextEdit::new("ant-2");
+    shell.providers.account_form.provider = rune::TextEdit::new("anthropic");
+    shell.providers.account_form.priority = rune::TextEdit::new("2");
+    shell.providers.account_form.quota_tokens = rune::TextEdit::new("200000");
+    providers::save_account(&mut shell);
+    providers::toggle_account_enabled(&mut shell, "ant-2".into());
+
+    shell.providers.routing_form.main_model = rune::TextEdit::new("anthropic/claude-opus-5-5");
+    shell.providers.routing_form.subagent_model =
+        rune::TextEdit::new("deepseek/deepseek-4.1-flash");
+    providers::save_routing(&mut shell);
+    assert!(matches!(shell.providers.routing_notice, Some(Ok(_))));
+    drop(shell);
+
+    // Reopen shell from disk: all settings, accounts and routing reload cleanly.
+    let mut reopened = shell_at(dir.path());
+    assert_eq!(reopened.settings.token_saver.ponytail, PonytailLevel::Full);
+    assert_eq!(reopened.settings.token_saver.caveman, CavemanLevel::Lite);
+    assert!(!reopened.settings.token_saver.rtk_enabled);
+
+    let disk = Settings::load(&Paths::with_root(dir.path()), None).settings;
+    assert_eq!(disk.token_saver, reopened.settings.token_saver);
+    assert_eq!(
+        disk.routing.main_model.as_deref(),
+        Some("anthropic/claude-opus-5-5")
+    );
+    assert_eq!(
+        disk.routing.subagent_model.as_deref(),
+        Some("deepseek/deepseek-4.1-flash")
+    );
+
+    assert_eq!(reopened.providers.accounts.len(), 2);
+    assert_eq!(reopened.providers.accounts[0].id, "ant-1");
+    assert!(reopened.providers.accounts[0].enabled);
+    assert_eq!(reopened.providers.accounts[0].quota_tokens, Some(100_000));
+    assert_eq!(reopened.providers.accounts[1].id, "ant-2");
+    assert!(!reopened.providers.accounts[1].enabled);
+    assert_eq!(
+        reopened.providers.routing.main_model.as_deref(),
+        Some("anthropic/claude-opus-5-5")
+    );
+    assert_eq!(
+        reopened.providers.routing.subagent_model.as_deref(),
+        Some("deepseek/deepseek-4.1-flash")
+    );
+    assert!(reopened
+        .providers
+        .list
+        .iter()
+        .any(|p| p.name == "anthropic"));
+    if std::env::var("ZERITH_PROVIDER")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .is_none()
+    {
+        assert_eq!(zerith_ui::active_provider(&reopened).name, "anthropic");
+    }
+    if std::env::var("ZERITH_MODEL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .is_none()
+    {
+        assert_eq!(reopened.chat.model, "anthropic/claude-opus-5-5");
+    }
+
+    // 3. Usage summary, Token Saver savings breakdown, and cooldown clearing.
+    let store = Store::open(dir.path().join("zerith.db")).expect("store");
+    store
+        .record_usage(&NewUsageRecord {
+            session_id: None,
+            account_id: "ant-1".into(),
+            provider: "anthropic".into(),
+            model: "claude-opus-5-5".into(),
+            role_kind: "main".into(),
+            prompt_tokens: 800,
+            completion_tokens: 200,
+            saved_rtk_tokens: 120,
+            saved_ponytail_tokens: 50,
+            saved_caveman_tokens: 30,
+            saved_tokens: 200,
+            status: "ok".into(),
+            latency_ms: 420,
+        })
+        .expect("record usage");
+    let future_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+        + 120_000;
+    store
+        .set_account_cooldown("ant-1", future_ms, Some("rate limited"))
+        .expect("set cooldown");
+    drop(store);
+
+    reopened.navigate(Screen::Settings);
+    let savings = reopened.settings.savings.ready().expect("savings loaded");
+    assert_eq!(savings.total_saved_rtk_tokens, 120);
+    assert_eq!(savings.total_saved_ponytail_tokens, 50);
+    assert_eq!(savings.total_saved_caveman_tokens, 30);
+    assert_eq!(savings.total_saved_tokens, 200);
+
+    reopened.navigate(Screen::Providers);
+    let usage = reopened.providers.usage.ready().expect("usage loaded");
+    assert_eq!(usage.active_account.as_deref(), Some("ant-1"));
+    assert_eq!(usage.active_model.as_deref(), Some("claude-opus-5-5"));
+    assert!(
+        usage
+            .accounts
+            .iter()
+            .find(|a| a.account_id == "ant-1")
+            .expect("ant-1 stats")
+            .cooldown_until
+            > 0
+    );
+
+    providers::clear_cooldown(&mut reopened, "ant-1".into());
+    let usage_after = reopened.providers.usage.ready().expect("usage refreshed");
+    assert_eq!(
+        usage_after
+            .accounts
+            .iter()
+            .find(|a| a.account_id == "ant-1")
+            .expect("ant-1 stats")
+            .cooldown_until,
+        0
+    );
+
+    // 4. Live route and TokenSaved events in ChatState + report completion + UI frame build.
+    reopened.apply(RunEvent::Route {
+        account_id: "ant-1".into(),
+        provider: "anthropic".into(),
+        model: "claude-opus-5-5".into(),
+        attempts: 1,
+    });
+    assert_eq!(
+        reopened.chat.active_route,
+        Some(("ant-1".into(), "claude-opus-5-5".into()))
+    );
+    reopened.apply(RunEvent::TokenSaved {
+        tool: "shell".into(),
+        before_bytes: 2_400,
+        after_bytes: 400,
+        filter: Some("build-output".into()),
+    });
+    assert_eq!(reopened.chat.saved_tokens, 500);
+
+    chat::events::apply_report(
+        &mut reopened,
+        &TurnReport {
+            prompt_tokens: 900,
+            completion_tokens: 100,
+            saved_tokens: 650,
+            account_id: Some("ant-2".into()),
+            model_used: Some("claude-sonnet-4".into()),
+            ..TurnReport::default()
+        },
+    );
+    assert_eq!(reopened.chat.saved_tokens, 650);
+    assert_eq!(
+        reopened.chat.active_route,
+        Some(("ant-2".into(), "claude-sonnet-4".into()))
+    );
+
+    for screen in [Screen::Providers, Screen::Settings, Screen::Chat] {
+        for dark in [true, false] {
+            let mut sh = shell_at(dir.path());
+            sh.navigate(screen);
+            sh.chat.active_route = Some(("ant-1".into(), "claude-opus-5-5".into()));
+            sh.chat.saved_tokens = 650;
+            let mut rt = rune::Runtime::new(
+                sh,
+                zerith_ui::view,
+                (1100.0, 720.0),
+                rune::Env::new(dark, 1.0),
+            );
+            rt.frame(0.0);
+        }
+    }
+
+    reopened.new_chat();
+    assert!(reopened.chat.active_route.is_none());
+    assert_eq!(reopened.chat.saved_tokens, 0);
 }

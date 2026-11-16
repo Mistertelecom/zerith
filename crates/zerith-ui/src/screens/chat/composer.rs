@@ -168,6 +168,12 @@ fn footer(s: &Shell, u: &Ui, layer: &mut Vec<El>) -> El {
     if c.compacting {
         foot = foot.child(text("Compactando…").font(ui::LABEL).color(u.muted_text));
     }
+    if c.saved_tokens > 0 {
+        foot = foot.child(widgets::pill(
+            format!("-{} tok", agentwork::compact_count(c.saved_tokens)),
+            u,
+        ));
+    }
     if let Some(m) = meter(s, u) {
         foot = foot.child(m);
     }
@@ -295,6 +301,29 @@ pub fn composer(s: &Shell, u: &Ui, layer: &mut Vec<El>) -> El {
         widgets::primary_icon("send", "Enviar a mensagem", ui::icon_send(), u, super::send)
     };
     popup(s, u, layer);
+    let border_color = match c.permission_mode() {
+        PermissionMode::Plan => {
+            if c.draft.focused {
+                u.accent
+            } else {
+                u.accent.alpha(0.55)
+            }
+        }
+        PermissionMode::Bypass => {
+            if c.draft.focused {
+                u.warn
+            } else {
+                u.warn.alpha(0.55)
+            }
+        }
+        _ => {
+            if c.draft.focused {
+                u.line_strong
+            } else {
+                u.line
+            }
+        }
+    };
     col()
         .key("composer")
         .w_full()
@@ -311,14 +340,7 @@ pub fn composer(s: &Shell, u: &Ui, layer: &mut Vec<El>) -> El {
                 .center_y()
                 .radius(ui::R_LG)
                 .fill(u.muted)
-                .border(
-                    1.0,
-                    if c.draft.focused {
-                        u.line_strong
-                    } else {
-                        u.line
-                    },
-                )
+                .border(1.0, border_color)
                 .child(field)
                 .child(action),
         )

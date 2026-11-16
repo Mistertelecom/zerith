@@ -18,9 +18,14 @@ pub fn load(s: &mut Shell) {
     s.work(
         move || -> Result<Vec<AgentDef>, String> {
             let cwd = std::env::current_dir().ok();
-            Ok(zerith_core::agents::list(
+            let extra = zerith_plugins::Library::open(&root.join("plugins"))
+                .and_then(|l| l.contributions())
+                .map(|c| c.agents)
+                .unwrap_or_default();
+            Ok(zerith_core::agents::list_with_extra(
                 &zerith_core::Paths::with_root(root),
                 cwd.as_deref(),
+                &extra,
             ))
         },
         |s, r| s.agents.list = r.into(),
@@ -33,10 +38,10 @@ fn agent_row(a: &AgentDef, u: &Ui) -> El {
         tags = tags.child(pill(m.clone(), u));
     }
     tags = tags.child(pill(
-        if a.layer == "project" {
-            "projeto"
-        } else {
-            "usuário"
+        match a.layer {
+            "project" => "projeto",
+            "plugin" => "plugin",
+            _ => "usuário",
         },
         u,
     ));

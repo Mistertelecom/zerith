@@ -8,7 +8,8 @@ use rune_kit::Markdown;
 
 use super::{Line, Shell};
 use crate::agentwork::{
-    format_duration, DiffKind, DiffSummary, Item, SubState, Subagent, ToolRow, ToolState,
+    format_duration, turn_changes, DiffKind, DiffSummary, Item, SubState, Subagent, ToolRow,
+    ToolState, TurnChanges,
 };
 use crate::ui::{self, Ui};
 use crate::widgets::{self, button, Tone};
@@ -102,6 +103,10 @@ fn diff_panel(d: &DiffSummary, u: &Ui) -> El {
             DiffKind::Del => (u.diff_del, "−", u.diff_del_ink),
             DiffKind::Ctx => (rune::Color::TRANSPARENT, " ", u.faint),
         };
+        let num = r
+            .line_no
+            .map(|n| format!("{n:>3}"))
+            .unwrap_or_else(|| "   ".into());
         panel = panel.child(
             row()
                 .key(format!("dl-{i}"))
@@ -109,6 +114,11 @@ fn diff_panel(d: &DiffSummary, u: &Ui) -> El {
                 .px(10.0)
                 .gap(8.0)
                 .fill(fill)
+                .child(
+                    el().w(28.0)
+                        .child(text(num).font(ui::MONO).color(u.faint))
+                        .a11y_hidden(),
+                )
                 .child(
                     // A fixed cell, so context lines (a blank mark) align.
                     el().w(10.0)
@@ -146,10 +156,12 @@ fn diff_panel(d: &DiffSummary, u: &Ui) -> El {
 }
 
 /// One tool call as a one-liner: icon, tool, short argument, duration. A diff
-/// opens by default; any other output opens on demand.
+/// or live running output opens by default; finished output opens on demand.
 fn tool_row(index: usize, t: &ToolRow, toggled: bool, u: &Ui) -> El {
     let has_body = t.diff.is_some() || !t.preview.is_empty();
-    let open = has_body && (t.diff.is_some() != toggled);
+    let open = has_body
+        && ((t.diff.is_some() || (t.state == ToolState::Running && !t.preview.is_empty()))
+            != toggled);
     let state_word = match t.state {
         ToolState::Running => "em execução",
         ToolState::Ok => "concluída",
@@ -327,7 +339,15 @@ fn thinking_row(index: usize, content: &str, open: bool, u: &Ui) -> El {
     c
 }
 
-pub fn line_row(index: usize, line: &Line, u: &Ui, live: bool, open: bool, rewind: bool) -> El {
+pub fn line_row(
+    index: usize,
+    line: &Line,
+    u: &Ui,
+    live: bool,
+    open: bool,
+    rewind: bool,
+    changes: Option<TurnChanges>,
+) -> El {
     if let Some(item) = &line.item {
         return match item {
             Item::Tool(t) => tool_row(index, t, open, u),
@@ -353,7 +373,14 @@ pub fn line_row(index: usize, line: &Line, u: &Ui, live: bool, open: bool, rewin
                     ),
             );
             if rewind {
-                c = c.child(button(
+                let mut tail = row().gap(8.0).center_y();
+                if let Some(ch) = changes.filter(|ch| ch.files > 0) {
+                    tail = tail.child(widgets::pill(
+                        format!("{} arq · +{} −{}", ch.files, ch.adds, ch.dels),
+                        u,
+                    ));
+                }
+                tail = tail.child(button(
                     format!("rewind-{index}"),
                     "Rebobinar",
                     Tone::Plain,
@@ -361,6 +388,7 @@ pub fn line_row(index: usize, line: &Line, u: &Ui, live: bool, open: bool, rewin
                     u,
                     |s, _| super::rewind(s),
                 ));
+                c = c.child(tail);
             }
             c
         }
@@ -430,7 +458,21 @@ pub fn list(s: &Shell, u: &Ui) -> El {
                     // latest checkpoint is that turn's.
                     let last_user = s.chat.lines.iter().rposition(|l| l.role == "user");
                     let rewind = s.chat.rewind && !s.chat.busy && last_user == Some(i);
-                    line_row(i, line, &uu, live, s.chat.open.contains(&i), rewind)
+                    let changes = rewind.then(|| {
+                        turn_changes(s.chat.lines[i + 1..].iter().filter_map(|l| match &l.item {
+                            Some(Item::Tool(t)) => Some(t),
+                            _ => None,
+                        }))
+                    });
+                    line_row(
+                        i,
+                        line,
+                        &uu,
+                        live,
+                        s.chat.open.contains(&i),
+                        rewind,
+                        changes,
+                    )
                 },
             ),
     );

@@ -1,19 +1,23 @@
-# 9Router
+# Gateway Nativo (substitui o antigo 9Router)
 
-Provider padrão. O Zerith fala com o 9Router só pela API HTTP
-OpenAI-compatible local; não lê o banco nem o frontend dele.
+O Zerith não usa nem exige mais o proxy externo **9Router** (`localhost:20128/v1`). Toda a camada de roteamento, múltiplas contas por provedor, rastreamento de cota e failover automático passou a viver dentro do próprio Zerith (`zerith-providers::Gateway` + `zerith-sessions::usage` + `zerith-runtime::resolve_gateway`).
+
+Veja o guia completo em [providers.md](providers.md).
+
+## Resumo rápido
 
 ```bash
-# 9Router rodando em localhost:20128
-zerith providers probe            # ok  http 200  ... models
-zerith providers models
-zerith secret set 9router         # se o 9Router exigir chave
-ZERITH_MODEL=<id> zerith chat "oi"
+zerith accounts add claude-1 anthropic --priority 1 --quota-tokens 200000 --window-hours 5
+zerith secret set claude-1
+zerith accounts add ds-fast deepseek --priority 1 --model deepseek-4.1-flash
+zerith secret set ds-fast
+zerith routing main anthropic/claude-opus-5-5
+zerith routing subagent deepseek/deepseek-4.1-flash
+zerith usage --hours 24
 ```
 
-Outra porta: `ZERITH_BASE_URL=http://localhost:<porta>/v1`.
+## Compatibilidade com proxies locais / OpenAI-compatible
 
-Evidência registrada em [aceite.md](aceite.md): `providers probe` →
-`http 200, 59 models`; turno real com streaming e `reasoning_content`.
+Se você ainda quiser apontar o Zerith para qualquer gateway HTTP OpenAI-compatible externo (vLLM, LiteLLM, proxy local próprio), basta usar `ZERITH_PROVIDER=custom` e `ZERITH_BASE_URL=http://localhost:<porta>/v1` (ou adicionar uma conta `custom` com `--url http://localhost:<porta>/v1`).
 
 Problemas: ver [troubleshooting.md](troubleshooting.md).

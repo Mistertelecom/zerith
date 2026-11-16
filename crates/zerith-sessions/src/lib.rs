@@ -14,6 +14,7 @@ pub mod plan;
 pub mod store;
 pub mod tasks;
 pub mod types;
+pub mod usage;
 
 pub use events::{Event, TurnEnd, TurnSummary};
 pub use ops::{MessageHit, SessionFilter};
@@ -21,3 +22,4 @@ pub use plan::{NewTask, Task, TaskState};
 pub use store::Store;
 pub use tasks::{Todo, TodoPatch, TodoStatus};
 pub use types::{Message, NewMessage, Role, Session, SessionSource};
+pub use usage::{AccountWindowStats, ModelUsageStats, NewUsageRecord, UsageSummary};

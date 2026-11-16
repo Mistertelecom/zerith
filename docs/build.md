@@ -42,10 +42,14 @@ verificada em CI.
 | Variável | Efeito |
 | --- | --- |
 | `ZERITH_HOME` | Sobrescreve a raiz de dados (testes, instalação portátil) |
-| `ZERITH_PROVIDER` | `9router` (padrão), `openai`, `anthropic`, `deepseek`, `gemini`, `openrouter`, `ollama`, `lmstudio`, `custom` |
+| `ZERITH_PROVIDER` | `openai` (padrão), `anthropic`, `deepseek`, `gemini`, `openrouter`, `ollama`, `lmstudio`, `custom` |
 | `ZERITH_BASE_URL` | URL do endpoint |
 | `ZERITH_API_KEY` | Chave do provider |
 | `ZERITH_MODEL` | Modelo padrão do chat |
+| `ZERITH_ACCOUNT_ID` | ID explícito da conta para atribuir uso/roteamento |
+| `ZERITH_SUBAGENT_MODEL` | Sobrescreve `[routing] subagent_model` |
+| `ZERITH_PONYTAIL` | Nível Ponytail (`off`, `lite`, `full`, `ultra`) |
+| `ZERITH_CAVEMAN` | Nível Caveman (`off`, `lite`, `full`, `ultra`, `wenyan`) |
 | `ZERITH_USER` | Identidade do escopo de memória (`user:<id>`) |
 | `ZERITH_SANDBOX` | `read-only`, `workspace-write` (padrão) ou `danger-full-access` |
 
@@ -56,6 +60,11 @@ No Windows, `ZERITH_HOME` precisa ser caminho Windows (`C:\...`), não MSYS
 
 ```bash
 zerith doctor                     # banco, schema, integrity_check, contagens
+zerith accounts list              # contas do gateway local e prioridades
+zerith routing show               # orquestrador, subagentes e combos
+zerith tokensaver show            # níveis Ponytail/Caveman/RTK e economia
+zerith usage [--hours 24]         # conta/modelo ativo, cota restante e economia
+zerith quota [--hours 24]         # alias de `usage`
 zerith chat "pergunta"            # turno com streaming, memória e persistência
 zerith session list               # conversas
 zerith memory list user:joao      # fatos confirmados e inferidos

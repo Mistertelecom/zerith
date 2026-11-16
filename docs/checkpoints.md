@@ -8,8 +8,9 @@ do Claude Code. Código em `zerith-sessions/src/checkpoints.rs`.
 1. Antes de cada turno que pode editar arquivos, o host abre um checkpoint:
    `Checkpoint::begin(store, data_root, session, turn)`. O ponto de corte da
    conversa é a última mensagem viva **antes** do prompt do turno.
-2. Antes de uma ferramenta de arquivo alterar algo, ela chama
-   `checkpoint.record_file(path)`. A primeira chamada por arquivo e por turno
+2. Antes de `write_file` ou `edit_file` alterar algo, ela chama
+   `exec.host.before_write(&path)` (ligado a `checkpoint.record_file(path)`
+   pelo runtime). A primeira chamada por arquivo e por turno
    copia o conteúdo anterior para
    `<raiz de dados>/checkpoints/<sessão>/<turno>/`; um arquivo que o turno
    **cria** é registrado como "não existia". Chamar de novo é inofensivo.
@@ -51,29 +52,24 @@ zerith rewind <id|nome> --turn 3 --both
 zerith rewind <id|nome> --turn 3 --both --purge    # e apaga as arquivadas de vez
 ```
 
-`zerith chat` e `zerith -p` abrem um checkpoint por turno. Enquanto as
-ferramentas de arquivo não chamarem `record_file` (veja abaixo), o checkpoint
-guarda o ponto de corte da **conversa** e nenhum arquivo.
+`zerith-runtime/src/agent.rs` (`run_agent_turn`) abre um checkpoint por turno
+quando o turno tem ferramentas (`Registry`) e banco em arquivo (cobrindo `-p`,
+`chat` e `zerith-ui`). Na janela (`zerith-ui`), o botão **Rebobinar** (com
+resumo de arquivos e linhas alteradas do turno) e o comando `/rewind`
+restauram o último checkpoint (`Mode::Both`).
 
-## API para o runtime e as ferramentas
+## Ligação no runtime e nas ferramentas
 
-```rust
-let turn = checkpoints::next_turn(&store, &session)?;
-let cp = Arc::new(Checkpoint::begin(&store, data_root, &session, turn)?);
-// ... antes de append(user message) ...
-```
-
-**Pontos de chamada que faltam (para quem é dono de `zerith-tools` / `zerith-runtime`):**
-
-- `write_file` e `edit_file`: chamar `cp.record_file(&path)?` **depois** da
-  autorização da política e **antes** de gravar. Se devolver erro, não gravar e
-  mostrar o erro ao modelo.
-- `CallCtx` precisa carregar um `Option<&Checkpoint>` (ou o runtime passar um
-  `Arc<Checkpoint>`); `Checkpoint` é `Send + Sync`, então chamadas paralelas
-  podem registrar ao mesmo tempo.
-- O runtime deve abrir o checkpoint **antes** de gravar a mensagem do usuário
-  do turno (o ponto de corte depende dessa ordem).
-
-Estado real: o CLI abre checkpoints; a ligação de `write_file`/`edit_file` ao
-`record_file` **não está feita por este trabalho** (as ferramentas não são
-deste escopo).
+- **Runtime (`zerith-runtime/src/agent.rs`):** antes de gravar a mensagem do
+  usuário do turno (para o ponto de corte incluir o prompt), `turn_body` calcula
+  `checkpoints::next_turn`, abre `Checkpoint::begin(&store, &root, session_id, turn)`
+  e registra `r.host().on_before_write(move |p| cp.record_file(p).map_err(|e| e.to_string()))`.
+  Se abrir o checkpoint falhar, o aviso vai para `stderr` e o turno segue sem
+  rewind (nunca aborta o turno).
+- **Ferramentas (`zerith-tools/src/builtin.rs` e `host.rs`):** `write_file` e
+  `edit_file` chamam `exec.host.before_write(&path)?` após `check_editable(&path)?`
+  e antes de gravar no disco (a política já foi aplicada pelo pipeline). Se
+  `record_file` devolver erro (ex.: arquivo acima de 10 MiB ou turno acima de
+  100 MiB), `before_write` cancela a edição e devolve o erro ao modelo.
+- **Fora do escopo por construção:** comandos de `shell` não passam por
+  `before_write` e não são rastreados.

@@ -4881,6 +4881,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
+ "zerith-core",
  "zerith-mcp",
 ]
 
@@ -4965,9 +4966,11 @@ version = "0.1.0"
 dependencies = [
  "rune",
  "rune-kit",
+ "rusqlite",
  "serde_json",
  "tempfile",
  "zerith-core",
+ "zerith-importers",
  "zerith-mcp",
  "zerith-memory",
  "zerith-plugins",

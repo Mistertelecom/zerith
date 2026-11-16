@@ -3,14 +3,15 @@
 //! Every function takes the data root explicitly (`<root>/zerith.db` lives
 //! beside `<root>/settings.toml`), so tests and snapshots stay isolated.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use zerith_core::settings::{self, ProviderEntry, WireProtocol};
 use zerith_core::{Paths, Settings};
 use zerith_memory::Scope;
-use zerith_providers::{Protocol, ProviderConfig, ProviderKind};
+use zerith_providers::{infer_provider, ModelSpec, Protocol, ProviderConfig, ProviderKind};
 use zerith_runtime::{Approval as RtApproval, ApprovalSender};
-use zerith_sessions::Store;
+use zerith_sessions::{Store, UsageSummary};
 
 use crate::screens::chat::{Approval, Decision};
 use crate::{Profile, Theme};
@@ -26,30 +27,83 @@ fn load(root: &Path) -> Settings {
 }
 
 fn kind_of(name: &str) -> ProviderKind {
-    [
-        ProviderKind::NineRouter,
-        ProviderKind::OpenAi,
-        ProviderKind::Anthropic,
-        ProviderKind::DeepSeek,
-        ProviderKind::Gemini,
-        ProviderKind::OpenRouter,
-        ProviderKind::Ollama,
-        ProviderKind::LmStudio,
-    ]
-    .into_iter()
-    .find(|k| k.as_str() == name)
-    .unwrap_or(ProviderKind::Custom)
+    ProviderKind::parse(name)
+}
+
+fn wire_to_protocol(p: WireProtocol) -> Protocol {
+    match p {
+        WireProtocol::OpenAi => Protocol::OpenAi,
+        WireProtocol::Anthropic => Protocol::Anthropic,
+    }
+}
+
+fn canonical_provider(raw: &str) -> String {
+    let kind = ProviderKind::parse(raw);
+    if kind == ProviderKind::Custom {
+        raw.trim().to_string()
+    } else {
+        kind.as_str().to_string()
+    }
+}
+
+fn dedup_accounts(accounts: &[settings::AccountEntry]) -> Vec<settings::AccountEntry> {
+    let mut seen = HashSet::new();
+    let mut rev = Vec::new();
+    for acc in accounts.iter().rev() {
+        if !acc.id.is_empty() && seen.insert(acc.id.clone()) {
+            rev.push(acc.clone());
+        }
+    }
+    rev.reverse();
+    rev
+}
+
+fn apply_account_defaults(
+    c: &mut ProviderConfig,
+    acc: &settings::AccountEntry,
+    allow_url_override: bool,
+) {
+    if let Some(p) = acc.protocol {
+        c.protocol = wire_to_protocol(p);
+    }
+    if allow_url_override {
+        if let Some(u) = acc
+            .base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            c.base_url = u.to_string();
+        }
+    }
+    if c.default_model.is_none() {
+        c.default_model = acc
+            .default_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+    }
+    if c.account_id.is_none() {
+        c.account_id = Some(acc.id.clone());
+    }
 }
 
 /// Providers: the environment's one first (what the CLI uses), then every
-/// `[[providers]]` entry from the settings layers. Keys come from
+/// `[[providers]]` entry from the settings layers and providers referenced by
+/// `[[accounts]]` / `[routing] main_model`. When `ZERITH_PROVIDER` is unset
+/// and `routing.main_model` or `accounts` names a primary provider, that
+/// provider is promoted first so the shell targets it by default. Keys come from
 /// `ZERITH_API_KEY` or the OS keyring, never from a file.
 pub fn configured_providers(root: &Path) -> Vec<ProviderConfig> {
     let st = load(root);
+    let env_provider_set = std::env::var("ZERITH_PROVIDER").is_ok_and(|v| !v.trim().is_empty());
+    let env_url_set = std::env::var("ZERITH_BASE_URL").is_ok_and(|v| !v.trim().is_empty());
     let mut env = ProviderConfig::from_env();
     if env.default_model.is_none() {
         env.default_model = st.model.clone();
     }
+    let env_name = env.name.clone();
     let mut out = vec![env];
     for e in &st.providers {
         let mut c = ProviderConfig::new(kind_of(&e.name));
@@ -58,10 +112,7 @@ pub fn configured_providers(root: &Path) -> Vec<ProviderConfig> {
             c.base_url = u.clone();
         }
         if let Some(p) = e.protocol {
-            c.protocol = match p {
-                WireProtocol::OpenAi => Protocol::OpenAi,
-                WireProtocol::Anthropic => Protocol::Anthropic,
-            };
+            c.protocol = wire_to_protocol(p);
         }
         c.default_model = e.default_model.clone();
         if let Some(t) = e.timeout_ms {
@@ -73,11 +124,102 @@ pub fn configured_providers(root: &Path) -> Vec<ProviderConfig> {
             None => out.push(c),
         }
     }
+
+    let accounts = dedup_accounts(&st.accounts);
+    for acc in &accounts {
+        let prov_name = canonical_provider(&acc.provider);
+        if prov_name.is_empty() {
+            continue;
+        }
+        if let Some(slot) = out
+            .iter_mut()
+            .find(|o| o.name.eq_ignore_ascii_case(&prov_name))
+        {
+            if st.provider_entry(&slot.name).is_none() {
+                let is_env_slot = slot.name == env_name && (env_provider_set || env_url_set);
+                apply_account_defaults(slot, acc, !is_env_slot);
+            } else if slot.default_model.is_none() {
+                slot.default_model = acc.default_model.clone();
+            }
+        } else {
+            let mut c = ProviderConfig::new(kind_of(&prov_name));
+            c.name = prov_name;
+            apply_account_defaults(&mut c, acc, true);
+            out.push(c);
+        }
+    }
+
+    let account_ids: Vec<&str> = accounts.iter().map(|a| a.id.as_str()).collect();
+    let main_from_routing: Option<(String, Option<String>)> = st
+        .routing
+        .main_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|raw| {
+            let spec = ModelSpec::parse_with_accounts(raw, &account_ids);
+            let model_opt = (!spec.model.trim().is_empty()).then(|| spec.model.trim().to_string());
+            if let Some(aid) = &spec.account_id {
+                accounts
+                    .iter()
+                    .find(|a| a.id == *aid)
+                    .map(|acc| (canonical_provider(&acc.provider), model_opt.clone()))
+            } else if let Some(p) = &spec.provider {
+                Some((canonical_provider(p), model_opt))
+            } else {
+                infer_provider(&spec.model).map(|k| (k.as_str().to_string(), model_opt))
+            }
+        });
+
+    let primary = main_from_routing.or_else(|| {
+        accounts
+            .iter()
+            .filter(|a| a.enabled)
+            .min_by_key(|a| a.priority)
+            .or_else(|| accounts.first())
+            .map(|acc| (canonical_provider(&acc.provider), acc.default_model.clone()))
+            .filter(|(p, _)| !p.is_empty())
+    });
+
+    if let Some((primary_name, primary_model)) = primary {
+        let pos = if let Some(idx) = out
+            .iter()
+            .position(|o| o.name.eq_ignore_ascii_case(&primary_name))
+        {
+            if out[idx].default_model.is_none() {
+                out[idx].default_model = primary_model;
+            }
+            idx
+        } else {
+            let mut c = ProviderConfig::new(kind_of(&primary_name));
+            c.name = primary_name;
+            c.default_model = primary_model;
+            out.push(c);
+            out.len() - 1
+        };
+        if !env_provider_set && pos != 0 {
+            let p = out.remove(pos);
+            out.insert(0, p);
+        }
+    }
+
     for c in &mut out {
         if c.api_key.is_none() {
             let key_ref = st
                 .provider_entry(&c.name)
-                .and_then(|p| p.api_key_ref.clone());
+                .and_then(|p| p.api_key_ref.clone())
+                .or_else(|| {
+                    accounts
+                        .iter()
+                        .filter(|a| a.enabled && canonical_provider(&a.provider) == c.name)
+                        .min_by_key(|a| a.priority)
+                        .or_else(|| {
+                            accounts
+                                .iter()
+                                .find(|a| canonical_provider(&a.provider) == c.name)
+                        })
+                        .map(|a| a.api_key_ref.clone().unwrap_or_else(|| a.id.clone()))
+                });
             c.api_key = zerith_core::secrets::resolve_api_key(&c.name, key_ref.as_deref())
                 .ok()
                 .flatten();
@@ -112,6 +254,90 @@ pub fn save_provider(root: &Path, cfg: &ProviderConfig) -> Result<(), String> {
 /// Stores an API key in the OS keyring under the provider's name.
 pub fn store_key(provider: &str, key: &str) -> Result<(), String> {
     zerith_core::secrets::set_secret(provider, key).map_err(|e| e.to_string())
+}
+
+/// Configured gateway accounts across settings layers (last entry wins per id).
+pub fn configured_accounts(root: &Path) -> Vec<settings::AccountEntry> {
+    dedup_accounts(&load(root).accounts)
+}
+
+/// Persists an account entry in `settings.toml` (`[[accounts]]`) and stores a
+/// non-empty API key in the OS keyring under `api_key_ref` (or `acc.id`).
+pub fn save_account(
+    root: &Path,
+    acc: &settings::AccountEntry,
+    api_key: Option<&str>,
+) -> Result<(), String> {
+    if acc.id.trim().is_empty() {
+        return Err("Informe o ID da conta".into());
+    }
+    let entry = acc.clone();
+    Settings::save_user(&Paths::with_root(root), |s| {
+        match s.accounts.iter_mut().find(|a| a.id == entry.id) {
+            Some(slot) => *slot = entry,
+            None => s.accounts.push(entry),
+        }
+    })
+    .map_err(|e| e.to_string())?;
+    if let Some(key) = api_key.filter(|k| !k.is_empty()) {
+        let key_ref = acc
+            .api_key_ref
+            .as_deref()
+            .filter(|r| !r.is_empty())
+            .unwrap_or(&acc.id);
+        zerith_core::secrets::set_secret(key_ref, key).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Removes a gateway account by id from the user settings layer.
+pub fn delete_account(root: &Path, id: &str) -> Result<(), String> {
+    Settings::save_user(&Paths::with_root(root), |s| {
+        s.accounts.retain(|a| a.id != id);
+    })
+    .map_err(|e| e.to_string())
+}
+
+/// Loads multi-model routing & delegation settings from the merged layers.
+pub fn load_routing(root: &Path) -> settings::RoutingSettings {
+    load(root).routing
+}
+
+/// Persists multi-model routing & delegation settings in the user settings layer.
+pub fn save_routing(root: &Path, routing: &settings::RoutingSettings) -> Result<(), String> {
+    let routing = routing.clone();
+    Settings::save_user(&Paths::with_root(root), |s| {
+        s.routing = routing;
+    })
+    .map_err(|e| e.to_string())
+}
+
+/// Loads Token Saver configuration from the merged layers.
+pub fn load_token_saver(root: &Path) -> settings::TokenSaverSettings {
+    load(root).token_saver
+}
+
+/// Persists Token Saver configuration in the user settings layer.
+pub fn save_token_saver(root: &Path, ts: &settings::TokenSaverSettings) -> Result<(), String> {
+    let ts = ts.clone();
+    Settings::save_user(&Paths::with_root(root), |s| {
+        s.token_saver = ts;
+    })
+    .map_err(|e| e.to_string())
+}
+
+/// Summarizes rolling-window usage, quota consumption, and Token Saver savings.
+pub fn usage_summary(db: &Path, window_hours: u32) -> Result<UsageSummary, String> {
+    Store::open(db)
+        .and_then(|st| st.usage_summary(window_hours))
+        .map_err(|e| e.to_string())
+}
+
+/// Clears any active failover cooldown for `account_id`.
+pub fn clear_account_cooldown(db: &Path, account_id: &str) -> Result<(), String> {
+    Store::open(db)
+        .and_then(|st| st.clear_account_cooldown(account_id))
+        .map_err(|e| e.to_string())
 }
 
 /// Answers a pending tool approval through the running turn's channel. With
@@ -344,4 +570,201 @@ pub fn compact_now(
 /// (input, output). Unknown prices return `None` and the UI shows no cost.
 pub fn model_price(_cfg: &ProviderConfig, _model: &str) -> Option<crate::agentwork::Price> {
     None
+}
+
+// ------------------------------------------------------------ hermes import
+
+/// Detects Hermes `state.db` installations and previews each valid database
+/// without writing to the source.
+pub fn detect_hermes() -> Vec<zerith_importers::SourcePreview> {
+    zerith_importers::detect()
+        .into_iter()
+        .filter(|l| l.sessions_table && l.messages_table)
+        .filter_map(|l| zerith_importers::preview(&l.path).ok())
+        .collect()
+}
+
+/// Previews a user-supplied Hermes source (`.db` or `.jsonl`) without writing
+/// to the source.
+pub fn preview_hermes(path: &Path) -> Result<zerith_importers::SourcePreview, String> {
+    if !path.is_file() {
+        return Err(format!("arquivo não encontrado: {}", path.display()));
+    }
+    if path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("jsonl"))
+    {
+        return preview_hermes_jsonl(path);
+    }
+    zerith_importers::preview(path).map_err(|e| e.to_string())
+}
+
+fn preview_hermes_jsonl(path: &Path) -> Result<zerith_importers::SourcePreview, String> {
+    use std::io::BufRead;
+
+    use serde_json::{Map, Value};
+    use zerith_importers::{SessionPreview, SourceLayout, SourcePreview};
+
+    #[derive(Default)]
+    struct Pending {
+        meta: Map<String, Value>,
+        message_count: usize,
+    }
+
+    let str_field = |m: &Map<String, Value>, keys: &[&str]| -> Option<String> {
+        keys.iter().find_map(|k| match m.get(*k)? {
+            Value::String(s) if !s.is_empty() => Some(s.clone()),
+            Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        })
+    };
+    let truthy = |v: &Value| -> bool {
+        match v {
+            Value::Bool(b) => *b,
+            Value::Number(n) => n.as_f64().is_some_and(|f| f != 0.0),
+            _ => false,
+        }
+    };
+    let time_ms = |m: &Map<String, Value>, keys: &[&str]| -> i64 {
+        keys.iter()
+            .find_map(|k| match m.get(*k)? {
+                Value::Number(n) => n.as_f64(),
+                Value::String(s) => s.parse().ok(),
+                _ => None,
+            })
+            .filter(|&secs| secs > 0.0)
+            .map_or(0, |secs| (secs * 1000.0) as i64)
+    };
+
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let reader = std::io::BufReader::new(file);
+    let mut order: Vec<(String, Pending)> = Vec::new();
+
+    for line in reader.lines() {
+        let line = line.map_err(|e| e.to_string())?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(Value::Object(mut obj)) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let is_message = obj.contains_key("role") && !obj.contains_key("messages");
+        let sid = if is_message {
+            str_field(&obj, &["session_id"])
+        } else {
+            str_field(&obj, &["id", "session_id"])
+        };
+        let Some(sid) = sid else {
+            continue;
+        };
+        let idx = match order.iter().position(|(k, _)| *k == sid) {
+            Some(i) => i,
+            None => {
+                order.push((sid, Pending::default()));
+                order.len() - 1
+            }
+        };
+        let p = &mut order[idx].1;
+        if is_message {
+            if obj.get("active").is_none_or(|v| v.is_null() || truthy(v)) {
+                p.message_count += 1;
+            }
+        } else {
+            if let Some(Value::Array(ms)) = obj.remove("messages") {
+                p.message_count += ms
+                    .into_iter()
+                    .filter(|m| {
+                        m.as_object().is_some_and(|mo| {
+                            mo.get("active").is_none_or(|v| v.is_null() || truthy(v))
+                        })
+                    })
+                    .count();
+            }
+            p.meta = obj;
+        }
+    }
+
+    let mut sessions = Vec::with_capacity(order.len());
+    let mut total_messages = 0;
+    let mut min_date: Option<i64> = None;
+    let mut max_date: Option<i64> = None;
+
+    for (sid, p) in order {
+        let m = &p.meta;
+        let created_at = time_ms(m, &["started_at", "created_at"]);
+        let updated = time_ms(m, &["ended_at", "updated_at"]);
+        let updated_at = if updated == 0 { created_at } else { updated };
+        total_messages += p.message_count;
+
+        let min_cand = if created_at > 0 {
+            Some(created_at)
+        } else if updated_at > 0 {
+            Some(updated_at)
+        } else {
+            None
+        };
+        if let Some(d) = min_cand {
+            min_date = Some(min_date.map_or(d, |cur| cur.min(d)));
+        }
+        let max_cand = if updated_at > 0 {
+            Some(updated_at)
+        } else if created_at > 0 {
+            Some(created_at)
+        } else {
+            None
+        };
+        if let Some(d) = max_cand {
+            max_date = Some(max_date.map_or(d, |cur| cur.max(d)));
+        }
+
+        sessions.push(SessionPreview {
+            title: str_field(m, &["title"]).unwrap_or_else(|| sid.clone()),
+            id: sid,
+            model: str_field(m, &["model"]),
+            created_at,
+            updated_at,
+            message_count: p.message_count,
+            archived: m.get("archived").is_some_and(truthy),
+        });
+    }
+
+    Ok(SourcePreview {
+        layout: SourceLayout {
+            path: path.to_path_buf(),
+            profile: "jsonl".to_string(),
+            sessions_table: true,
+            messages_table: true,
+        },
+        sessions,
+        total_messages,
+        min_date,
+        max_date,
+    })
+}
+
+/// Imports selected Hermes sessions (`.db`) or an exported `.jsonl` file into
+/// the Zerith store at `db`.
+pub fn run_hermes_import(
+    db: &Path,
+    source_path: &Path,
+    profile: &str,
+    include_archived: bool,
+    only_ids: Option<Vec<String>>,
+) -> Result<zerith_importers::ImportReport, String> {
+    let store = Store::open(db).map_err(|e| e.to_string())?;
+    if source_path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("jsonl"))
+    {
+        zerith_importers::import_jsonl(source_path, profile, &store).map_err(|e| e.to_string())
+    } else {
+        zerith_importers::import_selected(
+            source_path,
+            profile,
+            &store,
+            include_archived,
+            only_ids.as_deref(),
+        )
+        .map_err(|e| e.to_string())
+    }
 }

@@ -23,6 +23,7 @@
 //! have it. That tolerance is the whole point of not pinning one schema.
 
 use rusqlite::{Connection, OpenFlags};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use zerith_sessions::{NewMessage, Role, Session, SessionSource, Store};
 
@@ -37,6 +38,28 @@ pub struct SourceLayout {
     pub profile: String,
     pub sessions_table: bool,
     pub messages_table: bool,
+}
+
+/// Summary of one Hermes session for pre-import selection.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionPreview {
+    pub id: String,
+    pub title: String,
+    pub model: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub message_count: usize,
+    pub archived: bool,
+}
+
+/// Read-only preview of a Hermes database before importing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SourcePreview {
+    pub layout: SourceLayout,
+    pub sessions: Vec<SessionPreview>,
+    pub total_messages: usize,
+    pub min_date: Option<i64>,
+    pub max_date: Option<i64>,
 }
 
 /// Reported per run so the user sees real numbers instead of "done".
@@ -153,11 +176,55 @@ fn pick<'a>(cols: &[String], wanted: &[&'a str]) -> Option<&'a str> {
     wanted.iter().copied().find(|w| cols.iter().any(|c| c == w))
 }
 
-/// Imports every session in `path` into `store`.
-///
-/// `profile` names the source profile; it is part of the idempotency key so two
-/// profiles with the same session id do not collide.
-pub fn import(path: &Path, profile: &str, store: &Store) -> Result<ImportReport> {
+struct SourceSessionRow {
+    id: String,
+    title: String,
+    model: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+    archived: bool,
+}
+
+fn session_select_sql(scols: &[String]) -> String {
+    let title_col = pick(scols, &["title"]).unwrap_or("id");
+    let model_col = pick(scols, &["model"]);
+    let created_col = pick(scols, &["started_at", "created_at"]);
+    let updated_col = pick(scols, &["ended_at", "updated_at", "started_at"]);
+    let archived_col = pick(scols, &["archived"]);
+
+    format!(
+        "SELECT id, {title_col}, {model}, {created}, {updated}, {archived} FROM sessions ORDER BY id",
+        model = model_col.unwrap_or("NULL"),
+        created = created_col.unwrap_or("0"),
+        updated = updated_col.unwrap_or("0"),
+        archived = archived_col.unwrap_or("0"),
+    )
+}
+
+fn decode_session_row(row: &rusqlite::Row<'_>) -> Result<Option<SourceSessionRow>> {
+    let Ok(id) = row.get::<_, String>(0) else {
+        return Ok(None);
+    };
+    let title: String = row
+        .get::<_, Option<String>>(1)?
+        .unwrap_or_else(|| id.clone());
+    let model: Option<String> = row.get(2)?;
+    // Hermes stores REAL epoch seconds; Zerith stores milliseconds.
+    let created_at = to_ms(row.get::<_, Option<f64>>(3)?.unwrap_or(0.0));
+    let updated = to_ms(row.get::<_, Option<f64>>(4)?.unwrap_or(0.0));
+    let updated_at = if updated == 0 { created_at } else { updated };
+    let archived = row.get::<_, Option<i64>>(5)?.unwrap_or(0) != 0;
+    Ok(Some(SourceSessionRow {
+        id,
+        title,
+        model,
+        created_at,
+        updated_at,
+        archived,
+    }))
+}
+
+fn open_validated(path: &Path) -> Result<(Connection, SourceLayout)> {
     let src = open_read_only(path)?;
     let layout = inspect(path)?;
     if !layout.sessions_table || !layout.messages_table {
@@ -166,57 +233,153 @@ pub fn import(path: &Path, profile: &str, store: &Store) -> Result<ImportReport>
             path.display()
         )));
     }
+    Ok((src, layout))
+}
 
+/// Inspects a Hermes database read-only, listing sessions, active message
+/// counts, and date bounds without writing to the source.
+pub fn preview(path: &Path) -> Result<SourcePreview> {
+    let (src, layout) = open_validated(path)?;
+    let scols = columns(&src, "sessions")?;
+    let mcols = columns(&src, "messages")?;
+
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    let where_active = match pick(&mcols, &["active"]) {
+        Some(c) => format!(" WHERE COALESCE({c}, 1) = 1"),
+        None => String::new(),
+    };
+    let msg_sql =
+        format!("SELECT session_id, COUNT(*) FROM messages{where_active} GROUP BY session_id");
+    let mut mst = src.prepare(&msg_sql)?;
+    let mut mrows = mst.query([])?;
+    while let Some(mrow) = mrows.next()? {
+        if let Ok(Some(sid)) = mrow.get::<_, Option<String>>(0) {
+            let n = mrow.get::<_, i64>(1)?.max(0) as usize;
+            counts.insert(sid, n);
+        }
+    }
+
+    let sql = session_select_sql(&scols);
+    let mut st = src.prepare(&sql)?;
+    let mut rows = st.query([])?;
+
+    let mut sessions = Vec::new();
+    let mut total_messages = 0;
+    let mut min_date: Option<i64> = None;
+    let mut max_date: Option<i64> = None;
+
+    while let Some(row) = rows.next()? {
+        let Some(s) = decode_session_row(row)? else {
+            continue;
+        };
+        let message_count = counts.get(&s.id).copied().unwrap_or(0);
+        total_messages += message_count;
+
+        let min_candidate = if s.created_at > 0 {
+            Some(s.created_at)
+        } else if s.updated_at > 0 {
+            Some(s.updated_at)
+        } else {
+            None
+        };
+        if let Some(d) = min_candidate {
+            min_date = Some(min_date.map_or(d, |cur| cur.min(d)));
+        }
+
+        let max_candidate = if s.updated_at > 0 {
+            Some(s.updated_at)
+        } else if s.created_at > 0 {
+            Some(s.created_at)
+        } else {
+            None
+        };
+        if let Some(d) = max_candidate {
+            max_date = Some(max_date.map_or(d, |cur| cur.max(d)));
+        }
+
+        sessions.push(SessionPreview {
+            id: s.id,
+            title: s.title,
+            model: s.model,
+            created_at: s.created_at,
+            updated_at: s.updated_at,
+            message_count,
+            archived: s.archived,
+        });
+    }
+
+    Ok(SourcePreview {
+        layout,
+        sessions,
+        total_messages,
+        min_date,
+        max_date,
+    })
+}
+
+/// Imports every session in `path` into `store`.
+///
+/// `profile` names the source profile; it is part of the idempotency key so two
+/// profiles with the same session id do not collide.
+pub fn import(path: &Path, profile: &str, store: &Store) -> Result<ImportReport> {
+    import_selected(path, profile, store, true, None)
+}
+
+/// Imports sessions from `path` into `store`, filtering out archived sessions
+/// when `!include_archived` and restricting to `only_ids` when `Some`.
+///
+/// Sessions excluded by these user filters are counted in `sessions_seen` and
+/// skipped before `upsert_imported`, so they do not increment
+/// `sessions_imported`, `sessions_skipped`, or `failed`.
+pub fn import_selected(
+    path: &Path,
+    profile: &str,
+    store: &Store,
+    include_archived: bool,
+    only_ids: Option<&[String]>,
+) -> Result<ImportReport> {
+    let (src, _) = open_validated(path)?;
     let scols = columns(&src, "sessions")?;
     let mcols = columns(&src, "messages")?;
     let mut report = ImportReport::default();
+    let wanted: Option<HashSet<&str>> =
+        only_ids.map(|ids| ids.iter().map(String::as_str).collect());
 
-    let title_col = pick(&scols, &["title"]).unwrap_or("id");
-    let model_col = pick(&scols, &["model"]);
-    let created_col = pick(&scols, &["started_at", "created_at"]);
-    let updated_col = pick(&scols, &["ended_at", "updated_at", "started_at"]);
-    let archived_col = pick(&scols, &["archived"]);
-
-    let sql = format!(
-        "SELECT id, {title_col}, {model}, {created}, {updated}, {archived} FROM sessions ORDER BY id",
-        model = model_col.unwrap_or("NULL"),
-        created = created_col.unwrap_or("0"),
-        updated = updated_col.unwrap_or("0"),
-        archived = archived_col.unwrap_or("0"),
-    );
+    let sql = session_select_sql(&scols);
     let mut st = src.prepare(&sql)?;
     let mut rows = st.query([])?;
 
     while let Some(row) = rows.next()? {
         report.sessions_seen += 1;
-        let Ok(source_id) = row.get::<_, String>(0) else {
+        let Some(s) = decode_session_row(row)? else {
             report.failed.push("session with an undecodable id".into());
             continue;
         };
-        let title: String = row
-            .get::<_, Option<String>>(1)?
-            .unwrap_or_else(|| source_id.clone());
-        let model: Option<String> = row.get(2)?;
-        // Hermes stores REAL epoch seconds; Zerith stores milliseconds.
-        let created = to_ms(row.get::<_, Option<f64>>(3)?.unwrap_or(0.0));
-        let updated = to_ms(row.get::<_, Option<f64>>(4)?.unwrap_or(0.0));
-        let archived = row.get::<_, Option<i64>>(5)?.unwrap_or(0) != 0;
+
+        if !include_archived && s.archived {
+            continue;
+        }
+        if let Some(ref set) = wanted {
+            if !set.contains(s.id.as_str()) {
+                continue;
+            }
+        }
 
         let session = Session {
-            id: format!("hermes-{profile}-{source_id}"),
-            title,
+            id: format!("hermes-{profile}-{}", s.id),
+            title: s.title,
             source: SessionSource::Hermes,
-            source_id: Some(source_id.clone()),
+            source_id: Some(s.id.clone()),
             source_profile: Some(profile.to_string()),
-            model,
+            model: s.model,
             provider: None,
-            created_at: created,
-            updated_at: if updated == 0 { created } else { updated },
-            archived,
+            created_at: s.created_at,
+            updated_at: s.updated_at,
+            archived: s.archived,
         };
 
         let (local_id, created_now) = store.upsert_imported(&session)?;
-        let n = import_messages(&src, &mcols, &source_id, &local_id, store)?;
+        let n = import_messages(&src, &mcols, &s.id, &local_id, store)?;
         report.messages_imported += n;
         tally(&mut report, created_now, n);
     }

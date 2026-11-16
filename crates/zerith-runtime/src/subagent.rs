@@ -296,6 +296,7 @@ pub struct ChildSpec {
     pub deadline: Option<Instant>,
     /// Receives events of the child's own subagents.
     pub sink: Option<EventSink>,
+    pub settings: Option<zerith_core::Settings>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -360,6 +361,7 @@ pub fn run_child(spec: ChildSpec) -> Result<ChildOutput, ChildError> {
         scope: spec.scope.as_ref(),
         skills: skills.as_ref(),
         agent: spec.def.as_ref(),
+        settings: spec.settings.as_ref(),
         ..TurnContext::default()
     };
     let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -470,6 +472,7 @@ struct Runtime {
     depth: usize,
     gate: Arc<Gate>,
     limit: Option<usize>,
+    settings: Option<zerith_core::Settings>,
 }
 
 /// Binds the turn's session to its registry so the session tools work. Called
@@ -500,8 +503,43 @@ pub(crate) fn bind(
         depth: opts.depth,
         gate: opts.gate.clone().unwrap_or_else(Gate::global),
         limit: opts.max_concurrent,
+        settings: ctx.settings.cloned(),
     };
     tools.host().bind(session_id, Arc::new(rt));
+}
+
+pub(crate) fn pick_candidate<'a>(
+    db: &Path,
+    candidates: &'a [zerith_providers::RouteCandidate],
+) -> Option<&'a zerith_providers::RouteCandidate> {
+    if let Ok(store) = Store::open(db) {
+        if let Some(cand) = candidates.iter().find(|c| {
+            store
+                .is_account_available(
+                    &c.account_id,
+                    c.window_hours,
+                    c.quota_tokens,
+                    c.quota_requests,
+                )
+                .unwrap_or(true)
+        }) {
+            return Some(cand);
+        }
+    }
+    candidates.first()
+}
+
+pub(crate) fn resolve_child_route(
+    db: &Path,
+    settings: &zerith_core::Settings,
+    raw_model: &str,
+    fallback_cfg: &ProviderConfig,
+) -> (ProviderConfig, String) {
+    let (gw, effective_model) = crate::resolve_gateway(settings, raw_model, fallback_cfg);
+    match pick_candidate(db, &gw.candidates) {
+        Some(cand) => (cand.config.clone(), cand.model.clone()),
+        None => (fallback_cfg.clone(), effective_model),
+    }
 }
 
 /// Turns what the tools queued into events: subagent states as they came, and
@@ -585,11 +623,20 @@ impl Services for Runtime {
             policy.mode = Mode::Plan;
         }
         let id = format!("sub-{}", NEXT_ID.fetch_add(1, Ordering::Relaxed));
-        let model = req
-            .model
-            .clone()
-            .or_else(|| resolved.def.model.clone())
-            .unwrap_or_else(|| self.model.clone());
+        let settings = self.settings.clone().unwrap_or_else(|| {
+            zerith_core::Settings::load(
+                &zerith_core::Paths::resolve(),
+                Some(&self.policy.workspace),
+            )
+            .settings
+        });
+        let raw_model = settings.routing.resolve_subagent_model(
+            &resolved.name,
+            req.model.as_deref(),
+            resolved.def.model.as_deref(),
+            &self.model,
+        );
+        let (cfg, model) = resolve_child_route(&db, &settings, &raw_model, &self.cfg);
         let steps = resolved
             .def
             .max_turns
@@ -599,7 +646,7 @@ impl Services for Runtime {
         let description = req.description.clone();
         let spec = ChildSpec {
             db,
-            cfg: self.cfg.clone(),
+            cfg,
             policy,
             registry,
             parent: session.to_string(),
@@ -619,6 +666,7 @@ impl Services for Runtime {
                 deadline
             }),
             sink: Some(sink.clone()),
+            settings: Some(settings),
         };
         // Only the first level takes a permit; deeper children run under it.
         let permit_gate = (self.depth == 0).then(|| (self.gate.clone(), self.limit));

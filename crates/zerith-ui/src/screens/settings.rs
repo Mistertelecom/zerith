@@ -2,8 +2,10 @@
 
 use rune::{col, row, text, El, ScrollSpec, Tx};
 use rune_kit::{SegmentedControl, Switch};
-use zerith_sessions::Store;
+use zerith_core::{CavemanLevel, PonytailLevel, TokenSaverSettings};
+use zerith_sessions::{Store, UsageSummary};
 
+use crate::agentwork;
 use crate::ui::{self, Ui};
 use crate::widgets::{self, button, section, setting, Load, Tone};
 use crate::{wire, Profile, Shell, Theme};
@@ -18,20 +20,61 @@ pub struct Storage {
 
 pub struct SettingsState {
     pub profile: Profile,
+    pub token_saver: TokenSaverSettings,
+    pub savings: Load<UsageSummary>,
     pub storage: Load<Storage>,
     pub backup: Load<String>,
     pub notice: Option<Result<String, String>>,
 }
 
 impl SettingsState {
-    pub fn new(profile: Profile) -> Self {
+    pub fn new(profile: Profile, token_saver: TokenSaverSettings) -> Self {
         Self {
             profile,
+            token_saver,
+            savings: Load::Idle,
             storage: Load::Idle,
             backup: Load::Idle,
             notice: None,
         }
     }
+}
+
+pub fn load_usage(s: &mut Shell) {
+    s.settings.savings = Load::Loading;
+    let db = s.db().to_path_buf();
+    s.work(
+        move || wire::usage_summary(&db, 24),
+        |s, r| s.settings.savings = r.into(),
+    );
+}
+
+fn save_token_saver(s: &mut Shell) {
+    let root = s.root();
+    let ts = s.settings.token_saver.clone();
+    s.work(
+        move || wire::save_token_saver(&root, &ts),
+        |s, r| {
+            if let Err(e) = r {
+                s.settings.notice = Some(Err(format!("Não consegui salvar o Token Saver: {e}")));
+            }
+        },
+    );
+}
+
+pub fn set_ponytail(s: &mut Shell, level: PonytailLevel) {
+    s.settings.token_saver.ponytail = level;
+    save_token_saver(s);
+}
+
+pub fn set_caveman(s: &mut Shell, level: CavemanLevel) {
+    s.settings.token_saver.caveman = level;
+    save_token_saver(s);
+}
+
+pub fn set_rtk_enabled(s: &mut Shell, enabled: bool) {
+    s.settings.token_saver.rtk_enabled = enabled;
+    save_token_saver(s);
 }
 
 pub fn load_storage(s: &mut Shell) {
@@ -87,6 +130,36 @@ fn human(bytes: u64) -> String {
         b if b >= 1 << 20 => format!("{:.1} MB", b as f64 / (1u64 << 20) as f64),
         b if b >= 1 << 10 => format!("{:.0} KB", b as f64 / 1024.0),
         b => format!("{b} B"),
+    }
+}
+
+fn savings_detail(savings: &Load<UsageSummary>) -> String {
+    match savings {
+        Load::Idle | Load::Loading => "calculando…".to_string(),
+        Load::Failed(e) => format!("indisponível: {e}"),
+        Load::Ready(u) => {
+            if u.total_saved_tokens == 0 {
+                "Nenhuma economia registrada ainda".to_string()
+            } else {
+                let consumed = u
+                    .total_prompt_tokens
+                    .saturating_add(u.total_completion_tokens);
+                let baseline = consumed.saturating_add(u.total_saved_tokens);
+                let pct = if baseline > 0 {
+                    ((u.total_saved_tokens as f64 / baseline as f64) * 100.0).round() as u64
+                } else {
+                    0
+                };
+                format!(
+                    "RTK: {} tok · Ponytail: {} tok · Caveman: {} tok · Total: {} tok (-{}%)",
+                    agentwork::compact_count(u.total_saved_rtk_tokens),
+                    agentwork::compact_count(u.total_saved_ponytail_tokens),
+                    agentwork::compact_count(u.total_saved_caveman_tokens),
+                    agentwork::compact_count(u.total_saved_tokens),
+                    pct
+                )
+            }
+        }
     }
 }
 
@@ -241,6 +314,94 @@ pub fn view(s: &Shell, u: &Ui, system_reduced: bool) -> El {
         u,
     );
 
+    let pt_idx = match st.token_saver.ponytail {
+        PonytailLevel::Off => 0,
+        PonytailLevel::Lite => 1,
+        PonytailLevel::Full => 2,
+        PonytailLevel::Ultra => 3,
+    };
+    let cv_idx = match st.token_saver.caveman {
+        CavemanLevel::Off => 0,
+        CavemanLevel::Lite => 1,
+        CavemanLevel::Full => 2,
+        CavemanLevel::Ultra => 3,
+        CavemanLevel::Wenyan => 4,
+    };
+    let savings_line = savings_detail(&st.savings);
+    let token_saver = section(
+        "Token Saver (Economia de Tokens)",
+        vec![
+            setting(
+                "Ponytail (Lazy Senior Dev)",
+                "Instrui o agente a escrever o mínimo necessário com YAGNI e código nativo.",
+                SegmentedControl::new(&["Off", "Lite", "Full", "Ultra"], Some(pt_idx))
+                    .label("Ponytail (Lazy Senior Dev)")
+                    .fit()
+                    .on_pick(|s: &mut Shell, i: usize, _: &mut Tx| {
+                        let level = [
+                            PonytailLevel::Off,
+                            PonytailLevel::Lite,
+                            PonytailLevel::Full,
+                            PonytailLevel::Ultra,
+                        ][i];
+                        set_ponytail(s, level);
+                    })
+                    .build(&kit),
+                u,
+            ),
+            setting(
+                "Caveman (Compressão de Resposta)",
+                "Compacta explicações mantendo código, caminhos, comandos e alertas intactos.",
+                SegmentedControl::new(&["Off", "Lite", "Full", "Ultra", "Wenyan"], Some(cv_idx))
+                    .label("Caveman (Compressão de Resposta)")
+                    .fit()
+                    .on_pick(|s: &mut Shell, i: usize, _: &mut Tx| {
+                        let level = [
+                            CavemanLevel::Off,
+                            CavemanLevel::Lite,
+                            CavemanLevel::Full,
+                            CavemanLevel::Ultra,
+                            CavemanLevel::Wenyan,
+                        ][i];
+                        set_caveman(s, level);
+                    })
+                    .build(&kit),
+                u,
+            ),
+            setting(
+                "RTK (Compressão de Ferramentas)",
+                "Comprime saídas grandes de git, build, grep e logs antes de enviar ao modelo.",
+                Switch::new(st.token_saver.rtk_enabled)
+                    .label("RTK (Compressão de Ferramentas)")
+                    .hide_label()
+                    .on_toggle(|s: &mut Shell| {
+                        let next = !s.settings.token_saver.rtk_enabled;
+                        set_rtk_enabled(s, next);
+                    })
+                    .build(&kit),
+                u,
+            ),
+            setting(
+                "Economia registrada (24h)",
+                &savings_line,
+                button(
+                    "settings-usage-refresh",
+                    if st.savings.is_loading() {
+                        "Atualizando…"
+                    } else {
+                        "Atualizar"
+                    },
+                    Tone::Plain,
+                    !st.savings.is_loading(),
+                    u,
+                    |s, _| load_usage(s),
+                ),
+                u,
+            ),
+        ],
+        u,
+    );
+
     let about = section(
         "Sobre",
         vec![
@@ -265,6 +426,7 @@ pub fn view(s: &Shell, u: &Ui, system_reduced: bool) -> El {
         .child(privacy)
         .child(storage)
         .child(profile)
+        .child(token_saver)
         .child(about);
     if let Some(Err(e)) = &st.notice {
         body = body.child(widgets::error_line(e.clone(), u));

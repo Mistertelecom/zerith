@@ -9,7 +9,7 @@ para a maior precedência:
 | Usuário | `<raiz de dados>/settings.toml` | `user` |
 | Projeto | `<projeto>/.zerith/settings.toml` | `project` |
 | Projeto-local (não versionar) | `<projeto>/.zerith/settings.local.toml` | `local` |
-| Ambiente | `ZERITH_PROVIDER`, `ZERITH_BASE_URL`, `ZERITH_MODEL`, `ZERITH_USER`, `ZERITH_SANDBOX`, `ZERITH_MODE`, `ZERITH_PROFILE` | `env` |
+| Ambiente | `ZERITH_PROVIDER`, `ZERITH_BASE_URL`, `ZERITH_MODEL`, `ZERITH_USER`, `ZERITH_SANDBOX`, `ZERITH_MODE`, `ZERITH_PROFILE`, `ZERITH_SUBAGENT_MODEL`, `ZERITH_PONYTAIL`, `ZERITH_CAVEMAN` | `env` |
 
 Regras de mescla: tabelas mesclam por chave; **listas concatenam** entre
 camadas (regras de permissão, hooks, providers); escalares são substituídos.
@@ -22,9 +22,39 @@ ignorada: ...`) e o app sobe com as outras camadas.
 ## Exemplo
 
 ```toml
-provider = "openai"
-model = "gpt-4.1"
+provider = "anthropic"
+model = "claude-opus-5-5"
 profile = "balanced"        # economy | balanced | performance
+
+[[accounts]]
+id = "claude-principal"
+provider = "anthropic"
+priority = 1
+enabled = true
+quota_tokens = 200000
+quota_requests = 500
+window_hours = 5
+api_key_ref = "claude-principal"  # nome da entrada no cofre; nunca a chave
+
+[[accounts]]
+id = "deepseek-sub"
+provider = "deepseek"
+priority = 1
+enabled = true
+default_model = "deepseek-4.1-flash"
+quota_tokens = 2000000
+window_hours = 24
+api_key_ref = "deepseek-sub"
+
+[routing]
+main_model = "anthropic/claude-opus-5-5"
+subagent_model = "deepseek/deepseek-4.1-flash"
+explore_model = "deepseek/deepseek-4.1-flash"
+
+[token_saver]
+ponytail = "full"           # off | lite | full | ultra
+caveman = "lite"            # off | lite | full | ultra | wenyan
+rtk_enabled = true
 
 [[providers]]
 name = "openai"
@@ -78,13 +108,16 @@ O perfil é relido a cada turno, então trocar na janela vale já no próximo.
 
 | Campo | Usado por |
 | --- | --- |
-| `model` | `zerith chat`, `zerith -p` (quando `ZERITH_MODEL` não está definido) |
-| `providers[].api_key_ref` | `zerith chat`, `zerith -p` (busca no cofre) |
-| `memory.paused` | `zerith -p` |
+| `model` / `routing.main_model` | `zerith chat`, `zerith -p`, `zerith-ui` (quando `--model`/`ZERITH_MODEL` não estão definidos) |
+| `accounts[]` | Gateway local nativo (`zerith-runtime::resolve_gateway`, CLI e `zerith-ui`), failover, cotas e cofre |
+| `routing.*` | Delegação de subagentes (`subagent_model`, `explore_model`, `plan_model`, `role_models`) e `combos` |
+| `token_saver.*` | Prompt e compressão RTK por turno (`ponytail`, `caveman`, `rtk_enabled`) |
+| `providers[].api_key_ref` | `zerith chat`, `zerith -p`, `zerith providers` e `zerith-ui` (busca no cofre) |
+| `memory.paused` | `zerith -p`, `zerith chat`, `zerith-ui` |
 | `profile` | turnos (histórico) e `zerith plan run` (subagentes) |
 | `ui.*` | a janela lê e grava (tema, movimento reduzido) |
-| `permissions.*`, `hooks.*` | só biblioteca (**planejado** no runtime) |
-| `provider`, `base_url` | o provider ainda vem de `ProviderConfig::from_env` (mesmas variáveis) |
+| `permissions.*`, `hooks.*` | `Policy::from_settings` + `Guards` e runner de hooks em `zerith -p`, `zerith chat` e `zerith-ui` |
+| `provider`, `base_url` | `provider_config` em CLI/headless e `configured_providers` em `zerith-ui` (`ZERITH_PROVIDER`/`ZERITH_BASE_URL` ainda têm precedência) |
 
 ## Gravar
 

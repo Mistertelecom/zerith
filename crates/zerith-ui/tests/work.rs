@@ -6,8 +6,9 @@ use zerith_runtime::RunEvent;
 use zerith_security::Mode;
 use zerith_sessions::{NewMessage, Role, SessionSource, Store};
 use zerith_ui::agentwork::{
-    self as aw, filter_files, filter_slash, trigger, ContextMeter, Fill, Item, PermissionMode,
-    Question, QuestionSet, SubState, Subagent, TaskItem, TaskState, ToolState, Trigger, WorkEvent,
+    self as aw, filter_files, filter_slash, trigger, ContextMeter, DiffKind, DiffSummary, Fill,
+    Item, PermissionMode, Question, QuestionSet, SubState, Subagent, TaskItem, TaskState, ToolRow,
+    ToolState, Trigger, TurnChanges, WorkEvent,
 };
 use zerith_ui::screens::chat;
 use zerith_ui::{spec, Approval, Decision, Screen, Shell};
@@ -237,17 +238,22 @@ fn a_question_card_needs_every_answer_and_hands_them_over() {
 #[test]
 fn slash_and_mention_triggers_filter_and_replace_the_token() {
     let names = |q: &str| filter_slash(q).iter().map(|c| c.name).collect::<Vec<_>>();
-    assert_eq!(names("").len(), 9);
+    assert_eq!(names("").len(), 11);
     assert_eq!(names("c"), ["compact", "context", "clear"]);
     assert_eq!(
         names("mo"),
-        ["model", "memory"],
+        ["model", "mode", "memory"],
         "prefix first, then contained"
     );
     assert_eq!(
         names("ear"),
         ["clear"],
         "a contained match follows prefixes"
+    );
+    assert_eq!(
+        names("re"),
+        ["resume", "rewind"],
+        "rewind matches prefix after resume"
     );
     assert!(names("zzz").is_empty());
 
@@ -443,4 +449,119 @@ fn the_cards_build_in_both_themes_without_a_gpu() {
         );
         rt.frame(0.0);
     }
+}
+
+#[test]
+fn turn_changes_counts_unique_files_and_ignores_failed_or_running_edits() {
+    let mk = |id: &str, arg: &str, state: ToolState, adds: usize, dels: usize| ToolRow {
+        id: id.into(),
+        name: "edit_file".into(),
+        arg: arg.into(),
+        state,
+        millis: Some(10),
+        started: None,
+        preview: String::new(),
+        diff: Some(DiffSummary {
+            rows: Vec::new(),
+            more: 0,
+            adds,
+            dels,
+        }),
+    };
+    let mut read = mk("r", "src/e.rs", ToolState::Ok, 0, 0);
+    read.name = "read_file".into();
+    read.diff = None;
+
+    let tools = vec![
+        mk("1", "src/a.rs", ToolState::Ok, 2, 1),
+        mk("2", "src/a.rs", ToolState::Ok, 3, 2),
+        mk("3", "src/b.rs", ToolState::Ok, 1, 0),
+        mk("4", "src/c.rs", ToolState::Failed, 5, 4),
+        mk("5", "src/d.rs", ToolState::Running, 2, 1),
+        read,
+    ];
+    assert_eq!(
+        aw::turn_changes(&tools),
+        TurnChanges {
+            files: 2,
+            adds: 6,
+            dels: 3,
+        }
+    );
+    assert_eq!(aw::turn_changes(std::iter::empty()), TurnChanges::default());
+}
+
+#[test]
+fn diff_of_call_populates_one_based_line_numbers() {
+    let d = aw::diff_of_call(
+        "edit_file",
+        r#"{"path":"src/a.rs","old_string":"1\n2\n3\n4","new_string":"1\n2\n3\n40"}"#,
+    )
+    .expect("edit diff");
+    let rows: Vec<(DiffKind, Option<usize>, &str)> = d
+        .rows
+        .iter()
+        .map(|r| (r.kind, r.line_no, r.text.as_str()))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            (DiffKind::Ctx, Some(3), "3"),
+            (DiffKind::Del, Some(4), "4"),
+            (DiffKind::Add, Some(4), "40"),
+        ]
+    );
+
+    let w = aw::diff_of_call(
+        "write_file",
+        r#"{"path":"src/new.rs","content":"alpha\nbeta"}"#,
+    )
+    .expect("write diff");
+    let write_rows: Vec<(DiffKind, Option<usize>, &str)> = w
+        .rows
+        .iter()
+        .map(|r| (r.kind, r.line_no, r.text.as_str()))
+        .collect();
+    assert_eq!(
+        write_rows,
+        vec![
+            (DiffKind::Add, Some(1), "alpha"),
+            (DiffKind::Add, Some(2), "beta"),
+        ]
+    );
+}
+
+#[test]
+fn mode_and_rewind_slash_commands_execute() {
+    let dir = tempdir();
+    let db = dir.path().join("zerith.db");
+    let store = Store::open(&db).expect("store");
+    let sess = store
+        .create_session("r", SessionSource::Native)
+        .expect("session");
+    store
+        .append(&sess.id, &NewMessage::new(Role::User, "oi"))
+        .expect("append");
+
+    let mut s = shell_at(dir.path());
+    chat::set_mode(&mut s, PermissionMode::Default);
+    s.chat.draft = rune::TextEdit::new("/mode");
+    chat::run_command(&mut s, "mode");
+    assert_eq!(s.chat.permission_mode(), PermissionMode::AcceptEdits);
+    assert!(s.chat.draft.text.is_empty());
+
+    chat::run_command(&mut s, "mode");
+    assert_eq!(s.chat.permission_mode(), PermissionMode::Plan);
+    chat::run_command(&mut s, "mode");
+    assert_eq!(s.chat.permission_mode(), PermissionMode::Default);
+
+    s.chat.selected = Some(sess.id);
+    s.chat.draft = rune::TextEdit::new("/rewind");
+    chat::run_command(&mut s, "rewind");
+    assert!(s.chat.draft.text.is_empty());
+    assert!(
+        s.chat.status.contains("nenhum ponto"),
+        "no checkpoint yet: {}",
+        s.chat.status
+    );
 }

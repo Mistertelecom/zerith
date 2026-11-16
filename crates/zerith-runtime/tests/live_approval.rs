@@ -2,7 +2,7 @@
 //! default: it needs a running server and spends tokens.
 //!
 //! ```text
-//! ZERITH_LIVE_URL=http://localhost:20128/v1 ZERITH_LIVE_MODEL=<id> \
+//! ZERITH_LIVE_URL=http://localhost:11434/v1 ZERITH_LIVE_MODEL=<id> \
 //!   cargo test -p zerith-runtime --test live_approval -- --ignored --nocapture
 //! ```
 
@@ -31,7 +31,7 @@ fn a_real_model_asks_to_write_and_the_approval_lets_it() {
     // not refuse to start without a key; the key, when there is one, is sent.
     let mut cfg = ProviderConfig::new(ProviderKind::Ollama);
     cfg.base_url = url;
-    cfg.api_key = zerith_core::secrets::resolve_api_key("9router", None)
+    cfg.api_key = zerith_core::secrets::resolve_api_key("openai", None)
         .ok()
         .flatten();
     let client = Client::new(cfg).unwrap();

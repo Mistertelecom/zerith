@@ -468,11 +468,15 @@ fn run_one(
         .or_else(|_| subagent::resolve_agent(&cwd, None))?;
     let registry = subagent::child_registry(&zerith_tools::Registry::new(), &resolved, 1);
     let paths = zerith_core::Paths::resolve();
-    let model = resolved
-        .def
-        .model
-        .clone()
-        .unwrap_or_else(|| model.to_string());
+    let settings = zerith_core::Settings::load(&paths, Some(&cwd)).settings;
+    let fallback_cfg = zerith_providers::ProviderConfig::from_env();
+    let raw_model = settings.routing.resolve_subagent_model(
+        &resolved.name,
+        None,
+        resolved.def.model.as_deref(),
+        model,
+    );
+    let (cfg, model) = subagent::resolve_child_route(db, &settings, &raw_model, &fallback_cfg);
     let steps = ctx
         .budget
         .max_steps
@@ -485,7 +489,7 @@ fn run_one(
     let _permit = gate.acquire(limit, &ctx.cancel, deadline)?;
     let out = subagent::run_child(subagent::ChildSpec {
         db: db.to_path_buf(),
-        cfg: zerith_providers::ProviderConfig::from_env(),
+        cfg,
         policy,
         registry,
         parent: task.plan_id.clone(),
@@ -501,6 +505,7 @@ fn run_one(
         cancel: ctx.cancel.clone(),
         deadline,
         sink: None,
+        settings: Some(settings),
     })
     .map_err(|e| e.to_string())?;
     Ok(TaskOutcome {

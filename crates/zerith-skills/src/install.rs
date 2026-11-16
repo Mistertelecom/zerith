@@ -4,6 +4,7 @@
 //! rollback is a real answer and not a promise. Installing never executes
 //! anything: it copies files, scans them, and writes a manifest row.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -77,6 +78,7 @@ pub type Result<T> = std::result::Result<T, InstallError>;
 /// The skills root, its manifest, and the copies kept for rollback.
 pub struct Library {
     root: PathBuf,
+    extra: Vec<PathBuf>,
 }
 
 impl Library {
@@ -84,7 +86,15 @@ impl Library {
         let root = root.into();
         std::fs::create_dir_all(&root)?;
         std::fs::create_dir_all(root.join(".backups"))?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            extra: Vec::new(),
+        })
+    }
+
+    pub fn with_extra(mut self, dirs: impl IntoIterator<Item = PathBuf>) -> Self {
+        self.extra = dirs.into_iter().collect();
+        self
     }
 
     pub fn root(&self) -> &Path {
@@ -228,12 +238,32 @@ impl Library {
     /// on disk but are absent from this list, which is the whole meaning of
     /// disabling one.
     pub fn enabled(&self) -> Result<Vec<Installed>> {
-        Ok(self
-            .manifest()?
+        let m = self.manifest()?;
+        let mut seen: HashSet<String> = m.skills.iter().map(|s| s.name.clone()).collect();
+        let mut out: Vec<Installed> = m
             .skills
             .into_iter()
             .filter(|s| s.status == Status::Enabled)
-            .collect())
+            .collect();
+        for dir in &self.extra {
+            let Ok(sk) = scan(dir) else {
+                continue;
+            };
+            if !seen.insert(sk.frontmatter.name.clone()) {
+                continue;
+            }
+            out.push(Installed {
+                name: sk.frontmatter.name,
+                description: sk.frontmatter.description,
+                license: sk.frontmatter.license.unwrap_or_default(),
+                source: format!("plugin:{}", dir.display()),
+                status: Status::Enabled,
+                dir: dir.to_string_lossy().into_owned(),
+                installed_at: 0,
+                previous_dir: None,
+            });
+        }
+        Ok(out)
     }
 
     /// The metadata catalog: name and description only. Loading every body
@@ -249,14 +279,19 @@ impl Library {
     /// Reads one skill body on demand, which is the other half.
     pub fn load_body(&self, name: &str) -> Result<String> {
         let m = self.manifest()?;
-        let row = m
-            .skills
-            .iter()
-            .find(|s| s.name == name)
-            .ok_or_else(|| InstallError::Missing(name.to_string()))?;
-        Ok(std::fs::read_to_string(
-            self.root.join(&row.dir).join("SKILL.md"),
-        )?)
+        if let Some(row) = m.skills.iter().find(|s| s.name == name) {
+            return Ok(std::fs::read_to_string(
+                self.root.join(&row.dir).join("SKILL.md"),
+            )?);
+        }
+        for dir in &self.extra {
+            if let Ok(sk) = scan(dir) {
+                if sk.frontmatter.name == name {
+                    return Ok(std::fs::read_to_string(dir.join("SKILL.md"))?);
+                }
+            }
+        }
+        Err(InstallError::Missing(name.to_string()))
     }
 
     /// Parsed header of one installed skill, read from disk on each call.
@@ -448,5 +483,49 @@ mod tests {
         assert!(validate_dir_name("../evil").is_err());
         assert!(validate_dir_name("Demo").is_err());
         assert!(validate_dir_name("ok-name-1").is_ok());
+    }
+
+    #[test]
+    fn extra_dirs_load_after_user_manifest_with_user_precedence() {
+        let tmp = tempfile::tempdir_in(scratch()).unwrap();
+        let user_src = tmp.path().join("user-demo");
+        write_skill(&user_src, "demo", "corpo do usuario");
+        let plugin_override = tmp.path().join("plugin-demo");
+        write_skill(&plugin_override, "demo", "corpo do plugin");
+        let plugin_only = tmp.path().join("plugin-extra");
+        std::fs::create_dir_all(&plugin_only).unwrap();
+        std::fs::write(
+            plugin_only.join("SKILL.md"),
+            "---\nname: extra-skill\ndescription: do plugin\nallowed-tools: Read\n---\n\n# Extra\n",
+        )
+        .unwrap();
+
+        let lib = Library::open(tmp.path().join("skills"))
+            .unwrap()
+            .with_extra(vec![plugin_override, plugin_only]);
+
+        // Extra skill is visible before any user skill is installed.
+        let enabled = lib.enabled().unwrap();
+        assert_eq!(enabled.len(), 2);
+        let extra_row = enabled.iter().find(|s| s.name == "extra-skill").unwrap();
+        assert!(extra_row.source.starts_with("plugin:"));
+        assert_eq!(lib.skill_body("extra-skill").as_deref(), Some("# Extra\n"));
+        assert_eq!(
+            lib.allowed_tools("extra-skill").unwrap(),
+            Some(vec!["Read".to_string()])
+        );
+
+        // Installing a user skill with the same name takes precedence over the plugin.
+        lib.install(&user_src, "user").unwrap();
+        assert_eq!(
+            lib.skill_body("demo").as_deref(),
+            Some("corpo do usuario\n")
+        );
+
+        // Even when disabled by the user, the plugin skill of the same name stays hidden.
+        lib.set_status("demo", Status::Disabled).unwrap();
+        assert_eq!(lib.skill_body("demo"), None);
+        let names: Vec<String> = lib.enabled().unwrap().into_iter().map(|s| s.name).collect();
+        assert_eq!(names, vec!["extra-skill".to_string()]);
     }
 }

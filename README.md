@@ -13,11 +13,11 @@ que veio de cada uma estão em [UPSTREAMS.md](UPSTREAMS.md).
 
 | Crate | Papel |
 | --- | --- |
-| `zerith-core` | Identidade, `Paths` (por SO), erros |
-| `zerith-sessions` | SQLite, migrações versionadas, sessões, mensagens, eventos, checkpoints e rewind |
+| `zerith-core` | Identidade, `Paths` (por SO), erros, configurações em camadas (`accounts`, `routing`, `token_saver`) |
+| `zerith-sessions` | SQLite, migrações versionadas (`V1`–`V7`), sessões, mensagens, eventos, checkpoints, rewind e rastreamento de uso/cotas/economia |
 | `zerith-memory` | `MemoryBackend` + `SqliteMemory` (FTS5) + extração determinística |
-| `zerith-providers` | Endpoints OpenAI-compatible e Anthropic (9Router, Ollama, LM Studio) |
-| `zerith-runtime` | Um turno de agente: histórico → provider → mensagem gravada |
+| `zerith-providers` | Gateway nativo multi-conta com failover automático, presets nativos (`openai`, `anthropic`, `deepseek`, `gemini`, `openrouter`, `ollama`, `lmstudio`) e `ModelSpec` |
+| `zerith-runtime` | Um turno de agente, gateway + quota tracker, delegação multi-modelo de subagentes e Token Saver (`Ponytail`, `Caveman`, `RTK`) |
 | `zerith-importers` | Import read-only do Hermes (`~/.hermes/state.db`) |
 | `zerith-skills` | Formato Agent Skills, catálogo GitHub, instalação com rollback |
 | `zerith-mcp` | Cliente MCP (stdio e HTTP), configuração `[[mcp.servers]]`, ferramentas `mcp__<servidor>__<ferramenta>` no laço do agente |
@@ -68,7 +68,11 @@ zerith skills list|install|update|remove|enable|disable|rollback|validate|catalo
 zerith memory list|recall|remember|edit|forget|export|import|pause|resume|status
 zerith mcp list|add|remove|approve|tools|call
 zerith plugin list|show|install|enable|disable|trust|untrust|remove|tools
-zerith providers [probe|models|chat <model> <prompt>]
+zerith providers [show|probe|models|chat <model> <prompt>]
+zerith accounts [list|add <id> <provider> ...|remove|enable|disable|reset-cooldown <id>]
+zerith routing [show|main|subagent|explore|plan <model>|role <agent> <model>|combo <name> <m1,m2,...>]
+zerith tokensaver [show|ponytail <nível>|caveman <nível>|rtk <on|off>]
+zerith usage [--hours N] | quota [--hours N]
 zerith import detect | hermes [--profile P] [--jsonl ARQUIVO]
 ```
 
@@ -80,22 +84,29 @@ de passos; `130` Ctrl+C e `143` SIGTERM/fechamento do console (um segundo sinal
 encerra na hora). O cancelamento só é visto entre pedaços do stream e entre
 chamadas de ferramenta.
 
-## Providers
+## Providers e Gateway Local Nativo
 
-A escolha do endpoint vem do ambiente, um leitor só
-(`ProviderConfig::from_env`), usado pelo CLI e pela janela:
+O Zerith conecta diretamente aos provedores via Gateway Local Nativo Multi-Conta
+(com suporte a combos, limites de cota, failover automático e delegação de
+subagentes entre modelos/contas). Não depende de 9Router externo. Quando
+variáveis de ambiente estiverem definidas, elas continuam no topo da precedência:
 
 | Variável | Efeito |
 | --- | --- |
-| `ZERITH_PROVIDER` | `9router` (padrão), `openai`, `anthropic`, `deepseek`, `gemini`, `openrouter`, `ollama`, `lmstudio`, `custom` |
+| `ZERITH_PROVIDER` | `openai` (padrão), `anthropic`, `deepseek`, `gemini`, `openrouter`, `ollama`, `lmstudio`, `custom` |
 | `ZERITH_BASE_URL` | Sobrescreve a URL do endpoint |
 | `ZERITH_API_KEY` | Chave; exigida só no chat, não em `probe`/`models` |
 | `ZERITH_MODEL` | Modelo padrão do chat |
+| `ZERITH_ACCOUNT_ID` | ID explícito da conta no gateway |
+| `ZERITH_SUBAGENT_MODEL` | Sobrescreve `[routing] subagent_model` para subagentes |
+| `ZERITH_PONYTAIL` | Nível do protocolo Ponytail (`off`, `lite`, `full`, `ultra`) |
+| `ZERITH_CAVEMAN` | Nível do protocolo Caveman (`off`, `lite`, `full`, `ultra`, `wenyan`) |
 | `ZERITH_USER` | Dono do escopo de memória (padrão: usuário do SO) |
 
 `probe` e `models` funcionam sem chave de propósito: um servidor local
-(LM Studio, Ollama, 9Router) que lista modelos não deve ser escondido por falta
-de credencial que ele nem pede.
+(LM Studio, Ollama) que lista modelos não deve ser escondido por falta de
+credencial que ele nem pede. Detalhes do gateway, cotas e Token Saver estão em
+[docs/providers.md](docs/providers.md).
 
 ## Permissões, segurança e benchmark
 

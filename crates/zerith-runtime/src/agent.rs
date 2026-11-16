@@ -12,16 +12,18 @@
 //! window) and [`crate::spill`] (outputs too big for the model).
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
+use zerith_core::hooks::{run_hooks, HookEvent, HookOutcome, HookPayload};
 use zerith_providers::{
-    Cancel, ChatMessage, ChatRequest, Client, ProviderError, StreamEvent, ToolCall, ToolDef, Usage,
+    is_failover_error, suggested_cooldown_ms, Cancel, ChatMessage, ChatRequest, Client, Gateway,
+    GatewayOutcome, ProviderError, RouteCandidate, StreamEvent, ToolCall, ToolDef, Usage,
 };
 use zerith_security::Policy;
-use zerith_sessions::{checkpoints, NewMessage, Role, Store};
+use zerith_sessions::{checkpoints, migrations::now_ms, NewMessage, NewUsageRecord, Role, Store};
 use zerith_tools::Registry;
 
 use crate::compact::{replay_items, ClientSummarizer, History, Summarizer};
@@ -279,6 +281,40 @@ fn turn_body(
     if let Some(dir) = &agent.spill_dir {
         spill::prune(dir, SPILL_MAX_AGE);
     }
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let mut prompt_context = Vec::new();
+    if let Some(st) = ctx.settings {
+        if store.message_count(session_id).unwrap_or(1) == 0 {
+            let start_out = run_hooks(
+                HookEvent::SessionStart,
+                &HookPayload {
+                    session_id: session_id.to_string(),
+                    cwd: cwd.clone(),
+                    ..Default::default()
+                },
+                st,
+            );
+            log_hook_errors(log, HookEvent::SessionStart, &start_out.errors);
+        }
+        let prompt_out = run_hooks(
+            HookEvent::UserPromptSubmit,
+            &HookPayload {
+                session_id: session_id.to_string(),
+                prompt: Some(prompt.to_string()),
+                cwd: cwd.clone(),
+                ..Default::default()
+            },
+            st,
+        );
+        log_hook_errors(log, HookEvent::UserPromptSubmit, &prompt_out.errors);
+        if prompt_out.blocked() {
+            return Err(RunError::Blocked(hook_reason(
+                &prompt_out,
+                "UserPromptSubmit",
+            )));
+        }
+        prompt_context = prompt_out.additional_context;
+    }
     // Checkpoint first: its boundary is the newest message *before* this
     // prompt, so a conversation rewind removes the prompt too. A failure only
     // disables rewind for this turn; it never stops the turn.
@@ -323,6 +359,19 @@ fn turn_body(
     // The newest rows, which include the prompt just appended.
     let rows = store.recent_messages(session_id, agent.history.max(1))?;
     let mut hist = History::new(system, replay_items(&rows));
+    for text in prompt_context {
+        if text.trim().is_empty() {
+            continue;
+        }
+        let cid = store.append(
+            session_id,
+            &NewMessage {
+                raw: Some(json!({"hook_context": true})),
+                ..NewMessage::new(Role::User, text.clone())
+            },
+        )?;
+        hist.push(ChatMessage::user(text), cid);
+    }
 
     let defs: Vec<ToolDef> = agent
         .tools
@@ -337,7 +386,18 @@ fn turn_body(
                 .collect()
         })
         .unwrap_or_default();
-    let budget = client.config().context_limit.map(|l| l as usize * 8 / 10);
+    let budget = ctx
+        .settings
+        .and_then(|st| {
+            crate::resolve_gateway(st, model, client.config())
+                .0
+                .candidates
+                .into_iter()
+                .next()
+                .and_then(|c| c.config.context_limit)
+        })
+        .or(client.config().context_limit)
+        .map(|l| l as usize * 8 / 10);
     let default_summarizer = ClientSummarizer { client, model };
     let summarizer: &dyn Summarizer = agent.summarizer.unwrap_or(&default_summarizer);
     let mut summary_failed = false;
@@ -354,6 +414,12 @@ fn turn_body(
     };
 
     let (mut prompt_tokens, mut completion_tokens) = (0, 0);
+    let mut pending_rtk_tokens: u64 = 0;
+    let mut total_saved_rtk_tokens: u64 = 0;
+    let mut total_saved_ponytail_tokens: u64 = 0;
+    let mut total_saved_caveman_tokens: u64 = 0;
+    let mut last_account_id: Option<String> = None;
+    let mut last_model_used: Option<String> = None;
     let mut last = (0i64, String::new(), None::<String>);
     let max_steps = agent.max_steps.max(1);
     let mut reason = "done";
@@ -374,6 +440,8 @@ fn turn_body(
                     cancel,
                     log,
                     on_event,
+                    ctx.settings,
+                    &cwd,
                 );
             }
         }
@@ -387,13 +455,31 @@ fn turn_body(
             req = req.tools(defs.clone()).tool_choice("auto");
         }
         let mut failed = Vec::new();
-        let out = request(client, &req, cancel, on_event, &mut failed);
+        let out = request(
+            store,
+            client,
+            ctx,
+            agent,
+            session_id,
+            step,
+            model,
+            &req,
+            cancel,
+            on_event,
+            log,
+            &mut failed,
+            &mut pending_rtk_tokens,
+        );
         // A failed or abandoned attempt is evidence, not history: it goes to
         // the log and never to `messages`.
         for f in failed {
             log.emit("assistant/attempt", json!({"step": step, "attempt": f}));
         }
-        let out = out?;
+        let (out, gw_outcome, step_savings) = out?;
+        total_saved_ponytail_tokens += step_savings.ponytail;
+        total_saved_caveman_tokens += step_savings.caveman;
+        last_account_id = Some(gw_outcome.account_id);
+        last_model_used = Some(gw_outcome.model);
         if let Some(u) = &out.usage {
             prompt_tokens += u.prompt_tokens;
             completion_tokens += u.completion_tokens;
@@ -424,6 +510,32 @@ fn turn_body(
             // Told something while the answer streamed: the turn is not over.
             if step < max_steps && steer(store, session_id, agent, &mut hist, log)? > 0 {
                 continue;
+            }
+            if step < max_steps {
+                if let Some(st) = ctx.settings {
+                    let stop_out = run_hooks(
+                        HookEvent::Stop,
+                        &HookPayload {
+                            session_id: session_id.to_string(),
+                            cwd: cwd.clone(),
+                            ..Default::default()
+                        },
+                        st,
+                    );
+                    log_hook_errors(log, HookEvent::Stop, &stop_out.errors);
+                    if stop_out.blocked() {
+                        let msg = stop_message(&stop_out);
+                        let cid = store.append(
+                            session_id,
+                            &NewMessage {
+                                raw: Some(json!({"hook_stop": true})),
+                                ..NewMessage::new(Role::User, msg.clone())
+                            },
+                        )?;
+                        hist.push(ChatMessage::user(msg), cid);
+                        continue;
+                    }
+                }
             }
             break;
         }
@@ -480,7 +592,34 @@ fn turn_body(
                         .is_cancelled()
                         .then(|| (false, "[cancelado]".to_string()))
                 });
-                let (outcome, spilled) = pipe.finish(p, ran);
+                let (mut outcome, spilled) = pipe.finish(p, ran);
+                if ctx.settings.is_some_and(|s| s.token_saver.rtk_enabled) {
+                    let before_bytes = outcome.output.len();
+                    let compressed =
+                        crate::tokensaver::compress_tool_output(&call.name, &outcome.output);
+                    if compressed.saved_bytes > 0 {
+                        let after_bytes = compressed.text.len();
+                        outcome.output = compressed.text;
+                        pending_rtk_tokens += compressed.saved_tokens;
+                        total_saved_rtk_tokens += compressed.saved_tokens;
+                        log.emit(
+                            "tool/rtk",
+                            json!({
+                                "tool": call.name,
+                                "before": before_bytes,
+                                "after": after_bytes,
+                                "saved_tokens": compressed.saved_tokens,
+                                "filter": compressed.filter,
+                            }),
+                        );
+                        on_event(RunEvent::TokenSaved {
+                            tool: call.name.clone(),
+                            before_bytes,
+                            after_bytes,
+                            filter: compressed.filter.map(str::to_string),
+                        });
+                    }
+                }
                 record(store, session_id, call, &outcome.output, &mut hist)?;
                 let preview: String = outcome.output.chars().take(PREVIEW_CHARS).collect();
                 log.emit(
@@ -533,6 +672,9 @@ fn turn_body(
     on_event(RunEvent::Done {
         stored: Some(last.0),
     });
+    let total_saved_tokens = total_saved_rtk_tokens
+        .saturating_add(total_saved_ponytail_tokens)
+        .saturating_add(total_saved_caveman_tokens);
     Ok((
         TurnReport {
             session_id: session_id.to_string(),
@@ -541,6 +683,12 @@ fn turn_body(
             reasoning: last.2,
             prompt_tokens,
             completion_tokens,
+            saved_rtk_tokens: total_saved_rtk_tokens,
+            saved_ponytail_tokens: total_saved_ponytail_tokens,
+            saved_caveman_tokens: total_saved_caveman_tokens,
+            saved_tokens: total_saved_tokens,
+            account_id: last_account_id,
+            model_used: last_model_used,
         },
         reason,
     ))
@@ -559,28 +707,52 @@ fn shrink(
     cancel: &Cancel,
     log: &TurnLog<'_>,
     on_event: &mut dyn FnMut(RunEvent),
+    settings: Option<&zerith_core::Settings>,
+    cwd: &Path,
 ) {
     let before = hist.tokens();
     hist.prune_tools(budget);
     if hist.tokens() > budget && !*summary_failed {
-        match crate::compact::summarize_into(
-            store,
-            session_id,
-            hist,
-            budget / 2,
-            summarizer,
-            cancel,
-            log,
-            "pressure",
-        ) {
-            Ok(Some(r)) => on_event(RunEvent::Compacted {
-                before: r.tokens_before,
-                after: r.tokens_after,
-            }),
-            Ok(None) => {}
-            // A failed summary must not fail the turn: drop instead, and do
-            // not retry it on every step.
-            Err(_) => *summary_failed = true,
+        let blocked = if let Some(st) = settings {
+            let out = run_hooks(
+                HookEvent::PreCompact,
+                &HookPayload {
+                    session_id: session_id.to_string(),
+                    cwd: cwd.to_path_buf(),
+                    ..Default::default()
+                },
+                st,
+            );
+            log_hook_errors(log, HookEvent::PreCompact, &out.errors);
+            if out.blocked() {
+                log.emit("hook/pre_compact_blocked", json!({"reasons": out.reasons}));
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if !blocked {
+            match crate::compact::summarize_into(
+                store,
+                session_id,
+                hist,
+                budget / 2,
+                summarizer,
+                cancel,
+                log,
+                "pressure",
+            ) {
+                Ok(Some(r)) => on_event(RunEvent::Compacted {
+                    before: r.tokens_before,
+                    after: r.tokens_after,
+                }),
+                Ok(None) => {}
+                // A failed summary must not fail the turn: drop instead, and do
+                // not retry it on every step.
+                Err(_) => *summary_failed = true,
+            }
         }
     }
     let dropped = hist.drop_oldest(budget);
@@ -590,6 +762,41 @@ fn shrink(
             json!({"dropped_items": dropped, "tokens_before": before,
                    "tokens_after": hist.tokens()}),
         );
+    }
+}
+
+fn log_hook_errors(log: &TurnLog<'_>, event: HookEvent, errors: &[String]) {
+    for err in errors {
+        log.emit("hook/error", json!({"event": event.as_str(), "error": err}));
+    }
+}
+
+fn hook_reason(out: &HookOutcome, fallback: &str) -> String {
+    let parts: Vec<&str> = out
+        .reasons
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if parts.is_empty() {
+        fallback.to_string()
+    } else {
+        parts.join("\n")
+    }
+}
+
+fn stop_message(out: &HookOutcome) -> String {
+    let parts: Vec<&str> = out
+        .reasons
+        .iter()
+        .chain(&out.additional_context)
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if parts.is_empty() {
+        "continue".to_string()
+    } else {
+        parts.join("\n")
     }
 }
 
@@ -666,28 +873,86 @@ struct StepOut {
     usage: Option<Usage>,
 }
 
-/// One model request. Streaming first: a turn that only paints when it
-/// finishes reads as a hang. If the stream fails before anything was shown,
-/// fall back once to a blocking request — some OpenAI-compatible servers
-/// answer 400 to `stream: true`. Every attempt that did not become the answer
-/// is described in `failed`, for the audit log.
-fn request(
-    client: &Client,
-    req: &ChatRequest,
-    cancel: &Cancel,
-    on_event: &mut dyn FnMut(RunEvent),
+fn default_gateway(client: &Client, model: &str) -> Gateway {
+    let cfg = client.config();
+    let provider = if cfg.name.trim().is_empty() {
+        cfg.kind.as_str().to_string()
+    } else {
+        cfg.name.clone()
+    };
+    let account_id = cfg
+        .account_id
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| provider.clone());
+    Gateway::new(vec![RouteCandidate {
+        account_id,
+        provider,
+        model: model.to_string(),
+        config: cfg.clone(),
+        priority: 0,
+        quota_tokens: None,
+        quota_requests: None,
+        window_hours: 5,
+    }])
+}
+
+fn record_failover(
+    store: &Store,
+    session_id: &str,
+    role_kind: &str,
+    cand: &RouteCandidate,
+    err: &ProviderError,
+    cooldown_ms: u64,
     failed: &mut Vec<Value>,
-) -> Result<StepOut> {
-    let mut out = StepOut::default();
-    let mut painted = false;
-    let streamed = client.stream(req, cancel, |event| match event {
+) {
+    let until_ms = now_ms().saturating_add(i64::try_from(cooldown_ms).unwrap_or(i64::MAX));
+    let _ = store.set_account_cooldown(&cand.account_id, until_ms, Some(&err.to_string()));
+    let status = if matches!(
+        err,
+        ProviderError::RateLimited { .. } | ProviderError::Http { status: 429, .. }
+    ) {
+        "rate_limited"
+    } else {
+        "error"
+    };
+    let _ = store.record_usage(&NewUsageRecord {
+        session_id: Some(session_id.to_string()),
+        account_id: cand.account_id.clone(),
+        provider: cand.provider.clone(),
+        model: cand.model.clone(),
+        role_kind: role_kind.to_string(),
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        saved_rtk_tokens: 0,
+        saved_ponytail_tokens: 0,
+        saved_caveman_tokens: 0,
+        saved_tokens: 0,
+        status: status.to_string(),
+        latency_ms: 0,
+    });
+    failed.push(json!({
+        "mode": "gateway_failover",
+        "account": cand.account_id,
+        "model": cand.model,
+        "error": err.to_string(),
+    }));
+}
+
+fn apply_stream_event(
+    event: StreamEvent,
+    out: &mut StepOut,
+    painted: &mut bool,
+    on_event: &mut dyn FnMut(RunEvent),
+) {
+    match event {
         StreamEvent::Delta(t) => {
-            painted = true;
+            *painted = true;
             out.text.push_str(&t);
             on_event(RunEvent::Delta(t));
         }
         StreamEvent::Reasoning(r) => {
-            painted = true;
+            *painted = true;
             out.reasoning.get_or_insert_with(String::new).push_str(&r);
             on_event(RunEvent::Reasoning(r));
         }
@@ -698,10 +963,88 @@ fn request(
                 out.usage = usage;
             }
         }
+    }
+}
+
+/// Runs a single candidate preserving detailed `assistant/attempt` diagnostics
+/// when streaming falls back to blocking `complete` on HTTP 400.
+#[allow(clippy::too_many_arguments)]
+fn request_single(
+    store: &Store,
+    gateway: &Gateway,
+    cand: &RouteCandidate,
+    session_id: &str,
+    role_kind: &str,
+    req: &ChatRequest,
+    cancel: &Cancel,
+    on_event: &mut dyn FnMut(RunEvent),
+    failed: &mut Vec<Value>,
+) -> Result<(StepOut, GatewayOutcome<()>)> {
+    if cancel.is_cancelled() {
+        return Err(ProviderError::Cancelled.into());
+    }
+    let available = store
+        .is_account_available(
+            &cand.account_id,
+            cand.window_hours,
+            cand.quota_tokens,
+            cand.quota_requests,
+        )
+        .unwrap_or(true);
+    if !available {
+        return Err(ProviderError::RateLimited {
+            retry_after_ms: None,
+            body: "todas as contas configuradas atingiram o limite ou estão em cooldown".into(),
+        }
+        .into());
+    }
+
+    let started = Instant::now();
+    let mut cfg = cand.config.clone();
+    cfg.account_id = Some(cand.account_id.clone());
+    let mut cand_client = match Client::new(cfg) {
+        Ok(c) => c,
+        Err(err) => {
+            if is_failover_error(&err) {
+                record_failover(
+                    store,
+                    session_id,
+                    role_kind,
+                    cand,
+                    &err,
+                    suggested_cooldown_ms(&err),
+                    failed,
+                );
+            }
+            return Err(err.into());
+        }
+    };
+    if let Some(retry) = gateway.final_retry {
+        cand_client = cand_client.with_retry(retry);
+    }
+
+    let mut cand_req = req.clone();
+    cand_req.model = cand.model.clone();
+
+    let mut out = StepOut::default();
+    let mut painted = false;
+    let streamed = cand_client.stream(&cand_req, cancel, |event| {
+        apply_stream_event(event, &mut out, &mut painted, on_event);
     });
     let Err(e) = streamed else {
-        return Ok(out);
+        return Ok((
+            out,
+            GatewayOutcome {
+                value: (),
+                account_id: cand.account_id.clone(),
+                provider: cand.provider.clone(),
+                model: cand.model.clone(),
+                latency_ms: started.elapsed().as_millis() as u64,
+                attempts: 1,
+            },
+        ));
     };
+
     if !matches!(e, ProviderError::Cancelled) {
         failed.push(json!({
             "mode": "stream",
@@ -710,21 +1053,37 @@ fn request(
             "partial_chars": out.text.chars().count(),
         }));
     }
-    // Repeating a stream that already painted would show the answer twice;
-    // a 429 already went through its retries; a cancel is final.
-    if painted
-        || matches!(
-            e,
-            ProviderError::Cancelled | ProviderError::RateLimited { .. } | ProviderError::NoKey
-        )
-    {
+    if painted || !matches!(e, ProviderError::Http { status: 400, .. }) {
+        if !painted && is_failover_error(&e) {
+            record_failover(
+                store,
+                session_id,
+                role_kind,
+                cand,
+                &e,
+                suggested_cooldown_ms(&e),
+                failed,
+            );
+        }
         return Err(e.into());
     }
-    let c = match client.complete(req, cancel) {
+
+    let c = match cand_client.complete(&cand_req, cancel) {
         Ok(c) => c,
         Err(e2) => {
             if !matches!(e2, ProviderError::Cancelled) {
                 failed.push(json!({"mode": "complete", "error": e2.to_string()}));
+            }
+            if is_failover_error(&e2) {
+                record_failover(
+                    store,
+                    session_id,
+                    role_kind,
+                    cand,
+                    &e2,
+                    suggested_cooldown_ms(&e2),
+                    failed,
+                );
             }
             return Err(e2.into());
         }
@@ -735,10 +1094,161 @@ fn request(
     if !c.text.is_empty() {
         on_event(RunEvent::Delta(c.text.clone()));
     }
-    Ok(StepOut {
-        text: c.text,
-        reasoning: c.reasoning,
-        calls: c.tool_calls,
-        usage: c.usage,
-    })
+    Ok((
+        StepOut {
+            text: c.text,
+            reasoning: c.reasoning,
+            calls: c.tool_calls,
+            usage: c.usage,
+        },
+        GatewayOutcome {
+            value: (),
+            account_id: cand.account_id.clone(),
+            provider: cand.provider.clone(),
+            model: cand.model.clone(),
+            latency_ms: started.elapsed().as_millis() as u64,
+            attempts: 1,
+        },
+    ))
+}
+
+#[derive(Default, Clone, Copy)]
+struct StepSavings {
+    ponytail: u64,
+    caveman: u64,
+}
+
+/// One model request routed through the local [`Gateway`].
+///
+/// Streaming runs first; HTTP 400 falls back once to blocking completion.
+/// Multi-account failover, cooldowns, and usage telemetry are recorded per
+/// attempt against `store`.
+#[allow(clippy::too_many_arguments)]
+fn request(
+    store: &Store,
+    client: &Client,
+    ctx: TurnContext<'_>,
+    agent: &AgentOptions<'_>,
+    session_id: &str,
+    step: usize,
+    model: &str,
+    req: &ChatRequest,
+    cancel: &Cancel,
+    on_event: &mut dyn FnMut(RunEvent),
+    log: &TurnLog<'_>,
+    failed: &mut Vec<Value>,
+    pending_rtk_tokens: &mut u64,
+) -> Result<(StepOut, GatewayOutcome<()>, StepSavings)> {
+    let mut gateway = match ctx.settings {
+        Some(st) => crate::resolve_gateway(st, model, client.config()).0,
+        None => default_gateway(client, model),
+    };
+    gateway.final_retry = Some(client.retry_policy());
+
+    let role_kind = if agent.subagents.depth > 0 {
+        "subagent"
+    } else {
+        "main"
+    };
+
+    let (out, gw_outcome) = if gateway.candidates.len() == 1 {
+        let cand = &gateway.candidates[0];
+        request_single(
+            store, &gateway, cand, session_id, role_kind, req, cancel, on_event, failed,
+        )?
+    } else {
+        let mut out = StepOut::default();
+        let mut painted = false;
+        let gw_outcome = gateway.stream_with(
+            req,
+            cancel,
+            |cand| {
+                store
+                    .is_account_available(
+                        &cand.account_id,
+                        cand.window_hours,
+                        cand.quota_tokens,
+                        cand.quota_requests,
+                    )
+                    .unwrap_or(true)
+            },
+            |cand, err, cooldown_ms| {
+                record_failover(store, session_id, role_kind, cand, err, cooldown_ms, failed);
+            },
+            |event| apply_stream_event(event, &mut out, &mut painted, on_event),
+        )?;
+        (out, gw_outcome)
+    };
+
+    on_event(RunEvent::Route {
+        account_id: gw_outcome.account_id.clone(),
+        provider: gw_outcome.provider.clone(),
+        model: gw_outcome.model.clone(),
+        attempts: gw_outcome.attempts,
+    });
+    if ctx.settings.is_some() || gw_outcome.attempts > 1 {
+        log.emit(
+            "step/route",
+            json!({
+                "step": step,
+                "account": gw_outcome.account_id,
+                "provider": gw_outcome.provider,
+                "model": gw_outcome.model,
+                "attempts": gw_outcome.attempts,
+                "latency_ms": gw_outcome.latency_ms,
+            }),
+        );
+    }
+
+    let (prompt_tokens, completion_tokens) = out
+        .usage
+        .as_ref()
+        .map(|u| (u.prompt_tokens, u.completion_tokens))
+        .unwrap_or((0, 0));
+    let tool_args_bytes: usize = out.calls.iter().map(|c| c.arguments.len()).sum();
+    let step_rtk = std::mem::take(pending_rtk_tokens);
+    let (step_ponytail, step_caveman) = match ctx.settings {
+        Some(st) => (
+            crate::tokensaver::estimate_ponytail_saved_tokens(
+                st.token_saver.ponytail,
+                &out.text,
+                tool_args_bytes,
+                completion_tokens,
+            ),
+            crate::tokensaver::estimate_caveman_saved_tokens(
+                st.token_saver.caveman,
+                &out.text,
+                completion_tokens,
+            ),
+        ),
+        None => (0, 0),
+    };
+    let step_saved_tokens = step_rtk
+        .saturating_add(step_ponytail)
+        .saturating_add(step_caveman);
+
+    let _ = store.record_usage(&NewUsageRecord {
+        session_id: Some(session_id.to_string()),
+        account_id: gw_outcome.account_id.clone(),
+        provider: gw_outcome.provider.clone(),
+        model: gw_outcome.model.clone(),
+        role_kind: role_kind.to_string(),
+        prompt_tokens,
+        completion_tokens,
+        saved_rtk_tokens: step_rtk,
+        saved_ponytail_tokens: step_ponytail,
+        saved_caveman_tokens: step_caveman,
+        saved_tokens: step_saved_tokens,
+        status: "ok".to_string(),
+        latency_ms: gw_outcome.latency_ms,
+    });
+
+    Ok((
+        out,
+        gw_outcome,
+        StepSavings {
+            ponytail: step_ponytail,
+            caveman: step_caveman,
+        },
+    ))
 }

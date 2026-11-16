@@ -13,7 +13,10 @@ pub mod shellparse;
 
 pub use instructions::{load_instructions, system_prompt_with_instructions};
 pub use paths::Paths;
-pub use settings::Settings;
+pub use settings::{
+    AccountEntry, CavemanLevel, ComboEntry, PonytailLevel, RoutingSettings, Settings,
+    TokenSaverSettings,
+};
 
 /// Product identity. One place, so a rename never means a grep.
 pub const NAME: &str = "Zerith";

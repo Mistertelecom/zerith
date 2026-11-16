@@ -1,4 +1,4 @@
-//! Providers, and the 9Router in particular.
+//! Native multi-provider client and local failover gateway.
 //!
 //! The rule that shapes this crate: **do not pretend two APIs are the same**.
 //! OpenAI-compatible endpoints share one wire format; Anthropic's Messages API
@@ -10,11 +10,16 @@
 
 mod anthropic;
 mod config;
+pub mod gateway;
 mod openai;
 mod retry;
 pub mod stream;
 
 pub use config::{Protocol, ProviderConfig, ProviderKind};
+pub use gateway::{
+    infer_provider, is_failover_error, suggested_cooldown_ms, Gateway, GatewayOutcome, ModelSpec,
+    RouteCandidate,
+};
 pub use openai::{Client, Completion, Probe, Usage};
 pub use retry::RetryPolicy;
 

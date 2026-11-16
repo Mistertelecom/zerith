@@ -15,7 +15,10 @@
 mod hermes;
 mod hermes_jsonl;
 
-pub use hermes::{detect, import, ImportReport, SourceLayout};
+pub use hermes::{
+    detect, import, import_selected, preview, ImportReport, SessionPreview, SourceLayout,
+    SourcePreview,
+};
 pub use hermes_jsonl::{import_jsonl, import_jsonl_from};
 
 #[derive(Debug, thiserror::Error)]

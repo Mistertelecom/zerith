@@ -4,7 +4,7 @@
 //! `CARGO_TARGET_TMPDIR`, which Cargo only sets for integration tests.
 
 use std::path::{Path, PathBuf};
-use zerith_importers::{import, ImportError};
+use zerith_importers::{import, import_selected, preview, ImportError};
 use zerith_sessions::{SessionSource, Store};
 
 fn tmp() -> tempfile::TempDir {
@@ -142,4 +142,122 @@ fn an_interrupted_import_resumes_per_message() {
     assert_eq!(texts, ["oi", "olá", "de novo"]);
     let again = import(&src, "default", &store).unwrap();
     assert_eq!((again.sessions_skipped, again.messages_imported), (1, 0));
+}
+
+fn fixture_multi(dir: &Path) -> PathBuf {
+    let path = dir.join("multi.db");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE sessions (
+            id TEXT PRIMARY KEY, model TEXT, started_at REAL, ended_at REAL,
+            title TEXT, profile_name TEXT, archived INTEGER
+         );
+         CREATE TABLE messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT,
+            content TEXT, timestamp REAL, active INTEGER
+         );
+         INSERT INTO sessions(id, model, started_at, ended_at, title, profile_name, archived)
+            VALUES ('h1', 'hermes-3', 1700000000.0, 1700000050.0, 'Ativa um', 'default', 0),
+                   ('h2', 'hermes-4', 1700000100.0, 1700000200.0, 'Ativa dois', 'default', 0),
+                   ('h3', NULL,       1700000300.0, 1700000400.0, 'Arquivada', 'default', 1);
+         INSERT INTO messages(session_id, role, content, timestamp, active)
+            VALUES ('h1', 'user', 'oi', 1700000001.0, 1),
+                   ('h1', 'assistant', 'olá', 1700000002.0, 1),
+                   ('h1', 'assistant', 'apagada', 1700000003.0, 0),
+                   ('h2', 'user', 'segunda', 1700000150.0, 1),
+                   ('h3', 'user', 'antiga 1', 1700000350.0, 1),
+                   ('h3', 'assistant', 'antiga 2', 1700000360.0, 1);",
+    )
+    .unwrap();
+    drop(conn);
+    path
+}
+
+#[test]
+fn preview_counts_active_messages_dates_and_is_read_only() {
+    let dir = tmp();
+    let src = fixture_multi(dir.path());
+    let before = std::fs::read(&src).unwrap();
+
+    let p = preview(&src).unwrap();
+    assert!(p.layout.sessions_table && p.layout.messages_table);
+    assert_eq!(p.sessions.len(), 3);
+    assert_eq!(p.total_messages, 5);
+    assert_eq!(p.min_date, Some(1_700_000_000_000));
+    assert_eq!(p.max_date, Some(1_700_000_400_000));
+
+    assert_eq!(p.sessions[0].id, "h1");
+    assert_eq!(p.sessions[0].message_count, 2);
+    assert!(!p.sessions[0].archived);
+    assert_eq!(p.sessions[0].model.as_deref(), Some("hermes-3"));
+
+    assert_eq!(p.sessions[1].id, "h2");
+    assert_eq!(p.sessions[1].message_count, 1);
+
+    assert_eq!(p.sessions[2].id, "h3");
+    assert_eq!(p.sessions[2].message_count, 2);
+    assert!(p.sessions[2].archived);
+
+    let after = std::fs::read(&src).unwrap();
+    assert_eq!(before, after, "preview must not write to the source");
+
+    let empty_db = dir.path().join("empty.db");
+    let conn = rusqlite::Connection::open(&empty_db).unwrap();
+    conn.execute_batch("CREATE TABLE other (x INTEGER);")
+        .unwrap();
+    drop(conn);
+    assert!(matches!(preview(&empty_db), Err(ImportError::Schema(_))));
+}
+
+#[test]
+fn import_selected_filters_archived_and_only_ids() {
+    let dir = tmp();
+    let src = fixture_multi(dir.path());
+
+    // Excluding archived skips h3 without counting it as imported or skipped.
+    let store_no_arch = Store::open(dir.path().join("no_arch.db")).unwrap();
+    let r = import_selected(&src, "default", &store_no_arch, false, None).unwrap();
+    assert_eq!(r.sessions_seen, 3);
+    assert_eq!(r.sessions_imported, 2);
+    assert_eq!(r.sessions_skipped, 0);
+    assert_eq!(r.messages_imported, 3);
+    assert!(r.failed.is_empty());
+    assert!(store_no_arch
+        .session("hermes-default-h1")
+        .unwrap()
+        .is_some());
+    assert!(store_no_arch
+        .session("hermes-default-h2")
+        .unwrap()
+        .is_some());
+    assert!(store_no_arch
+        .session("hermes-default-h3")
+        .unwrap()
+        .is_none());
+
+    // Explicit only_ids imports just the picked sessions (including archived when allowed).
+    let store_picked = Store::open(dir.path().join("picked.db")).unwrap();
+    let ids = vec!["h2".to_string(), "h3".to_string()];
+    let r = import_selected(&src, "default", &store_picked, true, Some(&ids)).unwrap();
+    assert_eq!(r.sessions_imported, 2);
+    assert_eq!(r.sessions_skipped, 0);
+    assert_eq!(r.messages_imported, 3);
+    assert!(store_picked.session("hermes-default-h1").unwrap().is_none());
+    assert!(store_picked.session("hermes-default-h2").unwrap().is_some());
+    assert!(
+        store_picked
+            .session("hermes-default-h3")
+            .unwrap()
+            .unwrap()
+            .archived
+    );
+
+    // Combining include_archived = false with only_ids still excludes archived h3.
+    let store_both = Store::open(dir.path().join("both.db")).unwrap();
+    let ids = vec!["h1".to_string(), "h3".to_string()];
+    let r = import_selected(&src, "default", &store_both, false, Some(&ids)).unwrap();
+    assert_eq!(r.sessions_imported, 1);
+    assert_eq!(r.messages_imported, 2);
+    assert!(store_both.session("hermes-default-h1").unwrap().is_some());
+    assert!(store_both.session("hermes-default-h3").unwrap().is_none());
 }

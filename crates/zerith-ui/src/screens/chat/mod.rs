@@ -143,6 +143,10 @@ pub struct ChatState {
     pub compacting: bool,
     /// The runtime can rewind to a message's checkpoint.
     pub rewind: bool,
+    /// Active gateway route `(account_id, model)` for the current/last turn.
+    pub active_route: Option<(String, String)>,
+    /// Tokens saved by Token Saver (RTK, Ponytail, Caveman) in the active turn.
+    pub saved_tokens: u64,
 }
 
 impl ChatState {
@@ -188,6 +192,8 @@ impl ChatState {
             price: None,
             compacting: false,
             rewind: wire::checkpoints_supported(),
+            active_route: None,
+            saved_tokens: 0,
         }
     }
 
@@ -214,6 +220,8 @@ impl ChatState {
         self.plan_edit = None;
         self.question = None;
         self.compacting = false;
+        self.active_route = None;
+        self.saved_tokens = 0;
     }
 }
 
@@ -422,6 +430,7 @@ pub fn send(s: &mut Shell) {
     c.draft = TextEdit::new("");
     c.busy = true;
     c.status.clear();
+    c.saved_tokens = 0;
     c.lines.push(Line::new("user", prompt.clone()));
     c.lines.push(Line::new("assistant", String::new()));
     let paused = s.memory.paused;
@@ -452,17 +461,33 @@ pub fn send(s: &mut Shell) {
         // Tools act on the directory the window was started from; the policy
         // decides per call, and anything it marks "ask" comes back as a card.
         let workspace = std::env::current_dir().unwrap_or_else(|_| db.clone());
-        let settings =
-            zerith_core::Settings::load(&zerith_core::Paths::with_root(&root), Some(&workspace))
-                .settings;
+        let paths = zerith_core::Paths::with_root(&root);
+        let contrib = zerith_plugins::Library::open(&paths.root().join("plugins"))
+            .and_then(|l| l.contributions())
+            .ok();
+        let mut settings = zerith_core::Settings::load(&paths, Some(&workspace)).settings;
+        if let Some(c) = &contrib {
+            c.apply_hooks(&mut settings);
+        }
         let mut policy = Policy::from_settings(&settings, &workspace)
             .map(|p| p.with_handle(mode))
             .ok();
         let mut tools = Registry::new();
-        let paths = zerith_core::Paths::with_root(&root);
         // MCP servers from settings and plugins become `mcp__server__tool`.
-        let mcp = zerith_mcp::McpRegistry::load(&paths, Some(&workspace));
+        let mut mcp = zerith_mcp::McpRegistry::load(&paths, Some(&workspace));
+        if let Some(c) = &contrib {
+            mcp.extend(c.mcp.iter().map(|(_, s)| s.clone()).collect());
+        }
         let _ = mcp.register_into(&mut tools);
+        let prompt = if mcp.is_empty() {
+            prompt
+        } else {
+            let (expanded, errors) = mcp.expand_mentions(&prompt);
+            for e in &errors {
+                eprintln!("zerith-ui: {e}");
+            }
+            expanded
+        };
         // Hooks and rules ride the pipeline; a failure to build them leaves
         // the policy alone, which still gates every call.
         let guards = policy
@@ -472,9 +497,18 @@ pub fn send(s: &mut Shell) {
             tools.register(g.enter_plan_mode_tool());
             tools.register(g.exit_plan_mode_tool());
         }
-        let skills = zerith_skills::Library::open(db.parent().unwrap_or(&db).join("skills")).ok();
+        let skills = zerith_skills::Library::open(db.parent().unwrap_or(&db).join("skills"))
+            .ok()
+            .map(|l| {
+                if let Some(c) = &contrib {
+                    l.with_extra(c.skill_dirs())
+                } else {
+                    l
+                }
+            });
+        let extra_agents = contrib.as_ref().map(|c| c.agents.as_slice()).unwrap_or(&[]);
         let agent = agent_name.and_then(|n| {
-            zerith_core::agents::find(&zerith_core::Paths::with_root(&root), Some(&workspace), &n)
+            zerith_core::agents::find_with_extra(&paths, Some(&workspace), extra_agents, &n)
         });
         let reporter = handle.clone();
         let result = run_agent_turn(
@@ -485,6 +519,7 @@ pub fn send(s: &mut Shell) {
                 scope: Some(&scope),
                 skills: skills.as_ref(),
                 agent: agent.as_ref(),
+                settings: Some(&settings),
             },
             AgentOptions {
                 tools: policy.is_some().then_some(&tools),
@@ -507,9 +542,8 @@ pub fn send(s: &mut Shell) {
         );
         match result {
             Ok(r) => {
-                let usage = (r.prompt_tokens, r.completion_tokens);
                 handle.update(move |s: &mut Shell, _| {
-                    s.chat.usage = (usage != (0, 0)).then_some(usage);
+                    events::apply_report(s, &r);
                 });
             }
             Err(e) => {
@@ -584,7 +618,10 @@ fn header(s: &Shell, u: &Ui) -> El {
         Link::Up => (u.ok, "conectado".to_string()),
         Link::Down(e) => (u.danger, format!("sem conexão: {e}")),
     };
-    let provider = s.providers.active().name;
+    let (route_label, model_label) = match &c.active_route {
+        Some((account_id, model)) => (account_id.clone(), model.clone()),
+        None => (s.providers.active().name, c.model.clone()),
+    };
     row()
         .w_full()
         .h(28.0)
@@ -602,16 +639,16 @@ fn header(s: &Shell, u: &Ui) -> El {
             row()
                 .key("link")
                 .role("status")
-                .label(format!("{provider}: {word}"))
+                .label(format!("{route_label}: {word}"))
                 .gap(6.0)
                 .center_y()
                 .child(dot(color))
-                .child(text(provider).font(ui::LABEL).color(u.muted_text)),
+                .child(text(route_label).font(ui::LABEL).color(u.muted_text)),
         )
-        .child(if c.model.is_empty() {
+        .child(if model_label.is_empty() {
             el()
         } else {
-            pill(c.model.clone(), u)
+            pill(model_label, u)
         })
 }
 

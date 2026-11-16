@@ -1330,3 +1330,268 @@ fn a_steer_sent_while_the_final_answer_streams_keeps_the_turn_going() {
     assert_eq!(report.text, "segunda");
     assert_eq!(fake.seen.lock().unwrap().len(), 2);
 }
+
+// ---- gateway failover & token saver ---------------------------------------
+
+#[test]
+fn gateway_failover_switches_accounts_records_usage_and_skips_cooled_down_account() {
+    let fake1 = serve(vec![http(429, "Retry-After: 5\r\n", "rate limited")]);
+    let fake2 = serve(vec![text("ok da conta 2")]);
+
+    let mut settings = zerith_core::Settings {
+        accounts: vec![
+            zerith_core::AccountEntry {
+                id: "acc-1".into(),
+                provider: "openai".into(),
+                base_url: Some(fake1.url.clone()),
+                priority: 1,
+                enabled: true,
+                ..Default::default()
+            },
+            zerith_core::AccountEntry {
+                id: "acc-2".into(),
+                provider: "openai".into(),
+                base_url: Some(fake2.url.clone()),
+                priority: 2,
+                enabled: true,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    let mut cfg = ProviderConfig::new(ProviderKind::OpenAi).with_key("test-key");
+    cfg.base_url = fake1.url.clone();
+    cfg.timeout_ms = 5_000;
+    let fb_client = Client::new(cfg).unwrap().with_retry(RetryPolicy {
+        max_retries: 0,
+        base_ms: 1,
+        max_ms: 5,
+        max_retry_after_ms: 1_000,
+    });
+
+    let store = Store::open_in_memory().unwrap();
+    let sid = session(&store);
+    let mut events = Vec::new();
+    let report = run_agent_turn(
+        &store,
+        &fb_client,
+        TurnContext {
+            settings: Some(&settings),
+            ..TurnContext::default()
+        },
+        AgentOptions::default(),
+        &sid,
+        "gpt-4o",
+        "oi",
+        &Cancel::default(),
+        |e| events.push(e),
+    )
+    .unwrap();
+
+    assert_eq!(report.text, "ok da conta 2");
+    assert_eq!(report.account_id.as_deref(), Some("acc-2"));
+    assert_eq!(report.model_used.as_deref(), Some("gpt-4o"));
+    assert!(events.contains(&RunEvent::Route {
+        account_id: "acc-2".into(),
+        provider: "openai".into(),
+        model: "gpt-4o".into(),
+        attempts: 2,
+    }));
+    assert_eq!(fake1.seen.lock().unwrap().len(), 1);
+    assert_eq!(fake2.seen.lock().unwrap().len(), 1);
+
+    let summary = store.usage_summary(24).unwrap();
+    assert_eq!(summary.active_account.as_deref(), Some("acc-2"));
+    assert_eq!(summary.active_model.as_deref(), Some("gpt-4o"));
+    let acc1 = summary
+        .accounts
+        .iter()
+        .find(|a| a.account_id == "acc-1")
+        .expect("acc-1 recorded");
+    assert_eq!(acc1.rate_limits, 1);
+    assert!(acc1.cooldown_until > 0);
+    let acc2 = summary
+        .accounts
+        .iter()
+        .find(|a| a.account_id == "acc-2")
+        .expect("acc-2 recorded");
+    assert_eq!(acc2.requests, 1);
+    assert_eq!(acc2.prompt_tokens, 10);
+    assert_eq!(acc2.completion_tokens, 2);
+    assert!(!store.is_account_available("acc-1", 5, None, None).unwrap());
+    assert!(store.is_account_available("acc-2", 5, None, None).unwrap());
+
+    let log_events = store.events(&sid, 0, 100).unwrap();
+    assert!(log_events.iter().any(|e| {
+        e.kind == "assistant/attempt" && e.payload["attempt"]["mode"] == "gateway_failover"
+    }));
+    assert!(log_events
+        .iter()
+        .any(|e| e.kind == "step/route" && e.payload["account"] == "acc-2"));
+
+    // Next turn skips acc-1 while it is in cooldown without hitting its endpoint.
+    let fake1_skip = serve(vec![]);
+    let fake2_turn2 = serve(vec![text("segundo turno")]);
+    settings.accounts[0].base_url = Some(fake1_skip.url.clone());
+    settings.accounts[1].base_url = Some(fake2_turn2.url.clone());
+    let mut events2 = Vec::new();
+    let report2 = run_agent_turn(
+        &store,
+        &fb_client,
+        TurnContext {
+            settings: Some(&settings),
+            ..TurnContext::default()
+        },
+        AgentOptions::default(),
+        &sid,
+        "gpt-4o",
+        "continuar",
+        &Cancel::default(),
+        |e| events2.push(e),
+    )
+    .unwrap();
+    assert_eq!(report2.text, "segundo turno");
+    assert!(events2.contains(&RunEvent::Route {
+        account_id: "acc-2".into(),
+        provider: "openai".into(),
+        model: "gpt-4o".into(),
+        attempts: 1,
+    }));
+    assert!(fake1_skip.seen.lock().unwrap().is_empty());
+    assert_eq!(fake2_turn2.seen.lock().unwrap().len(), 1);
+}
+
+struct FakeBuildTool {
+    spec: ToolSpec,
+    output: String,
+}
+
+impl Tool for FakeBuildTool {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+    fn action(&self, _: &Value, _: &CallCtx<'_>) -> zerith_tools::Result<Option<Action>> {
+        Ok(None)
+    }
+    fn run(&self, _: &Value, _: &CallCtx<'_>, _: &Exec<'_>) -> zerith_tools::Result<String> {
+        Ok(self.output.clone())
+    }
+}
+
+#[test]
+fn token_saver_full_injects_prompts_compresses_build_output_and_records_savings() {
+    let mut build_out = String::new();
+    for i in 0..25 {
+        build_out.push_str(&format!("   Compiling pkg-{i:02} v0.1.0\n"));
+    }
+    build_out.push_str(
+        "error[E0308]: mismatched types\n \
+         --> src/lib.rs:42:9\n  \
+         |\n\
+         42 |     let x: u32 = \"hi\";\n  \
+         |                  ^^^^ expected `u32`, found `&str`\n\
+         error: could not compile `demo` due to 1 previous error\n",
+    );
+    assert!(build_out.len() > 500);
+
+    let dir = tmp();
+    let mut reg = Registry::empty();
+    reg.register(Box::new(FakeBuildTool {
+        spec: ToolSpec {
+            name: "fake_build".into(),
+            description: "runs build".into(),
+            parameters: json!({"type": "object"}),
+            returns: "build log",
+            permission: Permission::Read,
+            timeout: Duration::from_secs(10),
+            cancellable: true,
+            local: true,
+            source: "test".into(),
+        },
+        output: build_out,
+    }));
+    let pol = policy(dir.path());
+    let final_reply = sse(&[
+        json!({"choices":[{"delta":{"content":"```rust\nlet x: &str = \"hi\";\n```\ncorrigido"}}]}),
+        json!({"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30}}),
+    ]);
+    let fake = serve(vec![calls(&[("b1", "fake_build", json!({}))]), final_reply]);
+    let store = Store::open_in_memory().unwrap();
+    let sid = session(&store);
+
+    let settings = zerith_core::Settings {
+        token_saver: zerith_core::TokenSaverSettings {
+            ponytail: zerith_core::PonytailLevel::Full,
+            caveman: zerith_core::CavemanLevel::Full,
+            rtk_enabled: true,
+        },
+        ..Default::default()
+    };
+
+    let mut events = Vec::new();
+    let report = run_agent_turn(
+        &store,
+        &client(&fake.url, None),
+        TurnContext {
+            settings: Some(&settings),
+            ..TurnContext::default()
+        },
+        AgentOptions {
+            tools: Some(&reg),
+            policy: Some(&pol),
+            ..Default::default()
+        },
+        &sid,
+        "m",
+        "compile",
+        &Cancel::default(),
+        |e| events.push(e),
+    )
+    .unwrap();
+
+    assert!(report.text.contains("corrigido"), "{}", report.text);
+    assert!(report.saved_rtk_tokens > 0);
+    assert!(report.saved_ponytail_tokens > 0);
+    assert!(report.saved_caveman_tokens > 0);
+    assert_eq!(
+        report.saved_tokens,
+        report.saved_rtk_tokens + report.saved_ponytail_tokens + report.saved_caveman_tokens
+    );
+    assert!(events.iter().any(|e| matches!(
+        e,
+        RunEvent::TokenSaved { tool, before_bytes, after_bytes, filter }
+            if tool == "fake_build"
+                && *after_bytes < *before_bytes
+                && filter.as_deref() == Some("build-output")
+    )));
+
+    let seen = fake.seen.lock().unwrap();
+    let sys = seen[0]["messages"][0]["content"].as_str().unwrap();
+    assert!(sys.contains("Ponytail Full"), "{sys}");
+    assert!(sys.contains("Caveman Full"), "{sys}");
+
+    let second_msgs = seen[1]["messages"].as_array().unwrap();
+    let tool_msg = second_msgs.iter().find(|m| m["role"] == "tool").unwrap()["content"]
+        .as_str()
+        .unwrap();
+    assert!(tool_msg.contains("Compiled 25 packages"), "{tool_msg}");
+    assert!(
+        tool_msg.contains("error[E0308]: mismatched types"),
+        "{tool_msg}"
+    );
+    assert!(tool_msg.contains("--> src/lib.rs:42:9"), "{tool_msg}");
+    assert!(!tool_msg.contains("Compiling pkg-12"), "{tool_msg}");
+
+    let summary = store.usage_summary(24).unwrap();
+    assert_eq!(summary.total_saved_rtk_tokens, report.saved_rtk_tokens);
+    assert_eq!(
+        summary.total_saved_ponytail_tokens,
+        report.saved_ponytail_tokens
+    );
+    assert_eq!(
+        summary.total_saved_caveman_tokens,
+        report.saved_caveman_tokens
+    );
+    assert_eq!(summary.total_saved_tokens, report.saved_tokens);
+}

@@ -252,6 +252,8 @@ pub fn run_command(s: &mut Shell, name: &str) {
         }
         "skills" => s.navigate(Screen::Skills),
         "memory" => s.navigate(Screen::Memory),
+        "rewind" => rewind(s),
+        "mode" => cycle_mode(s),
         _ => {}
     }
 }

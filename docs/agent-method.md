@@ -15,20 +15,22 @@ não significa paridade de comportamento.
 | Modos de permissão (`default`, `acceptEdits`, `plan`, `dontAsk`, `bypassPermissions`) | Implementado | `zerith-security` |
 | Regras `allow`/`ask`/`deny` por ferramenta e padrão | Implementado | `Policy::check_tool` |
 | Sandbox de SO | **Parcial**: política checada pelo Zerith; `zerith doctor` mostra o nível | `zerith-security` |
-| Instruções de projeto (`AGENTS.md`/`CLAUDE.md`) | Implementado | `zerith-core/instructions.rs` |
-| Hooks de ciclo de vida | Implementado (ver `docs/hooks.md`) | `zerith-core/hooks.rs` |
+| Instruções de projeto (`AGENTS.md`/`CLAUDE.md`) | Implementado (`system_prompt_with_instructions`) | `zerith-core/instructions.rs` |
+| Hooks de ciclo de vida | Implementado para os 9 eventos (`Guards` + runtime + hosts CLI/UI; confirmação explícita para hooks de projeto planejada) | `zerith-core/hooks.rs`, `zerith-runtime` (`docs/hooks.md`) |
 | Skills (formato Agent Skills) | Implementado | `zerith-skills` |
 | Subagentes e planos | Implementado em modo plano | `zerith-runtime/src/plan.rs` |
 | Agentes nomeados em Markdown | Implementado | `zerith-core/agents.rs` |
-| MCP (stdio e HTTP), ferramentas, recursos, prompts | Cliente implementado; ligado ao `-p` | `zerith-mcp` (`docs/mcp.md`) |
-| Plugins em pacote | Manifesto e confiança implementados; carga de skills/agentes/hooks **planejada** | `zerith-plugins` |
-| `/rewind` (checkpoints de arquivos e conversa) | Armazenamento e restauração implementados; **as ferramentas de arquivo ainda não chamam `record_file`** | `docs/checkpoints.md` |
+| MCP (stdio e HTTP), ferramentas, recursos, prompts | Cliente e registro implementados; ligado a `-p`, `chat` e `zerith-ui` (incluindo servidores de plugins e `@servidor:recurso`) | `zerith-mcp` (`docs/mcp.md`) |
+| Plugins em pacote | Implementado: manifesto, confiança (`enable` + `trust`) e carga de skills, agentes, hooks e MCP via `contributions()` no CLI e na UI | `zerith-plugins` (`docs/plugins.md`) |
+| `/rewind` (checkpoints de arquivos e conversa) | Implementado: runtime abre checkpoint por turno e `write_file`/`edit_file` chamam `before_write` → `record_file` (`shell` fica fora do rastreamento) | `docs/checkpoints.md` |
 | `--resume`, `--continue`, `--fork`, nome de sessão | Implementado | `zerith-cli` |
 | Modo headless `-p` com `--output-format`, `--max-turns`, `--allowed-tools`, `--permission-mode`, `--json-schema` | Implementado (schema mínimo) | `zerith-cli` |
 | `--max-budget-usd` | Implementado **com preços informados pelo usuário** (sem tabela própria) | `zerith-cli` |
 | Memória entre sessões | Implementado (SQLite + FTS5), com pausa e exportação | `zerith-memory` |
 | Compactação de contexto | Existe em `zerith-runtime` (`compact.rs`); critérios em constante evolução | |
-| Rebobinar na janela | A janela já oferece "Rebobinar" quando há checkpoints | `zerith-ui` |
+| Rebobinar e interface na janela | Implementado em Rune: botão `Rebobinar` com resumo de arquivos/linhas alteradas do turno, `/rewind` e `/mode`, números de linha reais no diff inline, preview em andamento de ferramentas em execução e borda semântica de modo no composer | `zerith-ui` |
+| Gateway nativo multi-conta, cotas e delegação entre modelos | Implementado: `[[accounts]]`, cooldown + failover antes do primeiro token, `usage_records`/`account_cooldowns` (`V7`), `[routing]` (`main_model` + `subagent_model`/`explore_model`/`plan_model`/`role_models` + combos), CLI `usage`/`quota`/`accounts`/`routing` e tela **Provedores & Gateway Local** | `zerith-providers`, `zerith-sessions`, `zerith-runtime`, `zerith-cli`, `zerith-ui` |
+| Token Saver (`Ponytail`, `Caveman`, `RTK`) | Implementado com métricas individuais por protocolo (`saved_rtk_tokens`, `saved_ponytail_tokens`, `saved_caveman_tokens`) em `tokensaver.rs`, `usage_records`, CLI `tokensaver`/`usage` e **Configurações** | `zerith-runtime`, `zerith-sessions`, `zerith-cli`, `zerith-ui` |
 
 ## Conceitos do DeepSeek Harness
 

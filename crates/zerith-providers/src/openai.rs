@@ -1,5 +1,6 @@
-//! The OpenAI-compatible path, which is what 9Router speaks, and the `Client`
-//! that routes to the Anthropic module when the protocol says so.
+//! The OpenAI-compatible path used by Zerith's native multi-provider gateway,
+//! and the `Client` that routes to the Anthropic module when the protocol says
+//! so.
 //!
 //! `ureq` is blocking on purpose: the CLI probes an endpoint synchronously and
 //! the agent loop calls this from a worker thread. No async runtime in a
@@ -92,6 +93,10 @@ impl Client {
 
     pub fn config(&self) -> &ProviderConfig {
         &self.cfg
+    }
+
+    pub fn retry_policy(&self) -> RetryPolicy {
+        self.retry
     }
 
     pub(crate) fn endpoint(&self, path: &str) -> String {

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "kebab-case")]
 pub enum Protocol {
     /// `POST {base}/chat/completions`, `Authorization: Bearer`. Covers OpenAI,
-    /// 9Router, DeepSeek, OpenRouter, Ollama, LM Studio and every other
+    /// DeepSeek, Gemini, OpenRouter, Ollama, LM Studio and every other
     /// OpenAI-compatible server.
     OpenAi,
     /// `POST {base}/messages`, `x-api-key` + `anthropic-version`.
@@ -30,7 +30,6 @@ impl Protocol {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProviderKind {
-    NineRouter,
     OpenAi,
     Anthropic,
     DeepSeek,
@@ -42,9 +41,35 @@ pub enum ProviderKind {
 }
 
 impl ProviderKind {
+    pub const PRESETS: &[ProviderKind] = &[
+        ProviderKind::Anthropic,
+        ProviderKind::DeepSeek,
+        ProviderKind::OpenAi,
+        ProviderKind::Gemini,
+        ProviderKind::OpenRouter,
+        ProviderKind::Ollama,
+        ProviderKind::LmStudio,
+    ];
+
+    pub fn all_presets() -> &'static [ProviderKind] {
+        Self::PRESETS
+    }
+
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "openai" => Self::OpenAi,
+            "anthropic" | "claude" => Self::Anthropic,
+            "deepseek" => Self::DeepSeek,
+            "gemini" | "google" => Self::Gemini,
+            "openrouter" => Self::OpenRouter,
+            "ollama" => Self::Ollama,
+            "lmstudio" | "lm-studio" => Self::LmStudio,
+            _ => Self::Custom,
+        }
+    }
+
     pub fn default_base_url(self) -> &'static str {
         match self {
-            ProviderKind::NineRouter => "http://localhost:20128/v1",
             ProviderKind::OpenAi => "https://api.openai.com/v1",
             ProviderKind::Anthropic => "https://api.anthropic.com/v1",
             ProviderKind::DeepSeek => "https://api.deepseek.com/v1",
@@ -71,7 +96,6 @@ impl ProviderKind {
 
     pub fn as_str(self) -> &'static str {
         match self {
-            ProviderKind::NineRouter => "9router",
             ProviderKind::OpenAi => "openai",
             ProviderKind::Anthropic => "anthropic",
             ProviderKind::DeepSeek => "deepseek",
@@ -97,20 +121,23 @@ pub struct ProviderConfig {
     pub known_models: Vec<String>,
     pub context_limit: Option<u32>,
     pub timeout_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
 }
 
 impl Default for ProviderConfig {
     fn default() -> Self {
         Self {
-            name: "9router".into(),
-            kind: ProviderKind::NineRouter,
+            name: "openai".into(),
+            kind: ProviderKind::OpenAi,
             protocol: Protocol::OpenAi,
-            base_url: ProviderKind::NineRouter.default_base_url().into(),
+            base_url: ProviderKind::OpenAi.default_base_url().into(),
             api_key: None,
             default_model: None,
             known_models: Vec::new(),
             context_limit: None,
             timeout_ms: 60_000,
+            account_id: None,
         }
     }
 }
@@ -136,6 +163,11 @@ impl ProviderConfig {
         self
     }
 
+    pub fn with_account(mut self, account_id: impl Into<String>) -> Self {
+        self.account_id = Some(account_id.into());
+        self
+    }
+
     /// What is safe to show: the URL, never the key.
     pub fn redacted(&self) -> String {
         format!(
@@ -158,19 +190,13 @@ impl ProviderConfig {
     /// depending on which binary they launched.
     ///
     /// `ZERITH_PROVIDER` picks the kind, `ZERITH_BASE_URL` / `ZERITH_API_KEY` /
-    /// `ZERITH_MODEL` override its defaults. Unknown values fall back to the
-    /// 9Router, which is the local-first default.
+    /// `ZERITH_MODEL` / `ZERITH_ACCOUNT_ID` override its defaults. Absent or
+    /// empty `ZERITH_PROVIDER` defaults to `OpenAi`, and unknown provider names
+    /// resolve to `Custom`.
     pub fn from_env() -> Self {
-        let kind = match std::env::var("ZERITH_PROVIDER").as_deref() {
-            Ok("openai") => ProviderKind::OpenAi,
-            Ok("anthropic") => ProviderKind::Anthropic,
-            Ok("deepseek") => ProviderKind::DeepSeek,
-            Ok("gemini") => ProviderKind::Gemini,
-            Ok("openrouter") => ProviderKind::OpenRouter,
-            Ok("ollama") => ProviderKind::Ollama,
-            Ok("lmstudio") => ProviderKind::LmStudio,
-            Ok("custom") => ProviderKind::Custom,
-            _ => ProviderKind::NineRouter,
+        let kind = match std::env::var("ZERITH_PROVIDER") {
+            Ok(s) if !s.trim().is_empty() => ProviderKind::parse(s.trim()),
+            _ => ProviderKind::OpenAi,
         };
         let mut cfg = Self::new(kind);
         if let Ok(url) = std::env::var("ZERITH_BASE_URL") {
@@ -188,6 +214,12 @@ impl ProviderConfig {
                 cfg.default_model = Some(model);
             }
         }
+        if let Ok(account_id) = std::env::var("ZERITH_ACCOUNT_ID") {
+            let trimmed = account_id.trim();
+            if !trimmed.is_empty() {
+                cfg.account_id = Some(trimmed.to_string());
+            }
+        }
         cfg
     }
 
@@ -199,5 +231,82 @@ impl ProviderConfig {
             return Err(crate::ProviderError::NoKey);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn provider_kind_parse_and_presets() {
+        assert_eq!(ProviderKind::parse("openai"), ProviderKind::OpenAi);
+        assert_eq!(ProviderKind::parse("anthropic"), ProviderKind::Anthropic);
+        assert_eq!(ProviderKind::parse("claude"), ProviderKind::Anthropic);
+        assert_eq!(ProviderKind::parse("Claude"), ProviderKind::Anthropic);
+        assert_eq!(ProviderKind::parse("deepseek"), ProviderKind::DeepSeek);
+        assert_eq!(ProviderKind::parse("gemini"), ProviderKind::Gemini);
+        assert_eq!(ProviderKind::parse("google"), ProviderKind::Gemini);
+        assert_eq!(ProviderKind::parse("openrouter"), ProviderKind::OpenRouter);
+        assert_eq!(ProviderKind::parse("ollama"), ProviderKind::Ollama);
+        assert_eq!(ProviderKind::parse("lmstudio"), ProviderKind::LmStudio);
+        assert_eq!(ProviderKind::parse("lm-studio"), ProviderKind::LmStudio);
+        assert_eq!(ProviderKind::parse("my-proxy"), ProviderKind::Custom);
+
+        assert_eq!(ProviderKind::PRESETS, ProviderKind::all_presets());
+        assert_eq!(ProviderKind::PRESETS.len(), 7);
+        assert!(!ProviderKind::PRESETS.contains(&ProviderKind::Custom));
+    }
+
+    #[test]
+    fn default_config_uses_openai() {
+        let cfg = ProviderConfig::default();
+        assert_eq!(cfg.kind, ProviderKind::OpenAi);
+        assert_eq!(cfg.name, "openai");
+        assert_eq!(cfg.protocol, Protocol::OpenAi);
+        assert_eq!(cfg.base_url, "https://api.openai.com/v1");
+        assert_eq!(cfg.account_id, None);
+    }
+
+    #[test]
+    fn from_env_defaults_to_openai_and_reads_account_id() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let keys = [
+            "ZERITH_PROVIDER",
+            "ZERITH_BASE_URL",
+            "ZERITH_API_KEY",
+            "ZERITH_MODEL",
+            "ZERITH_ACCOUNT_ID",
+        ];
+        let saved: Vec<(&str, Option<String>)> =
+            keys.iter().map(|&k| (k, std::env::var(k).ok())).collect();
+        for k in keys {
+            std::env::remove_var(k);
+        }
+
+        let def = ProviderConfig::from_env();
+        assert_eq!(def.kind, ProviderKind::OpenAi);
+        assert_eq!(def.account_id, None);
+
+        std::env::set_var("ZERITH_PROVIDER", "claude");
+        std::env::set_var("ZERITH_ACCOUNT_ID", "acc-work");
+        let parsed = ProviderConfig::from_env();
+        assert_eq!(parsed.kind, ProviderKind::Anthropic);
+        assert_eq!(parsed.protocol, Protocol::Anthropic);
+        assert_eq!(parsed.account_id.as_deref(), Some("acc-work"));
+
+        std::env::set_var("ZERITH_PROVIDER", "custom-local");
+        let custom = ProviderConfig::from_env();
+        assert_eq!(custom.kind, ProviderKind::Custom);
+
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
     }
 }

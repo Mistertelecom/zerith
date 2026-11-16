@@ -332,7 +332,7 @@ pub struct SlashCommand {
     pub detail: &'static str,
 }
 
-pub const SLASH: [SlashCommand; 9] = [
+pub const SLASH: [SlashCommand; 11] = [
     SlashCommand {
         name: "compact",
         detail: "Resumir a conversa para liberar contexto",
@@ -368,6 +368,14 @@ pub const SLASH: [SlashCommand; 9] = [
     SlashCommand {
         name: "memory",
         detail: "Ver o que o Zerith lembra",
+    },
+    SlashCommand {
+        name: "rewind",
+        detail: "Desfazer arquivos e mensagens do último turno",
+    },
+    SlashCommand {
+        name: "mode",
+        detail: "Alternar modo de permissão (Shift+Tab)",
     },
 ];
 
@@ -517,6 +525,7 @@ pub enum DiffKind {
 #[derive(Clone, Debug, PartialEq)]
 pub struct DiffRow {
     pub kind: DiffKind,
+    pub line_no: Option<usize>,
     pub text: String,
 }
 
@@ -545,6 +554,33 @@ pub struct ToolRow {
     pub started: Option<std::time::Instant>,
     pub preview: String,
     pub diff: Option<DiffSummary>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TurnChanges {
+    pub files: usize,
+    pub adds: usize,
+    pub dels: usize,
+}
+
+/// Summarizes unique modified files and line deltas across successful diff-bearing tools.
+pub fn turn_changes<'a>(tools: impl IntoIterator<Item = &'a ToolRow>) -> TurnChanges {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = TurnChanges::default();
+    for t in tools {
+        if t.state != ToolState::Ok {
+            continue;
+        }
+        let Some(d) = &t.diff else {
+            continue;
+        };
+        if seen.insert(t.arg.as_str()) {
+            out.files += 1;
+        }
+        out.adds += d.adds;
+        out.dels += d.dels;
+    }
+    out
 }
 
 fn json_str<'a>(v: &'a serde_json::Value, key: &str) -> Option<&'a str> {
@@ -607,6 +643,7 @@ pub fn diff_of_call(name: &str, args: &str) -> Option<DiffSummary> {
                     LineKind::Removed => DiffKind::Del,
                     _ => DiffKind::Ctx,
                 },
+                line_no: line.new.or(line.old).map(|n| n as usize),
                 text: line.text.clone(),
             });
         }

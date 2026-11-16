@@ -13,9 +13,10 @@ use std::process::ExitCode;
 use zerith_core::{secrets, Paths, Settings};
 use zerith_importers::{detect, import, import_jsonl, ImportReport};
 use zerith_memory::{default_scope, Confidence, FactKind, MemoryBackend, Scope, SqliteMemory};
-use zerith_providers::{Cancel, ChatMessage, ChatRequest, Client, ProviderConfig};
+use zerith_providers::{Cancel, ChatMessage, ChatRequest, Client, ProviderError};
+use zerith_runtime::guards::Guards;
 use zerith_runtime::plan::{parse_plan, run_plan};
-use zerith_runtime::{run_turn_in, RunEvent, TurnContext};
+use zerith_runtime::{run_agent_turn, AgentOptions, RunError, RunEvent, TurnContext, TurnReport};
 use zerith_security::{redact, Action, Policy, Verdict, PRESETS};
 use zerith_sessions::{NewMessage, Role, SessionSource, Store, TaskState};
 use zerith_skills::catalog;
@@ -23,7 +24,7 @@ use zerith_skills::{discover, scan, Library, Status};
 use zerith_tools::{CallCtx, Registry};
 
 use crate::args::{parse_chat, parse_import_hermes, parse_rename, select_session, SessionArgs};
-use crate::headless::{load_settings, provider_config, ExitWith};
+use crate::headless::{load_settings, provider_config, resolve_model, ExitWith};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -81,7 +82,12 @@ usage:
   zerith mcp approve <name> --yes
   zerith mcp tools <server> | call <server> <tool> [json-args]
   zerith mcp tools <command and args>            (raw server, no config)
-  zerith providers [probe|models|chat <model> <prompt>]
+  zerith providers [show|probe|models|chat <model> <prompt>]
+  zerith usage [--hours N]
+  zerith quota [--hours N]
+  zerith accounts [list|add <id> <provider> ...|remove|enable|disable|reset-cooldown <id>]
+  zerith routing [show|main|subagent|explore|plan <model>|role <agent> <model>|combo <name> <m1,m2,...>]
+  zerith tokensaver [show|ponytail <off|lite|full|ultra>|caveman <off|lite|full|ultra|wenyan>|rtk <on|off>]
   zerith chat [--session <id>|--resume [id|name]|--continue] [--fork] [--model <id>] <prompt>
   zerith -p <prompt> [--output-format text|json|stream-json] [--model M]
         [--session ID | --resume [id|name] | --continue] [--fork]
@@ -162,7 +168,11 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 println!("\n[{}] {}", m.role.as_str(), m.content);
             }
         }
-        ("providers", _) => providers(args)?,
+        ("providers", _) => providers(&paths, args)?,
+        ("usage", _) | ("quota", _) => cmds::usage_cmd(&paths, args)?,
+        ("accounts", _) | ("account", _) => cmds::accounts_cmd(&paths, args)?,
+        ("routing", _) => cmds::routing_cmd(&paths, args)?,
+        ("tokensaver", _) => cmds::tokensaver_cmd(&paths, args)?,
         ("chat", _) => chat(&paths, args)?,
         ("import", Some("hermes")) => import_hermes(&paths, args)?,
         ("export", _) => cmds::export_cmd(&paths, args)?,
@@ -225,11 +235,13 @@ fn tools_cmd(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::E
             let raw = args.get(3).cloned().unwrap_or_else(|| "{}".to_string());
             let json: serde_json::Value = serde_json::from_str(&raw)?;
             paths.ensure()?;
-            let policy = Policy::from_env(paths.root())?;
+            let settings = load_settings(paths);
+            let workspace = std::env::current_dir().unwrap_or_else(|_| paths.root().to_path_buf());
+            let policy = Policy::from_settings(&settings, &workspace)?;
             let memory = SqliteMemory::open(paths.db()).ok();
             let scope = default_scope();
             let ctx = CallCtx {
-                workspace: paths.root(),
+                workspace: &workspace,
                 policy: &policy,
                 memory: memory.as_ref().map(|m| m as &dyn MemoryBackend),
                 scope: Some(&scope),
@@ -246,7 +258,9 @@ fn tools_cmd(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::E
 /// Shows what the current preset permits, and what it cannot enforce. The
 /// second half is the point: a preset that hides its limits is a lie.
 fn policy(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let policy = Policy::from_env(paths.root())?;
+    let settings = load_settings(paths);
+    let workspace = std::env::current_dir().unwrap_or_else(|_| paths.root().to_path_buf());
+    let policy = Policy::from_settings(&settings, &workspace)?;
     println!("preset        {}", policy.preset.name);
     println!("sandbox       {}", policy.preset.sandbox.as_str());
     println!("enforcement   {}", policy.enforcement.as_str());
@@ -634,12 +648,16 @@ fn chat(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>
         model: model_flag,
     } = parse_chat(args)?;
 
-    let settings = load_settings(paths);
+    let mut settings = load_settings(paths);
+    let contrib = zerith_plugins::Library::open(&paths.root().join("plugins"))
+        .and_then(|l| l.contributions())
+        .ok();
+    if let Some(c) = &contrib {
+        c.apply_hooks(&mut settings);
+    }
     let cfg = provider_config(&settings)?;
-    let model = model_flag
-        .or_else(|| cfg.default_model.clone())
-        .or_else(|| cfg.known_models.first().cloned())
-        .ok_or("no model: pass --model or set ZERITH_MODEL")?;
+    let model = resolve_model(model_flag, &settings, &cfg)
+        .ok_or("sem modelo: use --model, routing.main_model ou ZERITH_MODEL")?;
     let client = Client::new(cfg)?;
 
     paths.ensure()?;
@@ -647,50 +665,170 @@ fn chat(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>
     let session_id = select_session(&store, &session_flag, &prompt)?;
     let _: &SessionArgs = &session_flag;
 
+    let workspace = std::env::current_dir().unwrap_or_else(|_| paths.root().to_path_buf());
+    let mut policy = Policy::from_settings(&settings, &workspace)?;
+    let mut tools = Registry::new();
+    let mut mcp = zerith_mcp::McpRegistry::load(paths, Some(&workspace));
+    if let Some(c) = &contrib {
+        mcp.extend(c.mcp.iter().map(|(_, s)| s.clone()).collect());
+    }
+    for note in &mcp.notes {
+        eprintln!("zerith: {note}");
+    }
+    let done = mcp.register_into(&mut tools);
+    for e in &done.errors {
+        eprintln!("zerith: {e}");
+    }
+    let prompt = if mcp.is_empty() {
+        prompt
+    } else {
+        let (text, errors) = mcp.expand_mentions(&prompt);
+        for e in &errors {
+            eprintln!("zerith: {e}");
+        }
+        text
+    };
+    let guards = Guards::new(settings.clone(), &mut policy, session_id.clone());
+    tools.register(guards.enter_plan_mode_tool());
+    tools.register(guards.exit_plan_mode_tool());
+
     // Memory shares the same database file: one store, one schema, no second
     // source of truth to keep in sync.
     let memory = SqliteMemory::open(paths.db())?;
     let scope = default_scope();
+    let memory = (!settings.memory.paused).then_some(&memory as &dyn MemoryBackend);
 
     // Installed skills are consulted, but only their names and descriptions
     // reach the prompt unless the user named one.
-    let skills = Library::open(paths.skills()).ok();
+    let skills = Library::open(paths.skills()).ok().map(|l| {
+        if let Some(c) = &contrib {
+            l.with_extra(c.skill_dirs())
+        } else {
+            l
+        }
+    });
+
+    let cancel = Cancel::default();
+    signals::install(cancel.clone());
 
     let mut streamed = false;
-    let report = run_turn_in(
+    let result = run_agent_turn(
         &store,
         &client,
         TurnContext {
-            memory: Some(&memory),
+            memory,
             scope: Some(&scope),
             skills: skills.as_ref(),
+            settings: Some(&settings),
             ..TurnContext::default()
+        },
+        AgentOptions {
+            tools: Some(&tools),
+            policy: Some(&policy),
+            middleware: vec![Box::new(guards)],
+            spill_dir: Some(paths.root().join("spill")),
+            ..AgentOptions::for_profile(zerith_runtime::active_profile())
         },
         &session_id,
         &model,
         &prompt,
-        &Cancel::default(),
+        &cancel,
         |e| match e {
             RunEvent::Delta(text) => {
                 streamed = true;
-                println!("{text}");
+                print!("{text}");
+                let _ = std::io::Write::flush(&mut std::io::stdout());
             }
             RunEvent::Reasoning(r) => eprintln!("[reasoning] {r}"),
+            RunEvent::ToolCall { name, args, .. } => eprintln!("\n[tool] {name} {args}"),
+            RunEvent::ToolResult {
+                name,
+                ok,
+                output_preview,
+                ..
+            } => eprintln!(
+                "[tool:{}] {name}: {output_preview}",
+                if ok { "ok" } else { "erro" }
+            ),
+            RunEvent::Route {
+                account_id,
+                provider,
+                model,
+                attempts,
+            } if attempts > 1 => {
+                eprintln!(
+                    "[gateway:failover] tentativa #{attempts} -> conta {account_id} ({provider}/{model})"
+                );
+            }
             _ => {}
         },
-    )?;
-    if !streamed {
+    );
+
+    let end = zerith_core::hooks::run_hooks(
+        zerith_core::hooks::HookEvent::SessionEnd,
+        &zerith_core::hooks::HookPayload {
+            session_id,
+            cwd: workspace,
+            ..Default::default()
+        },
+        &settings,
+    );
+    for e in &end.errors {
+        eprintln!("zerith: {e}");
+    }
+
+    let report = match result {
+        Ok(r) => r,
+        Err(RunError::Provider(ProviderError::Cancelled)) => {
+            return Err(Box::new(ExitWith(
+                signals::received().unwrap_or(143),
+                "cancelado".into(),
+            )))
+        }
+        Err(e) => return Err(e.into()),
+    };
+    if streamed {
+        println!();
+    } else {
         println!("{}", report.text);
     }
-    eprintln!(
-        "\n[turn] {}  tokens {}→{}  msg {}",
-        report.session_id, report.prompt_tokens, report.completion_tokens, report.message_id
-    );
+    eprintln!("{}", format_chat_footer(&report, &model));
     Ok(())
 }
 
-fn providers(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let cfg = ProviderConfig::from_env();
+fn format_chat_footer(report: &TurnReport, fallback_model: &str) -> String {
+    let acc = report.account_id.as_deref().unwrap_or("-");
+    let mdl = report.model_used.as_deref().unwrap_or(fallback_model);
+    if report.saved_tokens > 0 {
+        format!(
+            "\n[turn] {}  conta {}  modelo {}  tokens {}→{}  saved {} (rtk:{} ponytail:{} caveman:{})  msg {}",
+            report.session_id,
+            acc,
+            mdl,
+            report.prompt_tokens,
+            report.completion_tokens,
+            report.saved_tokens,
+            report.saved_rtk_tokens,
+            report.saved_ponytail_tokens,
+            report.saved_caveman_tokens,
+            report.message_id,
+        )
+    } else {
+        format!(
+            "\n[turn] {}  conta {}  modelo {}  tokens {}→{}  msg {}",
+            report.session_id,
+            acc,
+            mdl,
+            report.prompt_tokens,
+            report.completion_tokens,
+            report.message_id,
+        )
+    }
+}
+
+fn providers(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let settings = load_settings(paths);
+    let cfg = provider_config(&settings)?;
     match args.get(1).map(String::as_str) {
         None | Some("show") => println!("{}", cfg.redacted()),
         Some("probe") => {
@@ -717,12 +855,21 @@ fn providers(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let model = args
                 .get(2)
                 .cloned()
+                .or_else(|| {
+                    settings
+                        .routing
+                        .main_model
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                })
                 .or_else(|| cfg.default_model.clone())
-                .ok_or("providers chat needs a model (or ZERITH_MODEL)")?;
+                .ok_or("providers chat precisa de um modelo (ou ZERITH_MODEL)")?;
             let prompt = args
                 .get(3)
                 .cloned()
-                .ok_or("providers chat needs a prompt")?;
+                .ok_or("providers chat precisa de um prompt")?;
             let client = Client::new(cfg)?;
             let req = ChatRequest::new(model, vec![ChatMessage::user(prompt)]);
             let out = client.complete(&req, &Default::default())?;
@@ -731,7 +878,7 @@ fn providers(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
             println!("{}", out.text);
         }
-        Some(other) => return Err(format!("unknown providers command: {other}").into()),
+        Some(other) => return Err(format!("comando desconhecido: providers {other}").into()),
     }
     Ok(())
 }
@@ -934,5 +1081,37 @@ mod tests {
         assert_eq!(flag_usize(&args, "--limit"), Some(7));
         assert_eq!(flag_value(&args, "--to").as_deref(), Some("f"));
         assert_eq!(flag_usize(&args, "--missing"), None);
+    }
+
+    #[test]
+    fn chat_footer_renders_account_model_and_optional_token_savings() {
+        let mut report = TurnReport {
+            session_id: "s-1".into(),
+            message_id: 9,
+            text: "ok".into(),
+            reasoning: None,
+            prompt_tokens: 120,
+            completion_tokens: 45,
+            saved_rtk_tokens: 30,
+            saved_ponytail_tokens: 15,
+            saved_caveman_tokens: 5,
+            saved_tokens: 50,
+            account_id: Some("acct-a".into()),
+            model_used: Some("gpt-4o".into()),
+        };
+        let with_saved = format_chat_footer(&report, "fallback");
+        assert_eq!(
+            with_saved,
+            "\n[turn] s-1  conta acct-a  modelo gpt-4o  tokens 120→45  saved 50 (rtk:30 ponytail:15 caveman:5)  msg 9"
+        );
+
+        report.saved_tokens = 0;
+        report.account_id = None;
+        report.model_used = None;
+        let without_saved = format_chat_footer(&report, "fallback-m");
+        assert_eq!(
+            without_saved,
+            "\n[turn] s-1  conta -  modelo fallback-m  tokens 120→45  msg 9"
+        );
     }
 }

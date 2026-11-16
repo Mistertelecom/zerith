@@ -23,6 +23,7 @@ pub mod question;
 pub mod spill;
 pub mod subagent;
 mod tasks;
+pub mod tokensaver;
 
 pub use agent::{
     approval_channel, inbox_channel, run_agent_turn, AgentOptions, Approval, ApprovalGate,
@@ -34,9 +35,14 @@ pub use pipeline::{Flow, Middleware, NoopMiddleware, ToolInvocation, ToolOutcome
 pub use question::{question_channel, QuestionGate, QuestionSender};
 pub use subagent::{Gate, SubagentOptions};
 
+use std::collections::HashSet;
 use std::sync::mpsc;
+use zerith_core::{secrets, settings::WireProtocol, AccountEntry, Settings};
 use zerith_memory::{MemoryBackend, Scope};
-use zerith_providers::{Client, ProviderError};
+use zerith_providers::{
+    infer_provider, Client, Gateway, ModelSpec, Protocol, ProviderConfig, ProviderError,
+    ProviderKind, RouteCandidate,
+};
 use zerith_sessions::Store;
 
 #[derive(Debug, thiserror::Error)]
@@ -47,6 +53,8 @@ pub enum RunError {
     Provider(#[from] ProviderError),
     #[error("no such session: {0}")]
     NoSession(String),
+    #[error("blocked by hook: {0}")]
+    Blocked(String),
 }
 
 pub type Result<T> = std::result::Result<T, RunError>;
@@ -110,6 +118,20 @@ pub enum RunEvent {
         id: u64,
         questions: Vec<zerith_tools::Question>,
     },
+    /// The local gateway chose an account/provider/model route for a step.
+    Route {
+        account_id: String,
+        provider: String,
+        model: String,
+        attempts: usize,
+    },
+    /// Token Saver RTK compressed a tool output before sending it to the model.
+    TokenSaved {
+        tool: String,
+        before_bytes: usize,
+        after_bytes: usize,
+        filter: Option<String>,
+    },
 }
 
 /// How many past messages are replayed to the model, newest first, when no
@@ -142,10 +164,11 @@ pub struct TurnContext<'a> {
     /// The agent this turn runs as. `None` is the default agent; a named one
     /// adds its instructions after the project's.
     pub agent: Option<&'a zerith_core::agents::AgentDef>,
+    pub settings: Option<&'a zerith_core::Settings>,
 }
 
 /// The turn's outcome, with the numbers a UI needs to show it honestly.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct TurnReport {
     pub session_id: String,
     pub message_id: i64,
@@ -153,6 +176,12 @@ pub struct TurnReport {
     pub reasoning: Option<String>,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    pub saved_rtk_tokens: u64,
+    pub saved_ponytail_tokens: u64,
+    pub saved_caveman_tokens: u64,
+    pub saved_tokens: u64,
+    pub account_id: Option<String>,
+    pub model_used: Option<String>,
 }
 
 /// Runs one turn and appends the answer.
@@ -289,6 +318,16 @@ pub(crate) fn system_prompt(
     if let Some(a) = ctx.agent {
         prompt_text.push_str(&format!("\n\n# Agente: {}\n\n{}", a.name, a.instructions));
     }
+    if let Some(st) = ctx.settings {
+        if let Some(pt) = tokensaver::ponytail_prompt(st.token_saver.ponytail) {
+            prompt_text.push_str("\n\n");
+            prompt_text.push_str(pt);
+        }
+        if let Some(cv) = tokensaver::caveman_prompt(st.token_saver.caveman) {
+            prompt_text.push_str("\n\n");
+            prompt_text.push_str(cv);
+        }
+    }
     if let (Some(mem), Some(scope)) = (ctx.memory, ctx.scope) {
         // A fact the user stated is stored before the answer is asked for, so
         // the same turn can already recall it — and a crash after this point
@@ -369,6 +408,385 @@ pub fn run_turn_async(
         })
     });
     (rx, handle)
+}
+
+fn map_protocol(p: WireProtocol) -> Protocol {
+    match p {
+        WireProtocol::OpenAi => Protocol::OpenAi,
+        WireProtocol::Anthropic => Protocol::Anthropic,
+    }
+}
+
+fn canonical_provider(raw: &str) -> String {
+    let kind = ProviderKind::parse(raw);
+    if kind == ProviderKind::Custom {
+        raw.trim().to_string()
+    } else {
+        kind.as_str().to_string()
+    }
+}
+
+fn same_provider(provider: &str, cfg: &ProviderConfig) -> bool {
+    if provider.eq_ignore_ascii_case(&cfg.name) {
+        return true;
+    }
+    let kind = ProviderKind::parse(provider);
+    kind != ProviderKind::Custom && kind == cfg.kind
+}
+
+fn compatible_provider(
+    acc_provider: &str,
+    target_provider: Option<&str>,
+    fallback_cfg: &ProviderConfig,
+) -> bool {
+    match target_provider {
+        Some(tp) => {
+            if acc_provider.eq_ignore_ascii_case(tp) {
+                return true;
+            }
+            let tk = ProviderKind::parse(tp);
+            let ak = ProviderKind::parse(acc_provider);
+            tk != ProviderKind::Custom && tk == ak
+        }
+        None => same_provider(acc_provider, fallback_cfg),
+    }
+}
+
+/// Keeps the last account entry per non-empty `id` so project/local layers
+/// override user-layer accounts with the same id.
+fn effective_accounts(settings: &Settings) -> Vec<&AccountEntry> {
+    let mut seen = HashSet::new();
+    let mut rev = Vec::new();
+    for acc in settings.accounts.iter().rev() {
+        if !acc.id.is_empty() && seen.insert(acc.id.as_str()) {
+            rev.push(acc);
+        }
+    }
+    rev.reverse();
+    rev
+}
+
+fn resolve_account_key(
+    acc: &AccountEntry,
+    base_url: &str,
+    fallback_cfg: &ProviderConfig,
+) -> Option<String> {
+    let key_ref = acc.api_key_ref.as_deref().or(Some(acc.id.as_str()));
+    if let Some(k) = secrets::resolve_api_key(&acc.provider, key_ref)
+        .ok()
+        .flatten()
+        .filter(|s| !s.trim().is_empty())
+    {
+        return Some(k);
+    }
+    if acc.api_key_ref.is_none() {
+        if let Some(k) = secrets::resolve_api_key(&acc.provider, None)
+            .ok()
+            .flatten()
+            .filter(|s| !s.trim().is_empty())
+        {
+            return Some(k);
+        }
+        let same_url = !base_url.trim().is_empty()
+            && base_url.trim_end_matches('/') == fallback_cfg.base_url.trim_end_matches('/');
+        if same_provider(&acc.provider, fallback_cfg) || same_url {
+            return fallback_cfg.api_key.clone();
+        }
+    }
+    None
+}
+
+fn candidate_from_account(
+    settings: &Settings,
+    acc: &AccountEntry,
+    spec_model: &str,
+    fallback_cfg: &ProviderConfig,
+) -> RouteCandidate {
+    let prov_name = canonical_provider(&acc.provider);
+    let entry = settings
+        .provider_entry(&acc.provider)
+        .or_else(|| settings.provider_entry(&prov_name));
+    let kind = ProviderKind::parse(&acc.provider);
+    let same_fb = same_provider(&acc.provider, fallback_cfg);
+
+    let protocol = acc
+        .protocol
+        .map(map_protocol)
+        .or_else(|| entry.and_then(|e| e.protocol).map(map_protocol))
+        .unwrap_or_else(|| {
+            if kind == ProviderKind::Custom && same_fb {
+                fallback_cfg.protocol
+            } else {
+                kind.default_protocol()
+            }
+        });
+
+    let base_url = acc
+        .base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            entry
+                .and_then(|e| e.base_url.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        })
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            if same_fb && !fallback_cfg.base_url.trim().is_empty() {
+                fallback_cfg.base_url.clone()
+            } else {
+                kind.default_base_url().to_string()
+            }
+        });
+
+    let api_key = resolve_account_key(acc, &base_url, fallback_cfg);
+    let default_model = acc
+        .default_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            entry
+                .and_then(|e| e.default_model.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            same_fb
+                .then(|| fallback_cfg.default_model.clone())
+                .flatten()
+        });
+
+    let model = if !spec_model.trim().is_empty() {
+        spec_model.trim().to_string()
+    } else {
+        default_model.clone().unwrap_or_default()
+    };
+
+    let mut cfg = ProviderConfig::new(kind);
+    cfg.name = prov_name.clone();
+    cfg.protocol = protocol;
+    cfg.base_url = base_url;
+    cfg.api_key = api_key;
+    cfg.default_model = default_model;
+    cfg.timeout_ms = entry
+        .and_then(|e| e.timeout_ms)
+        .unwrap_or(fallback_cfg.timeout_ms);
+    cfg.context_limit = entry
+        .and_then(|e| e.context_limit)
+        .or(fallback_cfg.context_limit);
+    cfg.account_id = Some(acc.id.clone());
+
+    RouteCandidate {
+        account_id: acc.id.clone(),
+        provider: prov_name,
+        model,
+        config: cfg,
+        priority: acc.priority,
+        quota_tokens: acc.quota_tokens,
+        quota_requests: acc.quota_requests,
+        window_hours: acc.window_hours,
+    }
+}
+
+fn candidate_from_provider(
+    settings: &Settings,
+    provider: &str,
+    spec_model: &str,
+    fallback_cfg: &ProviderConfig,
+) -> RouteCandidate {
+    let prov_name = canonical_provider(provider);
+    let entry = settings
+        .provider_entry(provider)
+        .or_else(|| settings.provider_entry(&prov_name));
+    let kind = ProviderKind::parse(provider);
+    let mut cfg = ProviderConfig::new(kind);
+    cfg.name = prov_name.clone();
+    cfg.timeout_ms = fallback_cfg.timeout_ms;
+    cfg.context_limit = fallback_cfg.context_limit;
+    if let Some(e) = entry {
+        if let Some(p) = e.protocol {
+            cfg.protocol = map_protocol(p);
+        }
+        if let Some(u) = e
+            .base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            cfg.base_url = u.to_string();
+        }
+        cfg.default_model = e.default_model.clone();
+        if let Some(t) = e.timeout_ms {
+            cfg.timeout_ms = t;
+        }
+        if e.context_limit.is_some() {
+            cfg.context_limit = e.context_limit;
+        }
+    }
+    let key_ref = entry.and_then(|e| e.api_key_ref.as_deref());
+    cfg.api_key = secrets::resolve_api_key(&prov_name, key_ref).ok().flatten();
+    let model = if !spec_model.trim().is_empty() {
+        spec_model.trim().to_string()
+    } else {
+        cfg.default_model.clone().unwrap_or_default()
+    };
+    RouteCandidate {
+        account_id: prov_name.clone(),
+        provider: prov_name,
+        model,
+        config: cfg,
+        priority: 0,
+        quota_tokens: None,
+        quota_requests: None,
+        window_hours: 5,
+    }
+}
+
+fn candidate_from_fallback(spec_model: &str, fallback_cfg: &ProviderConfig) -> RouteCandidate {
+    let provider = if fallback_cfg.name.trim().is_empty() {
+        fallback_cfg.kind.as_str().to_string()
+    } else {
+        fallback_cfg.name.clone()
+    };
+    let account_id = fallback_cfg
+        .account_id
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| provider.clone());
+    let model = if !spec_model.trim().is_empty() {
+        spec_model.trim().to_string()
+    } else {
+        fallback_cfg.default_model.clone().unwrap_or_default()
+    };
+    RouteCandidate {
+        account_id,
+        provider,
+        model,
+        config: fallback_cfg.clone(),
+        priority: 0,
+        quota_tokens: None,
+        quota_requests: None,
+        window_hours: 5,
+    }
+}
+
+/// Resolves a model string (plain model, `provider/model`, `account:model`, or
+/// combo name) into an ordered [`Gateway`] of [`RouteCandidate`]s plus the
+/// primary display model name.
+pub fn resolve_gateway(
+    settings: &Settings,
+    requested_model: &str,
+    fallback_cfg: &ProviderConfig,
+) -> (Gateway, String) {
+    let trimmed = requested_model.trim();
+    let combo_models = settings
+        .routing
+        .combo(trimmed)
+        .filter(|c| !c.models.is_empty())
+        .map(|c| c.models.as_slice());
+    let targets: Vec<&str> = match combo_models {
+        Some(ms) => ms.iter().map(String::as_str).collect(),
+        None => vec![trimmed],
+    };
+
+    let accounts = effective_accounts(settings);
+    let known_account_ids: Vec<&str> = accounts.iter().map(|a| a.id.as_str()).collect();
+
+    let mut candidates: Vec<RouteCandidate> = Vec::new();
+    let mut saw_explicit_disabled = false;
+
+    for target in targets {
+        let spec = ModelSpec::parse_with_accounts(target, &known_account_ids);
+        if let Some(ref acc_id) = spec.account_id {
+            if let Some(acc) = accounts.iter().copied().find(|a| a.id == *acc_id) {
+                if acc.enabled {
+                    candidates.push(candidate_from_account(
+                        settings,
+                        acc,
+                        &spec.model,
+                        fallback_cfg,
+                    ));
+                } else {
+                    saw_explicit_disabled = true;
+                }
+            }
+            continue;
+        }
+
+        let (target_provider, provider_explicit_or_configured) = if let Some(ref p) = spec.provider
+        {
+            (Some(p.clone()), true)
+        } else if let Some(inferred) = infer_provider(&spec.model) {
+            let name = inferred.as_str();
+            let has_entry = settings.provider_entry(name).is_some();
+            if !settings.accounts.is_empty() || has_entry {
+                (Some(name.to_string()), has_entry)
+            } else {
+                (None, false)
+            }
+        } else {
+            (None, false)
+        };
+
+        let mut matched: Vec<&AccountEntry> = accounts
+            .iter()
+            .copied()
+            .filter(|a| {
+                a.enabled
+                    && compatible_provider(&a.provider, target_provider.as_deref(), fallback_cfg)
+            })
+            .collect();
+        matched.sort_by_key(|a| a.priority);
+
+        if !matched.is_empty() {
+            for acc in matched {
+                candidates.push(candidate_from_account(
+                    settings,
+                    acc,
+                    &spec.model,
+                    fallback_cfg,
+                ));
+            }
+        } else if let Some(ref tp) = target_provider {
+            if provider_explicit_or_configured && !same_provider(tp, fallback_cfg) {
+                candidates.push(candidate_from_provider(
+                    settings,
+                    tp,
+                    &spec.model,
+                    fallback_cfg,
+                ));
+            } else {
+                candidates.push(candidate_from_fallback(&spec.model, fallback_cfg));
+            }
+        } else {
+            candidates.push(candidate_from_fallback(&spec.model, fallback_cfg));
+        }
+    }
+
+    if candidates.is_empty() && !saw_explicit_disabled {
+        let parsed = ModelSpec::parse_with_accounts(trimmed, &known_account_ids);
+        candidates.push(candidate_from_fallback(&parsed.model, fallback_cfg));
+    }
+
+    let display_model = candidates
+        .first()
+        .map(|c| c.model.clone())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            let parsed = ModelSpec::parse_with_accounts(trimmed, &known_account_ids);
+            if parsed.model.is_empty() {
+                trimmed.to_string()
+            } else {
+                parsed.model
+            }
+        });
+
+    (Gateway::new(candidates), display_model)
 }
 
 #[cfg(test)]
@@ -609,5 +1027,154 @@ mod skills_tests {
         lib.set_status("demo", zerith_skills::Status::Disabled)
             .unwrap();
         assert!(skills_block(&lib, "demo", 2000).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod gateway_tests {
+    use super::*;
+    use zerith_core::settings::ProviderEntry;
+    use zerith_core::ComboEntry;
+
+    #[test]
+    fn custom_fallback_is_preserved_when_accounts_and_provider_entries_are_empty() {
+        let settings = Settings::default();
+        let mut fb = ProviderConfig::new(ProviderKind::Custom).with_key("k");
+        fb.base_url = "http://127.0.0.1:9999/v1".into();
+
+        let (gw, model) = resolve_gateway(&settings, "claude-test", &fb);
+        assert_eq!(model, "claude-test");
+        assert_eq!(gw.candidates.len(), 1);
+        assert_eq!(gw.candidates[0].config.kind, ProviderKind::Custom);
+        assert_eq!(gw.candidates[0].config.base_url, "http://127.0.0.1:9999/v1");
+    }
+
+    #[test]
+    fn accounts_sort_stably_by_priority_and_combos_expand_in_order() {
+        let mut settings = Settings {
+            accounts: vec![
+                AccountEntry {
+                    id: "openai-b".into(),
+                    provider: "openai".into(),
+                    base_url: Some("http://127.0.0.1:2002/v1".into()),
+                    priority: 20,
+                    enabled: true,
+                    ..Default::default()
+                },
+                AccountEntry {
+                    id: "openai-a".into(),
+                    provider: "openai".into(),
+                    base_url: Some("http://127.0.0.1:2001/v1".into()),
+                    priority: 10,
+                    enabled: true,
+                    ..Default::default()
+                },
+                AccountEntry {
+                    id: "openai-disabled".into(),
+                    provider: "openai".into(),
+                    base_url: Some("http://127.0.0.1:2003/v1".into()),
+                    priority: 1,
+                    enabled: false,
+                    ..Default::default()
+                },
+                AccountEntry {
+                    id: "ds-1".into(),
+                    provider: "deepseek".into(),
+                    base_url: Some("http://127.0.0.1:3001/v1".into()),
+                    priority: 5,
+                    enabled: true,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        settings.routing.combos.push(ComboEntry {
+            name: "fast".into(),
+            models: vec![
+                "openai-b:gpt-4o-mini".into(),
+                "deepseek/deepseek-chat".into(),
+            ],
+        });
+
+        let fb = ProviderConfig::new(ProviderKind::OpenAi).with_key("fb-key");
+
+        // Bare openai model picks enabled openai accounts ordered by priority.
+        let (gw, model) = resolve_gateway(&settings, "gpt-4o", &fb);
+        assert_eq!(model, "gpt-4o");
+        let ids: Vec<&str> = gw
+            .candidates
+            .iter()
+            .map(|c| c.account_id.as_str())
+            .collect();
+        assert_eq!(ids, ["openai-a", "openai-b"]);
+        assert_eq!(gw.candidates[0].config.api_key.as_deref(), Some("fb-key"));
+
+        // Combo expands each target in declared order.
+        let (gw, model) = resolve_gateway(&settings, "fast", &fb);
+        assert_eq!(model, "gpt-4o-mini");
+        assert_eq!(gw.candidates.len(), 2);
+        assert_eq!(gw.candidates[0].account_id, "openai-b");
+        assert_eq!(gw.candidates[0].model, "gpt-4o-mini");
+        assert_eq!(gw.candidates[1].account_id, "ds-1");
+        assert_eq!(gw.candidates[1].model, "deepseek-chat");
+
+        // Explicitly targeting a disabled account leaves candidates empty.
+        let (gw, _) = resolve_gateway(&settings, "openai-disabled:gpt-4o", &fb);
+        assert!(gw.candidates.is_empty());
+    }
+
+    #[test]
+    fn explicit_provider_entry_builds_config_when_no_account_matches() {
+        let mut settings = Settings::default();
+        settings.providers.push(ProviderEntry {
+            name: "deepseek".into(),
+            base_url: Some("http://127.0.0.1:4444/v1".into()),
+            ..Default::default()
+        });
+        let fb = ProviderConfig::new(ProviderKind::Custom).with_key("fb-key");
+
+        let (gw, model) = resolve_gateway(&settings, "deepseek-chat", &fb);
+        assert_eq!(model, "deepseek-chat");
+        assert_eq!(gw.candidates.len(), 1);
+        assert_eq!(gw.candidates[0].provider, "deepseek");
+        assert_eq!(gw.candidates[0].config.kind, ProviderKind::DeepSeek);
+        assert_eq!(gw.candidates[0].config.base_url, "http://127.0.0.1:4444/v1");
+    }
+
+    #[test]
+    fn system_prompt_places_token_saver_after_agent_and_before_memory() {
+        let mut settings = Settings::default();
+        settings.token_saver.ponytail = zerith_core::PonytailLevel::Full;
+        settings.token_saver.caveman = zerith_core::CavemanLevel::Full;
+        let agent = zerith_core::agents::AgentDef {
+            name: "rev".into(),
+            description: String::new(),
+            model: None,
+            instructions: "INSTRUCAO-AGENTE".into(),
+            path: std::path::PathBuf::new(),
+            layer: "user",
+            tools: None,
+            disallowed_tools: Vec::new(),
+            permission_mode: None,
+            max_turns: None,
+            skills: Vec::new(),
+            isolation: zerith_core::agents::Isolation::None,
+            background: false,
+        };
+        let prompt = system_prompt(
+            "t",
+            TurnContext {
+                agent: Some(&agent),
+                settings: Some(&settings),
+                ..TurnContext::default()
+            },
+            false,
+            "s1",
+            "oi",
+        );
+        let ag_pos = prompt.find("INSTRUCAO-AGENTE").unwrap();
+        let pt_pos = prompt.find("Ponytail Full").unwrap();
+        let cv_pos = prompt.find("Caveman Full").unwrap();
+        assert!(ag_pos < pt_pos && pt_pos < cv_pos, "{prompt}");
     }
 }

@@ -13,7 +13,11 @@ fn main() {
     // onto the UI thread. `run` opens the window and supplies the state.
     let me = app.handle();
     let paths = Paths::resolve();
-    let _ = paths.ensure();
+    // A failure here would show up as an empty window; say it on stderr too,
+    // because the window may not open at all.
+    if let Err(e) = paths.ensure() {
+        eprintln!("zerith-ui: cannot prepare {}: {e}", paths.root().display());
+    }
     let db = paths.db();
     app.init(move || Shell::open(db, me)).run();
 }

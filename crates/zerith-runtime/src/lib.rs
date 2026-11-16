@@ -76,8 +76,9 @@ pub enum RunEvent {
     },
 }
 
-/// How many past messages are replayed to the model, newest first. Further
-/// trimming to the context window happens in `agent::fit_context`.
+/// How many past messages are replayed to the model, newest first, when no
+/// profile says otherwise (`AgentOptions::history`). Further trimming to the
+/// context window happens in `agent::fit_context`.
 pub const HISTORY_LIMIT: usize = 40;
 
 /// How much of the prompt may be spent on recalled facts. A rough 4 chars per
@@ -188,6 +189,15 @@ pub fn run_turn_cancellable(
     )
 }
 
+/// The execution profile in the merged settings (user, project, env). Read
+/// per turn so a change in the window applies to the next turn, CLI included.
+pub fn active_profile() -> zerith_core::settings::Profile {
+    let cwd = std::env::current_dir().ok();
+    zerith_core::Settings::load(&zerith_core::Paths::resolve(), cwd.as_deref())
+        .settings
+        .profile
+}
+
 /// The turn itself, without tools: one request, one stored answer. Every
 /// entry point above funnels here; it is `run_agent_turn` with tools off, so
 /// there is exactly one place that decides what the model sees.
@@ -206,7 +216,7 @@ pub fn run_turn_in(
         store,
         client,
         ctx,
-        AgentOptions::default(),
+        AgentOptions::for_profile(active_profile()),
         session_id,
         model,
         prompt,

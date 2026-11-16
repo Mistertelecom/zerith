@@ -105,6 +105,9 @@ pub struct AgentOptions<'a> {
     /// Without a gate, a call that needs approval is refused (fail closed).
     pub approvals: Option<&'a ApprovalGate>,
     pub max_steps: usize,
+    /// Past messages replayed to the model. The execution profile sets it
+    /// (`Profile::limits().history_window`); the default is `HISTORY_LIMIT`.
+    pub history: usize,
 }
 
 pub const DEFAULT_MAX_STEPS: usize = 25;
@@ -116,6 +119,17 @@ impl Default for AgentOptions<'_> {
             policy: None,
             approvals: None,
             max_steps: DEFAULT_MAX_STEPS,
+            history: HISTORY_LIMIT,
+        }
+    }
+}
+
+impl AgentOptions<'_> {
+    /// No tools, with the history window of an execution profile.
+    pub fn for_profile(p: zerith_core::settings::Profile) -> Self {
+        Self {
+            history: p.limits().history_window,
+            ..Self::default()
         }
     }
 }
@@ -156,7 +170,9 @@ pub fn run_agent_turn(
         prompt,
     ))];
     // The newest rows, which include the prompt just appended.
-    messages.extend(replay(&store.recent_messages(session_id, HISTORY_LIMIT)?));
+    messages.extend(replay(
+        &store.recent_messages(session_id, agent.history.max(1))?,
+    ));
 
     let defs: Vec<ToolDef> = agent
         .tools

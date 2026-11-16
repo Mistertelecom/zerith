@@ -520,6 +520,39 @@ fn a_long_session_replays_its_newest_messages_including_the_prompt() {
 }
 
 #[test]
+fn the_history_option_bounds_what_the_model_sees() {
+    let fake = serve(vec![text("ok")]);
+    let store = Store::open_in_memory().unwrap();
+    let sid = session(&store);
+    for i in 0..30 {
+        store
+            .append(&sid, &NewMessage::new(Role::User, format!("msg {i}")))
+            .unwrap();
+    }
+    run_agent_turn(
+        &store,
+        &client(&fake.url, Protocol::OpenAi),
+        TurnContext::default(),
+        AgentOptions {
+            history: 5,
+            ..Default::default()
+        },
+        &sid,
+        "m",
+        "AGORA",
+        &Cancel::default(),
+        |_| {},
+    )
+    .unwrap();
+    let seen = fake.seen.lock().unwrap();
+    let msgs = seen[0].1["messages"].as_array().unwrap();
+    // System prompt plus the five newest rows, the prompt among them.
+    assert_eq!(msgs.len(), 6);
+    assert_eq!(msgs.last().unwrap()["content"], "AGORA");
+    assert!(msgs.iter().all(|m| m["content"] != "msg 24"));
+}
+
+#[test]
 fn the_step_limit_stops_a_model_that_never_stops_calling_tools() {
     let dir = workspace();
     std::fs::write(dir.path().join("a.txt"), "A").unwrap();

@@ -535,7 +535,8 @@ fn plan(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>
             } else {
                 std::fs::read_to_string(file)?
             };
-            let mut agents = 2usize;
+            // The profile's subagent cap; `--agents` overrides it.
+            let mut agents = zerith_runtime::active_profile().limits().max_subagents;
             let mut model = std::env::var("ZERITH_MODEL").unwrap_or_default();
             let mut i = 3;
             while i < args.len() {

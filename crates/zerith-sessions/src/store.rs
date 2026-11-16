@@ -47,6 +47,15 @@ impl Store {
         &self.conn
     }
 
+    /// A write transaction that takes the write lock up front (`BEGIN
+    /// IMMEDIATE`), so it waits on the busy timeout. A deferred one that reads
+    /// first and then writes fails at once with SQLITE_BUSY when another
+    /// connection committed in between, which parallel subagents (one
+    /// connection each) make routine.
+    pub(crate) fn write_tx(&self) -> rusqlite::Result<rusqlite::Transaction<'_>> {
+        rusqlite::Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)
+    }
+
     /// Hands the connection to another crate that shares this schema
     /// (`zerith-memory`). The store stops existing afterwards.
     pub fn into_conn(self) -> Connection {
@@ -136,7 +145,7 @@ impl Store {
 
     /// Appends one message in its own transaction and bumps the session clock.
     pub fn append(&self, session_id: &str, m: &NewMessage) -> Result<i64> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.write_tx()?;
         tx.execute(
             "INSERT INTO messages(session_id, role, content, tool_name, tool_calls, reasoning, token_count, created_at, raw) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
@@ -162,7 +171,7 @@ impl Store {
 
     pub fn messages(&self, session_id: &str, limit: usize, offset: usize) -> Result<Vec<Message>> {
         let mut st = self.conn.prepare(
-            "SELECT id, session_id, role, content, tool_name, tool_calls, reasoning, token_count, created_at, raw FROM messages WHERE session_id = ?1 ORDER BY id LIMIT ?2 OFFSET ?3",
+            "SELECT id, session_id, role, content, tool_name, tool_calls, reasoning, token_count, created_at, raw FROM messages WHERE session_id = ?1 AND superseded = 0 ORDER BY id LIMIT ?2 OFFSET ?3",
         )?;
         let rows = st.query_map(
             params![session_id, limit as i64, offset as i64],
@@ -174,7 +183,7 @@ impl Store {
     /// The newest `limit` messages, oldest first: what a turn replays.
     pub fn recent_messages(&self, session_id: &str, limit: usize) -> Result<Vec<Message>> {
         let mut st = self.conn.prepare(
-            "SELECT * FROM (SELECT id, session_id, role, content, tool_name, tool_calls, reasoning, token_count, created_at, raw FROM messages WHERE session_id = ?1 ORDER BY id DESC LIMIT ?2) ORDER BY id",
+            "SELECT * FROM (SELECT id, session_id, role, content, tool_name, tool_calls, reasoning, token_count, created_at, raw FROM messages WHERE session_id = ?1 AND superseded = 0 ORDER BY id DESC LIMIT ?2) ORDER BY id",
         )?;
         let rows = st.query_map(params![session_id, limit as i64], row_to_message)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -182,7 +191,7 @@ impl Store {
 
     pub fn message_count(&self, session_id: &str) -> Result<i64> {
         Ok(self.conn.query_row(
-            "SELECT COUNT(*) FROM messages WHERE session_id = ?1",
+            "SELECT COUNT(*) FROM messages WHERE session_id = ?1 AND superseded = 0",
             params![session_id],
             |r| r.get(0),
         )?)

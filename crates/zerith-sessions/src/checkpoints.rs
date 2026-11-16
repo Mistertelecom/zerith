@@ -1,0 +1,486 @@
+//! Checkpoints and rewind: undo what a turn did to files and to the chat.
+//!
+//! One checkpoint per turn that may edit files. Before a tool mutates a file it
+//! calls [`Checkpoint::record_file`]; the first call per path copies the
+//! pre-edit bytes into `<data root>/checkpoints/<session>/<turn>/`, or records
+//! "did not exist" for a file the turn creates. [`restore`] puts that state back.
+//!
+//! Honest limits (same as Claude Code's `/rewind`):
+//! - only files a tool reported through `record_file` are tracked. Anything a
+//!   shell command changes (`rm`, `sed -i`, a build) is invisible here;
+//! - a restore overwrites whatever is on disk now, including edits the user
+//!   made by hand after the turn;
+//! - it is not version control. Keep using git.
+//!
+//! Conversation rewind is soft: rows after the boundary get `superseded = 1`
+//! and disappear from every reader, but stay in the file until
+//! [`purge_superseded`] is asked for explicitly.
+
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+use rusqlite::params;
+use serde::{Deserialize, Serialize};
+
+use crate::migrations::now_ms;
+use crate::store::Store;
+
+/// Turns kept per session; older ones lose their saved files.
+pub const KEEP_TURNS: i64 = 100;
+/// Largest single file a checkpoint will copy.
+pub const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
+/// Largest total copied for one turn.
+pub const MAX_TURN_BYTES: u64 = 100 * 1024 * 1024;
+
+#[derive(Debug, thiserror::Error)]
+pub enum CheckpointError {
+    #[error("banco de dados: {0}")]
+    Db(#[from] rusqlite::Error),
+    #[error("e/s: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("manifesto inválido: {0}")]
+    Manifest(#[from] serde_json::Error),
+    #[error(
+        "{path}: {size} bytes excede o limite de {cap} bytes do checkpoint; a edição não foi feita"
+    )]
+    TooLarge { path: String, size: u64, cap: u64 },
+    #[error("o turno {turn} já copiou {used} bytes; limite de {cap} bytes por turno atingido")]
+    TurnTooLarge { turn: i64, used: u64, cap: u64 },
+    #[error("{0} não é um arquivo regular; checkpoint recusado")]
+    NotAFile(String),
+    #[error("sem checkpoint para a sessão {session} no turno {turn}")]
+    NoCheckpoint { session: String, turn: i64 },
+    #[error("caminho não é UTF-8: {0}")]
+    BadPath(String),
+}
+
+pub type Result<T> = std::result::Result<T, CheckpointError>;
+
+/// What a restore puts back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Files only; the conversation stays as it is.
+    Code,
+    /// Messages only; files stay as they are.
+    Conversation,
+    Both,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Entry {
+    /// Absolute path as the tool saw it.
+    path: String,
+    existed: bool,
+    /// Blob file name inside the turn directory (only when `existed`).
+    blob: Option<String>,
+    size: u64,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct Manifest {
+    entries: Vec<Entry>,
+    bytes: u64,
+}
+
+/// One row of [`list`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointInfo {
+    pub turn: i64,
+    pub boundary_message_id: i64,
+    pub created_at: i64,
+    pub files: usize,
+    /// Live messages after the boundary: what a conversation rewind removes.
+    pub messages_after: i64,
+    /// Files of this turn were already put back by a code restore.
+    pub code_restored: bool,
+}
+
+/// What [`restore`] did, for the CLI and UI to print.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RestoreReport {
+    pub files_restored: usize,
+    /// Files the rewound turns created, now removed.
+    pub files_removed: usize,
+    pub messages_archived: usize,
+    /// Per-file failures; the restore keeps going.
+    pub errors: Vec<String>,
+}
+
+/// An open checkpoint for one turn. `Send + Sync`: tools may share it behind an
+/// `Arc` and call `record_file` from parallel calls.
+pub struct Checkpoint {
+    dir: PathBuf,
+    pub session: String,
+    pub turn: i64,
+    state: Mutex<(Manifest, HashSet<String>)>,
+}
+
+fn session_dir(data_root: &Path, session: &str) -> PathBuf {
+    let safe: String = session
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    data_root.join("checkpoints").join(safe)
+}
+
+fn turn_dir(data_root: &Path, session: &str, turn: i64) -> PathBuf {
+    session_dir(data_root, session).join(turn.to_string())
+}
+
+fn read_manifest(dir: &Path) -> Result<Manifest> {
+    match std::fs::read_to_string(dir.join("manifest.json")) {
+        Ok(t) => Ok(serde_json::from_str(&t)?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Manifest::default()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The turn number the next checkpoint of `session` should use.
+pub fn next_turn(store: &Store, session: &str) -> Result<i64> {
+    Ok(store.conn().query_row(
+        "SELECT COALESCE(MAX(turn), 0) + 1 FROM checkpoints WHERE session_id = ?1",
+        params![session],
+        |r| r.get(0),
+    )?)
+}
+
+impl Checkpoint {
+    /// Opens the checkpoint for `turn`. Call it **before** the turn's user
+    /// message is appended: the boundary is the newest live message at this
+    /// moment, so a conversation rewind to this turn removes the prompt too.
+    ///
+    /// Also prunes turns older than [`KEEP_TURNS`]. Starting a turn number that
+    /// already exists replaces it.
+    pub fn begin(store: &Store, data_root: &Path, session: &str, turn: i64) -> Result<Self> {
+        let boundary: i64 = store.conn().query_row(
+            "SELECT COALESCE(MAX(id), 0) FROM messages WHERE session_id = ?1 AND superseded = 0",
+            params![session],
+            |r| r.get(0),
+        )?;
+        let dir = turn_dir(data_root, session, turn);
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)?;
+        }
+        std::fs::create_dir_all(&dir)?;
+        store.conn().execute(
+            "INSERT OR REPLACE INTO checkpoints(session_id, turn, boundary_message_id, created_at, rewound)
+             VALUES (?1, ?2, ?3, ?4, 0)",
+            params![session, turn, boundary, now_ms()],
+        )?;
+        prune(store, data_root, session, turn - KEEP_TURNS)?;
+        Ok(Self {
+            dir,
+            session: session.to_string(),
+            turn,
+            state: Mutex::new((Manifest::default(), HashSet::new())),
+        })
+    }
+
+    /// Saves the current state of `path`, once per file per turn. **Call it
+    /// from `write_file` / `edit_file` before mutating**; if it returns an
+    /// error, do not make the edit and show the error to the model.
+    pub fn record_file(&self, path: &Path) -> Result<()> {
+        let abs = std::path::absolute(path)?;
+        let key = abs
+            .to_str()
+            .ok_or_else(|| CheckpointError::BadPath(abs.display().to_string()))?
+            .to_string();
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let (manifest, seen) = &mut *guard;
+        if seen.contains(&key) {
+            return Ok(());
+        }
+        let entry = match std::fs::metadata(&abs) {
+            Ok(meta) if meta.is_file() => {
+                if meta.len() > MAX_FILE_BYTES {
+                    return Err(CheckpointError::TooLarge {
+                        path: key,
+                        size: meta.len(),
+                        cap: MAX_FILE_BYTES,
+                    });
+                }
+                if manifest.bytes + meta.len() > MAX_TURN_BYTES {
+                    return Err(CheckpointError::TurnTooLarge {
+                        turn: self.turn,
+                        used: manifest.bytes,
+                        cap: MAX_TURN_BYTES,
+                    });
+                }
+                let blob = manifest.entries.len().to_string();
+                std::fs::copy(&abs, self.dir.join(&blob))?;
+                manifest.bytes += meta.len();
+                Entry {
+                    path: key.clone(),
+                    existed: true,
+                    blob: Some(blob),
+                    size: meta.len(),
+                }
+            }
+            Ok(_) => return Err(CheckpointError::NotAFile(key)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Entry {
+                path: key.clone(),
+                existed: false,
+                blob: None,
+                size: 0,
+            },
+            Err(e) => return Err(e.into()),
+        };
+        manifest.entries.push(entry);
+        // Blob first, manifest second: a crash leaves an unreferenced blob,
+        // never a manifest pointing at nothing.
+        let tmp = self.dir.join("manifest.json.tmp");
+        std::fs::write(&tmp, serde_json::to_vec(&*manifest)?)?;
+        std::fs::rename(&tmp, self.dir.join("manifest.json"))?;
+        seen.insert(key);
+        Ok(())
+    }
+
+    /// How many files this turn has recorded so far.
+    pub fn recorded(&self) -> usize {
+        self.state.lock().map(|g| g.0.entries.len()).unwrap_or(0)
+    }
+}
+
+fn prune(store: &Store, data_root: &Path, session: &str, up_to_turn: i64) -> Result<()> {
+    if up_to_turn < 1 {
+        return Ok(());
+    }
+    store.conn().execute(
+        "DELETE FROM checkpoints WHERE session_id = ?1 AND turn <= ?2",
+        params![session, up_to_turn],
+    )?;
+    let root = session_dir(data_root, session);
+    if let Ok(rd) = std::fs::read_dir(&root) {
+        for e in rd.flatten() {
+            let old = e
+                .file_name()
+                .to_str()
+                .and_then(|n| n.parse::<i64>().ok())
+                .is_some_and(|n| n <= up_to_turn);
+            if old {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The checkpoints of a session, oldest first.
+pub fn list(store: &Store, data_root: &Path, session: &str) -> Result<Vec<CheckpointInfo>> {
+    let mut st = store.conn().prepare(
+        "SELECT turn, boundary_message_id, created_at, rewound FROM checkpoints
+         WHERE session_id = ?1 ORDER BY turn",
+    )?;
+    let rows = st.query_map(params![session], |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, i64>(3)? != 0))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (turn, boundary_message_id, created_at, code_restored) = row?;
+        let files = read_manifest(&turn_dir(data_root, session, turn))
+            .map(|m| m.entries.len())
+            .unwrap_or(0);
+        let messages_after = store.conn().query_row(
+            "SELECT COUNT(*) FROM messages WHERE session_id = ?1 AND id > ?2 AND superseded = 0",
+            params![session, boundary_message_id],
+            |r| r.get(0),
+        )?;
+        out.push(CheckpointInfo {
+            turn,
+            boundary_message_id,
+            created_at,
+            files,
+            messages_after,
+            code_restored,
+        });
+    }
+    Ok(out)
+}
+
+/// What a restore to `turn` would touch. Read-only.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Preview {
+    /// `(path, existed_before)`: `false` means a restore deletes the file.
+    pub files: Vec<(String, bool)>,
+    pub messages_after: i64,
+}
+
+/// Shows what [`restore`] would do, without doing it.
+pub fn preview(store: &Store, data_root: &Path, session: &str, turn: i64) -> Result<Preview> {
+    let boundary: i64 = store
+        .conn()
+        .query_row(
+            "SELECT boundary_message_id FROM checkpoints WHERE session_id = ?1 AND turn = ?2",
+            params![session, turn],
+            |r| r.get(0),
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => CheckpointError::NoCheckpoint {
+                session: session.to_string(),
+                turn,
+            },
+            other => other.into(),
+        })?;
+    let mut out = Preview {
+        messages_after: store.conn().query_row(
+            "SELECT COUNT(*) FROM messages WHERE session_id = ?1 AND id > ?2 AND superseded = 0",
+            params![session, boundary],
+            |r| r.get(0),
+        )?,
+        ..Preview::default()
+    };
+    let turns: Vec<i64> = {
+        let mut st = store.conn().prepare(
+            "SELECT turn FROM checkpoints WHERE session_id = ?1 AND turn >= ?2 AND rewound = 0 ORDER BY turn",
+        )?;
+        let rows = st.query_map(params![session, turn], |r| r.get(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let mut seen = HashSet::new();
+    for t in turns {
+        for e in read_manifest(&turn_dir(data_root, session, t))?.entries {
+            if seen.insert(e.path.clone()) {
+                out.files.push((e.path, e.existed));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Puts the session back to the state **before** `turn` started.
+///
+/// Code: for every file recorded by `turn` or any later turn that was not
+/// already restored, the pre-edit state of the earliest turn wins (the file
+/// comes back, or is removed if the turn created it). Conversation: messages
+/// after the turn's boundary are marked superseded and the later checkpoints
+/// are forgotten. Per-file failures go to the report and do not stop the rest.
+pub fn restore(
+    store: &Store,
+    data_root: &Path,
+    session: &str,
+    turn: i64,
+    mode: Mode,
+) -> Result<RestoreReport> {
+    let boundary: i64 = store
+        .conn()
+        .query_row(
+            "SELECT boundary_message_id FROM checkpoints WHERE session_id = ?1 AND turn = ?2",
+            params![session, turn],
+            |r| r.get(0),
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => CheckpointError::NoCheckpoint {
+                session: session.to_string(),
+                turn,
+            },
+            other => other.into(),
+        })?;
+    let mut report = RestoreReport::default();
+
+    if matches!(mode, Mode::Code | Mode::Both) {
+        let turns: Vec<i64> = {
+            let mut st = store.conn().prepare(
+                "SELECT turn FROM checkpoints WHERE session_id = ?1 AND turn >= ?2 AND rewound = 0 ORDER BY turn",
+            )?;
+            let rows = st.query_map(params![session, turn], |r| r.get(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let mut done: HashSet<String> = HashSet::new();
+        for t in &turns {
+            let dir = turn_dir(data_root, session, *t);
+            for e in read_manifest(&dir)?.entries {
+                if !done.insert(e.path.clone()) {
+                    continue;
+                }
+                let target = PathBuf::from(&e.path);
+                let outcome = match (&e.blob, e.existed) {
+                    (Some(blob), true) => {
+                        if let Some(parent) = target.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        std::fs::copy(dir.join(blob), &target).map(|_| true)
+                    }
+                    _ => match std::fs::remove_file(&target) {
+                        Ok(()) => Ok(false),
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(err) => Err(err),
+                    },
+                };
+                match outcome {
+                    Ok(true) => report.files_restored += 1,
+                    Ok(false) => report.files_removed += 1,
+                    Err(err) => report.errors.push(format!("{}: {err}", e.path)),
+                }
+            }
+        }
+        // Consumed: re-applying these blobs later would clobber newer work.
+        for t in &turns {
+            let dir = turn_dir(data_root, session, *t);
+            if report.errors.is_empty() {
+                let _ = std::fs::remove_dir_all(&dir);
+                std::fs::create_dir_all(&dir)?;
+            }
+            store.conn().execute(
+                "UPDATE checkpoints SET rewound = ?3 WHERE session_id = ?1 AND turn = ?2",
+                params![session, t, report.errors.is_empty() as i64],
+            )?;
+        }
+    }
+
+    if matches!(mode, Mode::Conversation | Mode::Both) {
+        let tx = store.write_tx()?;
+        report.messages_archived = tx.execute(
+            "UPDATE messages SET superseded = 1 WHERE session_id = ?1 AND id > ?2 AND superseded = 0",
+            params![session, boundary],
+        )?;
+        tx.execute(
+            "DELETE FROM checkpoints WHERE session_id = ?1 AND turn >= ?2",
+            params![session, turn],
+        )?;
+        tx.execute(
+            "UPDATE sessions SET updated_at = ?2 WHERE id = ?1",
+            params![session, now_ms()],
+        )?;
+        tx.commit()?;
+        for e in std::fs::read_dir(session_dir(data_root, session))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let later = e
+                .file_name()
+                .to_str()
+                .and_then(|n| n.parse::<i64>().ok())
+                .is_some_and(|n| n >= turn);
+            if later {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
+    }
+    Ok(report)
+}
+
+/// Hard-deletes the messages a conversation rewind set aside. Irreversible;
+/// the CLI gates it behind an explicit flag.
+pub fn purge_superseded(store: &Store, session: &str) -> Result<usize> {
+    Ok(store.conn().execute(
+        "DELETE FROM messages WHERE session_id = ?1 AND superseded = 1",
+        params![session],
+    )?)
+}
+
+/// Deletes every saved file of a session (the session itself is untouched).
+pub fn delete_all(data_root: &Path, session: &str) -> Result<()> {
+    let dir = session_dir(data_root, session);
+    if dir.exists() {
+        std::fs::remove_dir_all(dir)?;
+    }
+    Ok(())
+}

@@ -52,7 +52,7 @@ impl Store {
         let mut st = self.conn().prepare(
             "SELECT m.session_id, m.id, snippet(messages_fts, 0, '[', ']', '…', 12)
              FROM messages_fts JOIN messages m ON m.id = messages_fts.rowid
-             WHERE messages_fts MATCH ?1 ORDER BY bm25(messages_fts) LIMIT ?2",
+             WHERE messages_fts MATCH ?1 AND m.superseded = 0 ORDER BY bm25(messages_fts) LIMIT ?2",
         )?;
         let rows = st.query_map(params![q, limit as i64], |r| {
             Ok(MessageHit {
@@ -142,7 +142,7 @@ impl Store {
             updated_at: ts,
             archived: false,
         };
-        let tx = self.conn().unchecked_transaction()?;
+        let tx = self.write_tx()?;
         tx.execute(
             "INSERT INTO sessions(id, title, source, model, provider, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
             params![fork.id, fork.title, fork.source.as_str(), fork.model, fork.provider, ts],
@@ -150,7 +150,7 @@ impl Store {
         tx.execute(
             "INSERT INTO messages(session_id, role, content, tool_name, tool_calls, reasoning, token_count, created_at, raw)
              SELECT ?1, role, content, tool_name, tool_calls, reasoning, token_count, created_at, raw
-             FROM messages WHERE session_id = ?2 AND (?3 IS NULL OR id <= ?3) ORDER BY id",
+             FROM messages WHERE session_id = ?2 AND superseded = 0 AND (?3 IS NULL OR id <= ?3) ORDER BY id",
             params![fork.id, id, upto_message_id],
         )?;
         tx.commit()?;

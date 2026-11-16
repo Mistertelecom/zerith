@@ -3,7 +3,10 @@ use zerith_sessions::{NewMessage, Role, Session, SessionSource, Store};
 #[test]
 fn schema_is_current_and_integrity_holds() {
     let s = Store::open_in_memory().unwrap();
-    assert_eq!(s.schema_version().unwrap(), 3);
+    assert_eq!(
+        s.schema_version().unwrap(),
+        zerith_sessions::migrations::CURRENT_VERSION
+    );
     assert!(s.integrity_ok().unwrap());
 }
 

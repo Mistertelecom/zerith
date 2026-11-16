@@ -85,7 +85,7 @@ impl Store {
     /// none does; a half-written plan would run twice on resume.
     pub fn create_plan(&self, plan_id: &str, tasks: &[NewTask]) -> Result<Vec<Task>> {
         let ts = now_ms();
-        let tx = self.conn().unchecked_transaction()?;
+        let tx = self.write_tx()?;
         let mut out = Vec::with_capacity(tasks.len());
         for (i, t) in tasks.iter().enumerate() {
             let id = format!("{plan_id}-{i:03}");

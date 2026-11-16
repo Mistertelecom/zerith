@@ -39,6 +39,10 @@ impl Role {
 pub enum SessionSource {
     Native,
     Hermes,
+    /// A child session spawned by the `agent` tool. `source_id` holds the
+    /// parent session id and `source_profile` the child's own id (the pair is
+    /// unique, the parent alone would not be).
+    Subagent,
 }
 
 impl SessionSource {
@@ -46,6 +50,7 @@ impl SessionSource {
         match self {
             SessionSource::Native => "native",
             SessionSource::Hermes => "hermes",
+            SessionSource::Subagent => "subagent",
         }
     }
 
@@ -53,6 +58,7 @@ impl SessionSource {
         match s {
             "native" => Some(SessionSource::Native),
             "hermes" => Some(SessionSource::Hermes),
+            "subagent" => Some(SessionSource::Subagent),
             _ => None,
         }
     }

@@ -65,8 +65,8 @@ fn migration_v3_backfills_and_is_idempotent() {
         s.conn()
             .execute_batch(
                 "DROP TRIGGER messages_ai; DROP TRIGGER messages_ad; DROP TRIGGER messages_au;
-                 DROP TABLE messages_fts; DROP TABLE settings;
-                 DELETE FROM schema_migrations WHERE version = 3;",
+                 DROP TABLE messages_fts; DROP TABLE settings; DROP TABLE events;
+                 DELETE FROM schema_migrations WHERE version IN (3, 4);",
             )
             .unwrap();
         s.append(&sess.id, &NewMessage::new(Role::User, "girafa antiga"))
@@ -74,7 +74,10 @@ fn migration_v3_backfills_and_is_idempotent() {
         sess.id
     };
     let s = Store::open(&db).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 3);
+    assert_eq!(
+        s.schema_version().unwrap(),
+        zerith_sessions::migrations::CURRENT_VERSION
+    );
     assert_eq!(s.search_messages("girafa", 5).unwrap()[0].session_id, id);
     drop(s);
     // Reopening runs nothing twice.
@@ -165,4 +168,43 @@ fn settings_round_trip() {
     assert_eq!(s.setting("k").unwrap().as_deref(), Some("2"));
     s.delete_setting("k").unwrap();
     assert_eq!(s.setting("k").unwrap(), None);
+}
+
+#[test]
+fn sessions_resolve_by_id_title_or_unique_prefix_and_rename_keeps_order() {
+    use zerith_sessions::names::ResolveError;
+    let s = Store::open_in_memory().unwrap();
+    let a = s
+        .create_session("Refatorar API", SessionSource::Native)
+        .unwrap();
+    let b = s
+        .create_session("refatorar api", SessionSource::Native)
+        .unwrap();
+    let c = s.create_session("outra", SessionSource::Native).unwrap();
+    assert_eq!(s.resolve_session(&a.id).unwrap().id, a.id);
+    assert_eq!(s.resolve_session("OUTRA").unwrap().id, c.id);
+    assert_eq!(s.resolve_session(&c.id[..8]).unwrap().id, c.id);
+    // Two sessions share a title: say so, do not pick one.
+    match s.resolve_session("refatorar api") {
+        Err(ResolveError::Ambiguous { ids, .. }) => assert_eq!(ids.len(), 2),
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(
+        s.resolve_session("zzzz"),
+        Err(ResolveError::NotFound(_))
+    ));
+    // `%` is data, not a wildcard.
+    assert!(matches!(
+        s.resolve_session("%%%%"),
+        Err(ResolveError::NotFound(_))
+    ));
+
+    let before = s.session(&b.id).unwrap().unwrap().updated_at;
+    s.rename_session(&b.id, "  novo nome ").unwrap();
+    let after = s.session(&b.id).unwrap().unwrap();
+    assert_eq!(after.title, "novo nome");
+    assert_eq!(after.updated_at, before);
+    assert!(s.rename_session(&b.id, "   ").is_err());
+    assert!(s.rename_session("nao-existe", "x").is_err());
+    assert!(s.latest_session().unwrap().is_some());
 }

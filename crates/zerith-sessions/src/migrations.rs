@@ -6,10 +6,72 @@
 
 use rusqlite::Connection;
 
-pub const CURRENT_VERSION: i32 = 3;
+/// Highest version this build knows. Migrations are applied by version number,
+/// not by "everything above the maximum", so a gap (v6 present, v5 not yet) is
+/// filled in later instead of being skipped forever.
+pub const CURRENT_VERSION: i32 = 6;
 
-/// Every migration, in order. Index 0 upgrades 0 -> 1.
-const MIGRATIONS: &[&str] = &[V1, V2, V3];
+/// Sequential migrations. Index 0 is version 1.
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4];
+
+/// Migrations with an explicit version, applied after the sequential ones.
+/// Task list owns v5, checkpoints v6.
+const VERSIONED: &[(i32, &str)] = &[(5, V5), (6, V6)];
+
+const V5: &str = r#"
+-- The agent's own checklist (task_create / task_update / task_list), one list
+-- per session. `blocks` / `blocked_by` are JSON arrays of todo ids.
+CREATE TABLE todos (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    subject     TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    status      TEXT NOT NULL DEFAULT 'pending',
+    blocks      TEXT NOT NULL DEFAULT '[]',
+    blocked_by  TEXT NOT NULL DEFAULT '[]',
+    created_at  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL
+);
+
+CREATE INDEX todos_by_session ON todos(session_id, id);
+"#;
+
+const V6: &str = r#"
+-- Soft conversation rewind: rows after a checkpoint are marked, not deleted.
+-- Readers that replay a conversation filter `superseded = 0`; only an explicit
+-- purge removes the rows.
+ALTER TABLE messages ADD COLUMN superseded INTEGER NOT NULL DEFAULT 0;
+
+-- One row per turn that may edit files. The file manifest and the copies of
+-- pre-edit content live on disk (`<data root>/checkpoints/<session>/<turn>`),
+-- so the tools that record them never need a database handle.
+CREATE TABLE checkpoints (
+    session_id          TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    turn                INTEGER NOT NULL,
+    boundary_message_id INTEGER NOT NULL,
+    created_at          INTEGER NOT NULL,
+    rewound             INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (session_id, turn)
+);
+"#;
+
+const V4: &str = r#"
+-- Audit trail of a turn: everything the model saw or was told is logged here
+-- (turn/start, step/*, tool/*, compaction/*, turn/end). `messages` stays the
+-- replay source; this table answers "what happened" and "did it finish".
+-- Streaming deltas are never written.
+CREATE TABLE events (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    turn_id    TEXT,
+    seq        INTEGER NOT NULL,
+    kind       TEXT NOT NULL,
+    payload    TEXT NOT NULL DEFAULT 'null',
+    created_at INTEGER NOT NULL
+);
+
+CREATE UNIQUE INDEX events_by_session ON events(session_id, seq);
+"#;
 
 const V3: &str = r#"
 -- Full-text search over message content. External content: the text lives
@@ -143,7 +205,7 @@ CREATE TABLE agent_tasks (
 CREATE INDEX agent_tasks_by_plan ON agent_tasks(plan_id, created_at);
 "#;
 
-/// Runs every pending migration inside one transaction.
+/// Runs every pending migration, each in its own transaction.
 pub fn run(conn: &mut Connection) -> rusqlite::Result<i32> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -151,24 +213,33 @@ pub fn run(conn: &mut Connection) -> rusqlite::Result<i32> {
              applied_at INTEGER NOT NULL
          );",
     )?;
-    let mut applied: i32 = conn.query_row(
-        "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
-        [],
-        |r| r.get(0),
-    )?;
-    while (applied as usize) < MIGRATIONS.len() {
-        let sql = MIGRATIONS[applied as usize];
-        let next = applied + 1;
+    let done: std::collections::HashSet<i32> = {
+        let mut st = conn.prepare("SELECT version FROM schema_migrations")?;
+        let rows = st.query_map([], |r| r.get(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let all = MIGRATIONS
+        .iter()
+        .enumerate()
+        .map(|(i, sql)| (i as i32 + 1, *sql))
+        .chain(VERSIONED.iter().copied());
+    for (version, sql) in all {
+        if done.contains(&version) {
+            continue;
+        }
         let tx = conn.transaction()?;
         tx.execute_batch(sql)?;
         tx.execute(
             "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
-            rusqlite::params![next, now_ms()],
+            rusqlite::params![version, now_ms()],
         )?;
         tx.commit()?;
-        applied = next;
     }
-    Ok(applied)
+    conn.query_row(
+        "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+        [],
+        |r| r.get(0),
+    )
 }
 
 pub fn now_ms() -> i64 {

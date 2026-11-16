@@ -4582,6 +4582,7 @@ dependencies = [
  "zerith-importers",
  "zerith-mcp",
  "zerith-memory",
+ "zerith-plugins",
  "zerith-providers",
  "zerith-runtime",
  "zerith-security",
@@ -4632,6 +4633,17 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "zerith-sessions",
+]
+
+[[package]]
+name = "zerith-plugins"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "zerith-mcp",
 ]
 
 [[package]]

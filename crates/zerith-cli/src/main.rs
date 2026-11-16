@@ -8,6 +8,7 @@ use zerith_core::Paths;
 use zerith_importers::{detect, import, ImportReport};
 use zerith_mcp::Client as McpClient;
 use zerith_memory::{Confidence, FactKind, MemoryBackend, Scope, SqliteMemory};
+use zerith_plugins::{Library as Plugins, Status as PluginStatus};
 use zerith_providers::{Cancel, ChatMessage, ChatRequest, Client, ProviderConfig};
 use zerith_runtime::plan::{parse_plan, run_plan};
 use zerith_runtime::{run_turn_in, RunEvent, TurnContext};
@@ -48,11 +49,15 @@ usage:
   zerith memory recall <scope> <query>
   zerith memory list <scope>
   zerith memory forget <id>
+  zerith memory edit <id> <text>
+  zerith memory export <scope>
   zerith skills list|installed|catalog [--refresh]
   zerith skills install <dir> | remove <name> | enable|disable <name>
   zerith skills update <name> <dir> | rollback <name>
   zerith skills validate <dir>
   zerith tools [list|call <tool> [json-args]]
+  zerith plugins [list|install <dir>|remove <name>|enable|disable <name>]
+  zerith plugins trust <name> | tools <name>
   zerith plan run <file|-> [--agents N] [--model id]
   zerith plan list
   zerith mcp tools <command and args>
@@ -161,6 +166,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         ("memory", Some(sub)) => memory(&paths, args, sub)?,
         ("skills", _) => skills(&paths, args)?,
         ("tools", _) => tools_cmd(&paths, args)?,
+        ("plugins", _) => plugins_cmd(&paths, args)?,
         ("mcp", _) => mcp(args)?,
         ("plan", _) => plan(&paths, args)?,
         _ => {
@@ -171,6 +177,67 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Plugin metadata only. Nothing here spawns a process except `tools`, which
+/// still requires the plugin to be enabled *and* reviewed.
+fn plugins_cmd(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    paths.ensure()?;
+    let lib = Plugins::open(&paths.root().join("plugins"))?;
+    match args.get(1).map(String::as_str) {
+        None | Some("list") => {
+            let all = lib.plugins()?;
+            if all.is_empty() {
+                println!("(no plugins installed)");
+            }
+            for p in all {
+                println!(
+                    "{:<16} {:<8} {:<9} {} {}",
+                    p.manifest.name,
+                    p.manifest.version,
+                    p.status.as_str(),
+                    if p.trusted { "trusted" } else { "unreviewed" },
+                    p.manifest.description
+                );
+            }
+        }
+        Some("install") => {
+            let dir = args.get(2).ok_or("plugins install needs a directory")?;
+            let p = lib.install(std::path::Path::new(dir))?;
+            println!(
+                "installed {} {} (disabled, unreviewed)",
+                p.manifest.name, p.manifest.version
+            );
+        }
+        Some("remove") => {
+            let name = args.get(2).ok_or("plugins remove needs a name")?;
+            lib.remove(name)?;
+            println!("removed {name}");
+        }
+        Some("enable") => {
+            let name = args.get(2).ok_or("plugins enable needs a name")?;
+            lib.set_status(name, PluginStatus::Enabled)?;
+            println!("enabled {name}");
+        }
+        Some("disable") => {
+            let name = args.get(2).ok_or("plugins disable needs a name")?;
+            lib.set_status(name, PluginStatus::Disabled)?;
+            println!("disabled {name}");
+        }
+        Some("trust") => {
+            let name = args.get(2).ok_or("plugins trust needs a name")?;
+            lib.trust(name)?;
+            println!("{name} marked as reviewed");
+        }
+        Some("tools") => {
+            let name = args.get(2).ok_or("plugins tools needs a name")?;
+            let mut client = lib.launch(name)?;
+            for t in client.tools()? {
+                println!("{}  {}", t.name, t.description.unwrap_or_default());
+            }
+        }
+        Some(other) => return Err(format!("unknown plugins command: {other}").into()),
+    }
+    Ok(())
+}
 /// Lists the built-in tools, or runs one against the current workspace.
 ///
 /// The catalogue prints every field the spec requires a tool to declare, so a
@@ -347,11 +414,44 @@ fn bench() -> Result<(), Box<dyn std::error::Error>> {
     // one row.
     let bytes = std::fs::metadata(&db)?.len();
     println!("db_size               {:>8} bytes", bytes);
+    // Resident memory after the load. Wall time above is the CPU proxy: this
+    // host has no portable CPU-time call in std, and a number invented from
+    // nothing would be worse than a documented proxy.
+    match rss_bytes() {
+        Some(rss) => println!("rss_after_load        {:>8} KB", rss / 1024),
+        None => println!("rss_after_load        (not measurable here)"),
+    }
     drop(store);
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())
 }
 
+/// Resident set size, in bytes.
+///
+/// Windows is read through PowerShell because the alternative is a hand-written
+/// FFI struct for one benchmark line. The cost is ~200 ms once, not per turn.
+fn rss_bytes() -> Option<u64> {
+    #[cfg(target_os = "windows")]
+    {
+        let script = format!("(Get-Process -Id {}).WorkingSet64", std::process::id());
+        let out = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", script.as_str()])
+            .output()
+            .ok()?;
+        String::from_utf8(out.stdout).ok()?.trim().parse().ok()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+                return Some(kb * 1024);
+            }
+        }
+        None
+    }
+}
 /// Consistent copy through the SQLite backup API. Copying a live WAL file with
 /// the filesystem would produce a database that only sometimes opens.
 fn backup(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -520,6 +620,17 @@ fn memory(paths: &Paths, args: &[String], sub: &str) -> Result<(), Box<dyn std::
             let id: i64 = args.get(2).ok_or("memory forget needs an id")?.parse()?;
             mem.forget(id)?;
             println!("forgotten {id}");
+        }
+        "edit" => {
+            let id: i64 = args.get(2).ok_or("memory edit needs an id")?.parse()?;
+            let text = args.get(3).cloned().ok_or("memory edit needs text")?;
+            mem.update(id, &text)?;
+            println!("{id} atualizado");
+        }
+        "export" => {
+            let scope = Scope(args.get(2).cloned().ok_or("memory export needs a scope")?);
+            let facts = mem.export(&scope)?;
+            println!("{}", serde_json::to_string_pretty(&facts)?);
         }
         _ => return Err(format!("unknown memory command: {sub}").into()),
     }
@@ -824,7 +935,7 @@ fn skills(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Erro
             paths.ensure()?;
             let force = args.iter().any(|a| a == "--refresh");
             let token = std::env::var("GITHUB_TOKEN").ok();
-            let cat = catalog::load(&paths.root(), token.as_deref(), force)?;
+            let cat = catalog::load(paths.root(), token.as_deref(), force)?;
             println!("fetched_at    {}", cat.fetched_at);
             for e in cat.entries {
                 println!(

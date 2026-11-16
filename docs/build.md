@@ -60,7 +60,13 @@ zerith doctor                     # banco, schema, integrity_check, contagens
 zerith chat "pergunta"            # turno com streaming, memória e persistência
 zerith session list               # conversas
 zerith memory list user:joao      # fatos confirmados e inferidos
+zerith memory edit <id> "novo texto"
+zerith memory export user:joao    # JSON de tudo no escopo
 zerith skills list                # SKILL.md encontradas, nada executado
+zerith skills catalog [--refresh] # estrelas, licenças e datas do GitHub
+zerith tools                      # catálogo com permissões e timeouts
+zerith tools call read_file '{"path":"docs/build.md"}'
+zerith plugins list               # metadados; nada é executado
 zerith mcp tools <cmd...>         # handshake MCP e lista de ferramentas
 zerith plan run plano.txt --agents 2
 zerith policy check <caminho>     # veredito do preset ativo

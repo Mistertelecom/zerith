@@ -15,6 +15,11 @@ de patch de terceiros.
 | `zerith-providers` | Endpoints OpenAI-compatible e Anthropic (9Router, Ollama, LM Studio) |
 | `zerith-runtime` | Um turno de agente: histórico → provider → mensagem gravada |
 | `zerith-importers` | Import read-only do Hermes (`~/.hermes/state.db`) |
+| `zerith-skills` | Formato Agent Skills, catálogo GitHub, instalação com rollback |
+| `zerith-mcp` | Cliente MCP sobre stdio (JSON-RPC 2.0) |
+| `zerith-tools` | Registry de ferramentas com permissões, timeouts e política |
+| `zerith-plugins` | Manifestos de plugin, ativação e revisão explícita |
+| `zerith-security` | Presets de sandbox, vereditos, redação de segredos |
 | `zerith-cli` | Binário `zerith` |
 | `zerith-ui` | Janela nativa em Rune (chat + lista de sessões) |
 
@@ -117,6 +122,47 @@ do servidor. `zerith mcp tools <cmd...>` completa o handshake e lista as
 ferramentas; `zerith mcp call <cmd...> -- <tool> <json>` executa uma. O
 processo filho é morto quando o cliente sai.
 
+## Ferramentas e plugins
+
+O registry (`zerith-tools`) declara, por ferramenta, o que o spec exige:
+nome, descrição, schema de parâmetros, resultado esperado, permissão,
+timeout, se é cancelável, se é local e a origem. `zerith tools` imprime tudo
+isso — uma ferramenta que esconde o timeout fica visível na hora.
+
+| Ferramenta | Permissão | Timeout | Observação |
+| --- | --- | --- | --- |
+| `read_file` | read | 5 s | dentro do workspace |
+| `write_file` | write | 5 s | fora do workspace exige aprovação |
+| `list_dir` | read | 5 s | diretórios terminam em `/` |
+| `memory_recall` | read | 2 s | `[confirmed|inferred] texto` |
+| `shell` | shell | 30 s | **recusada**: o host não tem jail |
+| `mcp_call` | network | 60 s | recusada sem transporte conectado |
+
+`shell` é recusada mesmo em `danger-full-access`, e o motivo é o do spec: sem
+sandbox real, "permitido" seria uma promessa que o host não cumpre. O caminho
+para executar comando é MCP ou plugin, que rodam em outro processo.
+
+### Plugins
+
+Um plugin é um diretório com `plugin.json` (nome, versão, `command`, `args`).
+Descobrir plugin lê o manifesto e **nada mais**: instalar não executa e não
+confia. `plugins install` grava como `disabled` + `unreviewed`; habilitar não
+basta — `plugins trust` marca a revisão humana, e só então `plugins tools`
+abre o processo. Um plugin que falha morre no próprio processo, como um
+servidor MCP, e não derruba a aplicação.
+
+```bash
+zerith plugins install ./meu-plugin   # disabled, unreviewed
+zerith plugins list
+zerith plugins enable meu-plugin      # ainda não executa
+zerith plugins trust meu-plugin       # revisão explícita
+zerith plugins tools meu-plugin       # agora inicia e lista ferramentas
+zerith plugins disable meu-plugin     # desativa sem apagar
+zerith plugins remove meu-plugin
+```
+
+Isso não é sandbox: o plugin roda com os privilégios do usuário. O manifesto
+também não é autorização — é metadado.
 ## Memória
 
 Fatos vivem no mesmo banco das sessões, com escopo (`user:<id>`), tipo
@@ -164,6 +210,12 @@ O CI (`.github/workflows/zerith.yml`) roda os três em Linux e Windows, mais um
 job que renderiza `--tree` e publica a árvore como artefato.
 
 Detalhes de toolchain, memória e caminhos: [docs/build.md](docs/build.md).
+
+## Aceite e release
+
+`docs/aceite.md` traz cada critério da seção 21 do spec com o estado real e a
+evidência; `docs/release.md` cobre instalação, desinstalação, atualização,
+benchmarks e o que ainda falta (assinatura, instaladores, matriz executada).
 
 ## Nota de build no Windows
 

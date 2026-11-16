@@ -475,7 +475,7 @@ pub fn skills_block(lib: &zerith_skills::Library, prompt: &str, budget: usize) -
                 if !take.is_empty() {
                     out.push_str("\n\n## ");
                     out.push_str(name);
-                    out.push_str("\n");
+                    out.push('\n');
                     out.push_str(&take);
                     spent += take.len();
                 }

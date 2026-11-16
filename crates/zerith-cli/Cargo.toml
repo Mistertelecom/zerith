@@ -17,6 +17,7 @@ zerith-importers = { path = "../zerith-importers" }
 zerith-runtime = { path = "../zerith-runtime" }
 zerith-skills = { path = "../zerith-skills" }
 zerith-tools = { path = "../zerith-tools" }
+zerith-plugins = { path = "../zerith-plugins" }
 zerith-mcp = { path = "../zerith-mcp" }
 zerith-security = { path = "../zerith-security" }
 serde_json.workspace = true

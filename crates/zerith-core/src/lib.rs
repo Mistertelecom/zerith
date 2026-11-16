@@ -9,6 +9,7 @@ pub mod instructions;
 pub mod paths;
 pub mod secrets;
 pub mod settings;
+pub mod shellparse;
 
 pub use instructions::{load_instructions, system_prompt_with_instructions};
 pub use paths::Paths;

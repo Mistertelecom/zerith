@@ -81,9 +81,17 @@ pub enum Decision {
 #[serde(default)]
 pub struct Permissions {
     /// Sandbox preset name (`read-only`, `workspace-write`,
-    /// `danger-full-access`). Env: `ZERITH_SANDBOX`.
+    /// `danger-full-access`). A permission mode name (`plan`, `acceptEdits`,
+    /// ...) is also accepted here, as shorthand for `default_mode` with the
+    /// default preset; the two name sets are disjoint. Env: `ZERITH_SANDBOX`.
     pub mode: String,
-    /// Rules as `Tool` or `Tool(pattern)`; `*` in the pattern matches anything.
+    /// How eagerly the agent acts without asking: `default`, `acceptEdits`,
+    /// `plan`, `dontAsk`, `bypassPermissions`. Absent: derived from the
+    /// preset. Env: `ZERITH_MODE`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_mode: Option<String>,
+    /// Rules as `Tool` or `Tool(specifier)`; `*` in the specifier matches
+    /// anything. See `docs/permissions.md` for the full syntax.
     pub allow: Vec<String>,
     pub ask: Vec<String>,
     pub deny: Vec<String>,
@@ -93,6 +101,7 @@ impl Default for Permissions {
     fn default() -> Self {
         Self {
             mode: "workspace-write".into(),
+            default_mode: None,
             allow: Vec::new(),
             ask: Vec::new(),
             deny: Vec::new(),
@@ -153,8 +162,10 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HookSpec {
-    /// `|`-separated tool names, each a `*` glob. Empty or absent: every tool.
-    /// Only used by `PreToolUse` / `PostToolUse`.
+    /// `|`-separated entries, each `tool` (a `*` glob) or `tool(specifier)`
+    /// (specifier: a `*` glob over the command / path / URL, as in permission
+    /// rules). Empty or absent: every tool. Only used by the tool events
+    /// (`PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `PermissionRequest`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matcher: Option<String>,
     pub command: String,
@@ -173,6 +184,8 @@ pub struct Hooks {
     pub user_prompt_submit: Vec<HookSpec>,
     pub pre_tool_use: Vec<HookSpec>,
     pub post_tool_use: Vec<HookSpec>,
+    pub post_tool_use_failure: Vec<HookSpec>,
+    pub permission_request: Vec<HookSpec>,
     pub stop: Vec<HookSpec>,
     pub pre_compact: Vec<HookSpec>,
     pub session_end: Vec<HookSpec>,
@@ -258,6 +271,7 @@ pub const ENV_KEYS: &[(&str, &str)] = &[
     ("ZERITH_MODEL", "model"),
     ("ZERITH_USER", "user"),
     ("ZERITH_SANDBOX", "permissions.mode"),
+    ("ZERITH_MODE", "permissions.default_mode"),
     ("ZERITH_PROFILE", "profile"),
 ];
 

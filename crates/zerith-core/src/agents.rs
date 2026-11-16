@@ -13,8 +13,25 @@
 //! Você revisa diffs. Aponte unwrap em caminhos de erro…
 //! ```
 //!
-//! The frontmatter is optional and only knows `description` and `model`;
-//! anything else is ignored so a file written for another tool still loads.
+//! The frontmatter is optional. Fields (Claude Code's names):
+//!
+//! | Field | Meaning |
+//! | --- | --- |
+//! | `name` | overrides the file name |
+//! | `description` | what the agent is for |
+//! | `tools` | allowlist; absent = every tool of the parent |
+//! | `disallowedTools` | removed from whatever `tools` leaves |
+//! | `model` | preferred model; the host may override |
+//! | `permissionMode` | `default`, `acceptEdits`, `plan`, `dontAsk`, `bypassPermissions` |
+//! | `maxTurns` | step limit for this agent |
+//! | `skills` | skills preloaded for this agent |
+//! | `isolation` | `worktree`: run in its own git worktree |
+//! | `background` | run without blocking the parent |
+//!
+//! Lists are `a, b`, `[a, b]` or YAML `- a` lines. Unknown keys are ignored so
+//! a file written for another tool still loads. Claude Code tool names
+//! (`Read`, `Write`, `Edit`, `Bash`, `Glob`, `Grep`) are mapped to Zerith's.
+//! Subagent execution is not here: this module only reads definitions.
 
 use crate::Paths;
 use std::path::{Path, PathBuf};
@@ -35,18 +52,103 @@ pub struct AgentDef {
     pub path: PathBuf,
     /// `user` or `project`: which layer the definition came from.
     pub layer: &'static str,
+    /// Allowlist (`tools:`); `None` inherits every tool.
+    pub tools: Option<Vec<String>>,
+    /// `disallowedTools:`, removed after the allowlist.
+    pub disallowed_tools: Vec<String>,
+    /// `permissionMode:` as written; parse it with `zerith_security::Mode::parse`.
+    pub permission_mode: Option<String>,
+    pub max_turns: Option<u32>,
+    pub skills: Vec<String>,
+    pub isolation: Isolation,
+    pub background: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Isolation {
+    #[default]
+    None,
+    /// Run in a temporary git worktree.
+    Worktree,
+}
+
+impl AgentDef {
+    /// The tools this agent may use out of `all` (the parent's tool names):
+    /// the `tools` allowlist (absent = all), minus `disallowedTools`. Entries
+    /// are exact names, `*` globs (`mcp__github__*`) or Claude Code names;
+    /// `Tool(specifier)` entries count as the tool (specifiers are permission
+    /// rules, not availability) in an allowlist and are ignored in a denylist.
+    /// Order of `all` is kept.
+    pub fn effective_tools(&self, all: &[&str]) -> Vec<String> {
+        let allow: Option<Vec<String>> = self.tools.as_ref().map(|t| names(t));
+        let deny: Vec<String> = self
+            .disallowed_tools
+            .iter()
+            .filter(|t| !t.contains('('))
+            .map(|t| canonical(t))
+            .collect();
+        let hit = |list: &[String], tool: &str| {
+            list.iter()
+                .any(|p| p == tool || (p.contains('*') && crate::settings::glob_match(p, tool)))
+        };
+        all.iter()
+            .filter(|t| allow.as_ref().is_none_or(|a| hit(a, t)))
+            .filter(|t| !hit(&deny, t))
+            .map(|t| t.to_string())
+            .collect()
+    }
+}
+
+fn names(list: &[String]) -> Vec<String> {
+    list.iter()
+        .map(|t| canonical(t.split('(').next().unwrap_or(t).trim()))
+        .collect()
+}
+
+/// Claude Code tool names to Zerith's; anything else is kept as written.
+fn canonical(t: &str) -> String {
+    match t.trim() {
+        "Read" => "read_file",
+        "Write" => "write_file",
+        "Edit" | "MultiEdit" => "edit_file",
+        "Bash" | "Shell" => "shell",
+        "Glob" => "glob",
+        "Grep" => "grep",
+        "LS" => "list_dir",
+        other => other,
+    }
+    .to_string()
 }
 
 /// Every agent visible from `project_dir`, sorted by name. Unreadable files
 /// are skipped: one broken definition must not hide the others.
 pub fn list(paths: &Paths, project_dir: Option<&Path>) -> Vec<AgentDef> {
+    list_checked(paths, project_dir).0
+}
+
+/// [`list`] plus one warning per name clash. Project beats user (the project
+/// definition replaces the user's); two files of the *same* layer with the
+/// same name (`a.md`, and `name: a` inside `b.md`) keep the first in
+/// file-name order and warn, so the outcome never depends on directory order.
+pub fn list_checked(paths: &Paths, project_dir: Option<&Path>) -> (Vec<AgentDef>, Vec<String>) {
     let mut out: Vec<AgentDef> = Vec::new();
+    let mut warnings = Vec::new();
     let mut layers = vec![(paths.agents(), "user")];
     if let Some(dir) = project_dir {
         layers.push((dir.join(".zerith").join("agents"), "project"));
     }
     for (dir, layer) in layers {
+        let mut seen: Vec<String> = Vec::new();
         for def in read_dir(&dir, layer) {
+            if seen.contains(&def.name) {
+                warnings.push(format!(
+                    "{}: agente `{}` repetido na camada {layer}; ignorado",
+                    def.path.display(),
+                    def.name
+                ));
+                continue;
+            }
+            seen.push(def.name.clone());
             match out.iter_mut().find(|a| a.name == def.name) {
                 Some(slot) => *slot = def,
                 None => out.push(def),
@@ -54,7 +156,7 @@ pub fn list(paths: &Paths, project_dir: Option<&Path>) -> Vec<AgentDef> {
         }
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
-    out
+    (out, warnings)
 }
 
 /// The named agent, or `None` for `default` and for names nobody defined.
@@ -71,17 +173,19 @@ fn read_dir(dir: &Path, layer: &'static str) -> Vec<AgentDef> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
-    entries
+    let mut files: Vec<PathBuf> = entries
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|x| x == "md") && p.is_file())
+        .collect();
+    files.sort();
+    files
+        .into_iter()
         .filter_map(|path| {
             let name = path.file_stem()?.to_string_lossy().into_owned();
-            if name == DEFAULT {
-                return None;
-            }
             let text = std::fs::read_to_string(&path).ok()?;
-            Some(parse(name, &text, path, layer))
+            let def = parse(name, &text, path, layer);
+            (def.name != DEFAULT).then_some(def)
         })
         .collect()
 }
@@ -99,16 +203,61 @@ pub fn parse(name: String, text: &str, path: PathBuf, layer: &'static str) -> Ag
         },
         None => ("", text),
     };
+    let mut name = name;
     let mut description = String::new();
     let mut model = None;
-    for line in header.lines() {
+    let mut def_tools = None;
+    let mut disallowed = Vec::new();
+    let mut permission_mode = None;
+    let mut max_turns = None;
+    let mut skills = Vec::new();
+    let mut isolation = Isolation::None;
+    let mut background = false;
+    let lines: Vec<&str> = header.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        i += 1;
+        // Top-level `key: value` only; indented lines belong to a list.
+        if line.starts_with([' ', '\t', '-']) {
+            continue;
+        }
         let Some((k, v)) = line.split_once(':') else {
             continue;
         };
-        let v = v.trim().trim_matches(|c| c == '"' || c == '\'').to_string();
+        let raw = v.trim();
+        let v = raw.trim_matches(|c| c == '"' || c == '\'').to_string();
+        // A YAML block list: the `- item` lines that follow an empty value.
+        let mut block = Vec::new();
+        if raw.is_empty() {
+            while i < lines.len() && lines[i].trim_start().starts_with('-') {
+                block.push(lines[i].trim_start()[1..].trim().to_string());
+                i += 1;
+            }
+        }
+        let list = || {
+            let mut items = block.clone();
+            items.extend(split_list(raw));
+            items.retain(|x| !x.is_empty());
+            items
+        };
         match k.trim() {
+            "name" if is_valid_name(&v) => name = v,
             "description" => description = v,
-            "model" if !v.is_empty() => model = Some(v),
+            "model" if !v.is_empty() && v != "inherit" => model = Some(v),
+            "tools" => def_tools = Some(list()).filter(|l| !l.is_empty()),
+            "disallowedTools" | "disallowed_tools" => disallowed = list(),
+            "permissionMode" | "permission_mode" if !v.is_empty() => permission_mode = Some(v),
+            "maxTurns" | "max_turns" => max_turns = v.parse().ok().filter(|n| *n > 0),
+            "skills" => skills = list(),
+            "isolation" => {
+                isolation = if v == "worktree" {
+                    Isolation::Worktree
+                } else {
+                    Isolation::None
+                }
+            }
+            "background" => background = v == "true",
             _ => {}
         }
     }
@@ -139,7 +288,33 @@ pub fn parse(name: String, text: &str, path: PathBuf, layer: &'static str) -> Ag
         instructions,
         path,
         layer,
+        tools: def_tools,
+        disallowed_tools: disallowed,
+        permission_mode,
+        max_turns,
+        skills,
+        isolation,
+        background,
     }
+}
+
+/// A name that is safe as a plan `agent:` reference and a file stem.
+fn is_valid_name(n: &str) -> bool {
+    !n.is_empty()
+        && n.len() <= 64
+        && n.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// `a, b`, `[a, b]` or `["a", "b"]`; empty for an empty value (block list).
+fn split_list(raw: &str) -> Vec<String> {
+    raw.trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .split(',')
+        .map(|x| x.trim().trim_matches(|c| c == '"' || c == '\'').to_string())
+        .filter(|x| !x.is_empty())
+        .collect()
 }
 
 #[cfg(test)]
@@ -197,5 +372,79 @@ mod tests {
         assert!(find(&paths, Some(&project), DEFAULT).is_none());
         assert!(find(&paths, Some(&project), "nobody").is_none());
         assert!(list(&paths, None).iter().all(|a| a.layer == "user"));
+    }
+
+    fn def(text: &str) -> AgentDef {
+        parse("x".into(), text, PathBuf::new(), "user")
+    }
+
+    #[test]
+    fn claude_code_frontmatter_fields_are_read() {
+        let a = def(
+            "---\nname: reviewer\ndescription: Revisa\ntools: Read, Grep, Bash(git *)\n\
+             disallowedTools: [write_file, \"edit_file\"]\nmodel: inherit\npermissionMode: plan\n\
+             maxTurns: 7\nskills:\n  - rust\n  - docs\nisolation: worktree\nbackground: true\n---\ncorpo",
+        );
+        assert_eq!(a.name, "reviewer");
+        assert_eq!(a.tools.as_deref().unwrap(), ["Read", "Grep", "Bash(git *)"]);
+        assert_eq!(a.disallowed_tools, ["write_file", "edit_file"]);
+        assert_eq!(a.model, None, "`inherit` means no preference");
+        assert_eq!(a.permission_mode.as_deref(), Some("plan"));
+        assert_eq!(a.max_turns, Some(7));
+        assert_eq!(a.skills, ["rust", "docs"]);
+        assert_eq!(a.isolation, Isolation::Worktree);
+        assert!(a.background);
+        assert_eq!(a.instructions, "corpo");
+
+        let plain = def("só corpo");
+        assert!(plain.tools.is_none() && plain.skills.is_empty() && !plain.background);
+        assert_eq!(plain.isolation, Isolation::None);
+        // A bad `name` falls back to the file name.
+        assert_eq!(def("---\nname: a b/c\n---\nx").name, "x");
+    }
+
+    #[test]
+    fn effective_tools_applies_allowlist_then_denylist() {
+        let all = [
+            "read_file",
+            "write_file",
+            "edit_file",
+            "shell",
+            "mcp__gh__search",
+            "mcp__gh__push",
+        ];
+        assert_eq!(def("x").effective_tools(&all).len(), 6);
+
+        let a = def(
+            "---\ntools: Read, Bash(git *), mcp__gh__*\ndisallowedTools: mcp__gh__push\n---\nx",
+        );
+        assert_eq!(
+            a.effective_tools(&all),
+            ["read_file", "shell", "mcp__gh__search"]
+        );
+
+        let d = def("---\ndisallowedTools: Write, Edit, Bash(rm *)\n---\nx");
+        assert_eq!(
+            d.effective_tools(&all),
+            ["read_file", "shell", "mcp__gh__search", "mcp__gh__push"],
+            "a specifier in disallowedTools is a rule, not an availability switch"
+        );
+        assert!(def("---\ntools: nothing\n---\nx")
+            .effective_tools(&all)
+            .is_empty());
+    }
+
+    #[test]
+    fn a_same_layer_clash_keeps_the_first_file_and_warns() {
+        let tmp = scratch();
+        let paths = Paths::with_root(tmp.path().join("home"));
+        std::fs::create_dir_all(paths.agents()).unwrap();
+        std::fs::write(paths.agents().join("a.md"), "primeiro").unwrap();
+        std::fs::write(paths.agents().join("b.md"), "---\nname: a\n---\nsegundo").unwrap();
+        let (all, warnings) = list_checked(&paths, None);
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].instructions, "primeiro");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("repetido"));
     }
 }

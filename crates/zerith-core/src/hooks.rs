@@ -27,18 +27,35 @@ pub enum HookEvent {
     UserPromptSubmit,
     PreToolUse,
     PostToolUse,
+    /// A tool call that failed or was refused (Claude Code: `PostToolUseFailure`).
+    PostToolUseFailure,
+    /// About to ask the user for approval; a hook may answer for them.
+    PermissionRequest,
     Stop,
     PreCompact,
     SessionEnd,
 }
 
 impl HookEvent {
+    /// Events whose hooks carry a `matcher` over the tool.
+    pub fn is_tool_event(self) -> bool {
+        matches!(
+            self,
+            HookEvent::PreToolUse
+                | HookEvent::PostToolUse
+                | HookEvent::PostToolUseFailure
+                | HookEvent::PermissionRequest
+        )
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             HookEvent::SessionStart => "SessionStart",
             HookEvent::UserPromptSubmit => "UserPromptSubmit",
             HookEvent::PreToolUse => "PreToolUse",
             HookEvent::PostToolUse => "PostToolUse",
+            HookEvent::PostToolUseFailure => "PostToolUseFailure",
+            HookEvent::PermissionRequest => "PermissionRequest",
             HookEvent::Stop => "Stop",
             HookEvent::PreCompact => "PreCompact",
             HookEvent::SessionEnd => "SessionEnd",
@@ -52,6 +69,8 @@ impl HookEvent {
             HookEvent::UserPromptSubmit => &h.user_prompt_submit,
             HookEvent::PreToolUse => &h.pre_tool_use,
             HookEvent::PostToolUse => &h.post_tool_use,
+            HookEvent::PostToolUseFailure => &h.post_tool_use_failure,
+            HookEvent::PermissionRequest => &h.permission_request,
             HookEvent::Stop => &h.stop,
             HookEvent::PreCompact => &h.pre_compact,
             HookEvent::SessionEnd => &h.session_end,
@@ -72,6 +91,11 @@ pub struct HookPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
     pub cwd: PathBuf,
+    /// What a `Tool(specifier)` matcher is tested against: the command for
+    /// `shell`, the path for file tools, the URL for network tools. Not sent
+    /// to the hook (it is already inside `tool_input`).
+    #[serde(skip)]
+    pub subject: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -140,12 +164,26 @@ impl HookOutcome {
 }
 
 /// Runs every hook configured for `event`, in order, and folds the results.
+///
+/// Call sites (the runtime and the UI own them):
+/// - `SessionStart` / `SessionEnd`: when a session opens / closes;
+/// - `UserPromptSubmit`: before the prompt is stored, `payload.prompt` set; a
+///   block drops the prompt, `additional_context` is added to the turn;
+/// - `PreToolUse` / `PostToolUse` / `PostToolUseFailure` /
+///   `PermissionRequest`: per tool call (the guards middleware does this);
+/// - `Stop`: when the model ends a turn; `continue_ == false` or a deny asks
+///   the host to keep the agent going with the reason as the next prompt;
+/// - `PreCompact`: before the context is compacted.
+///
+/// Fail-open: a hook that crashes, times out or exits with anything but 0/2 is
+/// recorded in `errors` and changes nothing. Only exit 2 or an explicit
+/// `deny` / `continue: false` blocks.
 pub fn run_hooks(event: HookEvent, payload: &HookPayload, settings: &Settings) -> HookOutcome {
     let mut out = HookOutcome::default();
     let tool = payload.tool_name.as_deref().unwrap_or("");
+    let subject = payload.subject.as_deref();
     for spec in event.specs(settings) {
-        let tool_event = matches!(event, HookEvent::PreToolUse | HookEvent::PostToolUse);
-        if tool_event && !matcher_hits(spec.matcher.as_deref(), tool) {
+        if event.is_tool_event() && !matcher_hits(spec.matcher.as_deref(), tool, subject) {
             continue;
         }
         run_one(spec, event, payload, &mut out);
@@ -156,10 +194,62 @@ pub fn run_hooks(event: HookEvent, payload: &HookPayload, settings: &Settings) -
     out
 }
 
-fn matcher_hits(matcher: Option<&str>, tool: &str) -> bool {
-    match matcher.map(str::trim).filter(|m| !m.is_empty()) {
-        None => true,
-        Some(m) => m.split('|').any(|p| glob_match(p.trim(), tool)),
+/// `matcher`: `|`-separated entries, each `tool` (`*` glob) or
+/// `tool(specifier)`. A `|` inside parentheses belongs to the specifier.
+/// A specifier entry needs a subject; without one it does not match.
+pub fn matcher_hits(matcher: Option<&str>, tool: &str, subject: Option<&str>) -> bool {
+    let Some(m) = matcher.map(str::trim).filter(|m| !m.is_empty()) else {
+        return true;
+    };
+    split_alternatives(m).iter().any(|entry| {
+        let entry = entry.trim();
+        match entry.split_once('(') {
+            Some((name, rest)) => {
+                let spec = rest.strip_suffix(')').unwrap_or(rest);
+                glob_match(name.trim(), tool)
+                    && subject.is_some_and(|s| subject_hits(tool, spec, s))
+            }
+            None => glob_match(entry, tool),
+        }
+    })
+}
+
+fn split_alternatives(m: &str) -> Vec<&str> {
+    let (mut out, mut depth, mut start) = (Vec::new(), 0i32, 0);
+    for (i, c) in m.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            '|' if depth <= 0 => {
+                out.push(&m[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&m[start..]);
+    out
+}
+
+fn subject_hits(tool: &str, spec: &str, subject: &str) -> bool {
+    let spec = spec.trim().to_lowercase();
+    let spec = match spec.strip_suffix(":*") {
+        Some(p) => format!("{p} *"),
+        None => spec,
+    };
+    let one = |text: &str| {
+        glob_match(&spec, text)
+            || spec.strip_suffix(" *").is_some_and(|p| p == text)
+            // `*.env` against a path also matches the file name.
+            || (!spec.contains('/')
+                && glob_match(&spec, text.rsplit('/').next().unwrap_or(text)))
+    };
+    let lower = subject.to_lowercase();
+    if tool == "shell" {
+        let a = crate::shellparse::analyze(&lower);
+        one(&lower) || a.raw.iter().chain(&a.inner).any(|p| one(p))
+    } else {
+        one(&lower.replace('\\', "/"))
     }
 }
 
@@ -371,6 +461,53 @@ mod tests {
         let o = run_hooks(HookEvent::PreToolUse, &payload("write_file"), &s);
         assert!(o.blocked(), "{o:?}");
         assert_eq!(o.reasons, vec!["nao"]);
+    }
+
+    #[test]
+    fn matcher_supports_tool_specifiers() {
+        let m = |m: &str, t: &str, s: Option<&str>| matcher_hits(Some(m), t, s);
+        assert!(m(
+            "shell(git push *)",
+            "shell",
+            Some("git push origin main")
+        ));
+        assert!(m(
+            "shell(git push *)",
+            "shell",
+            Some("timeout 5 git push origin")
+        ));
+        assert!(m("shell(git push *)", "shell", Some("ls && git push x")));
+        assert!(!m("shell(git push *)", "shell", Some("git status")));
+        assert!(!m("shell(git push *)", "shell", None));
+        assert!(m(
+            "write_file(*.env)|read_file",
+            "write_file",
+            Some("a/b/.env")
+        ));
+        assert!(m("write_file(*.env)|read_file", "read_file", None));
+        assert!(m("", "x", None));
+        assert!(m("mcp__*", "mcp__gh__search", None));
+    }
+
+    #[test]
+    fn specifier_matcher_gates_the_hook() {
+        let s = settings("PreToolUse", &[("shell(rm *)", DENY_JSON, 10_000)]);
+        let mut p = payload("shell");
+        p.subject = Some("rm -rf x".into());
+        assert!(run_hooks(HookEvent::PreToolUse, &p, &s).blocked());
+        p.subject = Some("ls".into());
+        assert!(!run_hooks(HookEvent::PreToolUse, &p, &s).blocked());
+    }
+
+    #[test]
+    fn new_events_read_their_own_tables() {
+        let s = settings("PostToolUseFailure", &[("", CONTEXT, 10_000)]);
+        let o = run_hooks(HookEvent::PostToolUseFailure, &payload("shell"), &s);
+        assert_eq!(o.additional_context, vec!["lembrete"]);
+        let none = run_hooks(HookEvent::PostToolUse, &payload("shell"), &s);
+        assert!(none.additional_context.is_empty());
+        let s = settings("PermissionRequest", &[("", DENY_JSON, 10_000)]);
+        assert!(run_hooks(HookEvent::PermissionRequest, &payload("shell"), &s).blocked());
     }
 
     #[test]

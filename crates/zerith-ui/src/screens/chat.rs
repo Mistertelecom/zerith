@@ -66,6 +66,9 @@ pub struct ChatState {
     /// `Client::models()`, fetched once when the selector first opens.
     pub models: Load<Vec<String>>,
     pub model_menu: bool,
+    /// The agent the next turn runs as; `None` is the default agent.
+    pub agent: Option<String>,
+    pub agent_menu: bool,
     pub link: Link,
     /// Transcript lines whose reasoning/tool section is expanded.
     pub open: HashSet<usize>,
@@ -93,6 +96,8 @@ impl ChatState {
             model,
             models: Load::Idle,
             model_menu: false,
+            agent: None,
+            agent_menu: false,
             link: Link::Unknown,
             open: HashSet::new(),
             pending_approval: None,
@@ -412,6 +417,9 @@ pub fn send(s: &mut Shell) {
         content: String::new(),
     });
     let paused = s.memory.paused;
+    // Resolved on the worker: reading agent files is disk I/O.
+    let agent_name = s.chat.agent.clone();
+    let root = s.root();
 
     std::thread::spawn(move || {
         let prepared = (|| -> Result<(Store, Client), String> {
@@ -438,6 +446,9 @@ pub fn send(s: &mut Shell) {
         let policy = Policy::from_env(&workspace);
         let tools = Registry::new();
         let skills = zerith_skills::Library::open(db.parent().unwrap_or(&db).join("skills")).ok();
+        let agent = agent_name.and_then(|n| {
+            zerith_core::agents::find(&zerith_core::Paths::with_root(&root), Some(&workspace), &n)
+        });
         let reporter = handle.clone();
         let result = run_agent_turn(
             &store,
@@ -446,7 +457,7 @@ pub fn send(s: &mut Shell) {
                 memory: memory.as_ref().map(|m| m as &dyn MemoryBackend),
                 scope: Some(&scope),
                 skills: skills.as_ref(),
-                ..TurnContext::default()
+                agent: agent.as_ref(),
             },
             AgentOptions {
                 tools: policy.is_ok().then_some(&tools),
@@ -730,6 +741,40 @@ fn model_select(s: &Shell, u: &Ui, layer: &mut Vec<El>) -> El {
         .build(&ui::kit(u), layer)
 }
 
+/// Opens or closes the agent menu, reading the definitions the first time.
+pub fn toggle_agents(s: &mut Shell) {
+    s.chat.agent_menu = !s.chat.agent_menu;
+    if s.chat.agent_menu && s.agents.list.is_idle() {
+        s.load_agents();
+    }
+}
+
+const DEFAULT_AGENT: &str = "Agente padrão";
+
+fn agent_select(s: &Shell, u: &Ui, layer: &mut Vec<El>) -> El {
+    let mut options = vec![DEFAULT_AGENT.to_string()];
+    if let Load::Ready(v) = &s.agents.list {
+        options.extend(v.iter().map(|a| a.name.clone()));
+    }
+    if let Some(a) = &s.chat.agent {
+        if !options.contains(a) {
+            options.push(a.clone());
+        }
+    }
+    Select::new("agent", &options)
+        .label("Agente")
+        .current(Some(s.chat.agent.as_deref().unwrap_or(DEFAULT_AGENT)))
+        .open(s.chat.agent_menu)
+        .placement(Placement::TopStart)
+        .on_toggle(toggle_agents)
+        .on_close(|s: &mut Shell| s.chat.agent_menu = false)
+        .on_choose(|s: &mut Shell, v: &str, _: &mut Tx| {
+            s.chat.agent = (v != DEFAULT_AGENT).then(|| v.to_string());
+            s.chat.agent_menu = false;
+        })
+        .build(&ui::kit(u), layer)
+}
+
 fn composer(s: &Shell, u: &Ui, layer: &mut Vec<El>) -> El {
     let c = &s.chat;
     let field = text_input(&c.draft, ui::BODY)
@@ -745,7 +790,7 @@ fn composer(s: &Shell, u: &Ui, layer: &mut Vec<El>) -> El {
         // shortcuts win while a turn runs or for navigation chords.
         .on_input_key(|s: &mut Shell, ev: &rune::KeyEvent, tx: &mut Tx| {
             let global = (ev.key == rune::Key::Escape
-                && (s.chat.cancel.is_some() || s.chat.model_menu))
+                && (s.chat.cancel.is_some() || s.chat.model_menu || s.chat.agent_menu))
                 || "1234567nk".chars().any(|c| ev.is_command(c));
             global && crate::on_key(s, ev, tx)
         });
@@ -761,7 +806,8 @@ fn composer(s: &Shell, u: &Ui, layer: &mut Vec<El>) -> El {
         .h(24.0)
         .gap(8.0)
         .center_y()
-        .child(model_select(s, u, layer));
+        .child(model_select(s, u, layer))
+        .child(agent_select(s, u, layer));
     if let Load::Failed(e) = &c.models {
         foot = foot.child(
             text(e.clone())

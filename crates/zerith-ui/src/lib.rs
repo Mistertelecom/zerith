@@ -456,8 +456,9 @@ pub fn on_key(s: &mut Shell, ev: &KeyEvent, tx: &mut Tx) -> bool {
         return true;
     }
     if ev.key == rune::Key::Escape {
-        if s.chat.model_menu {
+        if s.chat.model_menu || s.chat.agent_menu {
             s.chat.model_menu = false;
+            s.chat.agent_menu = false;
             return true;
         }
         if s.chat.cancel.is_some() {

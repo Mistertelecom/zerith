@@ -494,3 +494,26 @@ fn an_approval_event_reaches_the_runtime_channel() {
     });
     assert!(shell.chat.lines.iter().any(|l| l.role == "tool"));
 }
+
+#[test]
+fn agents_come_from_the_core_and_the_chat_can_pick_one() {
+    let dir = tempdir();
+    std::fs::create_dir_all(dir.path().join("agents")).expect("dir");
+    std::fs::write(
+        dir.path().join("agents/revisor.md"),
+        "---\ndescription: Revisa diffs\nmodel: m1\n---\nAponte unwrap.",
+    )
+    .expect("write");
+    let mut shell = shell_at(dir.path());
+    shell.navigate(Screen::Agents);
+    let list = shell.agents.list.ready().expect("loaded");
+    let revisor = list.iter().find(|a| a.name == "revisor").expect("revisor");
+    assert_eq!(revisor.description, "Revisa diffs");
+    assert_eq!(revisor.model.as_deref(), Some("m1"));
+    assert_eq!(revisor.layer, "user");
+
+    // Opening the agent menu lists them; the default agent is no selection.
+    zerith_ui::screens::chat::toggle_agents(&mut shell);
+    assert!(shell.chat.agent_menu);
+    assert!(shell.chat.agent.is_none());
+}

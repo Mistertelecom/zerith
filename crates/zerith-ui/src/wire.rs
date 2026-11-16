@@ -182,54 +182,6 @@ pub fn export_session(db: &Path, id: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// One agent definition.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Agent {
-    pub name: String,
-    pub path: PathBuf,
-    pub summary: String,
-}
-
-/// Agent definitions: `*.md` files in `./.zerith/agents`, first non-empty
-/// line as summary.
-// TODO(wire): zerith_core::agents::list(paths) -> Result<Vec<AgentDef>> once
-// the core owns agent definitions; no crate exposes them yet.
-pub fn agents() -> Result<Vec<Agent>, String> {
-    let dir = std::env::current_dir()
-        .map_err(|e| e.to_string())?
-        .join(".zerith")
-        .join("agents");
-    let Ok(read) = std::fs::read_dir(&dir) else {
-        return Ok(Vec::new());
-    };
-    let mut out: Vec<Agent> = read
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "md"))
-        .map(|path| {
-            let body = std::fs::read_to_string(&path).unwrap_or_default();
-            let summary = body
-                .lines()
-                .map(str::trim)
-                .find(|l| !l.is_empty() && *l != "---")
-                .unwrap_or("")
-                .trim_start_matches('#')
-                .trim()
-                .to_string();
-            Agent {
-                name: path
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
-                path,
-                summary,
-            }
-        })
-        .collect();
-    out.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(out)
-}
-
 /// What the window reads from settings at startup.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct UiPrefs {

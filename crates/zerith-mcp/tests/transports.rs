@@ -2,9 +2,12 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
+#[cfg(windows)]
 use std::time::{Duration, Instant};
 
-use zerith_mcp::{Client, McpError};
+use zerith_mcp::Client;
+#[cfg(windows)]
+use zerith_mcp::McpError;
 
 /// Answers `initialize`, then reads forever without answering.
 #[cfg(windows)]

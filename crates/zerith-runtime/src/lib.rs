@@ -12,7 +12,7 @@
 //!    and the assistant message is written once, whole, when the turn closes.
 
 use std::sync::mpsc;
-use zerith_providers::{ChatMessage, ChatRequest, Client, ProviderError};
+use zerith_providers::{ChatMessage, ChatRequest, Client, Completion, ProviderError, StreamEvent};
 use zerith_sessions::{NewMessage, Role, Store};
 
 #[derive(Debug, thiserror::Error)]
@@ -94,12 +94,60 @@ pub fn run_turn(
 
     let req = ChatRequest::new(model, messages);
     let cancel = zerith_providers::Cancel::default();
-    let completion = client.complete(&req, &cancel)?;
 
-    if let Some(r) = &completion.reasoning {
-        on_event(RunEvent::Reasoning(r.clone()));
+    // Streaming first: the window is the main host, and a turn that only
+    // paints when it finishes reads as a hang. If the endpoint rejects the
+    // stream before sending anything, fall back once to a blocking request —
+    // some OpenAI-compatible servers answer 400 to `stream: true`.
+    let mut text = String::new();
+    let mut reasoning: Option<String> = None;
+    let mut usage = None;
+    let streamed = client.stream(&req, &cancel, |event| match event {
+        StreamEvent::Delta(t) => {
+            text.push_str(&t);
+            on_event(RunEvent::Delta(t));
+        }
+        StreamEvent::Reasoning(r) => {
+            reasoning = Some(match reasoning.take() {
+                Some(mut acc) => {
+                    acc.push_str(&r);
+                    acc
+                }
+                None => r.clone(),
+            });
+            on_event(RunEvent::Reasoning(r));
+        }
+        // A trailing `[DONE]` carries no usage; it must not erase the
+        // counts an earlier chunk already reported.
+        StreamEvent::Done { usage: u } => {
+            if u.is_some() {
+                usage = u;
+            }
+        }
+    });
+
+    if let Err(e) = streamed {
+        // Only a stream that produced nothing is retried: repeating a stream
+        // that already painted text would show the answer twice.
+        if !text.is_empty() || matches!(e, ProviderError::Cancelled) {
+            return Err(e.into());
+        }
+        let completion = client.complete(&req, &cancel)?;
+        if let Some(r) = &completion.reasoning {
+            on_event(RunEvent::Reasoning(r.clone()));
+        }
+        on_event(RunEvent::Delta(completion.text.clone()));
+        text = completion.text;
+        reasoning = completion.reasoning;
+        usage = completion.usage;
     }
-    on_event(RunEvent::Delta(completion.text.clone()));
+
+    let completion = Completion {
+        text,
+        reasoning,
+        usage,
+        finish_reason: None,
+    };
 
     let message_id = store.append(
         session_id,

@@ -45,6 +45,15 @@ struct ChatBody<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<&'a str>,
     stream: bool,
+    /// OpenAI-compatible servers only report usage on a stream when asked;
+    /// without this the window shows no token counts at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptions>,
+}
+
+#[derive(Serialize)]
+struct StreamOptions {
+    include_usage: bool,
 }
 
 #[derive(Serialize)]
@@ -217,6 +226,7 @@ impl Client {
             temperature: req.temperature,
             reasoning_effort: req.reasoning_effort.as_deref(),
             stream: false,
+            stream_options: None,
         };
         let url = self.endpoint("chat/completions");
         let resp = self
@@ -268,6 +278,9 @@ impl Client {
             temperature: req.temperature,
             reasoning_effort: req.reasoning_effort.as_deref(),
             stream: true,
+            stream_options: Some(StreamOptions {
+                include_usage: true,
+            }),
         };
         let url = self.endpoint("chat/completions");
         let resp = self
@@ -304,7 +317,9 @@ impl Client {
             };
             if let Some(usage) = v.get("usage") {
                 if let Ok(u) = serde_json::from_value::<Usage>(usage.clone()) {
-                    on_event(StreamEvent::Done { usage: Some(u) });
+                    if u.total_tokens > 0 {
+                        on_event(StreamEvent::Done { usage: Some(u) });
+                    }
                 }
             }
         }

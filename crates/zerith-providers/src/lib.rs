@@ -13,7 +13,7 @@ mod openai;
 pub mod stream;
 
 pub use config::{Protocol, ProviderConfig, ProviderKind};
-pub use openai::{Client, Probe, Usage};
+pub use openai::{Client, Completion, Probe, Usage};
 
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};

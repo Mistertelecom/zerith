@@ -9,8 +9,9 @@ use zerith_importers::{detect, import, ImportReport};
 use zerith_mcp::Client as McpClient;
 use zerith_memory::{Confidence, FactKind, MemoryBackend, Scope, SqliteMemory};
 use zerith_providers::{ChatMessage, ChatRequest, Client, ProviderConfig};
+use zerith_runtime::plan::{parse_plan, run_plan};
 use zerith_runtime::{run_turn_with_memory, RunEvent};
-use zerith_sessions::{SessionSource, Store};
+use zerith_sessions::{SessionSource, Store, TaskState};
 use zerith_skills::{discover, scan};
 
 fn main() -> ExitCode {
@@ -40,6 +41,8 @@ usage:
   zerith memory forget <id>
   zerith skills list
   zerith skills validate <dir>
+  zerith plan run <file|-> [--agents N] [--model id]
+  zerith plan list
   zerith mcp tools <command and args>
   zerith mcp call <command and args> -- <tool> [json-args]
   zerith providers [probe|models|chat <model> <prompt>]
@@ -142,6 +145,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         ("memory", Some(sub)) => memory(&paths, args, sub)?,
         ("skills", _) => skills(&paths, args)?,
         ("mcp", _) => mcp(args)?,
+        ("plan", _) => plan(&paths, args)?,
         _ => {
             println!("{}", usage());
             return Err(format!("unknown command: {cmd}").into());
@@ -186,6 +190,84 @@ fn mcp(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", result.text());
         }
         other => return Err(format!("unknown mcp command: {other}").into()),
+    }
+    Ok(())
+}
+
+/// Plan mode: a list of tasks, run in dependency order with a bounded number
+/// of workers. Each task becomes its own session, so the transcript of what a
+/// subagent did is a conversation the user can read.
+fn plan(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let sub = args.get(1).map(String::as_str).unwrap_or("list");
+    paths.ensure()?;
+    match sub {
+        "list" => {
+            let store = Store::open(paths.db())?;
+            let plans = store.unfinished_plans()?;
+            if plans.is_empty() {
+                println!("(no unfinished plans)");
+            }
+            for p in plans {
+                let tasks = store.tasks(&p)?;
+                let done = tasks.iter().filter(|t| t.state == TaskState::Done).count();
+                println!("{p}  {done}/{} done", tasks.len());
+            }
+        }
+        "run" => {
+            let file = args
+                .get(2)
+                .ok_or("plan run needs a file (use - for stdin)")?;
+            let text = if file == "-" {
+                let mut buf = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+                buf
+            } else {
+                std::fs::read_to_string(file)?
+            };
+            let mut agents = 2usize;
+            let mut model = std::env::var("ZERITH_MODEL").unwrap_or_default();
+            let mut i = 3;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--agents" => {
+                        agents = args.get(i + 1).ok_or("--agents needs a number")?.parse()?;
+                        i += 2;
+                    }
+                    "--model" => {
+                        model = args.get(i + 1).ok_or("--model needs an id")?.clone();
+                        i += 2;
+                    }
+                    _ => i += 1,
+                }
+            }
+            let plan_id = format!("plan-{}", zerith_sessions::plan::task_id_seed());
+            let tasks = parse_plan(&plan_id, &text);
+            if tasks.is_empty() {
+                return Err("the plan is empty".into());
+            }
+            let store = Store::open(paths.db())?;
+            store.create_plan(&plan_id, &tasks)?;
+            println!(
+                "plan {plan_id}: {} task(s), up to {agents} agent(s)",
+                tasks.len()
+            );
+            let report = run_plan(
+                &paths.db(),
+                &plan_id,
+                &model,
+                agents,
+                Some(Scope::user(&scope_id())),
+                |task, state| println!("  {}  {}", state.as_str(), task.title),
+            )?;
+            println!(
+                "done {}  failed {}  skipped {}",
+                report.done, report.failed, report.skipped
+            );
+            if report.failed > 0 || report.skipped > 0 {
+                return Err("the plan did not finish cleanly".into());
+            }
+        }
+        other => return Err(format!("unknown plan command: {other}").into()),
     }
     Ok(())
 }

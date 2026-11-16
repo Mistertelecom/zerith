@@ -76,3 +76,25 @@ fn the_window_shows_the_facts_the_turn_would_recall() {
     assert!(shell.facts.is_empty());
     assert!(mem.list(&scope, 10).expect("list").is_empty());
 }
+
+#[test]
+fn an_unfinished_plan_shows_up_in_the_window() {
+    let dir = tempdir();
+    let db = dir.path().join("zerith.db");
+    let store = Store::open(&db).expect("store");
+    store
+        .create_plan(
+            "p",
+            &[zerith_sessions::NewTask {
+                title: "um".into(),
+                prompt: "faz um".into(),
+                agent: "default".into(),
+                depends_on: vec![],
+            }],
+        )
+        .expect("plan");
+    let shell = shell_at(dir.path());
+    assert_eq!(shell.plan_tasks.len(), 1);
+    assert_eq!(shell.plan_tasks[0].1, "um");
+    assert_eq!(shell.plan_tasks[0].0, "pending");
+}

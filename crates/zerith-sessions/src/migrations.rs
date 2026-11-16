@@ -6,10 +6,10 @@
 
 use rusqlite::Connection;
 
-pub const CURRENT_VERSION: i32 = 1;
+pub const CURRENT_VERSION: i32 = 2;
 
 /// Every migration, in order. Index 0 upgrades 0 -> 1.
-const MIGRATIONS: &[&str] = &[V1];
+const MIGRATIONS: &[&str] = &[V1, V2];
 
 const V1: &str = r#"
 CREATE TABLE sessions (
@@ -84,6 +84,27 @@ CREATE TRIGGER memory_facts_au AFTER UPDATE ON memory_facts BEGIN
     INSERT INTO memory_fts(memory_fts, rowid, text) VALUES('delete', old.id, old.text);
     INSERT INTO memory_fts(rowid, text) VALUES (new.id, new.text);
 END;
+"#;
+
+const V2: &str = r#"
+-- Subagent work, as durable rows: a plan that only lives in memory is a plan
+-- that disappears with the crash it was meant to survive.
+CREATE TABLE agent_tasks (
+    id            TEXT PRIMARY KEY,
+    plan_id       TEXT NOT NULL,
+    title         TEXT NOT NULL,
+    prompt        TEXT NOT NULL,
+    agent         TEXT NOT NULL DEFAULT 'default',
+    depends_on    TEXT,
+    session_id    TEXT REFERENCES sessions(id) ON DELETE SET NULL,
+    state         TEXT NOT NULL DEFAULT 'pending',
+    result        TEXT,
+    error         TEXT,
+    created_at    INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL
+);
+
+CREATE INDEX agent_tasks_by_plan ON agent_tasks(plan_id, created_at);
 "#;
 
 /// Runs every pending migration inside one transaction.

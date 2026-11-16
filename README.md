@@ -77,6 +77,16 @@ A escolha do endpoint vem do ambiente, um leitor só
 (LM Studio, Ollama, 9Router) que lista modelos não deve ser escondido por falta
 de credencial que ele nem pede.
 
+## Planos e subagentes
+
+Um plano é uma lista de tarefas (`título | prompt`, uma por linha) gravada em
+`agent_tasks` antes de rodar. Cada tarefa vira uma sessão própria, então o que
+um subagente fez é uma conversa legível. `zerith plan run <arquivo|-> --agents N`
+respeita dependências em cadeia, limita a concorrência a 8, marca `skipped`
+quando a dependência falhou e devolve tarefas `running` para `pending` no
+início (crash não trava o plano). `zerith plan list` mostra o que ficou pela
+metade; a janela tem o painel "Execução".
+
 ## Skills e MCP
 
 ### Skills

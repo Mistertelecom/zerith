@@ -6,8 +6,10 @@
 //! streaming deltas are never written one row each.
 
 pub mod migrations;
+pub mod plan;
 pub mod store;
 pub mod types;
 
+pub use plan::{NewTask, Task, TaskState};
 pub use store::Store;
 pub use types::{Message, NewMessage, Role, Session, SessionSource};

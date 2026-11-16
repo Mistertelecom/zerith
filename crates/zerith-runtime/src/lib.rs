@@ -11,6 +11,8 @@
 //! 2. **Streaming does not write per delta.** Tokens are shown as they arrive
 //!    and the assistant message is written once, whole, when the turn closes.
 
+pub mod plan;
+
 use std::sync::mpsc;
 use zerith_memory::{MemoryBackend, Scope};
 use zerith_providers::{ChatMessage, ChatRequest, Client, Completion, ProviderError, StreamEvent};

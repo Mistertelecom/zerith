@@ -42,6 +42,9 @@ pub struct Shell {
     /// Skills found on disk. Listed, never executed: enabling one is a user
     /// action, and no code runs merely because a window opened.
     pub skills: Vec<String>,
+    /// Tasks from plans that have unfinished work. Read from the store on
+    /// reload, so a plan started in another process shows up here.
+    pub plan_tasks: Vec<(String, String, String)>,
     pub draft: TextEdit,
     pub status: String,
     pub busy: bool,
@@ -63,6 +66,7 @@ impl Shell {
             lines: Vec::new(),
             facts: Vec::new(),
             skills: Vec::new(),
+            plan_tasks: Vec::new(),
             draft: TextEdit::new(""),
             status: String::new(),
             busy: false,
@@ -94,6 +98,15 @@ impl Shell {
                 .into_iter()
                 .map(|s| s.frontmatter.name)
                 .collect();
+        }
+        if let Ok(store) = Store::open(&self.db) {
+            let mut rows = Vec::new();
+            for plan in store.unfinished_plans().unwrap_or_default() {
+                for t in store.tasks(&plan).unwrap_or_default() {
+                    rows.push((t.state.as_str().to_string(), t.title, plan.clone()));
+                }
+            }
+            self.plan_tasks = rows;
         }
         self.facts = SqliteMemory::open(&self.db)
             .and_then(|m| m.list(&self.scope(), 50))
@@ -385,6 +398,7 @@ fn sidebar(s: &Shell, t: &tok::Theme) -> El {
             .min_h(0.0),
         )
         .child(memory_panel(s, t))
+        .child(plan_panel(s, t))
         .child(skills_panel(s, t))
 }
 
@@ -560,4 +574,33 @@ pub fn view(s: &Shell, _: &mut Cx<Shell>) -> El {
                 ),
         ),
     )
+}
+
+/// What a plan is doing right now. A plan with no unfinished work is absent
+/// rather than shown as finished work the user cannot act on.
+fn plan_panel(s: &Shell, t: &tok::Theme) -> El {
+    if s.plan_tasks.is_empty() {
+        return col().key("plan-none");
+    }
+    let mut rows = col().key("plan-rows").w_full().gap(2.0);
+    for (i, (state, title, plan)) in s.plan_tasks.iter().enumerate() {
+        rows = rows.child(
+            text(format!("{state}  {title}"))
+                .key(format!("pt-{i}"))
+                .label(format!("{title}, estado {state}, plano {plan}"))
+                .font(type_::LABEL)
+                .color(t.text),
+        );
+    }
+    col()
+        .key("plan")
+        .w_full()
+        .gap(6.0)
+        .child(
+            row()
+                .w_full()
+                .center_y()
+                .child(text("Execução").font(type_::TITLE).color(t.text).grow(1.0)),
+        )
+        .child(rows.shrink().min_h(0.0))
 }

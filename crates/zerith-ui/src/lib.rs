@@ -234,7 +234,7 @@ fn send(s: &mut Shell) {
         let (store, client) = match prepared {
             Ok(v) => v,
             Err(e) => {
-                let _ = handle.update(move |s: &mut Shell, _| s.fail(e));
+                handle.update(move |s: &mut Shell, _| s.fail(e));
                 return;
             }
         };
@@ -249,12 +249,12 @@ fn send(s: &mut Shell) {
             &model,
             &prompt,
             move |event| {
-                let _ = reporter.update(move |s: &mut Shell, _| s.apply(event));
+                reporter.update(move |s: &mut Shell, _| s.apply(event));
             },
         );
         if let Err(e) = result {
             let msg = e.to_string();
-            let _ = handle.update(move |s: &mut Shell, _| s.fail(msg));
+            handle.update(move |s: &mut Shell, _| s.fail(msg));
         }
     });
 }

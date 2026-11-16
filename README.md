@@ -91,8 +91,18 @@ lento nunca trava o frame.
 ## Testes
 
 `cargo test --workspace --exclude zerith-ui` — a UI fica de fora do caminho
-padrão porque compila o Rune (wgpu, winit) e leva minutos; ela é verificada com
-`cargo build -p zerith-ui` e pelos modos headless acima.
+padrão porque compila o Rune (wgpu, winit) e leva minutos. Ela tem testes
+próprios (`cargo test -p zerith-ui`, que não abrem janela) e é verificada de
+ponta a ponta pelos modos headless acima.
+
+Antes de qualquer push: `cargo fmt --all --check`,
+`cargo clippy --workspace --exclude zerith-ui --all-targets -j 1 -- -D warnings`
+e `cargo clippy -p zerith-ui --all-targets -j 1 -- -D warnings`.
+
+O CI (`.github/workflows/zerith.yml`) roda os três em Linux e Windows, mais um
+job que renderiza `--tree` e publica a árvore como artefato.
+
+Detalhes de toolchain, memória e caminhos: [docs/build.md](docs/build.md).
 
 ## Nota de build no Windows
 

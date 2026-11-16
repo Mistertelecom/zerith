@@ -1,8 +1,16 @@
 name: Zerith release
 
-# Builds a distributable per platform. No signing yet: the artifacts are
-# unsigned and the release notes must say so. `docs/release.md` is the
-# source of truth for install/uninstall and for what is still missing.
+# Builds portable archives per platform when a `zerith-v*` tag is pushed (or on
+# manual dispatch, which builds and uploads artifacts but publishes nothing).
+#
+#   Windows  zerith-<tag>-windows-x86_64.zip     + .sha256
+#   Linux    zerith-<tag>-linux-x86_64.tar.gz    + .sha256
+#   macOS    zerith-<tag>-macos-<arch>.tar.gz    + .sha256
+#
+# These are archives of binaries. There is no installer, no code signing and no
+# notarization, and the release notes say so. `docs/release.md` is the source
+# of truth. This file has never been executed by the author's tooling: the
+# first tag run is the first real test.
 
 on:
   workflow_dispatch:
@@ -12,6 +20,12 @@ on:
 concurrency:
   group: zerith-release-${{ github.ref }}
   cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
 
 jobs:
   build:
@@ -27,48 +41,94 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: .
+          # Release and test profiles share dependencies; one cache per OS.
+          key: release
       - name: Linux window dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libxcursor-dev libvulkan-dev
-      # Not parallel: the workspace members are heavy and CI runners have 7 GB.
-      - run: cargo test --workspace -j 2
-      - run: cargo build --release -p zerith-cli -p zerith-ui -j 2
+      # The UI crate compiles Rune (wgpu, winit): minutes, and no GPU needed for
+      # its tests. It is built below, not tested here, same as the CI lane.
+      - name: Test (workspace, without the window)
+        run: cargo test --workspace --exclude zerith-ui -j 2
+      - name: Build release binaries
+        run: cargo build --release -p zerith-cli -p zerith-ui -j 2
       - name: Package
+        id: pack
         shell: bash
         run: |
-          mkdir -p dist
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME:-dev}"
+          arch="$(uname -m)"
+          case "$arch" in x86_64|AMD64) arch=x86_64 ;; arm64|aarch64) arch=arm64 ;; esac
           case "${{ runner.os }}" in
-            Windows) cp target/release/zerith.exe target/release/zerith-ui.exe dist/ ;;
-            *)       cp target/release/zerith target/release/zerith-ui dist/ ;;
+            Windows) os=windows; ext=.exe ;;
+            Linux)   os=linux;   ext= ;;
+            macOS)   os=macos;   ext= ;;
           esac
-          cp docs/build.md docs/release.md README.md dist/
-          cd dist && sha256sum * > SHA256SUMS.txt 2>/dev/null || shasum -a 256 * > SHA256SUMS.txt
+          name="zerith-${tag}-${os}-${arch}"
+          mkdir -p "dist/${name}"
+          cp "target/release/zerith${ext}" "target/release/zerith-ui${ext}" "dist/${name}/"
+          cp README.md LICENSE THIRD_PARTY_NOTICES.md DEPENDENCY_LICENSES.md "dist/${name}/"
+          cp docs/release.md docs/build.md docs/aceite.md "dist/${name}/"
+          cd dist
+          if [ "$os" = windows ]; then
+            # Git Bash's tar is GNU tar and cannot write zip; PowerShell can.
+            powershell -NoProfile -Command "Compress-Archive -Path '${name}' -DestinationPath '${name}.zip'"
+            archive="${name}.zip"
+          else
+            tar -czf "${name}.tar.gz" "${name}"
+            archive="${name}.tar.gz"
+          fi
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$archive" > "${archive}.sha256"
+          else
+            shasum -a 256 "$archive" > "${archive}.sha256"
+          fi
+          cat "${archive}.sha256"
+          echo "archive=${archive}" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         with:
           name: zerith-${{ runner.os }}
-          path: dist
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+            dist/*.sha256
           if-no-files-found: error
 
-  # A release candidate is only a candidate: this job documents the gaps.
-  notes:
-    name: release notes
+  # Only a pushed tag publishes anything; manual runs stop at the artifacts.
+  publish:
+    name: publish release
+    if: startsWith(github.ref, 'refs/tags/zerith-v')
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
-      - name: Write known limitations
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - name: Release notes
         run: |
           {
-            echo "## Zerith ${{ github.ref_name }}"
+            echo "## Zerith ${GITHUB_REF_NAME}"
             echo
-            echo "Artefatos sem assinatura. Verifique com SHA256SUMS.txt."
-            echo "Limitações conhecidas: ver docs/aceite.md."
+            echo "Arquivos portáteis (binários), sem instalador. **Sem assinatura de código e sem notarização**:"
+            echo "o Windows SmartScreen e o Gatekeeper do macOS vão avisar. Confira o download com o arquivo \`.sha256\` ao lado;"
+            echo "isso prova integridade, não autoria."
+            echo
+            echo "Limitações conhecidas: veja \`docs/aceite.md\`, copiado abaixo."
             echo
             cat docs/aceite.md
           } > RELEASE_NOTES.md
-      - uses: actions/upload-artifact@v4
-        with:
-          name: zerith-release-notes
-          path: RELEASE_NOTES.md
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" assets/* \
+            --title "Zerith ${GITHUB_REF_NAME}" \
+            --notes-file RELEASE_NOTES.md \
+            --draft

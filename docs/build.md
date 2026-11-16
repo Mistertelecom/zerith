@@ -65,8 +65,12 @@ zerith skills list                # SKILL.md encontradas, nada executado
 zerith skills catalog [--refresh] # estrelas, licenças e datas do GitHub
 zerith tools                      # catálogo com permissões e timeouts
 zerith tools call read_file '{"path":"docs/build.md"}'
-zerith plugins list               # metadados; nada é executado
-zerith mcp tools <cmd...>         # handshake MCP e lista de ferramentas
+zerith plugin list               # metadados; nada é executado
+zerith mcp list                   # servidores configurados
+zerith mcp tools <servidor>       # handshake MCP e lista de ferramentas
+zerith checkpoints <sessão>       # pontos de rewind
+zerith rewind <sessão> --both     # desfaz arquivos e conversa de um turno
+zerith doctor --offline           # diagnóstico sem tocar a rede
 zerith plan run plano.txt --agents 2
 zerith policy check <caminho>     # veredito do preset ativo
 zerith bench                      # números em banco descartável
@@ -88,7 +92,18 @@ O banco é criado no primeiro comando. `zerith doctor` abre, roda
 
 ## Release
 
-Ainda não há pipeline de release. O caminho pretendido é `cargo build
---release -p zerith-cli -p zerith-ui -j 1` por plataforma, com as mesmas
-`[patch]` de `vendor/` — um `[patch]` de dependência não se aplica ao
-workspace que depende dela, então as cópias corrigidas do Rune precisam ficar aqui.
+Uma tag `zerith-v*` dispara `.github/workflows/zerith-release.yml`, que
+compila `cargo build --release -p zerith-cli -p zerith-ui` em Windows, Linux e
+macOS e empacota (zip no Windows, `tar.gz` nos outros, com `.sha256`). O
+workflow **nunca foi executado**; ver `docs/release.md`. Localmente:
+`cargo build --release -p zerith-cli -p zerith-ui -j 1`, com as mesmas `[patch]`
+de `vendor/` — um `[patch]` de dependência não se aplica ao workspace que
+depende dela, então as cópias corrigidas do Rune precisam ficar aqui.
+
+## Segmentos que dependem do SO
+
+- Ctrl+C/SIGTERM: `zerith -p` instala um tratador sem dependência
+  (`SetConsoleCtrlHandler` no Windows, `signal` no Unix) e sai com 130 ou 143.
+  Compilado e testado só no Windows; o ramo Unix **não foi compilado aqui**.
+- Testes de MCP por stdio usam PowerShell e só rodam no Windows; os de HTTP e
+  os do adaptador rodam em qualquer SO.

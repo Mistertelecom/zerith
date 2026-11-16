@@ -20,7 +20,7 @@ evidência executada, não código escrito. Onde falta, está dito o que falta.
 | Usuário configura um provider | Feito | `ZERITH_PROVIDER`, `ZERITH_BASE_URL`, `ZERITH_API_KEY`, `ZERITH_MODEL`; `zerith providers probe` |
 | 9Router via API local OpenAI-compatible | Feito | `providers probe` → `http 200, 59 models` em `localhost:20128/v1` |
 | Streaming funciona | Feito | turno real com `DEEPSEEKV4.1`: `[turn] tokens 2878→83`; SSE com `reasoning_content` |
-| Cancelamento funciona | Parcial — em correção | botão "parar" com `Cancel`; teste `stop_cancels_the_token_and_does_nothing_without_a_turn`. **O token só é checado entre linhas SSE**: um servidor que não envia nada (conexão presa, primeiro byte lento) não é interrompido até o timeout |
+| Cancelamento funciona | Parcial — em correção; não reverificado nesta rodada | botão "parar" com `Cancel`; teste `stop_cancels_the_token_and_does_nothing_without_a_turn`. **O token só é checado entre linhas SSE**: um servidor que não envia nada (conexão presa, primeiro byte lento) não é interrompido até o timeout |
 | Erros de rede úteis | Feito | `ProviderError::Http{status,body}`; `main()` imprime com `redact` |
 | Conversas persistidas | Feito | dois turnos na mesma sessão, `session show` com 4 mensagens |
 
@@ -59,9 +59,9 @@ evidência executada, não código escrito. Onde falta, está dito o que falta.
 
 | Item | Estado | Evidência |
 | --- | --- | --- |
-| Permissões respeitadas | Parcial — em correção | `Policy::check` antes de escrita e shell; teste de escape de workspace. **Leituras (`read_file`, `list_dir`) não passavam pela política**; regras `allow/ask/deny` de `settings.toml` existem só como biblioteca |
+| Permissões respeitadas | Parcial — em correção; não reverificado nesta rodada | `Policy::check` antes de escrita e shell; teste de escape de workspace. **Leituras (`read_file`, `list_dir`) não passavam pela política**; regras `allow/ask/deny` de `settings.toml` existem só como biblioteca |
 | Segredos não aparecem em logs | Feito | `redact` e `redact_headers`; erros do `main()` passam por `redact`; chaves no cofre do SO (`zerith secret`), `config show`/`secret get` mascaram |
-| Operações arriscadas exigem confirmação | Parcial — em correção | `Verdict::Ask` para escrita fora do workspace; `shell` recusada. **`Ask` é tratado como recusa: não há caminho de aprovação** — o usuário nunca é perguntado |
+| Operações arriscadas exigem confirmação | Parcial — em correção; não reverificado nesta rodada | `Verdict::Ask` para escrita fora do workspace; `shell` recusada. **`Ask` é tratado como recusa: não há caminho de aprovação** — o usuário nunca é perguntado |
 | Plugins e Skills tratados como não confiáveis | Feito | instalar = `disabled` + `unreviewed`; `trust` separado; scripts nunca executados |
 | Sandbox não anunciada como garantia | Feito | `Enforcement::Partial` impresso por `zerith policy` |
 
@@ -84,13 +84,35 @@ evidência executada, não código escrito. Onde falta, está dito o que falta.
 | Backup e restauração testados | Feito | `.audit/bk.sh`: backup, apagar banco, restore, `doctor` OK |
 | Configuração e dados sobrevivem à atualização | Feito | migrações versionadas; banco vive fora da pasta dos binários |
 
+## CLI, sessões, MCP e plugins
+
+| Item | Estado | Evidência |
+| --- | --- | --- |
+| Retomar, continuar e bifurcar sessões (`--resume`, `--continue`, `--fork`, nome) | Feito | `args::tests::select_session_creates_resumes_forks_and_explains_failures`, `sessions_resolve_by_id_title_or_unique_prefix_and_rename_keeps_order`; fumaça no binário: `session rename`, `session show "<título>"` |
+| Exportar, buscar e renomear sessões | Feito | `export`/`search` rodados no binário; `parse_export`, `parse_search`, `parse_rename` testados |
+| Rewind de arquivos e conversa (armazenamento e restauração) | Feito | 9 testes em `zerith-sessions/tests/checkpoints.rs` com diretórios temporários: restaura, remove o que o turno criou, vence o turno mais antigo, rewind suave + `--purge`, tetos de tamanho, retenção de 100 turnos |
+| Rewind desfaz o que o agente editou | **Pendente** | as ferramentas `write_file`/`edit_file` ainda não chamam `Checkpoint::record_file` (ver `docs/checkpoints.md`); sem isso o checkpoint guarda só o ponto de corte da conversa. Edições por `shell` nunca serão rastreadas |
+| `-p` com `--max-turns`, `--allowed-tools`, `--permission-mode`, `--json-schema`, `--max-budget-usd` | Parcial | parsers, validador de schema, custo e política testados (`args`, `schema`, `headless`); **nenhum teste executa um turno `-p` contra um modelo**. Orçamento exige preços informados pelo usuário; o schema cobre só `type`/`enum`/`required`/`properties`/`items` |
+| Código de saída 130/143 em Ctrl+C / SIGTERM | Parcial | código do primeiro sinal testado; o tratador real foi **compilado só no Windows** e não foi acionado por um sinal de verdade; o ramo Unix não foi compilado |
+| `doctor` estendido (configuração, cofre, sandbox, provider, MCP, plugins, banco) | Feito | executado no binário com `--offline`; o teste de alcance do provider (sem `--offline`) não foi rodado |
+| MCP no laço do agente (`mcp__<servidor>__<ferramenta>`) | Parcial | `zerith-mcp/tests/tools.rs` contra servidor HTTP no próprio teste: registro com schema, chamada, `isError`, servidor fora do ar, recursos, prompts. **Não** testado por stdio via adaptador; só `zerith -p` registra as ferramentas (janela e `chat` não) |
+| Servidor MCP de projeto exige aprovação do usuário | Feito | `a_project_cannot_approve_its_own_server`, `approval_from_the_user_file_lets_the_project_server_run` |
+| Plugins em pacote (skills, agentes, hooks, MCP) | Parcial | manifesto, validação de caminhos e confiança testados (`zerith-plugins/tests/library.rs`); só o MCP de plugin é carregado (em `-p`), o runtime **não** carrega skills, agentes e hooks de plugin |
+| Importar JSONL do Hermes pelo CLI | Parcial | `import hermes --jsonl` chama o importador já testado em `hermes_jsonl.rs`; nunca visto com uma exportação real |
+
 ## Resumo
 
-- Feito com evidência: 28 de 37 itens.
-- Parcial: 8 (cursor de import, CPU-time, instalador, matriz de release,
-  entrada de menu; e, rebaixados após revisão: permissões em leitura,
-  confirmação de operação arriscada, cancelamento).
-- Pendente: 1 (builds nas três plataformas).
+Contagem refeita a partir das tabelas acima (não de memória):
 
-Nenhum destes "parcial" foi escrito como se estivesse pronto: o spec proíbe
-marcar pronto sem evidência, e é mais útil saber onde dói.
+- Feito com evidência: 39 de 52 itens.
+- Parcial: 11.
+- Pendente: 2.
+
+Três linhas de segurança e cancelamento (`Cancelamento funciona`, `Permissões
+respeitadas`, `Operações arriscadas exigem confirmação`) ficaram como estavam e
+estão marcadas como **não reverificadas**: o runtime estava em edição por outra
+frente quando esta tabela foi atualizada e seus testes não puderam ser
+executados. O estado delas pode ter melhorado; não foi provado aqui.
+
+Nenhum destes "parcial" ou "pendente" foi escrito como se estivesse pronto: o
+spec proíbe marcar pronto sem evidência, e é mais útil saber onde dói.

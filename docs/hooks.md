@@ -4,12 +4,23 @@ Comandos do usuário executados em pontos fixos da sessão. Contrato
 inspirado no do Claude Code (só o conceito; nenhum código copiado).
 
 **Estado:** biblioteca pronta e testada (`zerith_core::hooks::run_hooks`).
-**Planejado:** o runtime ainda não dispara os eventos.
+Ligado ao runtime **só** para `PreToolUse`, `PermissionRequest`, `PostToolUse` e
+`PostToolUseFailure`, via `zerith_runtime::guards::Guards` (middleware que o host
+precisa colocar em `AgentOptions.middleware`). Os demais eventos são funções de
+biblioteca: o host as chama (pontos de chamada abaixo); nada os dispara sozinho.
 
 ## Eventos
 
-`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`,
-`PreCompact`, `SessionEnd`.
+| Evento | Quando | Quem chama |
+| --- | --- | --- |
+| `SessionStart` / `SessionEnd` | sessão abre / fecha | host (CLI, UI) |
+| `UserPromptSubmit` | antes de gravar o prompt; bloqueio descarta, contexto entra no turno | host |
+| `PreToolUse` | antes da chamada; pode negar, perguntar, reescrever `tool_input`, injetar contexto | `Guards::before` |
+| `PermissionRequest` | quando a chamada ia perguntar ao usuário; um hook pode **negar** (aprovar por hook não existe: o middleware só endurece) | `Guards::before` |
+| `PostToolUse` | depois de uma chamada bem-sucedida; o contexto vai ao modelo | `Guards::after` |
+| `PostToolUseFailure` | depois de uma chamada que falhou ou foi recusada | `Guards::after` |
+| `Stop` | o modelo termina o turno; `continue:false`/deny pede ao host que continue | host |
+| `PreCompact` | antes de compactar o contexto | host |
 
 ## Configuração
 
@@ -20,8 +31,12 @@ command = "python .zerith/guard.py"
 timeout_ms = 10000          # padrão 60000
 ```
 
-`matcher` só vale para `PreToolUse`/`PostToolUse`; vazio ou ausente casa
-tudo. Hooks de todas as camadas somam e rodam na ordem
+`matcher` vale para os eventos de ferramenta (`PreToolUse`, `PostToolUse`,
+`PostToolUseFailure`, `PermissionRequest`); vazio ou ausente casa tudo. Cada
+entrada é `ferramenta` (glob) ou `ferramenta(especificador)`, como nas regras
+de permissão: `shell(git push *)`, `write_file(*.env)|read_file`. O
+especificador casa o comando (`shell`, analisado como em `permissions.md`), o
+caminho ou a URL; sem esse dado a entrada não casa. Hooks de todas as camadas somam e rodam na ordem
 usuário → projeto → local.
 
 ## Execução
@@ -41,7 +56,10 @@ usuário → projeto → local.
 | exit 0, stdout JSON | `{decision?: "allow"\|"deny"\|"ask", reason?, updated_input?, additional_context?, continue?: bool}` |
 | exit 0, stdout não-JSON | texto vira `additional_context` |
 | exit 2 | bloqueia; stderr é o motivo |
-| outro código, timeout, falha ao iniciar | erro não bloqueante em `errors` |
+| outro código, timeout, falha ao iniciar | erro não bloqueante em `errors` (**fail-open**: a chamada segue; `Guards::take_errors` entrega para log) |
+
+Em `PreToolUse`, `updated_input` substitui os argumentos e a **política roda de
+novo** sobre eles: um hook não consegue permitir o que a política nega.
 
 Vários hooks: vence a decisão mais forte (deny > ask > allow); o primeiro
 bloqueio interrompe os seguintes; o último `updated_input` vale.

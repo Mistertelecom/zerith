@@ -4852,9 +4852,13 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
+ "toml",
  "ureq",
  "zerith-core",
+ "zerith-security",
+ "zerith-tools",
 ]
 
 [[package]]
@@ -4897,6 +4901,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
+ "toml",
  "zerith-core",
  "zerith-memory",
  "zerith-providers",
@@ -4910,7 +4915,11 @@ dependencies = [
 name = "zerith-security"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
  "tempfile",
+ "toml",
+ "windows-sys 0.61.2",
+ "zerith-core",
 ]
 
 [[package]]
@@ -4943,6 +4952,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
+ "ureq",
  "walkdir",
  "zerith-memory",
  "zerith-providers",
@@ -4955,8 +4965,10 @@ version = "0.1.0"
 dependencies = [
  "rune",
  "rune-kit",
+ "serde_json",
  "tempfile",
  "zerith-core",
+ "zerith-mcp",
  "zerith-memory",
  "zerith-plugins",
  "zerith-providers",

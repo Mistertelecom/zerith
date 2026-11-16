@@ -8,7 +8,7 @@ Formato Agent Skills: diretório com `SKILL.md` (frontmatter `name`,
 zerith skills validate <dir>     # inventário, scripts (não executados), alertas
 zerith skills install <dir>
 zerith skills enable|disable <nome>
-zerith skills update <nome> <dir>
+zerith skills update <nome> [dir]   # sem dir, relê a origem gravada na instalação (se for pasta)
 zerith skills rollback <nome>
 zerith skills remove <nome>
 zerith skills catalog [--refresh]  # repos reais do GitHub; GITHUB_TOKEN opcional

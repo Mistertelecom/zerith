@@ -9,7 +9,7 @@ para a maior precedência:
 | Usuário | `<raiz de dados>/settings.toml` | `user` |
 | Projeto | `<projeto>/.zerith/settings.toml` | `project` |
 | Projeto-local (não versionar) | `<projeto>/.zerith/settings.local.toml` | `local` |
-| Ambiente | `ZERITH_PROVIDER`, `ZERITH_BASE_URL`, `ZERITH_MODEL`, `ZERITH_USER`, `ZERITH_SANDBOX`, `ZERITH_PROFILE` | `env` |
+| Ambiente | `ZERITH_PROVIDER`, `ZERITH_BASE_URL`, `ZERITH_MODEL`, `ZERITH_USER`, `ZERITH_SANDBOX`, `ZERITH_MODE`, `ZERITH_PROFILE` | `env` |
 
 Regras de mescla: tabelas mesclam por chave; **listas concatenam** entre
 camadas (regras de permissão, hooks, providers); escalares são substituídos.
@@ -36,8 +36,9 @@ context_limit = 128000
 api_key_ref = "openai"      # nome da entrada no cofre; nunca a chave
 
 [permissions]
-mode = "workspace-write"
-allow = ["read_file", "list_dir"]
+mode = "workspace-write"    # preset: read-only | workspace-write | danger-full-access
+default_mode = "default"    # default | acceptEdits | plan | dontAsk | bypassPermissions
+allow = ["read_file", "list_dir", "shell(cargo test *)"]
 ask = ["write_file"]
 deny = ["write_file(*.env)"]
 

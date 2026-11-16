@@ -28,7 +28,13 @@ zerith memory list user:local
 zerith memory recall user:local "editor"
 zerith memory edit <id> "novo texto"
 zerith memory forget <id>          # tombstone: não ressuscita
-zerith memory export user:local
+zerith memory export [user:local]  # JSONL; sem escopo, todos
+zerith memory import fatos.jsonl   # ids novos; fato repetido não duplica
+zerith memory pause|resume|status  # extração automática (gravado no banco)
 ```
+
+`pause` para só a **extração automática**; `memory remember` e a recuperação
+continuam. `[memory] paused = true` em `settings.toml` é outra chave: desliga a
+memória inteira em `zerith -p`.
 
 A janela tem o painel **Memória**.

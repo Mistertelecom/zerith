@@ -14,15 +14,15 @@ que veio de cada uma estão em [UPSTREAMS.md](UPSTREAMS.md).
 | Crate | Papel |
 | --- | --- |
 | `zerith-core` | Identidade, `Paths` (por SO), erros |
-| `zerith-sessions` | SQLite, migrações versionadas, sessões e mensagens |
+| `zerith-sessions` | SQLite, migrações versionadas, sessões, mensagens, eventos, checkpoints e rewind |
 | `zerith-memory` | `MemoryBackend` + `SqliteMemory` (FTS5) + extração determinística |
 | `zerith-providers` | Endpoints OpenAI-compatible e Anthropic (9Router, Ollama, LM Studio) |
 | `zerith-runtime` | Um turno de agente: histórico → provider → mensagem gravada |
 | `zerith-importers` | Import read-only do Hermes (`~/.hermes/state.db`) |
 | `zerith-skills` | Formato Agent Skills, catálogo GitHub, instalação com rollback |
-| `zerith-mcp` | Cliente MCP sobre stdio (JSON-RPC 2.0) |
+| `zerith-mcp` | Cliente MCP (stdio e HTTP), configuração `[[mcp.servers]]`, ferramentas `mcp__<servidor>__<ferramenta>` no laço do agente |
 | `zerith-tools` | Registry de ferramentas com permissões, timeouts e política |
-| `zerith-plugins` | Manifestos de plugin, ativação e revisão explícita |
+| `zerith-plugins` | Manifestos de plugin (inclui pacotes de skills/agentes/hooks/MCP), ativação e revisão explícita |
 | `zerith-security` | Presets de sandbox, vereditos, redação de segredos |
 | `zerith-cli` | Binário `zerith` |
 | `zerith-ui` | Janela nativa em Rune: chat, histórico, agentes, skills, memória, provedores, configurações |
@@ -52,21 +52,33 @@ cargo run --bin zerith -- doctor
 ## CLI
 
 ```text
-zerith version
-zerith paths
-zerith doctor                       # abre o banco, roda integrity_check
-zerith session list [--limit N]
-zerith session new <title>
-zerith session show <id>
-zerith memory remember <scope> <text> [--inferred]
-zerith memory recall <scope> <query>
-zerith memory list <scope>
-zerith memory forget <id>
+zerith version | paths | policy | bench | backup | restore <file>
+zerith doctor [--offline]           # banco, configuração, sandbox, cofre, provider, MCP, plugins
+zerith session list|new|show|rename
+zerith search <texto>               # busca de texto completo nas mensagens
+zerith export <sessão> [--format md|jsonl] [--out ARQ]
+zerith checkpoints <sessão>         # pontos de restauração
+zerith rewind <sessão> [--turn N] [--code|--conversation|--both] [--purge]
+zerith chat [--resume [id|nome]|--continue|--session id] [--fork] [--model id] <prompt>
+zerith -p <prompt> [--output-format text|json|stream-json] [--max-turns N]
+        [--max-budget-usd X --price-in P --price-out P] [--allowed-tools ...]
+        [--disallowed-tools ...] [--permission-mode MODO] [--json-schema ...]
+zerith agents list
+zerith skills list|install|update|remove|enable|disable|rollback|validate|catalog
+zerith memory list|recall|remember|edit|forget|export|import|pause|resume|status
+zerith mcp list|add|remove|approve|tools|call
+zerith plugin list|show|install|enable|disable|trust|untrust|remove|tools
 zerith providers [probe|models|chat <model> <prompt>]
-zerith import detect
-zerith import hermes [--profile <name>]
-zerith chat [--session <id>] [--model <id>] <prompt>
+zerith import detect | hermes [--profile P] [--jsonl ARQUIVO]
 ```
+
+`<sessão>` aceita o id, o título (sem diferenciar maiúsculas) ou um prefixo de
+id único com 4+ caracteres; título repetido é erro que lista os candidatos.
+
+Códigos de saída: `0` sucesso; `1` erro, schema não atendido, orçamento ou limite
+de passos; `130` Ctrl+C e `143` SIGTERM/fechamento do console (um segundo sinal
+encerra na hora). O cancelamento só é visto entre pedaços do stream e entre
+chamadas de ferramenta.
 
 ## Providers
 
@@ -120,10 +132,11 @@ mostra inventário, scripts encontrados e flags (`curl`, `| sh`, `rm -rf`,
 
 ### MCP
 
-Cliente stdio, um objeto JSON-RPC por linha, sem shell na linha de comando
-do servidor. `zerith mcp tools <cmd...>` completa o handshake e lista as
-ferramentas; `zerith mcp call <cmd...> -- <tool> <json>` executa uma. O
-processo filho é morto quando o cliente sai.
+Cliente stdio e HTTP, sem shell na linha de comando do servidor. Servidores de
+`[[mcp.servers]]` viram ferramentas `mcp__<servidor>__<ferramenta>` no laço do
+agente (hoje em `zerith -p`), com recursos `@servidor:recurso` e prompts como
+comandos. Servidor definido por um projeto só roda depois de
+`zerith mcp approve`. Detalhes e limites em [docs/mcp.md](docs/mcp.md).
 
 ## Ferramentas e plugins
 
@@ -155,17 +168,36 @@ abre o processo. Um plugin que falha morre no próprio processo, como um
 servidor MCP, e não derruba a aplicação.
 
 ```bash
-zerith plugins install ./meu-plugin   # disabled, unreviewed
-zerith plugins list
-zerith plugins enable meu-plugin      # ainda não executa
-zerith plugins trust meu-plugin       # revisão explícita
-zerith plugins tools meu-plugin       # agora inicia e lista ferramentas
-zerith plugins disable meu-plugin     # desativa sem apagar
-zerith plugins remove meu-plugin
+zerith plugin install ./meu-plugin    # disabled, unreviewed
+zerith plugin show meu-plugin         # o que ele executa
+zerith plugin enable meu-plugin       # ainda não executa
+zerith plugin trust meu-plugin --yes  # revisão explícita
+zerith plugin tools meu-plugin        # agora inicia e lista ferramentas
+zerith plugin disable meu-plugin      # desativa sem apagar
+zerith plugin remove meu-plugin
 ```
 
-Isso não é sandbox: o plugin roda com os privilégios do usuário. O manifesto
-também não é autorização — é metadado.
+Um plugin também pode ser um pacote de skills, agentes, hooks e servidores MCP
+([docs/plugins.md](docs/plugins.md)). Isso não é sandbox: o plugin roda com os
+privilégios do usuário. O manifesto também não é autorização — é metadado.
+
+## Rewind
+
+`zerith rewind` desfaz o que um turno fez nos arquivos e na conversa. Só vê
+edições feitas pelas ferramentas de arquivo, nunca as de comandos de shell, e
+sobrescreve o que está no disco. Limites e API em
+[docs/checkpoints.md](docs/checkpoints.md).
+
+## Método de agente
+
+O mapa entre o método do Claude Code, a arquitetura do DeepSeek Harness e o
+que o Zerith tem de fato (implementado x planejado) está em
+[docs/agent-method.md](docs/agent-method.md).
+
+## Capturas de tela
+
+Ainda não há capturas versionadas. Caminhos reservados:
+`docs/img/chat.png`, `docs/img/skills.png`, `docs/img/memoria.png`.
 ## Memória
 
 Fatos vivem no mesmo banco das sessões, com escopo (`user:<id>`), tipo
@@ -210,7 +242,10 @@ Antes de qualquer push: `cargo fmt --all --check`,
 e `cargo clippy -p zerith-ui --all-targets -j 1 -- -D warnings`.
 
 O CI (`.github/workflows/zerith.yml`) roda os três em Linux e Windows, mais um
-job que renderiza `--tree` e publica a árvore como artefato.
+job que renderiza `--tree` e publica a árvore como artefato. Uma tag
+`zerith-v*` dispara `.github/workflows/zerith-release.yml` (zip no Windows,
+`tar.gz` no Linux e no macOS, com `.sha256`; sem instalador e sem assinatura;
+ainda nunca executado).
 
 Detalhes de toolchain, memória e caminhos: [docs/build.md](docs/build.md).
 

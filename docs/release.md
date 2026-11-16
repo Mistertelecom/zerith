@@ -5,19 +5,27 @@ já existe. Onde não há evidência, está dito.
 
 ## O que sai no pacote
 
-| Plataforma | Binários |
-| --- | --- |
-| Windows | `zerith.exe`, `zerith-ui.exe` |
-| Linux | `zerith`, `zerith-ui` |
-| macOS | `zerith`, `zerith-ui` |
+| Plataforma | Arquivo | Conteúdo |
+| --- | --- | --- |
+| Windows | `zerith-<tag>-windows-x86_64.zip` + `.sha256` | `zerith.exe`, `zerith-ui.exe` |
+| Linux | `zerith-<tag>-linux-x86_64.tar.gz` + `.sha256` | `zerith`, `zerith-ui` |
+| macOS | `zerith-<tag>-macos-<arch>.tar.gz` + `.sha256` | `zerith`, `zerith-ui` |
 
-O workflow `.github/workflows/zerith-release.yml` roda `cargo test` e
-`cargo build --release -p zerith-cli -p zerith-ui` na matriz
-`windows-latest`, `ubuntu-latest`, `macos-latest`, empacota com
-`SHA256SUMS.txt` e anexa as limitações conhecidas às notas.
+Cada arquivo traz também README, LICENSE, avisos de terceiros e estes docs. É
+um **arquivo de binários**: não há instalador, desinstalador, entrada de menu,
+assinatura nem notarização.
 
-**Não executado ainda.** Só o Windows foi compilado nesta máquina. A matriz do
-workflow é a intenção declarada, não um resultado.
+O workflow `.github/workflows/zerith-release.yml` roda, na matriz
+`windows-latest`, `ubuntu-latest`, `macos-latest`: `cargo test --workspace
+--exclude zerith-ui`, `cargo build --release -p zerith-cli -p zerith-ui`,
+empacota e calcula o SHA-256. Numa tag `zerith-v*`, um job final cria um
+**rascunho** de release no GitHub com os arquivos e as limitações conhecidas;
+uma execução manual só gera artefatos.
+
+**Não executado ainda.** O YAML foi validado com `yaml.safe_load`, nada além
+disso: o workflow nunca rodou no GitHub. Só o Windows foi compilado nesta
+máquina. A matriz é a intenção declarada, não um resultado. A UI não é testada
+no lane de release (compila Rune); só é construída.
 
 ## Instalação portátil (única forma suportada hoje)
 
@@ -82,7 +90,7 @@ e por clique; um turno em voo roda em thread própria e termina sozinho.
 
 ## O que falta para uma release de verdade
 
-1. Executar a matriz em CI e publicar os artefatos.
+1. Executar a matriz em CI uma vez (o workflow existe, nunca rodou).
 2. Assinatura de código (Windows Authenticode, notarização macOS).
 3. Instaladores com entrada de menu e desinstalador.
 4. Rodar a UI em Linux e macOS de verdade (só o build é verificado hoje).

@@ -1,101 +1,165 @@
-//! The visual vocabulary, taken from OpenHuman's own token sheet
-//! (`app/src/styles/tokens.css`, `.dark` block) instead of invented here: same
-//! surface ladder, same text ladder, same accent. Values are sRGB hex because
-//! Rune authors colour in OKLCH but accepts `#rrggbb` through `color::hex`.
+//! The visual vocabulary: a bluish-neutral ladder, a monochrome primary, blue
+//! only for selection, focus, links and the trajectory accent. Concepts and
+//! plain colour values follow the DeepSeek Harness design-platform sheet
+//! (neutral-bluish ladder, alpha hairlines, state colours); no brand asset is
+//! used. Values are `#rrggbb` plus an alpha, because Rune authors colour in
+//! OKLCH but accepts hex through `color::hex`.
 //!
-//! Nothing in this file draws; it only names colours, type sizes and the icons the shell needs, so the screens stay about behaviour.
+//! Nothing in this file draws; it only names colours, radii, motion curves,
+//! type sizes and the icons the shell needs, so screens stay about behaviour.
 
 use rune::color::hex;
-use rune::{Color, Icon, TextStyle};
+use rune::{Color, CubicBezier, Curve, Easing, Icon, TextStyle};
 
 #[derive(Clone, Copy)]
 pub struct Ui {
     /// Which ladder this is; the kit and the theme toggle read it.
     pub dark: bool,
-    /// `--surface-canvas`: the window behind everything.
+    /// The window behind everything.
     pub canvas: Color,
-    /// `--surface-chrome`: the frame the sidebar sits on.
+    /// The frame the sidebar sits on.
     pub chrome: Color,
-    /// `--surface`: the content sheet.
+    /// `bg-base`: the content sheet.
     pub surface: Color,
-    /// `--surface-muted`: inputs and bubbles.
+    /// `bg-layer-1`: inputs, bubbles, code.
     pub muted: Color,
-    /// `--surface-hover`.
+    /// `bg-layer-2`: raised rows and popups.
+    pub layer2: Color,
+    /// `bg-layer-3`: the highest fill.
+    pub layer3: Color,
+    /// The current navigation item or selected row.
+    pub selected: Color,
+    /// `interactive-bg-hover`: an alpha overlay, safe on any fill.
     pub hover: Color,
-    /// `--line`.
+    /// `interactive-bg-active`: the pressed overlay.
+    pub active: Color,
+    /// `border-l2`: the hairline most borders use.
     pub line: Color,
-    /// `--line-strong`.
+    /// `border-l3`: a hairline that must read (focused field, open card).
     pub line_strong: Color,
-    /// `--content`.
+    /// `label-primary`.
     pub content: Color,
-    /// `--content-secondary`.
+    /// `label-secondary`.
     pub secondary: Color,
-    /// `--content-muted`.
+    /// `label-tertiary`.
     pub muted_text: Color,
-    /// `--content-faint`.
+    /// `label-caption`: placeholders, counters.
     pub faint: Color,
-    /// `--primary-500`.
+    /// Primary button fill: near-black on light, near-white on dark.
     pub primary: Color,
-    /// `--primary-600`, for the pressed state.
+    /// Primary button hover and press.
     pub primary_press: Color,
-    /// `--content-inverted`: text and icons on an accent fill.
+    /// Ink on the primary fill.
     pub inverted: Color,
-    /// `--success-500`: a reachable provider. Status dots only, never fills.
+    /// Blue 500: selection, focus ring, trajectory accent.
+    pub accent: Color,
+    /// Links and accent text, legible on its ladder.
+    pub accent_text: Color,
+    /// Selection and current-step tint.
+    pub accent_soft: Color,
+    /// `state-success`. Marks only, never big fills.
     pub ok: Color,
-    /// `--warning-500`: checking, or answered with a complaint.
+    /// `state-warn`.
     pub warn: Color,
-    /// `--danger-500`: unreachable, failed, destructive.
+    /// `state-error`.
     pub danger: Color,
+    /// `state-done` (violet): a finished subagent or plan.
+    pub done: Color,
+    /// `state-idle`: nothing happening.
+    pub idle: Color,
+    pub warn_soft: Color,
+    pub danger_soft: Color,
+    /// Diff added and removed line fills, and the marks beside them.
+    pub diff_add: Color,
+    pub diff_del: Color,
+    pub diff_add_ink: Color,
+    pub diff_del_ink: Color,
 }
 
 fn c(s: &str) -> Color {
     hex(s).expect("a token in this file is not #rrggbb")
 }
 
+/// A hex colour with straight alpha: how hairlines and overlays are named.
+fn a(s: &str, alpha: f32) -> Color {
+    c(s).alpha(alpha)
+}
+
+/// Dark ladder: bluish-neutral 950 base, layers 875 / 850 / 800.
 pub fn dark() -> Ui {
     Ui {
         dark: true,
-        canvas: c("#000000"),
-        chrome: c("#0a0a0a"),
-        surface: c("#171717"),
-        muted: c("#262626"),
-        hover: c("#262626"),
-        line: c("#262626"),
-        line_strong: c("#404040"),
-        content: c("#f5f5f5"),
-        secondary: c("#d4d4d4"),
-        muted_text: c("#a3a3a3"),
-        faint: c("#737373"),
-        primary: c("#2f6ef4"),
-        primary_press: c("#2563eb"),
-        inverted: c("#ffffff"),
+        canvas: c("#1b1b1c"),
+        chrome: c("#1b1b1c"),
+        surface: c("#151517"),
+        muted: c("#232324"),
+        layer2: c("#2c2c2e"),
+        layer3: c("#353638"),
+        selected: c("#2c2c2e"),
+        hover: a("#ffffff", 0.07),
+        active: a("#ffffff", 0.12),
+        line: a("#ffffff", 0.10),
+        line_strong: a("#ffffff", 0.18),
+        content: c("#f1f3f5"),
+        secondary: c("#cfd3d6"),
+        muted_text: c("#adb2b8"),
+        faint: c("#81858c"),
+        primary: c("#f9fafb"),
+        primary_press: c("#ebeef2"),
+        inverted: c("#0f1115"),
+        accent: c("#3b82f6"),
+        accent_text: c("#60a5fa"),
+        accent_soft: a("#3b82f6", 0.18),
         ok: c("#22c55e"),
         warn: c("#f59e0b"),
-        danger: c("#ef4444"),
+        danger: c("#f25a5a"),
+        done: c("#a78bfa"),
+        idle: c("#545557"),
+        warn_soft: a("#f59e0b", 0.12),
+        danger_soft: a("#f25a5a", 0.12),
+        diff_add: c("#1f3124"),
+        diff_del: c("#3c1f1b"),
+        diff_add_ink: c("#41c977"),
+        diff_del_ink: c("#fa423e"),
     }
 }
 
-/// OpenHuman's `:root` (light) block, same roles as `dark()`.
+/// Light ladder: white base, layers `#f5f6f7` / `#f1f3f5` / `#ebeef2`.
 pub fn light() -> Ui {
     Ui {
         dark: false,
-        canvas: c("#f5f5f5"),
-        chrome: c("#d6d6d6"),
+        canvas: c("#f9fafb"),
+        chrome: c("#f9fafb"),
         surface: c("#ffffff"),
-        muted: c("#fafafa"),
-        hover: c("#f0f0f0"),
-        line: c("#e5e5e5"),
-        line_strong: c("#d4d4d4"),
-        content: c("#171717"),
-        secondary: c("#525252"),
-        muted_text: c("#737373"),
-        faint: c("#a3a3a3"),
-        primary: c("#2f6ef4"),
-        primary_press: c("#2563eb"),
+        muted: c("#f5f6f7"),
+        layer2: c("#f1f3f5"),
+        layer3: c("#ebeef2"),
+        selected: c("#ebeef2"),
+        hover: a("#263148", 0.06),
+        active: a("#263148", 0.10),
+        line: a("#000000", 0.08),
+        line_strong: a("#000000", 0.14),
+        content: c("#0f1115"),
+        secondary: c("#61666b"),
+        muted_text: c("#81858c"),
+        faint: c("#adb2b8"),
+        primary: c("#0f1115"),
+        primary_press: c("#43454a"),
         inverted: c("#ffffff"),
-        ok: c("#16a34a"),
-        warn: c("#d97706"),
-        danger: c("#dc2626"),
+        accent: c("#3b82f6"),
+        accent_text: c("#2563eb"),
+        accent_soft: a("#3b82f6", 0.12),
+        ok: c("#22c55e"),
+        warn: c("#f59e0b"),
+        danger: c("#ec1313"),
+        done: c("#7c3aed"),
+        idle: c("#d4d4d4"),
+        warn_soft: a("#f59e0b", 0.12),
+        danger_soft: a("#ec1313", 0.08),
+        diff_add: c("#e6f4e7"),
+        diff_del: c("#fce6e2"),
+        diff_add_ink: c("#01a241"),
+        diff_del_ink: c("#ba2723"),
     }
 }
 
@@ -107,9 +171,33 @@ pub fn pick(dark_mode: bool) -> Ui {
     }
 }
 
-/// The kit `Markdown` reads its colours from. Starts from Rune's neutral dark
-/// kit and overwrites only the roles Markdown paints (text, code surface,
-/// rules, links) with this file's tokens, so an answer matches the window.
+/// Radii of the design scale: 4 / 8 / 12 / 16 / 20 / 28. The scale is kept
+/// whole even where a step is unused today.
+#[allow(dead_code)]
+pub const R_XS: f32 = 4.0;
+pub const R_SM: f32 = 8.0;
+pub const R_MD: f32 = 12.0;
+pub const R_LG: f32 = 16.0;
+#[allow(dead_code)]
+pub const R_XL: f32 = 20.0;
+#[allow(dead_code)]
+pub const R_PANEL: f32 = 28.0;
+
+/// The one motion curve of the design: `cubic-bezier(0.4, 0, 0.2, 1)`.
+pub const EASE: Easing = Easing::CubicBezier(CubicBezier::new(0.4, 0.0, 0.2, 1.0));
+/// 100 ms: hover and press feedback.
+pub const FAST: Curve = Curve::tween(0.1, EASE);
+/// 200 ms: the default transition.
+#[allow(dead_code)]
+pub const BASE: Curve = Curve::tween(0.2, EASE);
+/// 300 ms: panels and disclosure.
+#[allow(dead_code)]
+pub const SLOW: Curve = Curve::tween(0.3, EASE);
+
+/// The kit `Markdown` and the kit's controls read their colours from. Starts
+/// from Rune's neutral kit and overwrites the roles they paint (text, code
+/// surface, rules, links, focus) with this file's tokens, so an answer and a
+/// popup match the window.
 pub fn kit(u: &Ui) -> rune_kit::Kit {
     let mut k = rune_kit::Kit::neutral(u.dark);
     let p = &mut k.c;
@@ -117,26 +205,27 @@ pub fn kit(u: &Ui) -> rune_kit::Kit {
     p.bg_base = u.surface;
     p.bg_deep = u.chrome;
     p.layer_01 = u.muted;
-    p.layer_02 = u.muted;
-    p.layer_03 = u.hover;
+    p.layer_02 = u.layer2;
+    p.layer_03 = u.layer3;
     p.text_base = u.content;
     p.text_strong = u.content;
     p.text_muted = u.muted_text;
     p.text_weak = u.muted_text;
     p.text_faint = u.faint;
-    p.text_accent = u.primary;
+    p.text_accent = u.accent_text;
     p.border_muted = u.line;
     p.border_weak = u.line;
     p.border_base = u.line_strong;
     p.border_strong = u.line_strong;
     // Switches, segment indicators and focus outlines take the window's one
     // accent instead of the kit's own blue.
-    p.bg_accent = u.primary;
+    p.bg_accent = u.accent;
     p.text_contrast = u.inverted;
-    p.border_focus = u.primary.alpha(0.6);
+    p.border_focus = u.accent.alpha(0.7);
     p.hover = u.hover;
+    p.pressed = u.active;
     // The off switch track: visible on white, quiet on the dark sheet.
-    p.layer_04 = u.line_strong;
+    p.layer_04 = u.layer3;
     k
 }
 
@@ -147,6 +236,8 @@ pub const BODY: TextStyle = TextStyle::new(13.5, 400.0).lh(20.0);
 pub const SMALL: TextStyle = TextStyle::new(12.0, 400.0).lh(17.0);
 /// Eyebrow labels and section headers.
 pub const LABEL: TextStyle = TextStyle::new(11.0, 500.0).lh(15.0);
+/// Code, paths and diffs.
+pub const MONO: TextStyle = TextStyle::new(12.0, 400.0).mono().lh(17.0);
 /// Panel and message headers.
 pub const TITLE: TextStyle = TextStyle::new(13.0, 600.0).lh(18.0);
 
@@ -285,3 +376,39 @@ glyph!(
     "shield",
     r#"<path d="M8 2.5l4.5 1.8v3.6c0 2.7-1.9 4.6-4.5 5.6-2.6-1-4.5-2.9-4.5-5.6V4.3z"/>"#
 );
+glyph!(
+    icon_terminal,
+    "terminal",
+    r#"<path d="M3 4.5l3.5 3.5L3 11.5M8 12h5"/>"#
+);
+glyph!(
+    icon_file,
+    "file",
+    r#"<path d="M4.5 2.75h4.25l3 3v7a.5.5 0 0 1-.5.5h-6.75a.5.5 0 0 1-.5-.5v-9.5a.5.5 0 0 1 .5-.5zM8.5 2.75v3.25h3.25"/>"#
+);
+glyph!(
+    icon_tool,
+    "tool",
+    r#"<path d="M9.5 3.25a3 3 0 0 0-3.2 4L3 10.55l2.45 2.45 3.3-3.3a3 3 0 0 0 4-3.2L11 8.25 8.75 6 10.5 4.25z"/>"#
+);
+glyph!(
+    icon_chevron_right,
+    "chevron-right",
+    r#"<path d="M6 3.75L10.25 8 6 12.25"/>"#
+);
+glyph!(
+    icon_chevron_down,
+    "chevron-down",
+    r#"<path d="M3.75 6L8 10.25 12.25 6"/>"#
+);
+glyph!(
+    icon_list,
+    "task-list",
+    r#"<path d="M6.5 4.5h6.5M6.5 8h6.5M6.5 11.5h6.5M3 4.5h.01M3 8h.01M3 11.5h.01"/>"#
+);
+glyph!(
+    icon_question,
+    "question",
+    r#"<circle cx="8" cy="8" r="5.5"/><path d="M6.5 6.5a1.6 1.6 0 1 1 2.3 1.45c-.5.3-.8.65-.8 1.3M8 11.25h.01"/>"#
+);
+glyph!(icon_cross, "cross", r#"<path d="M5 5l6 6M11 5l-6 6"/>"#);

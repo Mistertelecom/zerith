@@ -485,14 +485,18 @@ fn an_approval_event_reaches_the_runtime_channel() {
     assert_eq!(card.id, "7");
     shell.decide(Decision::Once);
     assert!(shell.chat.pending_approval.is_none());
-    // Tool rows land in the transcript as collapsible "tool" lines.
+    // Tool results land in the transcript as tool rows.
     shell.apply(zerith_runtime::RunEvent::ToolResult {
         id: "c1".into(),
         name: "read_file".into(),
         ok: true,
         output_preview: "fn main".into(),
     });
-    assert!(shell.chat.lines.iter().any(|l| l.role == "tool"));
+    assert!(shell
+        .chat
+        .lines
+        .iter()
+        .any(|l| matches!(&l.item, Some(zerith_ui::agentwork::Item::Tool(_)))));
 }
 
 #[test]

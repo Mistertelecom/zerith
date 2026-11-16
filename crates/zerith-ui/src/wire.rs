@@ -263,3 +263,85 @@ pub fn reveal(path: &Path) -> Result<(), String> {
         .map(|_| ())
         .map_err(|e| e.to_string())
 }
+
+// ------------------------------------------------------------ agent work
+
+/// Whether the store can rewind a turn: the checkpoints module exists in
+/// `zerith_sessions`, so the "Rebobinar" affordance is real, not a placeholder.
+pub fn checkpoints_supported() -> bool {
+    true
+}
+
+/// How many checkpoints the session has (what Rebobinar can reach).
+pub fn checkpoint_turns(db: &Path, session: &str) -> Vec<i64> {
+    let root = db.parent().unwrap_or(Path::new("."));
+    Store::open(db)
+        .ok()
+        .and_then(|st| zerith_sessions::checkpoints::list(&st, root, session).ok())
+        .map(|v| v.into_iter().map(|c| c.turn).collect())
+        .unwrap_or_default()
+}
+
+/// Restores the newest checkpoint: files and conversation. Returns a one-line
+/// report for the status text.
+pub fn rewind_latest(db: &Path, session: &str) -> Result<String, String> {
+    use zerith_sessions::checkpoints::{self, Mode};
+    let root = db.parent().unwrap_or(Path::new("."));
+    let st = Store::open(db).map_err(|e| e.to_string())?;
+    let turn = *checkpoint_turns(db, session)
+        .last()
+        .ok_or("nenhum ponto de restauração")?;
+    let r =
+        checkpoints::restore(&st, root, session, turn, Mode::Both).map_err(|e| e.to_string())?;
+    Ok(format!(
+        "Rebobinado: {} arquivo(s) restaurados, {} removidos, {} mensagem(ns) arquivadas",
+        r.files_restored, r.files_removed, r.messages_archived
+    ))
+}
+
+/// Hands the answers of an `ask_user` card to the runtime.
+///
+/// TODO(wire): ask_user. Expected: `zerith_runtime::QuestionSender::answer(id,
+/// Vec<Vec<String>>)`, created with the turn beside `approval_channel()`; an
+/// empty vector means the user declined.
+pub fn answer_question(
+    sender: Option<&zerith_runtime::QuestionSender>,
+    id: &str,
+    answers: &[Vec<String>],
+) {
+    let (Some(tx), Ok(id)) = (sender, id.parse::<u64>()) else {
+        return;
+    };
+    // The runtime takes one flat list: every pick of every question, in order.
+    tx.answer(id, answers.iter().flatten().cloned().collect());
+}
+
+/// Compacts the open conversation now, off the UI thread. Returns the number
+/// of messages summarized, or why nothing happened.
+pub fn compact_now(
+    db: &Path,
+    cfg: ProviderConfig,
+    session: &str,
+    model: &str,
+) -> Result<usize, String> {
+    let store = Store::open(db).map_err(|e| e.to_string())?;
+    let client = zerith_providers::Client::new(cfg).map_err(|e| e.to_string())?;
+    zerith_runtime::compact_now(
+        &store,
+        &client,
+        session,
+        model,
+        &zerith_providers::Cancel::default(),
+        None,
+    )
+    .map(|r| r.map_or(0, |r| r.summarized))
+    .map_err(|e| e.to_string())
+}
+
+/// Price of a model in USD per million tokens.
+///
+/// TODO(wire): pricing. Expected: `ProviderConfig::price(model) -> Option<(f64, f64)>`
+/// (input, output). Unknown prices return `None` and the UI shows no cost.
+pub fn model_price(_cfg: &ProviderConfig, _model: &str) -> Option<crate::agentwork::Price> {
+    None
+}

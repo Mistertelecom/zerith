@@ -9,6 +9,7 @@
 //! threads and come back through `AppHandle::update`, so nothing slow ever
 //! happens inside a frame.
 
+pub mod agentwork;
 pub mod screens;
 mod ui;
 mod widgets;
@@ -41,7 +42,7 @@ const SIDEBAR: f32 = 240.0;
 /// The sheet's inset from the window edge, OpenHuman's `m-2`.
 const INSET: f32 = 8.0;
 /// `rounded-2xl`.
-const SHEET_RADIUS: f32 = 16.0;
+const SHEET_RADIUS: f32 = ui::R_LG;
 /// Sessions read per page. The list is virtualized, so this bounds memory and
 /// query time, not what is drawn.
 pub const SESSION_PAGE: usize = 200;
@@ -493,9 +494,9 @@ fn nav_item(screen: Screen, current: Screen, u: &Ui) -> El {
         .gap(10.0)
         .center_y()
         .radius(8.0)
-        .fill(if on { u.muted } else { u.chrome })
+        .fill(if on { u.selected } else { u.chrome })
         .hover(u.hover)
-        .press(u.line_strong)
+        .press(u.active)
         .on_press(move |s: &mut Shell| s.navigate(screen))
         .child(icon(screen.icon(), 16.0).color(if on { u.content } else { u.muted_text }))
         .child(
@@ -597,7 +598,7 @@ fn session_list(s: &Shell, u: Ui) -> El {
                     .px(10.0)
                     .radius(8.0)
                     .center_y()
-                    .fill(if on { u.muted } else { u.chrome })
+                    .fill(if on { u.selected } else { u.chrome })
                     .hover(u.hover)
                     .on_press(move |s: &mut Shell| s.select_session(&id))
                     .child(
@@ -700,7 +701,7 @@ pub fn view(s: &Shell, cx: &mut Cx<Shell>) -> El {
     }
     let u = ui::pick(dark);
     cx.foreground(u.content);
-    cx.focus_ring(2.0, 2.0, u.primary.alpha(0.55));
+    cx.focus_ring(2.0, 2.0, u.accent.alpha(0.7));
 
     let mut layer = Vec::new();
     let body = match s.screen {
@@ -724,21 +725,27 @@ pub fn view(s: &Shell, cx: &mut Cx<Shell>) -> El {
         .border(1.0, u.line)
         .child(body);
 
-    let base = col().w_full().h_full().fill(u.canvas).child(
-        row()
-            .w_full()
-            .h_full()
-            .fill(u.chrome)
-            .child(sidebar(s, &u))
-            .child(
-                col()
-                    .grow(1.0)
-                    .min_w(0.0)
-                    .h_full()
-                    .padding(INSET)
-                    .child(sheet),
-            ),
-    );
+    // Hover and press fade on the design's one curve, 100 ms.
+    let base = col()
+        .w_full()
+        .h_full()
+        .fill(u.canvas)
+        .hover_motion_within(ui::FAST, ui::FAST)
+        .child(
+            row()
+                .w_full()
+                .h_full()
+                .fill(u.chrome)
+                .child(sidebar(s, &u))
+                .child(
+                    col()
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .h_full()
+                        .padding(INSET)
+                        .child(sheet),
+                ),
+        );
     rune_kit::root(base, layer)
 }
 

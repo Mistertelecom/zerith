@@ -1,21 +1,32 @@
-//! The conversation: transcript, approval card, composer.
+//! The conversation. `mod.rs` owns the state and the turn; the rest is split by
+//! what it draws: `events` adapts runtime events into state, `transcript`
+//! draws the messages and tool/subagent rows, `panels` the cards above the
+//! composer, `composer` the input row, popups and footer.
+
+mod actions;
+mod composer;
+pub mod events;
+mod panels;
+mod transcript;
 
 use std::collections::HashSet;
 
-use rune::{col, el, row, rule, text, text_input, El, GrowthSpec, ScrollSpec, TextEdit, Tx};
-use rune_kit::{Collapsible, Markdown, Placement, Select};
+use rune::{col, el, row, rule, text, El, TextEdit};
 use zerith_memory::{MemoryBackend, SqliteMemory};
 use zerith_providers::{Cancel, Client};
-use zerith_runtime::{
-    approval_channel, run_agent_turn, AgentOptions, ApprovalSender, RunEvent, TurnContext,
-};
-use zerith_security::Policy;
+use zerith_runtime::{approval_channel, run_agent_turn, AgentOptions, ApprovalSender, TurnContext};
+use zerith_security::{Mode, ModeHandle, Policy};
 use zerith_sessions::Store;
 use zerith_tools::Registry;
 
+use crate::agentwork::{self, ContextMeter, Item, PermissionMode, Price, QuestionState, TaskItem};
 use crate::ui::{self, Ui};
-use crate::widgets::{self, button, chip, dot, eyebrow, pill, Load, Tone};
+use crate::widgets::{chip, dot, pill, Load};
 use crate::{row_of, wire, Shell};
+
+pub use actions::*;
+pub use events::{answer_question, apply, apply_work, skip_question};
+pub use panels::approval_card;
 
 /// Messages read when a conversation opens. Older ones load on demand.
 pub const MESSAGE_PAGE: usize = 200;
@@ -25,6 +36,25 @@ pub const MESSAGE_PAGE: usize = 200;
 pub struct Line {
     pub role: &'static str,
     pub content: String,
+    /// A tool call, a subagent or a note; plain messages carry none.
+    pub item: Option<Item>,
+}
+
+impl Line {
+    pub fn new(role: &'static str, content: impl Into<String>) -> Self {
+        Self {
+            role,
+            content: content.into(),
+            item: None,
+        }
+    }
+    pub fn item(item: Item) -> Self {
+        Self {
+            role: "item",
+            content: String::new(),
+            item: Some(item),
+        }
+    }
 }
 
 /// A tool waiting for the user's permission.
@@ -70,21 +100,59 @@ pub struct ChatState {
     pub agent: Option<String>,
     pub agent_menu: bool,
     pub link: Link,
-    /// Transcript lines whose reasoning/tool section is expanded.
+    /// Transcript lines the user toggled open (or closed, for rows that open
+    /// by default, like a diff).
     pub open: HashSet<usize>,
     pub pending_approval: Option<Approval>,
     /// Tools the user allowed for the rest of this conversation.
     pub allowed: HashSet<String>,
     /// Decisions taken, newest last: what the runtime was told.
     pub decisions: Vec<(String, Decision)>,
-    /// `(prompt, completion)` tokens of the last turn, when the provider said.
+    /// `(prompt, completion)` tokens of the last model request, when the
+    /// provider said. The prompt side is what sits in the context window.
     pub usage: Option<(u64, u64)>,
     /// The running turn's approval channel. `None` between turns.
     pub approvals: Option<ApprovalSender>,
+    /// The running turn's `ask_user` channel. `None` between turns.
+    pub questions: Option<zerith_runtime::QuestionSender>,
+
+    // ---- agent work
+    /// The live checklist, replaced whole by each update.
+    pub tasks: Vec<TaskItem>,
+    pub tasks_open: bool,
+    /// The plan card's editor, while the plan is being edited.
+    pub plan_edit: Option<TextEdit>,
+    /// Plans the user approved with edits: `(approval id, edited text)`.
+    pub plan_edits: Vec<(String, String)>,
+    /// The open `ask_user` card.
+    pub question: Option<QuestionState>,
+    /// Answers handed to the runtime: `(question set id, answers)`.
+    pub answers: Vec<(String, Vec<Vec<String>>)>,
+    /// The live permission mode, shared with the policy of the running turn.
+    pub mode: ModeHandle,
+    pub mode_menu: bool,
+    /// Files of the working directory, for `@`.
+    pub files: Load<Vec<String>>,
+    /// Row highlighted in the `/` or `@` popup.
+    pub popup_active: usize,
+    /// The draft text Esc closed the popup for; typing reopens it.
+    pub popup_dismissed: Option<String>,
+    /// USD per million tokens of the active model, when known.
+    pub price: Option<Price>,
+    /// A compaction is running.
+    pub compacting: bool,
+    /// The runtime can rewind to a message's checkpoint.
+    pub rewind: bool,
 }
 
 impl ChatState {
     pub fn new(model: String) -> Self {
+        // The mode the policy would start in, so the chip is true before the
+        // first turn builds a policy of its own.
+        let start = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| Policy::from_env(cwd).ok())
+            .map_or(Mode::Default, |p| p.mode());
         Self {
             selected: None,
             lines: Vec::new(),
@@ -105,7 +173,47 @@ impl ChatState {
             decisions: Vec::new(),
             usage: None,
             approvals: None,
+            questions: None,
+            tasks: Vec::new(),
+            tasks_open: true,
+            plan_edit: None,
+            plan_edits: Vec::new(),
+            question: None,
+            answers: Vec::new(),
+            mode: ModeHandle::new(start),
+            mode_menu: false,
+            files: Load::Idle,
+            popup_active: 0,
+            popup_dismissed: None,
+            price: None,
+            compacting: false,
+            rewind: wire::checkpoints_supported(),
         }
+    }
+
+    /// The permission mode in force right now.
+    pub fn permission_mode(&self) -> PermissionMode {
+        PermissionMode::from_security(self.mode.get())
+    }
+
+    /// Tokens in the window against the active provider's limit.
+    pub fn meter(&self, limit: Option<u32>) -> Option<ContextMeter> {
+        let (p, q) = self.usage?;
+        Some(ContextMeter { used: p + q, limit })
+    }
+
+    /// Clears what belongs to one conversation.
+    fn forget_turn_state(&mut self) {
+        self.open.clear();
+        self.lines.clear();
+        self.more = false;
+        self.usage = None;
+        self.allowed.clear();
+        self.pending_approval = None;
+        self.tasks.clear();
+        self.plan_edit = None;
+        self.question = None;
+        self.compacting = false;
     }
 }
 
@@ -119,15 +227,9 @@ fn role_label(role: &str) -> &'static str {
 }
 
 pub fn load_selected(s: &mut Shell) {
-    let c = &mut s.chat;
-    c.lines.clear();
-    c.open.clear();
-    c.more = false;
-    c.usage = None;
-    c.allowed.clear();
-    c.pending_approval = None;
-    let Some(id) = c.selected.clone() else {
-        c.status.clear();
+    s.chat.forget_turn_state();
+    let Some(id) = s.chat.selected.clone() else {
+        s.chat.status.clear();
         return;
     };
     let db = s.db().to_path_buf();
@@ -144,10 +246,7 @@ pub fn load_selected(s: &mut Shell) {
             c.lines = msgs
                 .into_iter()
                 .filter(|m| !m.content.trim().is_empty())
-                .map(|m| Line {
-                    role: role_label(m.role.as_str()),
-                    content: m.content,
-                })
+                .map(|m| Line::new(role_label(m.role.as_str()), m.content))
                 .collect();
             c.status.clear();
         }
@@ -175,10 +274,7 @@ pub fn load_all(s: &mut Shell) {
                 s.chat.lines = msgs
                     .into_iter()
                     .filter(|m| !m.content.trim().is_empty())
-                    .map(|m| Line {
-                        role: role_label(m.role.as_str()),
-                        content: m.content,
-                    })
+                    .map(|m| Line::new(role_label(m.role.as_str()), m.content))
                     .collect();
             }
             Err(e) => s.chat.status = e,
@@ -188,92 +284,10 @@ pub fn load_all(s: &mut Shell) {
 
 pub fn new_chat(s: &mut Shell) {
     let c = &mut s.chat;
+    c.forget_turn_state();
     c.selected = None;
-    c.open.clear();
-    c.lines.clear();
-    c.more = false;
-    c.usage = None;
-    c.allowed.clear();
-    c.pending_approval = None;
     c.draft = TextEdit::new("");
     c.status.clear();
-}
-
-pub fn apply(s: &mut Shell, event: RunEvent) {
-    let c = &mut s.chat;
-    match event {
-        RunEvent::Delta(chunk) => {
-            if let Some(last) = c.lines.last_mut().filter(|l| l.role == "assistant") {
-                last.content.push_str(&chunk);
-            } else {
-                c.lines.push(Line {
-                    role: "assistant",
-                    content: chunk,
-                });
-            }
-        }
-        RunEvent::Reasoning(chunk) => {
-            if let Some(last) = c.lines.last_mut().filter(|l| l.role == "thinking") {
-                last.content.push_str(&chunk);
-            } else {
-                c.lines.push(Line {
-                    role: "thinking",
-                    content: chunk,
-                });
-            }
-        }
-        RunEvent::Done { .. } => {
-            c.busy = false;
-            c.cancel = None;
-            c.approvals = None;
-            c.status.clear();
-            c.lines.retain(|l| {
-                l.role != "thinking" && !(l.role == "assistant" && l.content.is_empty())
-            });
-            c.link = Link::Up;
-            s.refresh_sessions();
-        }
-        RunEvent::ToolCall { name, args, .. } => {
-            c.lines.push(Line {
-                role: "tool",
-                content: format!("{name} {args}"),
-            });
-        }
-        RunEvent::ToolResult {
-            name,
-            ok,
-            output_preview,
-            ..
-        } => {
-            let mark = if ok { "ok" } else { "erro" };
-            c.lines.push(Line {
-                role: "tool",
-                content: format!(
-                    "{name} → {mark}
-{output_preview}"
-                ),
-            });
-            // The next text delta starts a fresh answer below the tool rows.
-            c.lines.push(Line {
-                role: "assistant",
-                content: String::new(),
-            });
-        }
-        RunEvent::ApprovalNeeded { id, tool, summary } => {
-            request_approval(
-                s,
-                Approval {
-                    id: id.to_string(),
-                    title: format!("{tool} quer executar"),
-                    tool,
-                    summary,
-                },
-            );
-        }
-        RunEvent::Usage { input, output } => c.usage = Some((input, output)),
-        #[allow(unreachable_patterns)]
-        _ => {}
-    }
 }
 
 pub fn stop(s: &mut Shell) {
@@ -317,10 +331,7 @@ fn fail(s: &mut Shell, error: String) {
     c.approvals = None;
     c.pending_approval = None;
     c.status = error.clone();
-    c.lines.push(Line {
-        role: "error",
-        content: error,
-    });
+    c.lines.push(Line::new("error", error));
 }
 
 /// Fetches the model list once. The answer is cached for the window's life;
@@ -400,22 +411,19 @@ pub fn send(s: &mut Shell) {
     let model = s.chat.model.clone();
     let cfg = s.providers.active();
     let handle = s.me.clone();
+    let mode = s.chat.mode.clone();
     let cancel = Cancel::default();
     let (approvals_tx, gate) = approval_channel();
+    let (questions_tx, question_gate) = zerith_runtime::question_channel();
     let c = &mut s.chat;
     c.cancel = Some(cancel.clone());
     c.approvals = Some(approvals_tx);
+    c.questions = Some(questions_tx);
     c.draft = TextEdit::new("");
     c.busy = true;
     c.status.clear();
-    c.lines.push(Line {
-        role: "user",
-        content: prompt.clone(),
-    });
-    c.lines.push(Line {
-        role: "assistant",
-        content: String::new(),
-    });
+    c.lines.push(Line::new("user", prompt.clone()));
+    c.lines.push(Line::new("assistant", String::new()));
     let paused = s.memory.paused;
     // Resolved on the worker: reading agent files is disk I/O.
     let agent_name = s.chat.agent.clone();
@@ -444,8 +452,26 @@ pub fn send(s: &mut Shell) {
         // Tools act on the directory the window was started from; the policy
         // decides per call, and anything it marks "ask" comes back as a card.
         let workspace = std::env::current_dir().unwrap_or_else(|_| db.clone());
-        let policy = Policy::from_env(&workspace);
-        let tools = Registry::new();
+        let settings =
+            zerith_core::Settings::load(&zerith_core::Paths::with_root(&root), Some(&workspace))
+                .settings;
+        let mut policy = Policy::from_settings(&settings, &workspace)
+            .map(|p| p.with_handle(mode))
+            .ok();
+        let mut tools = Registry::new();
+        let paths = zerith_core::Paths::with_root(&root);
+        // MCP servers from settings and plugins become `mcp__server__tool`.
+        let mcp = zerith_mcp::McpRegistry::load(&paths, Some(&workspace));
+        let _ = mcp.register_into(&mut tools);
+        // Hooks and rules ride the pipeline; a failure to build them leaves
+        // the policy alone, which still gates every call.
+        let guards = policy
+            .as_mut()
+            .map(|p| zerith_runtime::guards::Guards::new(settings.clone(), p, session_id.clone()));
+        if let Some(g) = &guards {
+            tools.register(g.enter_plan_mode_tool());
+            tools.register(g.exit_plan_mode_tool());
+        }
         let skills = zerith_skills::Library::open(db.parent().unwrap_or(&db).join("skills")).ok();
         let agent = agent_name.and_then(|n| {
             zerith_core::agents::find(&zerith_core::Paths::with_root(&root), Some(&workspace), &n)
@@ -461,9 +487,15 @@ pub fn send(s: &mut Shell) {
                 agent: agent.as_ref(),
             },
             AgentOptions {
-                tools: policy.is_ok().then_some(&tools),
-                policy: policy.as_ref().ok(),
+                tools: policy.is_some().then_some(&tools),
+                policy: policy.as_ref(),
                 approvals: Some(&gate),
+                questions: Some(&question_gate),
+                middleware: guards
+                    .into_iter()
+                    .map(|g| Box::new(g) as Box<dyn zerith_runtime::Middleware + Send + Sync>)
+                    .collect(),
+                spill_dir: Some(root.join("spill")),
                 history,
                 ..AgentOptions::default()
             },
@@ -491,143 +523,12 @@ pub fn send(s: &mut Shell) {
     });
 }
 
-fn line_row(index: usize, line: &Line, u: &Ui, live: bool, open: bool) -> El {
-    match line.role {
-        "user" => row().w_full().justify_end().pb(18.0).child(
-            col()
-                .max_w(560.0)
-                .py(9.0)
-                .px(13.0)
-                .radius(14.0)
-                .fill(u.muted)
-                .child(
-                    text(line.content.clone())
-                        .wrap()
-                        .font(ui::BODY)
-                        .color(u.content)
-                        .selectable(true),
-                ),
-        ),
-        "thinking" | "tool" => {
-            let title = if line.role == "thinking" {
-                "Raciocínio"
-            } else {
-                "Ferramenta"
-            };
-            col().w_full().pb(18.0).child(
-                Collapsible::new(title, open)
-                    .ghost()
-                    .on_toggle(move |s: &mut Shell| s.toggle_open(index))
-                    .child(
-                        text(line.content.clone())
-                            .wrap()
-                            .font(ui::SMALL)
-                            .color(u.muted_text)
-                            .selectable(true),
-                    )
-                    .build(&ui::kit(u)),
-            )
-        }
-        "error" => col()
-            .w_full()
-            .pb(18.0)
-            .child(widgets::error_line(line.content.clone(), u)),
-        _ => {
-            let body = if line.content.is_empty() {
-                "…".to_string()
-            } else {
-                line.content.clone()
-            };
-            let answer = if line.role == "assistant" {
-                Markdown::new(body)
-                    .streaming(live)
-                    .selectable(true)
-                    .build(&ui::kit(u))
-            } else {
-                text(body)
-                    .wrap()
-                    .font(ui::BODY)
-                    .color(u.content)
-                    .selectable(true)
-            };
-            col()
-                .w_full()
-                .pb(18.0)
-                .gap(4.0)
-                .child(eyebrow(
-                    if line.role == "assistant" {
-                        "Zerith"
-                    } else {
-                        "Sistema"
-                    },
-                    u,
-                ))
-                .child(answer)
-        }
+/// Opens or closes the agent menu, reading the definitions the first time.
+pub fn toggle_agents(s: &mut Shell) {
+    s.chat.agent_menu = !s.chat.agent_menu;
+    if s.chat.agent_menu && s.agents.list.is_idle() {
+        s.load_agents();
     }
-}
-
-/// The permission card. It sits above the composer, so the decision is the
-/// next thing the eye meets, and holds the turn until answered.
-pub fn approval_card(a: &Approval, u: &Ui) -> El {
-    col()
-        .key("approval")
-        .role("alertdialog")
-        .label(format!("Permissão pedida: {}", a.title))
-        .w_full()
-        .padding(14.0)
-        .gap(10.0)
-        .radius(12.0)
-        .fill(u.muted)
-        .border(1.0, u.line_strong)
-        .child(
-            row()
-                .w_full()
-                .gap(8.0)
-                .center_y()
-                .child(rune::icon(ui::icon_shield(), 16.0).color(u.warn))
-                .child(
-                    text(a.title.clone())
-                        .font(ui::TITLE)
-                        .color(u.content)
-                        .grow(1.0)
-                        .min_w(0.0)
-                        .truncate(),
-                )
-                .child(pill(a.tool.clone(), u)),
-        )
-        .child(
-            text(a.summary.clone())
-                .wrap()
-                .font(ui::SMALL)
-                .color(u.secondary)
-                .selectable(true),
-        )
-        .child(
-            row()
-                .w_full()
-                .gap(8.0)
-                .child(button(
-                    "approve-once",
-                    "Permitir uma vez",
-                    Tone::Primary,
-                    true,
-                    u,
-                    |s, _| s.decide(Decision::Once),
-                ))
-                .child(button(
-                    "approve-session",
-                    "Permitir na sessão",
-                    Tone::Plain,
-                    true,
-                    u,
-                    |s, _| s.decide(Decision::Session),
-                ))
-                .child(el().grow(1.0))
-                .child(button("deny", "Negar", Tone::Danger, true, u, |s, _| {
-                    s.decide(Decision::Deny)
-                })),
-        )
 }
 
 pub const SUGGESTIONS: [&str; 3] = [
@@ -654,10 +555,10 @@ fn empty_state(u: &Ui) -> El {
         .w_full()
         .grow(1.0)
         .center()
-        .gap(6.0)
+        .gap(8.0)
         .child(
             text("Como posso ajudar?")
-                .font(ui::TITLE.lh(22.0))
+                .font(ui::TITLE.lh(24.0))
                 .color(u.content),
         )
         .child(
@@ -666,7 +567,7 @@ fn empty_state(u: &Ui) -> El {
                 .font(ui::SMALL)
                 .color(u.muted_text),
         )
-        .child(chips.mt(14.0))
+        .child(chips.mt(16.0))
 }
 
 fn header(s: &Shell, u: &Ui) -> El {
@@ -678,7 +579,7 @@ fn header(s: &Shell, u: &Ui) -> El {
         .map(|r| r.title.clone())
         .unwrap_or_else(|| "Nova conversa".to_string());
     let (color, word) = match &c.link {
-        Link::Unknown => (u.faint, "não verificado".to_string()),
+        Link::Unknown => (u.idle, "não verificado".to_string()),
         Link::Checking => (u.warn, "verificando".to_string()),
         Link::Up => (u.ok, "conectado".to_string()),
         Link::Down(e) => (u.danger, format!("sem conexão: {e}")),
@@ -714,200 +615,12 @@ fn header(s: &Shell, u: &Ui) -> El {
         })
 }
 
-fn model_select(s: &Shell, u: &Ui, layer: &mut Vec<El>) -> El {
-    let c = &s.chat;
-    let mut options: Vec<String> = match &c.models {
-        Load::Ready(m) => m.clone(),
-        _ => Vec::new(),
-    };
-    if !c.model.is_empty() && !options.contains(&c.model) {
-        options.insert(0, c.model.clone());
-    }
-    let placeholder = match &c.models {
-        Load::Loading => "carregando modelos…",
-        Load::Failed(_) => "modelos indisponíveis",
-        _ => "escolher modelo",
-    };
-    Select::new("model", &options)
-        .label("Modelo")
-        .placeholder(placeholder)
-        .current((!c.model.is_empty()).then_some(c.model.as_str()))
-        .open(c.model_menu && !options.is_empty())
-        .placement(Placement::TopStart)
-        .on_toggle(toggle_models)
-        .on_close(|s: &mut Shell| s.chat.model_menu = false)
-        .on_choose(|s: &mut Shell, v: &str, _: &mut Tx| {
-            s.chat.model = v.to_string();
-            s.chat.model_menu = false;
-        })
-        .build(&ui::kit(u), layer)
-}
-
-/// Opens or closes the agent menu, reading the definitions the first time.
-pub fn toggle_agents(s: &mut Shell) {
-    s.chat.agent_menu = !s.chat.agent_menu;
-    if s.chat.agent_menu && s.agents.list.is_idle() {
-        s.load_agents();
-    }
-}
-
-const DEFAULT_AGENT: &str = "Agente padrão";
-
-fn agent_select(s: &Shell, u: &Ui, layer: &mut Vec<El>) -> El {
-    let mut options = vec![DEFAULT_AGENT.to_string()];
-    if let Load::Ready(v) = &s.agents.list {
-        options.extend(v.iter().map(|a| a.name.clone()));
-    }
-    if let Some(a) = &s.chat.agent {
-        if !options.contains(a) {
-            options.push(a.clone());
-        }
-    }
-    Select::new("agent", &options)
-        .label("Agente")
-        .current(Some(s.chat.agent.as_deref().unwrap_or(DEFAULT_AGENT)))
-        .open(s.chat.agent_menu)
-        .placement(Placement::TopStart)
-        .on_toggle(toggle_agents)
-        .on_close(|s: &mut Shell| s.chat.agent_menu = false)
-        .on_choose(|s: &mut Shell, v: &str, _: &mut Tx| {
-            s.chat.agent = (v != DEFAULT_AGENT).then(|| v.to_string());
-            s.chat.agent_menu = false;
-        })
-        .build(&ui::kit(u), layer)
-}
-
-fn composer(s: &Shell, u: &Ui, layer: &mut Vec<El>) -> El {
-    let c = &s.chat;
-    let field = text_input(&c.draft, ui::BODY)
-        .key("draft")
-        .grow(1.0)
-        .min_w(0.0)
-        .color(u.content)
-        .label("Mensagem para o Zerith")
-        .placeholder("Pergunte algo…", u.faint)
-        .on_edit(|s: &mut Shell| &mut s.chat.draft)
-        .on_submit(|s: &mut Shell, _: &mut Tx| send(s))
-        // The editor would take Esc (blur) and Ctrl+digits; the window's
-        // shortcuts win while a turn runs or for navigation chords.
-        .on_input_key(|s: &mut Shell, ev: &rune::KeyEvent, tx: &mut Tx| {
-            let global = (ev.key == rune::Key::Escape
-                && (s.chat.cancel.is_some() || s.chat.model_menu || s.chat.agent_menu))
-                || "1234567nk".chars().any(|c| ev.is_command(c));
-            global && crate::on_key(s, ev, tx)
-        });
-    let action = if c.busy {
-        widgets::icon_button("stop", "Parar o turno (Esc)", ui::icon_stop(), u, |s| {
-            s.stop()
-        })
-    } else {
-        widgets::primary_icon("send", "Enviar a mensagem", ui::icon_send(), u, send)
-    };
-    let mut foot = row()
-        .w_full()
-        .h(24.0)
-        .gap(8.0)
-        .center_y()
-        .child(model_select(s, u, layer))
-        .child(agent_select(s, u, layer));
-    if let Load::Failed(e) = &c.models {
-        foot = foot.child(
-            text(e.clone())
-                .font(ui::LABEL)
-                .color(u.faint)
-                .truncate()
-                .shrink()
-                .min_w(0.0),
-        );
-    }
-    foot = foot.child(el().grow(1.0));
-    if let Some((p, q)) = c.usage {
-        foot = foot.child(
-            text(format!("{p} entrada · {q} saída tokens"))
-                .key("usage")
-                .font(ui::LABEL)
-                .color(u.faint),
-        );
-    }
-    if !c.status.is_empty() {
-        foot = foot.child(
-            text(c.status.clone())
-                .font(ui::LABEL)
-                .color(u.faint)
-                .truncate()
-                .shrink()
-                .min_w(0.0),
-        );
-    }
-    col()
-        .key("composer")
-        .w_full()
-        .gap(6.0)
-        .child(
-            row()
-                .w_full()
-                .min_h(44.0)
-                .pl(14.0)
-                .pr(8.0)
-                .py(8.0)
-                .gap(8.0)
-                .center_y()
-                .radius(12.0)
-                .fill(u.muted)
-                .border(
-                    1.0,
-                    if c.draft.focused {
-                        u.line_strong
-                    } else {
-                        u.line
-                    },
-                )
-                .child(field)
-                .child(action),
-        )
-        .child(foot.px(2.0))
-}
-
 pub fn view(s: &Shell, u: &Ui, layer: &mut Vec<El>) -> El {
     let c = &s.chat;
     let body = if c.lines.is_empty() {
         empty_state(u)
     } else {
-        // Virtualized: a long conversation mounts only the visible messages.
-        let n = c.lines.len();
-        let busy = c.busy;
-        let uu = *u;
-        let mut inner = col().w_full();
-        if c.more {
-            inner = inner.child(row().w_full().pb(16.0).justify_center().child(button(
-                "older",
-                "Carregar mensagens anteriores",
-                Tone::Plain,
-                true,
-                u,
-                |s, _| load_all(s),
-            )));
-        }
-        inner = inner.child(
-            col()
-                .key("transcript")
-                .w_full()
-                .growth(GrowthSpec::default())
-                .virtual_rows(
-                    n,
-                    80.0,
-                    |_: &Shell, i| format!("line-{i}").into(),
-                    move |s: &Shell, i| {
-                        let line = &s.chat.lines[i];
-                        let live = busy && i + 1 == s.chat.lines.len();
-                        line_row(i, line, &uu, live, s.chat.open.contains(&i))
-                    },
-                ),
-        );
-        inner
-            .scroll(ScrollSpec { stick_bottom: true })
-            .grow(1.0)
-            .min_h(0.0)
+        transcript::list(s, u)
     };
     let mut page = col()
         .w_full()
@@ -916,8 +629,20 @@ pub fn view(s: &Shell, u: &Ui, layer: &mut Vec<El>) -> El {
         .child(header(s, u))
         .child(rule(1.0, u.line).w_full())
         .child(body);
+    // One card at a time asks something of the user; the checklist is
+    // information and sits under it.
     if let Some(a) = &c.pending_approval {
-        page = page.child(approval_card(a, u));
+        page = page.child(if agentwork::is_plan(&a.tool, &a.title) {
+            panels::plan_card(s, a, u)
+        } else {
+            panels::approval_card(a, u)
+        });
     }
-    page.child(composer(s, u, layer))
+    if let Some(q) = &c.question {
+        page = page.child(panels::question_card(q, u));
+    }
+    if let Some(t) = panels::tasks(s, u) {
+        page = page.child(t);
+    }
+    page.child(composer::composer(s, u, layer))
 }

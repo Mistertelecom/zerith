@@ -2,7 +2,7 @@
 //! from `Ui` and announces a role and a label, so a screen built from these is
 //! keyboard- and screen-reader-usable without remembering to be.
 
-use rune::{col, el, icon, row, rule, text, text_input, El, Icon, TextEdit, Tx};
+use rune::{col, el, icon, row, rule, text, text_input, Color, El, Icon, TextEdit, Tx};
 use rune_kit::Spinner;
 
 use crate::ui::{self, Ui};
@@ -61,9 +61,9 @@ pub fn icon_button(
         .label(label.into())
         .focusable(true)
         .size(28.0, 28.0)
-        .radius(8.0)
+        .radius(ui::R_SM)
         .hover(u.hover)
-        .press(u.line_strong)
+        .press(u.active)
         .on_press(move |s: &mut Shell| f(s))
         .center()
         .child(icon(ic, 16.0).color(u.muted_text))
@@ -114,8 +114,8 @@ pub fn button(
     let label = label.into();
     let (fill, ink, hover) = match tone {
         Tone::Primary => (u.primary, u.inverted, u.primary_press),
-        Tone::Plain => (u.muted, u.secondary, u.hover),
-        Tone::Danger => (u.muted, u.danger, u.hover),
+        Tone::Plain => (Color::TRANSPARENT, u.secondary, u.hover),
+        Tone::Danger => (Color::TRANSPARENT, u.danger, u.hover),
     };
     let mut b = row()
         .key(key.into())
@@ -124,7 +124,7 @@ pub fn button(
         .h(28.0)
         .px(12.0)
         .center()
-        .radius(8.0)
+        .radius(ui::R_SM)
         .fill(fill)
         .child(text(label).font(ui::SMALL).color(ink));
     if tone != Tone::Primary {
@@ -133,7 +133,7 @@ pub fn button(
     if enabled {
         b.focusable(true)
             .hover(hover)
-            .press(u.line_strong)
+            .press(u.active)
             .on_press_tx(move |s: &mut Shell, tx: &mut Tx| f(s, tx))
     } else {
         b.disabled(true).focusable(false).opacity(0.5)
@@ -252,7 +252,7 @@ pub fn chip(
         .radius(15.0)
         .border(1.0, u.line)
         .hover(u.hover)
-        .press(u.line_strong)
+        .press(u.active)
         .on_press(move |s: &mut Shell| f(s))
         .child(text(label).font(ui::SMALL).color(u.secondary))
 }

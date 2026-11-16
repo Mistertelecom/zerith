@@ -1,0 +1,12 @@
+[package]
+name = "zerith-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+zerith-core = { path = "../zerith-core" }
+zerith-sessions = { path = "../zerith-sessions" }
+zerith-providers = { path = "../zerith-providers" }
+serde_json.workspace = true
+thiserror.workspace = true

@@ -12,7 +12,11 @@ de patch de terceiros.
 | `zerith-core` | Identidade, `Paths` (por SO), erros |
 | `zerith-sessions` | SQLite, migrações versionadas, sessões e mensagens |
 | `zerith-memory` | `MemoryBackend` + `SqliteMemory` (FTS5) |
+| `zerith-providers` | Endpoints OpenAI-compatible e Anthropic (9Router, Ollama, LM Studio) |
+| `zerith-runtime` | Um turno de agente: histórico → provider → mensagem gravada |
+| `zerith-importers` | Import read-only do Hermes (`~/.hermes/state.db`) |
 | `zerith-cli` | Binário `zerith` |
+| `zerith-ui` | Janela nativa em Rune (chat + lista de sessões) |
 
 Um banco só: `zerith-sessions` é dono do schema; `zerith-memory` usa o mesmo
 arquivo e as mesmas migrações.
@@ -50,7 +54,45 @@ zerith memory remember <scope> <text> [--inferred]
 zerith memory recall <scope> <query>
 zerith memory list <scope>
 zerith memory forget <id>
+zerith providers [probe|models|chat <model> <prompt>]
+zerith import detect
+zerith import hermes [--profile <name>]
+zerith chat [--session <id>] [--model <id>] <prompt>
 ```
+
+## Providers
+
+A escolha do endpoint vem do ambiente, um leitor só
+(`ProviderConfig::from_env`), usado pelo CLI e pela janela:
+
+| Variável | Efeito |
+| --- | --- |
+| `ZERITH_PROVIDER` | `9router` (padrão), `openai`, `anthropic`, `deepseek`, `gemini`, `openrouter`, `ollama`, `lmstudio`, `custom` |
+| `ZERITH_BASE_URL` | Sobrescreve a URL do endpoint |
+| `ZERITH_API_KEY` | Chave; exigida só no chat, não em `probe`/`models` |
+| `ZERITH_MODEL` | Modelo padrão do chat |
+
+`probe` e `models` funcionam sem chave de propósito: um servidor local
+(LM Studio, Ollama, 9Router) que lista modelos não deve ser escondido por falta
+de credencial que ele nem pede.
+
+## Janela
+
+```bash
+cargo run -p zerith-ui              # abre a janela
+cargo run -p zerith-ui -- --snap ui.png   # render headless, sem display
+cargo run -p zerith-ui -- --tree          # árvore de elementos, sem display
+```
+
+A janela desenha em Rune — sem webview, sem Chromium, sem JavaScript. O turno
+roda em thread de trabalho e volta por `AppHandle::update`, então um modelo
+lento nunca trava o frame.
+
+## Testes
+
+`cargo test --workspace --exclude zerith-ui` — a UI fica de fora do caminho
+padrão porque compila o Rune (wgpu, winit) e leva minutos; ela é verificada com
+`cargo build -p zerith-ui` e pelos modos headless acima.
 
 ## Nota de build no Windows
 

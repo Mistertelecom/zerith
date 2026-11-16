@@ -5,6 +5,10 @@ members = [
     "crates/zerith-sessions",
     "crates/zerith-memory",
     "crates/zerith-cli",
+    "crates/zerith-providers",
+    "crates/zerith-runtime",
+    "crates/zerith-importers",
+    "crates/zerith-ui",
 ]
 
 [workspace.package]
@@ -19,9 +23,21 @@ rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 anyhow = "1"
 thiserror = "2"
 tempfile = "3"
+ureq = { version = "2", features = ["json"] }
 
 # The pinned MSVC toolset on this machine rejects /Z7 for the bundled SQLite
 # build (cl.exe D8050). Debug info is not needed for the library/tests we ship,
 # so dev builds compile without it. Remove when the toolset is fixed.
 [profile.dev]
 debug = false
+
+# Rune's own vendored forks. A dependency's [patch] table does not apply to the
+# workspace that depends on it, so every app that builds Rune patches these too.
+# Copied verbatim from rune/vendor at rev bc05f817; refresh with
+# scripts/vendor-*.sh in the Rune checkout when bumping the revision.
+[patch.crates-io]
+parley_engine = { path = "vendor/parley_engine" }
+winit = { path = "vendor/winit" }
+wgpu-hal = { path = "vendor/wgpu-hal" }
+accesskit_windows = { path = "vendor/accesskit_windows" }
+accesskit_macos = { path = "vendor/accesskit_macos" }

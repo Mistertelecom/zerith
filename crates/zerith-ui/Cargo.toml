@@ -1,0 +1,19 @@
+[package]
+name = "zerith-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "zerith-ui"
+path = "src/main.rs"
+
+[dependencies]
+zerith-core = { path = "../zerith-core" }
+zerith-sessions = { path = "../zerith-sessions" }
+zerith-providers = { path = "../zerith-providers" }
+zerith-runtime = { path = "../zerith-runtime" }
+rune = { git = "https://github.com/anomalyco/rune", rev = "bc05f817ed19488a10a6f1a928cc0521c1c70c75" }
+
+[dev-dependencies]
+tempfile.workspace = true

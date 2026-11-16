@@ -21,3 +21,31 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// The system prompt for a native session.
+///
+/// Kept in core because the CLI, the Rune window and a future RPC host must
+/// send the same text: a prompt that differs per host makes the provider's
+/// prefix cache useless and the model's behavior unpredictable.
+///
+/// `title` is the session's name. It is the only per-session fact the prompt
+/// uses, and it is passed in rather than read from storage so this stays pure.
+pub fn system_prompt(title: &str) -> String {
+    format!(
+        "You are Zerith, a native desktop AI agent harness running on the user's \
+         own machine. Answer in the language the user writes in. Be direct and \
+         concrete; say what you do not know.\n\nConversation: {title}"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_prompt_names_the_session_and_the_product() {
+        let p = system_prompt("status do build");
+        assert!(p.contains("Zerith"));
+        assert!(p.contains("status do build"));
+    }
+}

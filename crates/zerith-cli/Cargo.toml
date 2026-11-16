@@ -12,4 +12,7 @@ path = "src/main.rs"
 zerith-core = { path = "../zerith-core" }
 zerith-sessions = { path = "../zerith-sessions" }
 zerith-memory = { path = "../zerith-memory" }
+zerith-providers = { path = "../zerith-providers" }
+zerith-importers = { path = "../zerith-importers" }
+zerith-runtime = { path = "../zerith-runtime" }
 serde_json.workspace = true

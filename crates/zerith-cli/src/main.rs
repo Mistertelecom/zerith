@@ -5,7 +5,10 @@
 
 use std::process::ExitCode;
 use zerith_core::Paths;
+use zerith_importers::{detect, import, ImportReport};
 use zerith_memory::{Confidence, FactKind, MemoryBackend, Scope, SqliteMemory};
+use zerith_providers::{ChatMessage, ChatRequest, Client, ProviderConfig};
+use zerith_runtime::{run_turn, RunEvent};
 use zerith_sessions::{SessionSource, Store};
 
 fn main() -> ExitCode {
@@ -32,7 +35,11 @@ usage:
   zerith memory remember <scope> <text> [--inferred]
   zerith memory recall <scope> <query>
   zerith memory list <scope>
-  zerith memory forget <id>"
+  zerith memory forget <id>
+  zerith providers [probe|models|chat <model> <prompt>]
+  zerith chat [--session <id>] [--model <id>] <prompt>
+  zerith import hermes [--profile <name>]
+  zerith import detect"
 }
 
 fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -108,6 +115,24 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 println!("\n[{}] {}", m.role.as_str(), m.content);
             }
         }
+        ("providers", _) => providers(args)?,
+        ("chat", _) => chat(&paths, args)?,
+        ("import", Some("hermes")) => import_hermes(&paths, args)?,
+        ("import", Some("detect")) => {
+            let found = detect();
+            if found.is_empty() {
+                println!("(no Hermes install found)");
+            }
+            for s in found {
+                println!(
+                    "{}  profile={}  tables: sessions={} messages={}",
+                    s.path.display(),
+                    s.profile,
+                    s.sessions_table,
+                    s.messages_table
+                );
+            }
+        }
         ("memory", Some(sub)) => memory(&paths, args, sub)?,
         _ => {
             println!("{}", usage());
@@ -164,6 +189,159 @@ fn memory(paths: &Paths, args: &[String], sub: &str) -> Result<(), Box<dyn std::
             println!("forgotten {id}");
         }
         _ => return Err(format!("unknown memory command: {sub}").into()),
+    }
+    Ok(())
+}
+
+/// One turn: resolve the session, stream the answer, persist it whole.
+///
+/// The turn runs on this thread. A CLI has nothing else to do while it waits,
+/// so the extra thread `run_turn_async` exists for the window, not here.
+fn chat(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    // `--flag value` pairs are consumed first, so a model id is never
+    // mistaken for the prompt. Everything left is user text, joined back.
+    let mut positionals: Vec<&str> = Vec::new();
+    let mut session_flag = None;
+    let mut model_flag = None;
+    let mut i = 1;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--session" || a == "--model" {
+            let value = args.get(i + 1).cloned();
+            if a == "--session" {
+                session_flag = value;
+            } else {
+                model_flag = value;
+            }
+            i += 2;
+            continue;
+        }
+        if a.starts_with("--") {
+            i += 1;
+            continue;
+        }
+        positionals.push(a);
+        i += 1;
+    }
+    if positionals.is_empty() {
+        return Err("chat needs a prompt".into());
+    }
+    let prompt = positionals.join(" ");
+
+    let cfg = ProviderConfig::from_env();
+    let model = model_flag
+        .or_else(|| cfg.default_model.clone())
+        .or_else(|| cfg.known_models.first().cloned())
+        .ok_or("no model: pass --model or set ZERITH_MODEL")?;
+    let client = Client::new(cfg)?;
+
+    paths.ensure()?;
+    let store = Store::open(paths.db())?;
+    let session_id = match session_flag {
+        Some(id) => id,
+        None => {
+            let title: String = prompt.chars().take(48).collect();
+            store.create_session(&title, SessionSource::Native)?.id
+        }
+    };
+
+    let mut streamed = false;
+    let report = run_turn(&store, &client, &session_id, &model, &prompt, |e| match e {
+        RunEvent::Delta(text) => {
+            streamed = true;
+            println!("{text}");
+        }
+        RunEvent::Reasoning(r) => eprintln!("[reasoning] {r}"),
+        RunEvent::Done { .. } => {}
+    })?;
+    if !streamed {
+        println!("{}", report.text);
+    }
+    eprintln!(
+        "\n[turn] {}  tokens {}→{}  msg {}",
+        report.session_id, report.prompt_tokens, report.completion_tokens, report.message_id
+    );
+    Ok(())
+}
+
+fn providers(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = ProviderConfig::from_env();
+    match args.get(1).map(String::as_str) {
+        None | Some("show") => println!("{}", cfg.redacted()),
+        Some("probe") => {
+            let client = Client::new(cfg)?;
+            let probe = client.probe();
+            println!(
+                "{}  http {}  {} ms  {} models",
+                if probe.ok { "ok" } else { "fail" },
+                probe.status,
+                probe.latency_ms,
+                probe.models.len()
+            );
+            if !probe.detail.is_empty() {
+                println!("{}", probe.detail);
+            }
+        }
+        Some("models") => {
+            let client = Client::new(cfg)?;
+            for id in client.models()? {
+                println!("{id}");
+            }
+        }
+        Some("chat") => {
+            let model = args
+                .get(2)
+                .cloned()
+                .or_else(|| cfg.default_model.clone())
+                .ok_or("providers chat needs a model (or ZERITH_MODEL)")?;
+            let prompt = args
+                .get(3)
+                .cloned()
+                .ok_or("providers chat needs a prompt")?;
+            let client = Client::new(cfg)?;
+            let req = ChatRequest::new(model, vec![ChatMessage::user(prompt)]);
+            let out = client.complete(&req, &Default::default())?;
+            if let Some(r) = out.reasoning {
+                eprintln!("[reasoning]\n{r}");
+            }
+            println!("{}", out.text);
+        }
+        Some(other) => return Err(format!("unknown providers command: {other}").into()),
+    }
+    Ok(())
+}
+
+fn import_hermes(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let profile = args
+        .iter()
+        .position(|a| a == "--profile")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+    let sources = detect();
+    let Some(first) = sources.first() else {
+        return Err("no Hermes database found (~/.hermes/state.db)".into());
+    };
+    let picked = match &profile {
+        Some(p) => sources
+            .iter()
+            .find(|s| &s.profile == p)
+            .ok_or_else(|| format!("no Hermes profile named {p}"))?,
+        None => first,
+    };
+    paths.ensure()?;
+    let store = Store::open(paths.db())?;
+    let report: ImportReport = import(&picked.path, &picked.profile, &store)?;
+    println!(
+        "sessions seen {}  imported {}  skipped {}  messages {}  skipped {}  failed {}",
+        report.sessions_seen,
+        report.sessions_imported,
+        report.sessions_skipped,
+        report.messages_imported,
+        report.messages_skipped,
+        report.failed.len()
+    );
+    for f in &report.failed {
+        eprintln!("failed: {f}");
     }
     Ok(())
 }

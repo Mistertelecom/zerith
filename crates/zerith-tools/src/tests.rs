@@ -209,7 +209,7 @@ fn plan_mode_denies_shell_and_writes() {
     let p = policy(dir.path(), Mode::Plan);
     let r = Registry::new();
     let (v, _) = r
-        .authorize("shell", &json!({"command": "ls"}), &ctx(&p))
+        .authorize("shell", &json!({"command": "rm -rf alvo"}), &ctx(&p))
         .unwrap();
     assert!(matches!(v, Verdict::Deny(_)));
 }
@@ -229,4 +229,74 @@ fn an_unknown_tool_names_itself_in_the_error() {
         .call("nope", &json!({}), &ctx(&p))
         .unwrap_err();
     assert!(err.to_string().contains("nope"));
+}
+
+#[test]
+fn only_read_only_tools_are_concurrency_safe() {
+    let r = Registry::new();
+    for name in ["read_file", "list_dir", "glob", "grep", "memory_recall"] {
+        assert!(r.concurrency_safe(name, &json!({})), "{name}");
+    }
+    for name in ["write_file", "edit_file", "shell", "nope"] {
+        assert!(!r.concurrency_safe(name, &json!({})), "{name}");
+    }
+    assert!(r.uses_memory("memory_recall") && !r.uses_memory("grep"));
+}
+
+#[test]
+fn grep_modes_case_and_head_limit() {
+    let dir = scratch();
+    std::fs::write(dir.path().join("a.txt"), "Foo\nfoo\nbar\n").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "FOO\n").unwrap();
+    let p = policy(dir.path(), Mode::Default);
+    let (r, c) = (Registry::new(), ctx(&p));
+    let g = |args: serde_json::Value| r.call("grep", &args, &c).unwrap();
+
+    assert_eq!(
+        g(json!({"query": "foo", "output_mode": "files"})),
+        "a.txt\nb.txt"
+    );
+    assert_eq!(
+        g(json!({"query": "foo", "output_mode": "count"})),
+        "a.txt:2\nb.txt:1"
+    );
+    // `-i: false` is case-sensitive.
+    assert_eq!(
+        g(json!({"query": "foo", "-i": false, "output_mode": "count"})),
+        "a.txt:1"
+    );
+    let limited = g(json!({"query": "foo", "head_limit": 2}));
+    assert_eq!(limited.lines().count(), 3, "{limited}");
+    assert!(limited.contains("[parado em 2 resultados]"));
+    assert!(r
+        .call("grep", &json!({"query": "x", "output_mode": "xml"}), &c)
+        .is_err());
+}
+
+/// A grandchild of the shell must die with it. The grandchild appends to a
+/// file; once the shell is killed the file must stop growing.
+#[test]
+fn shell_timeout_kills_the_whole_process_tree() {
+    let dir = scratch();
+    let p = policy(dir.path(), Mode::Bypass);
+    let cmd = if cfg!(windows) {
+        // cmd starts ping as a child: ping is the grandchild of the shell tool.
+        "ping -n 40 127.0.0.1 > grand.txt"
+    } else {
+        "sh -c 'while :; do echo x >> grand.txt; sleep 1; done'"
+    };
+    let err = Registry::new()
+        .call(
+            "shell",
+            &json!({"command": cmd, "timeout_secs": 2}),
+            &ctx(&p),
+        )
+        .unwrap_err();
+    assert!(matches!(err, ToolError::Timeout(_)), "{err}");
+    let size = || std::fs::metadata(dir.path().join("grand.txt")).map(|m| m.len());
+    std::thread::sleep(Duration::from_millis(500));
+    let first = size().unwrap();
+    assert!(first > 0, "the grandchild never ran");
+    std::thread::sleep(Duration::from_millis(2500));
+    assert_eq!(size().unwrap(), first, "grandchild survived the kill");
 }

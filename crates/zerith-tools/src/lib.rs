@@ -10,16 +10,30 @@
 //! the user (`Verdict::Ask`) calls `authorize`, asks, then `run_approved`;
 //! [`Registry::call`] is the non-interactive path and treats Ask as Deny.
 
+mod agent_tool;
+mod ask_user;
 mod builtin;
+mod fntool;
+mod host;
+mod jobs;
+mod skill_tool;
+mod tasks;
+mod web;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use zerith_providers::Cancel;
 use zerith_security::{Action, Policy, Verdict};
 
+pub use ask_user::{parse_questions, Question, QuestionOption};
 pub use builtin::shell_command;
+pub use host::{AgentRequest, EventSink, Host, HostEvent, Services, SkillLoad};
+pub use skill_tool::check as check_skill_args;
+pub use tasks::{check as check_task_args, STATUSES as TASK_STATUSES};
+pub use web::SearchTool;
 
 /// What a caller may be asked to allow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +121,8 @@ pub struct Exec<'a> {
     pub cancel: &'a Cancel,
     pub deadline: Instant,
     pub timeout: Duration,
+    /// Session state shared by the tools of one registry.
+    pub host: &'a Host,
 }
 
 impl Exec<'_> {
@@ -127,6 +143,20 @@ pub trait Tool: Send + Sync {
     fn spec(&self) -> &ToolSpec;
     fn action(&self, args: &Value, ctx: &CallCtx<'_>) -> Result<Option<Action>>;
     fn run(&self, args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String>;
+
+    /// May this call run beside other safe calls of the same model step?
+    /// Only for calls with no side effects and no shared mutable state: the
+    /// loop runs consecutive safe calls on threads, and an unsafe one is a
+    /// barrier. Default false, so a new tool is serial until it opts in.
+    fn concurrency_safe(&self, _args: &Value) -> bool {
+        false
+    }
+
+    /// Needs `CallCtx::memory`. The memory backend is not `Sync`, so the loop
+    /// runs such a call on its own thread, never on a worker.
+    fn uses_memory(&self) -> bool {
+        false
+    }
 }
 
 /// The cap on what one call hands back to the model. Bigger outputs keep the
@@ -134,7 +164,8 @@ pub trait Tool: Send + Sync {
 pub const OUTPUT_CAP_CHARS: usize = 30_000;
 
 pub struct Registry {
-    tools: Vec<Box<dyn Tool>>,
+    tools: Vec<Arc<dyn Tool>>,
+    host: Host,
 }
 
 impl Default for Registry {
@@ -147,19 +178,58 @@ impl Registry {
     /// The built-in set. Small on purpose: a tool that cannot be tested is a
     /// tool that cannot be trusted with a workspace.
     pub fn new() -> Self {
+        let mut tools: Vec<Arc<dyn Tool>> = builtin::all().into_iter().map(Arc::from).collect();
+        tools.extend(fntool::extra().into_iter().map(Arc::from));
         Self {
-            tools: builtin::all(),
+            tools,
+            host: Host::default(),
         }
     }
 
     pub fn empty() -> Self {
-        Self { tools: Vec::new() }
+        Self {
+            tools: Vec::new(),
+            host: Host::default(),
+        }
     }
 
     /// Adds a tool; a later tool with the same name replaces the earlier one.
     pub fn register(&mut self, tool: Box<dyn Tool>) {
         self.tools.retain(|t| t.spec().name != tool.spec().name);
-        self.tools.push(tool);
+        self.tools.push(Arc::from(tool));
+    }
+
+    /// Session state of this registry: bound by the runtime, read by tools.
+    pub fn host(&self) -> &Host {
+        &self.host
+    }
+
+    /// A registry with only the tools `keep` accepts, sharing their code but
+    /// not their state (own host, own background jobs, own read history). What
+    /// a subagent gets.
+    pub fn subset(&self, keep: impl Fn(&str) -> bool) -> Self {
+        Self {
+            tools: self
+                .tools
+                .iter()
+                .filter(|t| keep(&t.spec().name))
+                .cloned()
+                .collect(),
+            host: Host::default(),
+        }
+    }
+
+    /// Replaces `agent` with a variant whose calls never join a parallel
+    /// group. For a subagent that may spawn children: it already holds a
+    /// concurrency permit.
+    pub fn serialize_agents(&mut self) {
+        for t in agent_tool::all(false) {
+            // Only swap tools the registry already offers: a child without
+            // `agent` must not gain it here.
+            if self.get(&t.spec().name).is_some() {
+                self.register(t);
+            }
+        }
     }
 
     pub fn specs(&self) -> Vec<&ToolSpec> {
@@ -215,6 +285,21 @@ impl Registry {
         ctx: &CallCtx<'_>,
         cancel: &Cancel,
     ) -> Result<String> {
+        Ok(truncate(
+            self.run_raw(name, args, ctx, cancel)?,
+            OUTPUT_CAP_CHARS,
+        ))
+    }
+
+    /// Like [`Registry::run_approved`] but the output is returned whole, so
+    /// the caller can spill what does not fit instead of losing it.
+    pub fn run_raw(
+        &self,
+        name: &str,
+        args: &Value,
+        ctx: &CallCtx<'_>,
+        cancel: &Cancel,
+    ) -> Result<String> {
         let tool = self
             .find(name)
             .ok_or_else(|| ToolError::NotFound(name.into()))?;
@@ -223,9 +308,20 @@ impl Registry {
             cancel,
             deadline: Instant::now() + timeout,
             timeout,
+            host: &self.host,
         };
         exec.check()?;
-        Ok(truncate(tool.run(args, ctx, &exec)?, OUTPUT_CAP_CHARS))
+        tool.run(args, ctx, &exec)
+    }
+
+    /// Whether this exact call may run beside other safe calls. Unknown tool: no.
+    pub fn concurrency_safe(&self, name: &str, args: &Value) -> bool {
+        self.find(name).is_some_and(|t| t.concurrency_safe(args))
+    }
+
+    /// Whether the tool reads `CallCtx::memory` (see [`Tool::uses_memory`]).
+    pub fn uses_memory(&self, name: &str) -> bool {
+        self.find(name).is_some_and(|t| t.uses_memory())
     }
 
     /// The non-interactive path: Allow runs, Ask and Deny refuse.

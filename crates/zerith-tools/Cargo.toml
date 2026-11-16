@@ -12,6 +12,7 @@ zerith-providers = { path = "../zerith-providers" }
 serde_json.workspace = true
 thiserror.workspace = true
 walkdir = "2"
+ureq.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

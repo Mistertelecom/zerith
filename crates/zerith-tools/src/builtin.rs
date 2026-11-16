@@ -30,6 +30,16 @@ impl Tool for Builtin {
     fn run(&self, args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
         (self.run)(args, ctx, exec)
     }
+    // Read-only and stateless: safe to run side by side.
+    fn concurrency_safe(&self, _: &Value) -> bool {
+        matches!(
+            self.spec.name.as_str(),
+            "read_file" | "list_dir" | "glob" | "grep" | "memory_recall"
+        )
+    }
+    fn uses_memory(&self) -> bool {
+        self.spec.name == "memory_recall"
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -128,13 +138,16 @@ pub(crate) fn all() -> Vec<Box<dyn crate::Tool>> {
         ),
         tool(
             "grep",
-            "Procura texto (substring, sem diferenciar maiúsculas) em arquivos.",
+            "Procura texto (substring) em arquivos. Diferencia maiúsculas só com \"-i\": false.",
             json!({"type": "object", "properties": {
                 "query": {"type": "string"},
                 "path": {"type": "string", "description": "diretório ou arquivo (padrão: workspace)"},
-                "glob": {"type": "string", "description": "filtra arquivos, ex.: *.rs"}
+                "glob": {"type": "string", "description": "filtra arquivos, ex.: *.rs"},
+                "-i": {"type": "boolean", "description": "ignora maiúsculas (padrão true)"},
+                "output_mode": {"type": "string", "enum": ["content", "files", "count"], "description": "content (padrão): linhas; files: só caminhos; count: ocorrências por arquivo"},
+                "head_limit": {"type": "integer", "description": "máximo de resultados (padrão e teto 500)"}
             }, "required": ["query"]}),
-            "linhas \"caminho:N: texto\"",
+            "linhas \"caminho:N: texto\", ou caminhos, ou \"caminho:contagem\"",
             Permission::Read,
             30,
             dir_action,
@@ -145,7 +158,8 @@ pub(crate) fn all() -> Vec<Box<dyn crate::Tool>> {
             "Executa um comando no shell do sistema (cmd no Windows, sh nos demais) dentro do workspace.",
             json!({"type": "object", "properties": {
                 "command": {"type": "string"},
-                "timeout_secs": {"type": "integer", "description": "padrão 120, máximo 600"}
+                "timeout_secs": {"type": "integer", "description": "padrão 120, máximo 600"},
+                "run_in_background": {"type": "boolean", "description": "devolve um id na hora; leia com shell_output, encerre com shell_kill (até 4 jobs)"}
             }, "required": ["command"]}),
             "código de saída, stdout e stderr",
             Permission::Shell,
@@ -189,9 +203,10 @@ fn shell_action(args: &Value, _: &CallCtx<'_>) -> Result<Option<Action>> {
     Ok(Some(Action::Shell(str_arg(args, "command")?.to_string())))
 }
 
-fn read_file(args: &Value, ctx: &CallCtx<'_>, _: &Exec<'_>) -> Result<String> {
+fn read_file(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
     let path = ctx.resolve(str_arg(args, "path")?);
     let text = std::fs::read_to_string(&path)?;
+    exec.host.note_read(&path);
     let offset = args["offset"].as_u64().unwrap_or(1).max(1) as usize;
     let limit = args["limit"].as_u64().unwrap_or(2000) as usize;
     let total = text.lines().count();
@@ -214,13 +229,17 @@ fn read_file(args: &Value, ctx: &CallCtx<'_>, _: &Exec<'_>) -> Result<String> {
     Ok(out)
 }
 
-fn write_file(args: &Value, ctx: &CallCtx<'_>, _: &Exec<'_>) -> Result<String> {
+fn write_file(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
     let path = ctx.resolve(str_arg(args, "path")?);
     let content = str_arg(args, "content")?;
+    exec.host.check_editable(&path)?;
+    exec.host.before_write(&path)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(&path, content)?;
+    // The model knows what it just wrote; a follow-up edit needs no re-read.
+    exec.host.note_read(&path);
     Ok(format!(
         "{} bytes escritos em {}",
         content.len(),
@@ -228,8 +247,9 @@ fn write_file(args: &Value, ctx: &CallCtx<'_>, _: &Exec<'_>) -> Result<String> {
     ))
 }
 
-fn edit_file(args: &Value, ctx: &CallCtx<'_>, _: &Exec<'_>) -> Result<String> {
+fn edit_file(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
     let path = ctx.resolve(str_arg(args, "path")?);
+    exec.host.check_editable(&path)?;
     let old = str_arg(args, "old_string")?;
     let new = str_arg(args, "new_string")?;
     let all = args["replace_all"].as_bool().unwrap_or(false);
@@ -243,6 +263,9 @@ fn edit_file(args: &Value, ctx: &CallCtx<'_>, _: &Exec<'_>) -> Result<String> {
     }
     let text = std::fs::read_to_string(&path)?;
     let n = text.matches(old).count();
+    if n > 0 {
+        exec.host.before_write(&path)?;
+    }
     match (n, all) {
         (0, _) => Err(ToolError::Failed(format!(
             "old_string não encontrado em {}",
@@ -254,6 +277,7 @@ fn edit_file(args: &Value, ctx: &CallCtx<'_>, _: &Exec<'_>) -> Result<String> {
         ))),
         _ => {
             std::fs::write(&path, text.replace(old, new))?;
+            exec.host.note_read(&path);
             Ok(format!(
                 "{n} ocorrência(s) substituída(s) em {}",
                 path.display()
@@ -335,13 +359,30 @@ fn glob(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
 }
 
 fn grep(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
-    // ponytail: substring match only; `regex` is not in Cargo.lock. Add it if
-    // the model keeps asking for patterns.
-    let query = str_arg(args, "query")?.to_lowercase();
+    // ponytail: substring match only; `regex` is not in Cargo.lock, and a new
+    // dependency for this is not worth it yet. Swap the `contains` below for a
+    // compiled `Regex` (default-features = false) if the model needs patterns.
+    let insensitive = args["-i"].as_bool().unwrap_or(true);
+    let raw = str_arg(args, "query")?;
+    let query = if insensitive {
+        raw.to_lowercase()
+    } else {
+        raw.to_string()
+    };
+    let mode = args["output_mode"].as_str().unwrap_or("content");
+    if !matches!(mode, "content" | "files" | "count") {
+        return Err(ToolError::BadArguments(
+            "output_mode precisa ser content, files ou count".into(),
+        ));
+    }
+    let cap = args["head_limit"]
+        .as_u64()
+        .map_or(MAX_MATCHES, |n| (n as usize).clamp(1, MAX_MATCHES));
     let filter = args["glob"].as_str();
     let base = ctx.resolve(args["path"].as_str().unwrap_or("."));
     let mut out = Vec::new();
-    for item in walk(&base, exec) {
+    let mut truncated = false;
+    'files: for item in walk(&base, exec) {
         let (rel, entry) = item?;
         let name = entry.file_name().to_string_lossy();
         if let Some(f) = filter {
@@ -353,23 +394,47 @@ fn grep(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
         let Ok(text) = std::fs::read_to_string(entry.path()) else {
             continue;
         };
+        let shown = if base.is_file() {
+            name.to_string()
+        } else {
+            rel.clone()
+        };
+        let mut hits = 0;
         for (i, line) in text.lines().enumerate() {
-            if line.to_lowercase().contains(&query) {
-                let shown = if base.is_file() {
-                    name.to_string()
-                } else {
-                    rel.clone()
-                };
-                out.push(format!("{shown}:{}: {}", i + 1, line.trim()));
-                if out.len() >= MAX_MATCHES {
-                    out.push(format!("[parado em {MAX_MATCHES} resultados]"));
-                    return Ok(out.join("\n"));
-                }
+            let found = if insensitive {
+                line.to_lowercase().contains(&query)
+            } else {
+                line.contains(&query)
+            };
+            if !found {
+                continue;
             }
+            hits += 1;
+            if mode == "content" {
+                out.push(format!("{shown}:{}: {}", i + 1, line.trim()));
+                if out.len() >= cap {
+                    truncated = true;
+                    break 'files;
+                }
+            } else if mode == "files" {
+                break;
+            }
+        }
+        match mode {
+            "files" if hits > 0 => out.push(shown),
+            "count" if hits > 0 => out.push(format!("{shown}:{hits}")),
+            _ => {}
+        }
+        if mode != "content" && out.len() >= cap {
+            truncated = true;
+            break;
         }
     }
     if out.is_empty() {
         return Ok("nenhuma ocorrência".into());
+    }
+    if truncated {
+        out.push(format!("[parado em {cap} resultados]"));
     }
     Ok(out.join("\n"))
 }
@@ -389,16 +454,28 @@ pub fn shell_command(cmd: &str) -> Command {
 
 fn shell(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
     let cmd = str_arg(args, "command")?;
+    if args["run_in_background"].as_bool().unwrap_or(false) {
+        return crate::jobs::start(args, ctx.workspace, exec.host);
+    }
     let secs = args["timeout_secs"].as_u64().unwrap_or(120).clamp(1, 600);
     let deadline = exec
         .deadline
         .min(std::time::Instant::now() + Duration::from_secs(secs));
-    let mut child = shell_command(cmd)
+    let mut command = shell_command(cmd);
+    command
         .current_dir(ctx.workspace)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    // Own process group, so a timeout can kill the shell and everything it started.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    // The jail attaches the process to a Job Object on Windows (kill-on-close,
+    // process and memory caps) and wraps it in `sandbox-exec` on macOS. It
+    // fails closed: no jail, no process. What it does and does not confine is
+    // in `zerith policy` and `docs/sandbox.md`.
+    let mut jailed = zerith_security::jail::Jail::for_policy(ctx.policy).spawn(command)?;
+    let child = &mut jailed.child;
     // Pipes are drained on threads: a child that fills a pipe buffer would
     // otherwise block forever while we wait for it to exit.
     let drain = |r: Option<Box<dyn Read + Send>>| {
@@ -424,11 +501,7 @@ fn shell(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
             None
         };
         if let Some(e) = stop {
-            // ponytail: kills the direct child only; grandchildren spawned by
-            // `cmd`/`sh` may survive. Use a job object / process group if that
-            // ever bites.
-            let _ = child.kill();
-            let _ = child.wait();
+            jailed.kill_tree();
             return Err(e);
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -469,4 +542,33 @@ fn memory_recall(args: &Value, ctx: &CallCtx<'_>, _: &Exec<'_>) -> Result<String
         .map(|h| format!("[{}] {}", h.fact.confidence.as_str(), h.fact.text))
         .collect::<Vec<_>>()
         .join("\n"))
+}
+
+/// Kills the shell and every process it started.
+///
+/// Windows: `taskkill /T /F` walks the tree by parent pid. Unix: the child
+/// leads its own group (see `process_group` in `shell`), so `kill -KILL -pgid`
+/// reaches all of it.
+// ponytail: a grandchild that detached itself (setsid, `start`, double fork)
+// escapes both. A Windows job object / Linux cgroup would catch it; add if a
+// real tool leaks.
+pub(crate) fn kill_tree(child: &mut std::process::Child) {
+    let pid = child.id().to_string();
+    let mut killer = if cfg!(windows) {
+        let mut c = Command::new("taskkill");
+        c.args(["/T", "/F", "/PID", &pid]);
+        c
+    } else {
+        let mut c = Command::new("kill");
+        c.args(["-KILL", "--", &format!("-{pid}")]);
+        c
+    };
+    let _ = killer
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    // Covers a missing taskkill/kill binary, and reaps the zombie.
+    let _ = child.kill();
+    let _ = child.wait();
 }

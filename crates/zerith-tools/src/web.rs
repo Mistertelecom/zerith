@@ -6,8 +6,9 @@
 //! covers every redirect hop and a hostname that points at an internal address
 //! (DNS rebinding included), not just the URL the model wrote.
 //!
-//! `web_search` exists only when `ZERITH_SEARCH_URL` is set when the registry
-//! is built. It is not faked: no endpoint, no tool.
+//! `web_search` always exists: against `ZERITH_SEARCH_URL` (JSON) when that is
+//! set when the registry is built, else against DuckDuckGo's HTML page, parsed
+//! into title / url / snippet.
 
 use std::io::{self, Read};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
@@ -44,11 +45,12 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
         |a, _| Ok(Some(Action::Network(fetch_label(a)?))),
         fetch,
     )];
-    if let Ok(url) = std::env::var(SEARCH_ENV) {
-        if !url.trim().is_empty() {
-            v.push(Box::new(SearchTool::new(url)));
-        }
-    }
+    let url = std::env::var(SEARCH_ENV).unwrap_or_default();
+    v.push(Box::new(if url.trim().is_empty() {
+        SearchTool::duckduckgo()
+    } else {
+        SearchTool::new(url)
+    }));
     v
 }
 
@@ -117,6 +119,16 @@ impl ureq::Resolver for PublicOnly {
 /// token. The thread is bounded by the request timeout, so a cancelled call
 /// leaves nothing running for long.
 fn get(url: &str, private: bool, exec: &Exec<'_>) -> Result<(String, Vec<u8>)> {
+    request(url, None, private, exec)
+}
+
+/// GET, or a form POST when `form` is given.
+fn request(
+    url: &str,
+    form: Option<String>,
+    private: bool,
+    exec: &Exec<'_>,
+) -> Result<(String, Vec<u8>)> {
     let mut b = ureq::AgentBuilder::new()
         .timeout(TIMEOUT)
         .redirects(MAX_REDIRECTS)
@@ -129,7 +141,16 @@ fn get(url: &str, private: bool, exec: &Exec<'_>) -> Result<(String, Vec<u8>)> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let r = (|| -> std::result::Result<(String, Vec<u8>), String> {
-            let resp = agent.get(&url_owned).call().map_err(|e| match e {
+            let sent = match &form {
+                // DuckDuckGo answers a bare client with a bot check (HTTP 202).
+                Some(body) => agent
+                    .post(&url_owned)
+                    .set("User-Agent", BROWSER_UA)
+                    .set("Content-Type", "application/x-www-form-urlencoded")
+                    .send_string(body),
+                None => agent.get(&url_owned).call(),
+            };
+            let resp = sent.map_err(|e| match e {
                 ureq::Error::Status(code, _) => format!("HTTP {code}"),
                 other => other.to_string(),
             })?;
@@ -280,16 +301,29 @@ pub fn html_to_text(html: &str) -> String {
 
 // --- search -----------------------------------------------------------------
 
-/// `web_search` against a configured endpoint. The endpoint is a URL template:
-/// `{query}` is replaced with the percent-encoded query, or `?q=` is appended
-/// when there is no placeholder. The response must be JSON; it is returned as
-/// pretty JSON, capped at the tool-output limit by the registry.
+const DDG_URL: &str = "https://html.duckduckgo.com/html/";
+const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+const MAX_RESULTS: usize = 10;
+
+/// `web_search`. With a template (`ZERITH_SEARCH_URL`): `{query}` is replaced
+/// with the percent-encoded query, or `?q=` is appended when there is no
+/// placeholder; the response must be JSON and is returned pretty-printed.
+/// Without one: DuckDuckGo HTML, parsed by [`parse_ddg`].
 pub struct SearchTool {
     spec: ToolSpec,
+    /// Empty: DuckDuckGo.
     template: String,
 }
 
 impl SearchTool {
+    /// The default: DuckDuckGo, no account and no configuration.
+    pub fn duckduckgo() -> Self {
+        let mut t = Self::new("");
+        t.spec.description = "Pesquisa na web (DuckDuckGo) e devolve até 10 resultados com título, URL e trecho. Use para fatos recentes ou que você não sabe; depois leia a página com web_fetch e cite a URL.".into();
+        t.spec.returns = "resultados numerados: título, URL e trecho";
+        t
+    }
+
     pub fn new(template: impl Into<String>) -> Self {
         let spec = ToolSpec {
             name: "web_search".into(),
@@ -312,7 +346,9 @@ impl SearchTool {
 
     fn url(&self, query: &str) -> String {
         let q = encode(query);
-        if self.template.contains("{query}") {
+        if self.template.is_empty() {
+            format!("{DDG_URL}?q={q}")
+        } else if self.template.contains("{query}") {
             self.template.replace("{query}", &q)
         } else if self.template.contains('?') {
             format!("{}&q={q}", self.template)
@@ -344,7 +380,21 @@ impl Tool for SearchTool {
     }
 
     fn run(&self, args: &Value, _: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
-        let url = self.url(str_arg(args, "query")?);
+        let query = str_arg(args, "query")?;
+        if self.template.is_empty() {
+            let (_, body) = request(DDG_URL, Some(format!("q={}", encode(query))), false, exec)?;
+            let hits = parse_ddg(&String::from_utf8_lossy(&body));
+            if hits.is_empty() {
+                return Ok(format!("nenhum resultado para: {query}"));
+            }
+            return Ok(hits
+                .iter()
+                .enumerate()
+                .map(|(i, h)| format!("{}. {}\n   {}\n   {}", i + 1, h.title, h.url, h.snippet))
+                .collect::<Vec<_>>()
+                .join("\n"));
+        }
+        let url = self.url(query);
         check_url(&url)?;
         // The endpoint is the operator's own choice (often a local SearxNG),
         // so private addresses are allowed here, unlike `web_fetch`.
@@ -359,9 +409,113 @@ impl Tool for SearchTool {
     }
 }
 
+/// One search result.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Hit {
+    pub title: String,
+    pub url: String,
+    pub snippet: String,
+}
+
+/// The inner text of the first `<a ... class="<class>" ... href="..">..</a>`
+/// at or after `from`, with its href and where it ends.
+fn anchor(html: &str, from: usize, class: &str) -> Option<(String, String, usize)> {
+    let at = from + html[from..].find(&format!("class=\"{class}\""))?;
+    let open = html[..at].rfind("<a")?;
+    let gt = at + html[at..].find('>')?;
+    let href = html[open..gt]
+        .split("href=\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .unwrap_or("");
+    let close = gt + html[gt..].find("</a>")?;
+    // `<b>` marks the query words; dropped so it adds no spaces.
+    let inner = html[gt + 1..close].replace("<b>", "").replace("</b>", "");
+    Some((href.replace("&amp;", "&"), html_to_text(&inner), close))
+}
+
+/// The real target of a DuckDuckGo redirect (`//duckduckgo.com/l/?uddg=...`);
+/// any other link is returned as is.
+fn ddg_target(href: &str) -> String {
+    let Some(enc) = href.split("uddg=").nth(1) else {
+        return if href.starts_with("//") {
+            format!("https:{href}")
+        } else {
+            href.to_string()
+        };
+    };
+    let enc = enc.split('&').next().unwrap_or("");
+    let b = enc.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = (b[i] == b'%' && i + 2 < b.len())
+            .then(|| u8::from_str_radix(&enc[i + 1..i + 3], 16).ok())
+            .flatten();
+        match hex {
+            Some(v) => {
+                out.push(v);
+                i += 3;
+            }
+            None => {
+                out.push(if b[i] == b'+' { b' ' } else { b[i] });
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Results of a DuckDuckGo HTML page, ads skipped, at most [`MAX_RESULTS`].
+pub fn parse_ddg(html: &str) -> Vec<Hit> {
+    let mut hits = Vec::new();
+    let mut pos = 0;
+    while hits.len() < MAX_RESULTS {
+        let Some((href, title, end)) = anchor(html, pos, "result__a") else {
+            break;
+        };
+        // The snippet belongs to this result only if it comes before the next.
+        let next = html[end..]
+            .find("class=\"result__a\"")
+            .map_or(html.len(), |p| end + p);
+        let snippet = anchor(&html[..next], end, "result__snippet")
+            .map(|(_, s, _)| s)
+            .unwrap_or_default();
+        pos = end;
+        let url = ddg_target(&href);
+        if url.contains("duckduckgo.com/y.js") || !url.starts_with("http") {
+            continue; // an ad, or a link to DuckDuckGo itself
+        }
+        hits.push(Hit {
+            title,
+            url,
+            snippet,
+        });
+    }
+    hits
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duckduckgo_page_becomes_results() {
+        let hits = parse_ddg(include_str!("../tests/fixtures/ddg.html"));
+        assert_eq!(hits.len(), 3, "{hits:?}");
+        assert_eq!(hits[0].title, "Rust Versions | Rust Changelogs");
+        assert_eq!(hits[0].url, "https://releases.rs/");
+        assert!(hits[0]
+            .snippet
+            .starts_with("Rust Versions # Stable: 1.100.0"));
+        // A redirect link resolves to the page it points at; ads are dropped.
+        assert_eq!(
+            hits[1].url,
+            "https://blog.rust-lang.org/2026/11/12/Rust-1.100.0/?a=1&b=2"
+        );
+        assert_eq!(hits[2].title, "Install Rust - Rust Programming Language");
+        assert_eq!(hits[2].snippet, "");
+    }
 
     #[test]
     fn html_becomes_readable_text() {

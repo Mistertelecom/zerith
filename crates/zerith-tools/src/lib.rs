@@ -13,6 +13,7 @@
 mod agent_tool;
 mod ask_user;
 mod authoring;
+mod browser;
 mod builtin;
 mod fntool;
 mod host;

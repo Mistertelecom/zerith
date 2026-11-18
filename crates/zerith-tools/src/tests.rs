@@ -300,3 +300,35 @@ fn shell_timeout_kills_the_whole_process_tree() {
     std::thread::sleep(Duration::from_millis(2500));
     assert_eq!(size().unwrap(), first, "grandchild survived the kill");
 }
+
+#[test]
+fn memory_save_writes_once_and_respects_the_pause() {
+    use zerith_memory::{MemoryBackend, Scope, SqliteMemory};
+    let dir = scratch();
+    let p = policy(dir.path(), Mode::Default);
+    let mem = SqliteMemory::open(dir.path().join("m.db")).unwrap();
+    let scope = Scope::user("t");
+    let c = CallCtx {
+        memory: Some(&mem),
+        scope: Some(&scope),
+        ..ctx(&p)
+    };
+    let r = Registry::new();
+    let args = json!({"text": "O usuário prefere o editor Helix", "kind": "preference"});
+    // No approval needed, in the strictest asking mode.
+    let out = r.call("memory_save", &args, &c).unwrap();
+    assert!(out.starts_with("salvo"), "{out}");
+    let again = r.call("memory_save", &args, &c).unwrap();
+    assert!(again.starts_with("já estava"), "{again}");
+    let facts = mem.list(&scope, 10).unwrap();
+    assert_eq!(facts.len(), 1);
+    assert_eq!(facts[0].kind, zerith_memory::FactKind::Preference);
+    assert!(r.uses_memory("memory_save"));
+
+    let bad = r.call("memory_save", &json!({"text": "x", "kind": "segredo"}), &c);
+    assert!(bad.is_err());
+    mem.set_paused(true).unwrap();
+    let paused = r.call("memory_save", &json!({"text": "outro fato"}), &c);
+    assert!(matches!(paused, Err(ToolError::Denied(_))), "{paused:?}");
+    assert_eq!(mem.list(&scope, 10).unwrap().len(), 1);
+}

@@ -1,0 +1,941 @@
+//! `browser`: drives a real Chromium (Edge/Chrome) over the DevTools protocol.
+//!
+//! One browser per data folder, started on first use with its own profile
+//! (`<data>/browser-profile`) and left running: every call, and every process
+//! (each `zerith tools call` is one), reattaches through the
+//! `DevToolsActivePort` file Chromium writes in that profile. The protocol is
+//! spoken over a minimal WebSocket client on `std::net` (localhost only, no
+//! TLS), one request at a time under a global lock.
+
+use std::collections::hash_map::RandomState;
+use std::hash::BuildHasher;
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use serde_json::{json, Value};
+use zerith_core::Paths;
+use zerith_providers::media::{b64_decode, b64_encode};
+use zerith_security::Action;
+
+use crate::fntool::{make_with, opt_str, str_arg};
+use crate::{CallCtx, Exec, Permission, Result, Tool, ToolError};
+
+const LOAD_WAIT: Duration = Duration::from_secs(30);
+const TEXT_CAP: usize = 15_000;
+/// Socket poll interval: how often a blocked read looks at cancel/deadline.
+const POLL: Duration = Duration::from_millis(200);
+const MAX_MESSAGE: usize = 64 << 20;
+
+pub(crate) fn all() -> Vec<Box<dyn Tool>> {
+    vec![make_with(
+        "browser",
+        "Controla um navegador real (Edge/Chrome) pelo DevTools: abre páginas, lê o conteúdo, clica, digita, roda JavaScript e tira prints. \
+Fluxo: navigate {url} → snapshot (título, texto visível e lista numerada de elementos [n]) → click/type com ref=n → snapshot de novo para ver o resultado. \
+O navegador fica aberto entre chamadas, com perfil próprio do Zerith (logins feitos nele continuam valendo). \
+screenshot devolve uma linha Markdown ![screenshot](caminho) para mostrar ao usuário.",
+        json!({"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["navigate", "snapshot", "click", "type", "press", "eval", "screenshot", "back", "close"]},
+            "url": {"type": "string", "description": "navigate: endereço http(s)"},
+            "ref": {"type": "integer", "description": "click/type: número [n] do elemento no último snapshot"},
+            "selector": {"type": "string", "description": "click/type: seletor CSS, alternativa ao ref"},
+            "text": {"type": "string", "description": "type: texto a digitar (substitui o conteúdo do campo)"},
+            "submit": {"type": "boolean", "description": "type: aperta Enter depois de digitar"},
+            "key": {"type": "string", "description": "press: Enter, Tab, Escape, Backspace, Delete, ArrowUp/Down/Left/Right, PageUp, PageDown, Home, End, Space ou um caractere"},
+            "expression": {"type": "string", "description": "eval: expressão JavaScript; o valor volta como JSON (promises são aguardadas)"}
+        }, "required": ["action"]}),
+        "navigate/click/type/press/back: título e URL da página; snapshot: texto visível e elementos numerados; eval: o valor; screenshot: caminho do PNG e linha Markdown",
+        Permission::Network,
+        60,
+        false,
+        |a, _| Ok(Some(Action::Network(label(a)?))),
+        run,
+    )]
+}
+
+/// What the approval prompt shows: the action and what it targets.
+fn label(args: &Value) -> Result<String> {
+    let action = str_arg(args, "action")?;
+    let detail: String = match action {
+        "navigate" => str_arg(args, "url")?.into(),
+        "click" | "type" => opt_str(args, "selector")
+            .map(String::from)
+            .unwrap_or_else(|| format!("ref {}", args["ref"])),
+        "press" => str_arg(args, "key")?.into(),
+        "eval" => str_arg(args, "expression")?.chars().take(200).collect(),
+        "snapshot" | "screenshot" | "back" | "close" => String::new(),
+        other => return Err(bad_action(other)),
+    };
+    Ok(format!("navegador {action} {detail}")
+        .trim_end()
+        .to_string())
+}
+
+fn bad_action(a: &str) -> ToolError {
+    ToolError::BadArguments(format!(
+        "ação desconhecida: {a}; use navigate, snapshot, click, type, press, eval, screenshot, back ou close"
+    ))
+}
+
+static SESSION: Mutex<Option<Cdp>> = Mutex::new(None);
+
+fn run(args: &Value, _: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
+    let action = str_arg(args, "action")?;
+    let root = Paths::resolve().root;
+    let profile = root.join("browser-profile");
+    let mut slot = SESSION.lock().unwrap_or_else(|e| e.into_inner());
+    if action == "close" {
+        *slot = None;
+        return close(&profile, exec);
+    }
+    let c = attach(&mut slot, &profile, exec)?;
+    let r = act(c, action, args, &root, exec);
+    // A broken socket (or a frame cut by cancel/timeout) is not reusable.
+    if matches!(
+        r,
+        Err(ToolError::Io(_) | ToolError::Timeout(_) | ToolError::Cancelled)
+    ) {
+        *slot = None;
+    }
+    r
+}
+
+fn act(c: &mut Cdp, action: &str, args: &Value, root: &Path, exec: &Exec<'_>) -> Result<String> {
+    // Drop events left over from earlier calls (late loads, page timers).
+    c.wait(&[], Duration::ZERO, exec)?;
+    c.seen.clear();
+    match action {
+        "navigate" => {
+            let url = nav_url(str_arg(args, "url")?)?;
+            let r = c.call("Page.navigate", json!({ "url": url }), exec)?;
+            if let Some(e) = r["errorText"].as_str().filter(|e| !e.is_empty()) {
+                return Err(ToolError::Failed(format!("não abriu {url}: {e}")));
+            }
+            // No loaderId = same-document navigation: no load event comes.
+            let loaded =
+                r["loaderId"].is_null() || c.wait(&["Page.loadEventFired"], LOAD_WAIT, exec)?;
+            Ok(format!(
+                "{}{}\nUse snapshot para ler a página e ver os elementos.",
+                c.page(exec)?,
+                if loaded {
+                    ""
+                } else {
+                    "\n(ainda carregando após 30 s)"
+                }
+            ))
+        }
+        "snapshot" => {
+            let v = c.eval(SNAPSHOT_JS, exec)?["value"].take();
+            let full = v["text"].as_str().unwrap_or("");
+            let text: String = full.chars().take(TEXT_CAP).collect();
+            let items: Vec<&str> = v["items"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+            Ok(format!(
+                "Título: {}\nURL: {}\n\n--- Texto visível{} ---\n{text}\n\n--- Elementos interativos (use ref=N em click/type) ---\n{}",
+                v["title"].as_str().unwrap_or(""),
+                v["url"].as_str().unwrap_or(""),
+                if full.chars().count() > TEXT_CAP { " (cortado em 15 mil caracteres)" } else { "" },
+                if items.is_empty() { "(nenhum)".to_string() } else { items.join("\n") }
+            ))
+        }
+        "click" => {
+            let at = c.eval(
+                &format!(
+                    "(() => {{ const e = {}; if (!e) return null; e.scrollIntoView({{block: 'center', inline: 'center'}}); \
+                     const r = e.getBoundingClientRect(); \
+                     return {{x: r.left + r.width / 2, y: r.top + r.height / 2, \
+                     label: (e.getAttribute('aria-label') || e.innerText || e.value || e.tagName).trim().replace(/\\s+/g, ' ').slice(0, 80)}}; }})()",
+                    find(args)?
+                ),
+                exec,
+            )?["value"]
+                .take();
+            if at.is_null() {
+                return Err(not_found());
+            }
+            // Trusted mouse events at the element's centre, like a real click.
+            for t in ["mouseMoved", "mousePressed", "mouseReleased"] {
+                c.call(
+                    "Input.dispatchMouseEvent",
+                    json!({"type": t, "x": at["x"], "y": at["y"], "button": "left", "clickCount": 1}),
+                    exec,
+                )?;
+            }
+            c.settle(exec)?;
+            Ok(format!(
+                "Clicou em \"{}\".\n{}",
+                at["label"].as_str().unwrap_or(""),
+                c.page(exec)?
+            ))
+        }
+        "type" => {
+            let text = args["text"]
+                .as_str()
+                .ok_or_else(|| ToolError::BadArguments("text precisa ser uma string".into()))?;
+            let found = c.eval(
+                &format!(
+                    "(() => {{ const e = {}; if (!e) return false; e.focus(); if (typeof e.select === 'function') e.select(); return true; }})()",
+                    find(args)?
+                ),
+                exec,
+            )?;
+            if found["value"] != true {
+                return Err(not_found());
+            }
+            // insertText replaces the selection, so the field ends with `text`.
+            c.call("Input.insertText", json!({ "text": text }), exec)?;
+            let submit = args["submit"].as_bool().unwrap_or(false);
+            if submit {
+                press(c, "Enter", exec)?;
+                c.settle(exec)?;
+            }
+            Ok(format!(
+                "Digitou {} caracteres{}.\n{}",
+                text.chars().count(),
+                if submit { " e apertou Enter" } else { "" },
+                c.page(exec)?
+            ))
+        }
+        "press" => {
+            let key = str_arg(args, "key")?;
+            press(c, key, exec)?;
+            c.settle(exec)?;
+            Ok(format!("Apertou {key}.\n{}", c.page(exec)?))
+        }
+        "eval" => {
+            let r = c.eval(str_arg(args, "expression")?, exec)?;
+            Ok(match &r["value"] {
+                Value::String(s) => s.clone(),
+                Value::Null if r["type"] == "undefined" => "undefined".into(),
+                v => serde_json::to_string_pretty(v).unwrap_or_default(),
+            })
+        }
+        "screenshot" => {
+            c.call("Page.bringToFront", json!({}), exec)?;
+            let r = c.call("Page.captureScreenshot", json!({"format": "png"}), exec)?;
+            let png = r["data"]
+                .as_str()
+                .and_then(b64_decode)
+                .ok_or_else(|| ToolError::Failed("o navegador não devolveu a imagem".into()))?;
+            let dir = root.join("browser").join("shots");
+            std::fs::create_dir_all(&dir)?;
+            let ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis());
+            let path = dir.join(format!("{ms}.png"));
+            std::fs::write(&path, &png)?;
+            Ok(format!(
+                "Captura salva em {} ({} KB).\n{}\nCole a linha Markdown acima na resposta para o usuário ver a imagem.",
+                path.display(),
+                png.len().div_ceil(1024),
+                md_image(&path)
+            ))
+        }
+        "back" => {
+            c.eval("history.back()", exec)?;
+            c.settle(exec)?;
+            c.page(exec)
+        }
+        other => Err(bad_action(other)),
+    }
+}
+
+fn not_found() -> ToolError {
+    ToolError::BadArguments(
+        "elemento não encontrado; rode snapshot de novo (os números mudam quando a página muda)"
+            .into(),
+    )
+}
+
+/// JS expression for the element `ref` (from the last snapshot) or `selector`.
+fn find(args: &Value) -> Result<String> {
+    let r = &args["ref"];
+    let n = r.as_f64().map(|f| f as u64).or_else(|| {
+        r.as_str()?
+            .trim_matches(|c| c == '[' || c == ']')
+            .parse()
+            .ok()
+    });
+    match (n, opt_str(args, "selector")) {
+        (Some(n), _) => Ok(format!(
+            "document.querySelector('[data-zerith-ref=\"{n}\"]')"
+        )),
+        // A JSON string literal is a valid JS string literal.
+        (None, Some(s)) => Ok(format!("document.querySelector({})", Value::from(s))),
+        (None, None) => Err(ToolError::BadArguments(
+            "informe ref (número do snapshot) ou selector".into(),
+        )),
+    }
+}
+
+fn nav_url(u: &str) -> Result<String> {
+    let u = u.trim();
+    let lower = u.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") || lower == "about:blank" {
+        Ok(u.into())
+    } else if u.contains("://") {
+        Err(ToolError::BadArguments(
+            "só URLs http:// e https:// são aceitas".into(),
+        ))
+    } else {
+        Ok(format!("https://{u}"))
+    }
+}
+
+/// `![screenshot](path)`, same rule as `media::markdown_image`: `/` separators,
+/// `<...>` around a path with spaces or `)`.
+fn md_image(path: &Path) -> String {
+    let p = path.to_string_lossy().replace('\\', "/");
+    if p.contains(char::is_whitespace) || p.contains(')') {
+        format!("![screenshot](<{p}>)")
+    } else {
+        format!("![screenshot]({p})")
+    }
+}
+
+fn press(c: &mut Cdp, key: &str, exec: &Exec<'_>) -> Result<()> {
+    const NAMED: &[(&str, u32)] = &[
+        ("Enter", 13),
+        ("Tab", 9),
+        ("Escape", 27),
+        ("Backspace", 8),
+        ("Delete", 46),
+        ("ArrowLeft", 37),
+        ("ArrowUp", 38),
+        ("ArrowRight", 39),
+        ("ArrowDown", 40),
+        ("Home", 36),
+        ("End", 35),
+        ("PageUp", 33),
+        ("PageDown", 34),
+        ("Space", 32),
+    ];
+    let (key, code, vk, text) =
+        if let Some(&(name, vk)) = NAMED.iter().find(|(n, _)| n.eq_ignore_ascii_case(key)) {
+            match name {
+                "Enter" => (name, name, vk, "\r"),
+                "Space" => (" ", name, vk, " "),
+                _ => (name, name, vk, ""),
+            }
+        } else if let [ch] = key.chars().collect::<Vec<_>>()[..] {
+            let vk = if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_uppercase() as u32
+            } else {
+                0
+            };
+            (key, "", vk, key)
+        } else {
+            return Err(ToolError::BadArguments(format!(
+                "tecla desconhecida: {key}"
+            )));
+        };
+    let mut ev = json!({"type": if text.is_empty() { "rawKeyDown" } else { "keyDown" },
+        "key": key, "code": code, "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk});
+    if !text.is_empty() {
+        ev["text"] = text.into();
+    }
+    c.call("Input.dispatchKeyEvent", ev.clone(), exec)?;
+    ev["type"] = "keyUp".into();
+    if let Some(o) = ev.as_object_mut() {
+        o.remove("text");
+    }
+    c.call("Input.dispatchKeyEvent", ev, exec)?;
+    Ok(())
+}
+
+/// Visible text plus every visible interactive element, numbered through a
+/// `data-zerith-ref` attribute that `find` targets later.
+const SNAPSHOT_JS: &str = r#"(() => {
+  document.querySelectorAll('[data-zerith-ref]').forEach(e => e.removeAttribute('data-zerith-ref'));
+  const sel = 'a[href],button,input:not([type=hidden]),textarea,select,summary,[role=button],[role=link],[role=checkbox],[role=radio],[role=tab],[role=menuitem],[role=option],[role=switch],[contenteditable=""],[contenteditable=true]';
+  const items = [];
+  let n = 0;
+  for (const e of document.querySelectorAll(sel)) {
+    if (n >= 150) break;
+    const r = e.getBoundingClientRect(), s = getComputedStyle(e);
+    if (r.width === 0 || r.height === 0 || s.visibility === 'hidden' || s.display === 'none') continue;
+    n++;
+    e.setAttribute('data-zerith-ref', n);
+    const tag = e.tagName.toLowerCase();
+    const role = e.getAttribute('role') || (tag === 'input' ? 'input[' + (e.type || 'text') + ']' : tag);
+    const label = (e.getAttribute('aria-label') || e.innerText || (tag === 'input' && e.type !== 'password' ? e.value : '') || e.title || e.alt || '').trim().replace(/\s+/g, ' ').slice(0, 80);
+    let line = '[' + n + '] ' + role + ' "' + label + '"';
+    if (e.placeholder) line += ' placeholder="' + e.placeholder + '"';
+    if (tag === 'a') line += ' -> ' + e.href;
+    items.push(line);
+  }
+  const text = (document.body ? document.body.innerText : '').replace(/\n{3,}/g, '\n\n').trim();
+  return {title: document.title, url: location.href, text, items};
+})()"#;
+
+// --- browser process -----------------------------------------------------------
+
+fn browser_exe() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("ZERITH_BROWSER") {
+        return Some(p.into());
+    }
+    let candidates: &[&str] = if cfg!(windows) {
+        &[
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        ]
+    } else if cfg!(target_os = "macos") {
+        &[
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        ]
+    } else {
+        &[
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/microsoft-edge",
+            "/snap/bin/chromium",
+        ]
+    };
+    candidates.iter().map(PathBuf::from).find(|p| p.exists())
+}
+
+fn http(port: u16, method: &str, path: &str) -> io::Result<Value> {
+    ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .request(method, &format!("http://127.0.0.1:{port}{path}"))
+        .call()
+        .map_err(|e| io::Error::other(e.to_string()))?
+        .into_json()
+}
+
+fn file_port(profile: &Path) -> Option<u16> {
+    std::fs::read_to_string(profile.join("DevToolsActivePort"))
+        .ok()?
+        .lines()
+        .next()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// The port of a browser already serving this profile (the file outlives a
+/// crashed browser, so the port must also answer).
+fn live_port(profile: &Path) -> Option<u16> {
+    file_port(profile).filter(|p| http(*p, "GET", "/json/version").is_ok())
+}
+
+fn pages(port: u16) -> io::Result<Vec<String>> {
+    Ok(http(port, "GET", "/json/list")?
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|t| t["type"] == "page")
+        .filter_map(|t| t["id"].as_str().map(String::from))
+        .collect())
+}
+
+fn launch(profile: &Path, exec: &Exec<'_>) -> Result<u16> {
+    let exe = browser_exe().ok_or_else(|| {
+        ToolError::Failed(
+            "nenhum Edge/Chrome/Chromium encontrado; defina ZERITH_BROWSER com o caminho do executável"
+                .into(),
+        )
+    })?;
+    std::fs::create_dir_all(profile)?;
+    let _ = std::fs::remove_file(profile.join("DevToolsActivePort"));
+    let mut cmd = Command::new(&exe);
+    cmd.arg("--remote-debugging-port=0")
+        .arg(format!("--user-data-dir={}", profile.display()))
+        .args(["--no-first-run", "--no-default-browser-check"]);
+    if std::env::var("ZERITH_BROWSER_HEADLESS").is_ok_and(|v| v == "1") {
+        cmd.arg("--headless=new");
+    }
+    // ponytail: never killed here; it outlives this process so the next call
+    // (or the next app start) reattaches. `close` is what ends it.
+    cmd.arg("about:blank")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| ToolError::Failed(format!("não consegui abrir {}: {e}", exe.display())))?;
+    let until = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < until {
+        exec.check()?;
+        if let Some(p) = live_port(profile) {
+            return Ok(p);
+        }
+        std::thread::sleep(POLL);
+    }
+    Err(ToolError::Failed(
+        "o navegador abriu mas não expôs a porta DevTools em 20 s".into(),
+    ))
+}
+
+/// The session for the current page: reused while its tab exists, else a
+/// fresh connection to the first tab (launching the browser if none runs).
+fn attach<'a>(slot: &'a mut Option<Cdp>, profile: &Path, exec: &Exec<'_>) -> Result<&'a mut Cdp> {
+    let (port, list) = match file_port(profile).and_then(|p| pages(p).ok().map(|l| (p, l))) {
+        Some(x) => x,
+        None => {
+            let p = launch(profile, exec)?;
+            (p, pages(p).map_err(|e| fail(exec, e))?)
+        }
+    };
+    if slot
+        .as_ref()
+        .is_some_and(|c| c.port != port || !list.contains(&c.target))
+    {
+        *slot = None;
+    }
+    if slot.is_none() {
+        let target = match list.into_iter().next() {
+            Some(t) => t,
+            None => http(port, "PUT", "/json/new?about:blank").map_err(|e| fail(exec, e))?["id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        };
+        let ws =
+            Ws::connect(port, &format!("/devtools/page/{target}")).map_err(|e| fail(exec, e))?;
+        let mut c = Cdp {
+            ws,
+            port,
+            target,
+            frame: String::new(),
+            id: 0,
+            seen: Vec::new(),
+        };
+        c.call("Page.enable", json!({}), exec)?;
+        let tree = c.call("Page.getFrameTree", json!({}), exec)?;
+        c.frame = tree["frameTree"]["frame"]["id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        *slot = Some(c);
+    }
+    Ok(slot.as_mut().expect("session set above"))
+}
+
+fn close(profile: &Path, exec: &Exec<'_>) -> Result<String> {
+    let Some(port) = live_port(profile) else {
+        return Ok("O navegador não está aberto.".into());
+    };
+    let v = http(port, "GET", "/json/version").map_err(|e| fail(exec, e))?;
+    let path = v["webSocketDebuggerUrl"]
+        .as_str()
+        .and_then(|u| u.find("/devtools/").map(|i| u[i..].to_string()))
+        .ok_or_else(|| ToolError::Failed("o navegador não informou o endereço DevTools".into()))?;
+    let mut ws = Ws::connect(port, &path).map_err(|e| fail(exec, e))?;
+    ws.send(&json!({"id": 1, "method": "Browser.close"}).to_string())
+        .map_err(|e| fail(exec, e))?;
+    let until = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < until && live_port(profile).is_some() {
+        std::thread::sleep(POLL);
+    }
+    Ok("Navegador fechado.".into())
+}
+
+fn fail(exec: &Exec<'_>, e: io::Error) -> ToolError {
+    exec.check().err().unwrap_or(ToolError::Io(e))
+}
+
+// --- DevTools protocol -----------------------------------------------------------
+
+struct Cdp {
+    ws: Ws,
+    port: u16,
+    target: String,
+    /// Main frame id: events of other frames do not count as navigation.
+    frame: String,
+    id: u64,
+    /// Main-frame `Page.*` events since the action started.
+    seen: Vec<String>,
+}
+
+impl Cdp {
+    fn send(&mut self, method: &str, params: Value) -> io::Result<u64> {
+        self.id += 1;
+        self.ws
+            .send(&json!({"id": self.id, "method": method, "params": params}).to_string())?;
+        Ok(self.id)
+    }
+
+    fn recv(&mut self, exec: &Exec<'_>) -> io::Result<Value> {
+        let stop = || {
+            exec.check()
+                .map_err(|e| io::Error::new(io::ErrorKind::TimedOut, e.to_string()))
+        };
+        let text = read_message(
+            &mut Patient {
+                r: &mut self.ws.r,
+                stop,
+            },
+            &mut self.ws.w,
+        )?;
+        let v: Value = serde_json::from_str(&text)?;
+        if let Some(m) = v["method"].as_str() {
+            let p = &v["params"];
+            if p["frameId"]
+                .as_str()
+                .or(p["frame"]["id"].as_str())
+                .is_none_or(|f| f == self.frame)
+            {
+                self.seen.push(m.to_string());
+                if self.seen.len() > 64 {
+                    self.seen.remove(0);
+                }
+            }
+        }
+        Ok(v)
+    }
+
+    /// One request; events read while waiting go to `seen`.
+    fn call(&mut self, method: &str, params: Value, exec: &Exec<'_>) -> Result<Value> {
+        let id = self.send(method, params).map_err(|e| fail(exec, e))?;
+        loop {
+            let mut v = self.recv(exec).map_err(|e| fail(exec, e))?;
+            if v["id"].as_u64() == Some(id) {
+                if let Some(e) = v.get("error") {
+                    return Err(ToolError::Failed(format!(
+                        "{method}: {}",
+                        e["message"].as_str().unwrap_or("erro do navegador")
+                    )));
+                }
+                return Ok(v["result"].take());
+            }
+        }
+    }
+
+    /// `Runtime.evaluate` by value; a JS exception is an error. Returns the
+    /// `RemoteObject` (`value`, `type`).
+    fn eval(&mut self, expr: &str, exec: &Exec<'_>) -> Result<Value> {
+        let mut r = self.call(
+            "Runtime.evaluate",
+            json!({"expression": expr, "returnByValue": true, "awaitPromise": true}),
+            exec,
+        )?;
+        if let Some(d) = r.get("exceptionDetails") {
+            let msg = d["exception"]["description"]
+                .as_str()
+                .or(d["text"].as_str())
+                .unwrap_or("erro");
+            return Err(ToolError::Failed(format!("JavaScript: {msg}")));
+        }
+        Ok(r["result"].take())
+    }
+
+    fn page(&mut self, exec: &Exec<'_>) -> Result<String> {
+        let v = self.eval("[document.title, location.href]", exec)?;
+        Ok(format!(
+            "Página: {} — {}",
+            v["value"][0].as_str().unwrap_or(""),
+            v["value"][1].as_str().unwrap_or("")
+        ))
+    }
+
+    /// Waits up to `dur` for one of `events`. A frame is only started when
+    /// bytes are already waiting, so the local timeout never cuts one.
+    fn wait(&mut self, events: &[&str], dur: Duration, exec: &Exec<'_>) -> Result<bool> {
+        let until = Instant::now() + dur;
+        loop {
+            if self.seen.iter().any(|s| events.contains(&s.as_str())) {
+                return Ok(true);
+            }
+            let ready = self.ws.r.fill_buf().map(|b| !b.is_empty());
+            match ready {
+                Ok(true) => {
+                    self.recv(exec).map_err(|e| fail(exec, e))?;
+                }
+                Ok(false) => {
+                    return Err(fail(
+                        exec,
+                        io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "o navegador fechou a conexão",
+                        ),
+                    ))
+                }
+                Err(e) if is_timeout(&e) => {
+                    exec.check()?;
+                    if Instant::now() >= until {
+                        return Ok(false);
+                    }
+                }
+                Err(e) => return Err(fail(exec, e)),
+            }
+        }
+    }
+
+    /// After input that may navigate: waits briefly for a main-frame load to
+    /// start and, if one did, for it to finish.
+    // ponytail: frameStoppedLoading also ends the wait (bfcache restores
+    // fire no load event); a page that navigates after 1 s is not awaited.
+    fn settle(&mut self, exec: &Exec<'_>) -> Result<()> {
+        let started = ["Page.frameStartedLoading", "Page.frameNavigated"];
+        if self.wait(&started, Duration::from_secs(1), exec)? {
+            self.wait(
+                &["Page.loadEventFired", "Page.frameStoppedLoading"],
+                LOAD_WAIT,
+                exec,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+// --- WebSocket (RFC 6455, client side, no TLS) ---------------------------------
+
+struct Ws {
+    r: BufReader<TcpStream>,
+    w: TcpStream,
+}
+
+impl Ws {
+    fn connect(port: u16, path: &str) -> io::Result<Ws> {
+        let s = TcpStream::connect(("127.0.0.1", port))?;
+        s.set_read_timeout(Some(Duration::from_secs(5)))?;
+        s.set_write_timeout(Some(Duration::from_secs(10)))?;
+        let mut w = s.try_clone()?;
+        let key = b64_encode(&random::<16>());
+        // No Origin header: Chromium refuses DevTools sockets with an
+        // unlisted Origin, and accepts them without one.
+        write!(
+            w,
+            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+             Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        )?;
+        let mut r = BufReader::new(s);
+        let mut status = String::new();
+        r.read_line(&mut status)?;
+        if !status.contains(" 101") {
+            return Err(io::Error::other(format!(
+                "o DevTools recusou a conexão: {}",
+                status.trim()
+            )));
+        }
+        // ponytail: Sec-WebSocket-Accept is not checked (needs SHA-1, not in
+        // this crate); the peer is a localhost port read from the browser's
+        // own profile file.
+        loop {
+            let mut line = String::new();
+            if r.read_line(&mut line)? == 0 {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            if line.trim().is_empty() {
+                break;
+            }
+        }
+        r.get_ref().set_read_timeout(Some(POLL))?;
+        Ok(Ws { r, w })
+    }
+
+    fn send(&mut self, text: &str) -> io::Result<()> {
+        self.w
+            .write_all(&encode_frame(0x1, text.as_bytes(), Some(random())))
+    }
+}
+
+/// Non-cryptographic random bytes from std's randomly seeded hasher: enough
+/// for a handshake nonce and frame masks on localhost.
+fn random<const N: usize>() -> [u8; N] {
+    let mut out = [0u8; N];
+    for (i, c) in out.chunks_mut(8).enumerate() {
+        c.copy_from_slice(&RandomState::new().hash_one(i).to_le_bytes()[..c.len()]);
+    }
+    out
+}
+
+fn is_timeout(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    )
+}
+
+/// A reader that sits out the socket's poll timeout, asking `stop` each time
+/// (cancel / deadline), so a frame is never cut by the poll interval itself.
+struct Patient<'a, F: Fn() -> io::Result<()>> {
+    r: &'a mut BufReader<TcpStream>,
+    stop: F,
+}
+
+impl<F: Fn() -> io::Result<()>> Read for Patient<'_, F> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            match self.r.read(buf) {
+                Err(e) if is_timeout(&e) => (self.stop)()?,
+                r => return r,
+            }
+        }
+    }
+}
+
+/// One final frame; masked when `mask` is given (client to server).
+fn encode_frame(opcode: u8, payload: &[u8], mask: Option<[u8; 4]>) -> Vec<u8> {
+    let mut f = vec![0x80 | opcode];
+    let m = if mask.is_some() { 0x80 } else { 0 };
+    match payload.len() {
+        n if n < 126 => f.push(m | n as u8),
+        n if n <= 0xffff => {
+            f.push(m | 126);
+            f.extend_from_slice(&(n as u16).to_be_bytes());
+        }
+        n => {
+            f.push(m | 127);
+            f.extend_from_slice(&(n as u64).to_be_bytes());
+        }
+    }
+    match mask {
+        Some(k) => {
+            f.extend_from_slice(&k);
+            f.extend(payload.iter().enumerate().map(|(i, b)| b ^ k[i % 4]));
+        }
+        None => f.extend_from_slice(payload),
+    }
+    f
+}
+
+/// One frame as `(fin, opcode, payload)`, unmasked.
+fn read_frame(r: &mut impl Read) -> io::Result<(bool, u8, Vec<u8>)> {
+    let mut h = [0u8; 2];
+    r.read_exact(&mut h)?;
+    let len = match h[1] & 0x7f {
+        126 => {
+            let mut b = [0u8; 2];
+            r.read_exact(&mut b)?;
+            u64::from(u16::from_be_bytes(b))
+        }
+        127 => {
+            let mut b = [0u8; 8];
+            r.read_exact(&mut b)?;
+            u64::from_be_bytes(b)
+        }
+        n => u64::from(n),
+    };
+    if len > MAX_MESSAGE as u64 {
+        return Err(io::Error::other("mensagem do navegador grande demais"));
+    }
+    let mask = if h[1] & 0x80 != 0 {
+        let mut k = [0u8; 4];
+        r.read_exact(&mut k)?;
+        Some(k)
+    } else {
+        None
+    };
+    let mut p = vec![0u8; len as usize];
+    r.read_exact(&mut p)?;
+    if let Some(k) = mask {
+        for (i, b) in p.iter_mut().enumerate() {
+            *b ^= k[i % 4];
+        }
+    }
+    Ok((h[0] & 0x80 != 0, h[0] & 0x0f, p))
+}
+
+/// The next data message, reassembled from fragments; pings are answered on
+/// `w`, a close frame is an error.
+fn read_message(r: &mut impl Read, w: &mut impl Write) -> io::Result<String> {
+    let mut msg = Vec::new();
+    loop {
+        let (fin, op, p) = read_frame(r)?;
+        match op {
+            0x0..=0x2 => {
+                msg.extend_from_slice(&p);
+                if msg.len() > MAX_MESSAGE {
+                    return Err(io::Error::other("mensagem do navegador grande demais"));
+                }
+                if fin {
+                    return String::from_utf8(msg)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e));
+                }
+            }
+            0x8 => {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "o navegador fechou a conexão",
+                ))
+            }
+            0x9 => w.write_all(&encode_frame(0xA, &p, Some(random())))?,
+            _ => {} // pong
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frames_round_trip_every_length_encoding() {
+        for (n, marker) in [
+            (0, 0),
+            (125, 125),
+            (126, 126),
+            (65_535, 126),
+            (65_536, 127),
+            (70_000, 127),
+        ] {
+            let p: Vec<u8> = (0..n).map(|i| (i * 31 + 7) as u8).collect();
+            let f = encode_frame(0x1, &p, Some([9, 8, 7, 6]));
+            assert_eq!(f[0], 0x81, "fin + text");
+            assert_eq!(f[1], 0x80 | marker, "mask bit + length marker for {n}");
+            if n > 0 {
+                assert_ne!(&f[f.len() - n..], &p[..], "payload is masked");
+            }
+            let (fin, op, q) = read_frame(&mut &f[..]).unwrap();
+            assert!(fin);
+            assert_eq!(op, 0x1);
+            assert_eq!(q, p);
+        }
+    }
+
+    #[test]
+    fn a_message_is_reassembled_and_pings_are_answered() {
+        let mut first = encode_frame(0x1, b"{\"id\":", None);
+        first[0] &= 0x7f; // not final
+        let mut wire = first;
+        wire.extend(encode_frame(0x9, b"hi", None));
+        wire.extend(encode_frame(0x0, b"1}", None));
+        wire.extend(encode_frame(0x8, b"", None));
+        let mut r = &wire[..];
+        let mut out = Vec::new();
+        assert_eq!(read_message(&mut r, &mut out).unwrap(), "{\"id\":1}");
+        assert_eq!(out[0], 0x8A, "pong");
+        assert_ne!(out[1] & 0x80, 0, "client frames are masked");
+        assert_eq!(
+            read_frame(&mut &out[..]).unwrap(),
+            (true, 0xA, b"hi".to_vec())
+        );
+        let e = read_message(&mut r, &mut out).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::ConnectionAborted);
+    }
+
+    #[test]
+    fn targets_and_urls_are_checked() {
+        assert_eq!(
+            find(&json!({"ref": "[3]"})).unwrap(),
+            "document.querySelector('[data-zerith-ref=\"3\"]')"
+        );
+        assert_eq!(
+            find(&json!({"selector": "a[title=\"x\"]"})).unwrap(),
+            "document.querySelector(\"a[title=\\\"x\\\"]\")"
+        );
+        assert!(find(&json!({})).is_err());
+        assert_eq!(nav_url("example.com").unwrap(), "https://example.com");
+        assert!(nav_url("file:///etc/passwd").is_err());
+        assert!(label(&json!({"action": "explode"})).is_err());
+        assert_eq!(
+            label(&json!({"action": "navigate", "url": "https://a.b"})).unwrap(),
+            "navegador navigate https://a.b"
+        );
+    }
+}

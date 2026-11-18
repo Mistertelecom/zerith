@@ -453,12 +453,9 @@ fn web_fetch_caps_the_body_and_stops_on_cancel() {
 }
 
 #[test]
-fn web_search_exists_only_with_an_endpoint() {
-    // ZERITH_SEARCH_URL is read when the registry is built; this test never
-    // sets it, so the tool must be absent rather than faked.
-    if std::env::var("ZERITH_SEARCH_URL").is_err() {
-        assert!(Registry::new().get("web_search").is_none());
-    }
+fn web_search_exists_without_configuration() {
+    // No ZERITH_SEARCH_URL: DuckDuckGo. With it: the endpoint.
+    assert!(Registry::new().get("web_search").is_some());
     let mut r = Registry::empty();
     r.register(Box::new(zerith_tools::SearchTool::new(
         "http://127.0.0.1:1/s",

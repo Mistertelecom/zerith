@@ -38,7 +38,7 @@ impl Tool for Builtin {
         )
     }
     fn uses_memory(&self) -> bool {
-        self.spec.name == "memory_recall"
+        matches!(self.spec.name.as_str(), "memory_recall" | "memory_save")
     }
 }
 
@@ -176,6 +176,19 @@ pub(crate) fn all() -> Vec<Box<dyn crate::Tool>> {
             5,
             |_, _| Ok(None),
             memory_recall,
+        ),
+        tool(
+            "memory_save",
+            "Guarda na memória durável um fato, preferência ou instrução que o usuário disse ou confirmou e que vale para conversas futuras (ex.: editor favorito, idioma, estilo de resposta, nome do projeto, \"sempre rode os testes\"). Use por conta própria, sem pedir, assim que o usuário revelar algo assim. Uma frase curta e autossuficiente, na terceira pessoa (\"O usuário prefere respostas curtas\"). Não salve progresso de tarefa, resultados temporários nem segredos (senhas, chaves, tokens).",
+            json!({"type": "object", "properties": {
+                "text": {"type": "string", "description": "o fato, em uma frase autossuficiente"},
+                "kind": {"type": "string", "enum": ["instruction", "preference", "fact"], "description": "instruction: regra a seguir sempre; preference: gosto do usuário; fact: informação (padrão)"}
+            }, "required": ["text"]}),
+            "confirmação do que foi salvo, ou que já estava na memória",
+            Permission::Read,
+            5,
+            |_, _| Ok(None),
+            memory_save,
         ),
     ]
 }
@@ -563,6 +576,52 @@ fn memory_recall(args: &Value, ctx: &CallCtx<'_>, _: &Exec<'_>) -> Result<String
         .map(|h| format!("[{}] {}", h.fact.confidence.as_str(), h.fact.text))
         .collect::<Vec<_>>()
         .join("\n"))
+}
+
+fn memory_save(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
+    let text = str_arg(args, "text")?.trim();
+    if text.is_empty() {
+        return Err(ToolError::BadArguments("text está vazio".into()));
+    }
+    let kind = match args["kind"].as_str().unwrap_or("fact") {
+        k @ ("instruction" | "preference" | "fact") => zerith_memory::FactKind::parse(k),
+        other => {
+            return Err(ToolError::BadArguments(format!(
+                "kind precisa ser instruction, preference ou fact, não {other}"
+            )))
+        }
+    };
+    let (Some(mem), Some(scope)) = (ctx.memory, ctx.scope) else {
+        return Err(ToolError::Denied("memória desligada ou pausada".into()));
+    };
+    let session = exec.host.session();
+    // The same switch automatic extraction obeys: paused, or a private session.
+    if !mem
+        .is_extraction_allowed(session.as_deref().unwrap_or(""))
+        .unwrap_or(false)
+    {
+        return Err(ToolError::Denied(
+            "a memória está pausada para esta sessão".into(),
+        ));
+    }
+    let known = mem
+        .recall(scope, text, 20)
+        .map_err(|e| ToolError::Failed(e.to_string()))?;
+    if known
+        .iter()
+        .any(|h| h.fact.superseded_by.is_none() && h.fact.text.trim().eq_ignore_ascii_case(text))
+    {
+        return Ok(format!("já estava na memória: {text}"));
+    }
+    mem.remember(
+        scope,
+        kind,
+        text,
+        zerith_memory::Confidence::Confirmed,
+        session.as_deref(),
+    )
+    .map_err(|e| ToolError::Failed(e.to_string()))?;
+    Ok(format!("salvo na memória ({}): {text}", kind.as_str()))
 }
 
 /// Kills the shell and every process it started.

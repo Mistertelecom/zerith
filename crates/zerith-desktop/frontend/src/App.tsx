@@ -217,14 +217,23 @@ export default function App() {
         setSelected(id);
         setMessages([]);
       }
-      setMessages((prev) => [...prev, { kind: "user", text: prompt }]);
+      // The previous answer lives only in `turn` until the session is reloaded:
+      // keep it in the transcript before the new turn resets that state.
+      const done = turn.blocks.map((b) =>
+        b.kind === "assistant" ? { ...b, streaming: false } : b,
+      );
+      setMessages((prev) => [
+        ...prev,
+        ...done,
+        { kind: "user", text: prompt },
+      ]);
       setTurn({ ...emptyTurn, busy: true });
       await api.sendTurn({ sessionId: id, model, prompt, mode, history: 20 });
     } catch (e) {
       setError(String(e));
       setTurn((prev) => ({ ...prev, busy: false }));
     }
-  }, [draft, model, mode, selected]);
+  }, [draft, model, mode, selected, turn.blocks]);
 
   // A provider saved in Ajustes changes the models the composer can offer, so
   // the boot payload is re-read when the panel closes.

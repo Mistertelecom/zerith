@@ -9,13 +9,17 @@
 //! request header, never to a log or an error message.
 
 mod anthropic;
+mod codex;
 mod config;
+pub mod explain;
 pub mod gateway;
+pub mod media;
+pub mod oauth;
 mod openai;
 mod retry;
 pub mod stream;
 
-pub use config::{Protocol, ProviderConfig, ProviderKind};
+pub use config::{AuthMode, OAuthCredential, OAuthTool, Protocol, ProviderConfig, ProviderKind};
 pub use gateway::{
     infer_provider, is_failover_error, suggested_cooldown_ms, Gateway, GatewayOutcome, ModelSpec,
     RouteCandidate,

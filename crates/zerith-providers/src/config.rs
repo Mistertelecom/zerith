@@ -14,6 +14,9 @@ pub enum Protocol {
     OpenAi,
     /// `POST {base}/messages`, `x-api-key` + `anthropic-version`.
     Anthropic,
+    /// `POST {base}/responses`: the Responses API a Codex subscription answers
+    /// on. Flat `input`, typed SSE.
+    Responses,
 }
 
 impl Protocol {
@@ -21,7 +24,94 @@ impl Protocol {
         match self {
             Protocol::OpenAi => "openai",
             Protocol::Anthropic => "anthropic",
+            Protocol::Responses => "responses",
         }
+    }
+}
+
+/// How a request proves who it is. `ApiKey` is the historical path; `Oauth`
+/// swaps the credential header (and, for Anthropic, adds the beta header the
+/// subscription endpoint requires).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AuthMode {
+    #[default]
+    ApiKey,
+    Oauth,
+}
+
+impl AuthMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AuthMode::ApiKey => "api-key",
+            AuthMode::Oauth => "oauth",
+        }
+    }
+}
+
+/// Which CLI a credential belongs to. Endpoints and client ids live in
+/// `oauth::provider`, keyed by this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OAuthTool {
+    ClaudeCode,
+    Codex,
+    Antigravity,
+}
+
+impl OAuthTool {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "claude-code" | "claude" | "anthropic" => Some(Self::ClaudeCode),
+            "codex" | "openai" => Some(Self::Codex),
+            "antigravity" | "google" => Some(Self::Antigravity),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claude-code",
+            Self::Codex => "codex",
+            Self::Antigravity => "antigravity",
+        }
+    }
+}
+
+/// What the cofre stores. `Debug` is hand-written: a derived one would print the
+/// tokens into any `{:?}` of a config or an error.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OAuthCredential {
+    pub access_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
+    /// Unix seconds, from the server's `expires_in`.
+    pub expires_at: i64,
+    /// `chatgpt-account-id` (Codex) or the Google project (Antigravity).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    pub tool: OAuthTool,
+}
+
+impl std::fmt::Debug for OAuthCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuthCredential")
+            .field("access_token", &"***")
+            .field("refresh_token", &self.refresh_token.as_ref().map(|_| "***"))
+            .field("expires_at", &self.expires_at)
+            .field("account_id", &self.account_id)
+            .field("tool", &self.tool)
+            .finish()
+    }
+}
+
+impl OAuthCredential {
+    /// True when the token is worth sending. The skew keeps a token from
+    /// expiring mid-stream; it never loops, because `expires_in` below the skew
+    /// still yields exactly one refresh per call.
+    pub fn needs_refresh(&self, now: i64) -> bool {
+        const SKEW: i64 = 300;
+        self.expires_at - now < SKEW
     }
 }
 
@@ -37,6 +127,8 @@ pub enum ProviderKind {
     OpenRouter,
     Ollama,
     LmStudio,
+    /// A Codex subscription: OAuth only, own base URL and protocol.
+    Codex,
     Custom,
 }
 
@@ -49,6 +141,7 @@ impl ProviderKind {
         ProviderKind::OpenRouter,
         ProviderKind::Ollama,
         ProviderKind::LmStudio,
+        ProviderKind::Codex,
     ];
 
     pub fn all_presets() -> &'static [ProviderKind] {
@@ -64,6 +157,7 @@ impl ProviderKind {
             "openrouter" => Self::OpenRouter,
             "ollama" => Self::Ollama,
             "lmstudio" | "lm-studio" => Self::LmStudio,
+            "codex" => Self::Codex,
             _ => Self::Custom,
         }
     }
@@ -77,6 +171,7 @@ impl ProviderKind {
             ProviderKind::OpenRouter => "https://openrouter.ai/api/v1",
             ProviderKind::Ollama => "http://localhost:11434/v1",
             ProviderKind::LmStudio => "http://localhost:1234/v1",
+            ProviderKind::Codex => "https://chatgpt.com/backend-api/codex",
             ProviderKind::Custom => "",
         }
     }
@@ -84,6 +179,7 @@ impl ProviderKind {
     pub fn default_protocol(self) -> Protocol {
         match self {
             ProviderKind::Anthropic => Protocol::Anthropic,
+            ProviderKind::Codex => Protocol::Responses,
             _ => Protocol::OpenAi,
         }
     }
@@ -103,6 +199,7 @@ impl ProviderKind {
             ProviderKind::OpenRouter => "openrouter",
             ProviderKind::Ollama => "ollama",
             ProviderKind::LmStudio => "lmstudio",
+            ProviderKind::Codex => "codex",
             ProviderKind::Custom => "custom",
         }
     }
@@ -117,6 +214,13 @@ pub struct ProviderConfig {
     /// Never logged, never serialized into an error, never printed by `show`.
     #[serde(skip_serializing)]
     pub api_key: Option<String>,
+    /// `ApiKey` (default) or `Oauth`. With `Oauth`, `api_key` stays empty and
+    /// `oauth` carries the credential.
+    #[serde(default)]
+    pub auth: AuthMode,
+    /// Never serialized: a `Debug` of the config must not print tokens.
+    #[serde(skip_serializing)]
+    pub oauth: Option<OAuthCredential>,
     pub default_model: Option<String>,
     pub known_models: Vec<String>,
     pub context_limit: Option<u32>,
@@ -133,6 +237,8 @@ impl Default for ProviderConfig {
             protocol: Protocol::OpenAi,
             base_url: ProviderKind::OpenAi.default_base_url().into(),
             api_key: None,
+            auth: AuthMode::ApiKey,
+            oauth: None,
             default_model: None,
             known_models: Vec::new(),
             context_limit: None,
@@ -254,10 +360,11 @@ mod tests {
         assert_eq!(ProviderKind::parse("ollama"), ProviderKind::Ollama);
         assert_eq!(ProviderKind::parse("lmstudio"), ProviderKind::LmStudio);
         assert_eq!(ProviderKind::parse("lm-studio"), ProviderKind::LmStudio);
+        assert_eq!(ProviderKind::parse("codex"), ProviderKind::Codex);
         assert_eq!(ProviderKind::parse("my-proxy"), ProviderKind::Custom);
 
         assert_eq!(ProviderKind::PRESETS, ProviderKind::all_presets());
-        assert_eq!(ProviderKind::PRESETS.len(), 7);
+        assert_eq!(ProviderKind::PRESETS.len(), 8);
         assert!(!ProviderKind::PRESETS.contains(&ProviderKind::Custom));
     }
 

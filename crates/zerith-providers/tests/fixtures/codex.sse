@@ -1,0 +1,14 @@
+event: response.created
+data: {"type":"response.created","response":{"id":"r1"}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"Olá"}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":" mundo"}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_1","name":"read_file","arguments":"{\"path\":\"a.rs\"}"}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"usage":{"input_tokens":10,"output_tokens":3,"total_tokens":13}}}

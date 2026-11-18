@@ -7,5 +7,10 @@ license.workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+rusqlite.workspace = true
 thiserror.workspace = true
 ureq.workspace = true
+# PKCE: SHA-256 and a CSPRNG. `ring` is already in the tree through ureq's TLS.
+ring = "0.17"
+base64 = "0.22"
+

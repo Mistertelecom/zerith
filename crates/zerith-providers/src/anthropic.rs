@@ -94,8 +94,32 @@ pub(crate) fn body(req: &ChatRequest, stream: bool) -> Value {
     b
 }
 
+/// A Claude subscription token only serves requests that open with the
+/// Claude Code identity as the FIRST system block; anything else gets a bare
+/// `429 rate_limit_error` even with quota left (verified against the live API).
+/// Our own system prompt follows as a second block.
+const CLAUDE_CODE_IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+
+fn body_for(client: &Client, req: &ChatRequest, stream: bool) -> Value {
+    let mut b = body(req, stream);
+    let cfg = client.config();
+    let subscription = cfg.auth == crate::AuthMode::Oauth
+        && cfg
+            .oauth
+            .as_ref()
+            .is_some_and(|c| c.tool == crate::OAuthTool::ClaudeCode);
+    if subscription {
+        let mut blocks = vec![json!({"type": "text", "text": CLAUDE_CODE_IDENTITY})];
+        if let Some(own) = b.get("system").and_then(Value::as_str) {
+            blocks.push(json!({"type": "text", "text": own}));
+        }
+        b["system"] = json!(blocks);
+    }
+    b
+}
+
 pub(crate) fn complete(client: &Client, req: &ChatRequest, cancel: &Cancel) -> Result<Completion> {
-    let resp = client.post("messages", &body(req, false), cancel)?;
+    let resp = client.post("messages", &body_for(client, req, false), cancel)?;
     let text = resp
         .into_string()
         .map_err(|e| ProviderError::Transport(e.to_string()))?;
@@ -155,7 +179,7 @@ pub(crate) fn stream(
     cancel: &Cancel,
     on: &mut impl FnMut(StreamEvent),
 ) -> Result<()> {
-    let resp = client.post("messages", &body(req, true), cancel)?;
+    let resp = client.post("messages", &body_for(client, req, true), cancel)?;
     let mut state = AnthropicStream::default();
     crate::stream::for_each_data(resp, cancel, |data| state.feed(data, on))?;
     state.finish(on)
@@ -250,6 +274,31 @@ impl AnthropicStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_claude_subscription_opens_with_the_claude_code_identity() {
+        let mut cfg = crate::ProviderConfig::new(crate::ProviderKind::Anthropic);
+        cfg.auth = crate::AuthMode::Oauth;
+        cfg.oauth = Some(crate::OAuthCredential {
+            access_token: "t".into(),
+            refresh_token: None,
+            expires_at: 4_000_000_000,
+            account_id: None,
+            tool: crate::OAuthTool::ClaudeCode,
+        });
+        let oauth = Client::new(cfg).unwrap();
+        let req = ChatRequest::new(
+            "m",
+            vec![crate::ChatMessage::system("sou o zerith"), crate::ChatMessage::user("oi")],
+        );
+        let b = body_for(&oauth, &req, false);
+        assert_eq!(b["system"][0]["text"], CLAUDE_CODE_IDENTITY);
+        assert_eq!(b["system"][1]["text"], "sou o zerith");
+
+        // an API key keeps the plain string: nothing to prove there
+        let key = Client::new(crate::ProviderConfig::new(crate::ProviderKind::Anthropic)).unwrap();
+        assert_eq!(body_for(&key, &req, false)["system"], "sou o zerith");
+    }
     use crate::ChatMessage;
 
     #[test]

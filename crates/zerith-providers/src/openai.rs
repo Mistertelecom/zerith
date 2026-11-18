@@ -6,12 +6,13 @@
 //! the agent loop calls this from a worker thread. No async runtime in a
 //! harness that does not need one.
 
-use crate::config::{Protocol, ProviderConfig};
+use crate::config::{AuthMode, OAuthTool, Protocol, ProviderConfig};
 use crate::retry::{self, map_err, RetryPolicy};
 use crate::stream::OpenAiStream;
 use crate::{Cancel, ChatRequest, ProviderError, Result, Role, StreamEvent, ToolCall};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -110,16 +111,53 @@ impl Client {
     /// Applies whichever credential the protocol expects. The key never reaches
     /// a log or an error string.
     fn authored(&self, mut req: ureq::Request) -> ureq::Request {
-        if self.cfg.protocol == Protocol::Anthropic {
-            req = req.set("anthropic-version", "2023-06-01");
-        }
-        if let Some(key) = &self.cfg.api_key {
-            req = match self.cfg.protocol {
-                Protocol::OpenAi => req.set("Authorization", &format!("Bearer {key}")),
-                Protocol::Anthropic => req.set("x-api-key", key),
-            };
+        for (name, value) in self.headers() {
+            req = req.set(&name, &value);
         }
         req
+    }
+
+    /// Exactly the headers auth contributes, lowercase-keyed. Separate from
+    /// `authored` so a test can assert them without a socket.
+    fn headers(&self) -> BTreeMap<String, String> {
+        let mut h = BTreeMap::new();
+        if self.cfg.protocol == Protocol::Anthropic {
+            h.insert("anthropic-version".into(), "2023-06-01".into());
+        }
+        match (self.cfg.auth, &self.cfg.oauth) {
+            (AuthMode::Oauth, Some(cred)) => {
+                h.insert(
+                    "authorization".into(),
+                    format!("Bearer {}", cred.access_token),
+                );
+                match cred.tool {
+                    OAuthTool::ClaudeCode => {
+                        h.insert("anthropic-beta".into(), "oauth-2025-04-20".into());
+                    }
+                    OAuthTool::Codex => {
+                        h.insert("originator".into(), "codex_cli_rs".into());
+                        if let Some(id) = &cred.account_id {
+                            h.insert("chatgpt-account-id".into(), id.clone());
+                        }
+                    }
+                    OAuthTool::Antigravity => {}
+                }
+            }
+            _ => {
+                if let Some(key) = &self.cfg.api_key {
+                    match self.cfg.protocol {
+                        Protocol::Anthropic => {
+                            h.insert("x-api-key".into(), key.clone());
+                        }
+                        // Responses takes the same Bearer the OpenAI path takes.
+                        Protocol::OpenAi | Protocol::Responses => {
+                            h.insert("authorization".into(), format!("Bearer {key}"));
+                        }
+                    }
+                }
+            }
+        }
+        h
     }
 
     /// POSTs JSON with bounded retry. Only the send is retried: by the time
@@ -135,9 +173,31 @@ impl Client {
         })
     }
 
+    /// Same as `post`, declaring an SSE answer. Streaming endpoints refuse a
+    /// buffered `Accept`, so the header is not decoration here.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn post_stream(
+        &self,
+        path: &str,
+        body: &Value,
+        cancel: &Cancel,
+    ) -> Result<ureq::Response> {
+        let url = self.endpoint(path);
+        retry::send(&self.retry, cancel, || {
+            self.authored(self.agent.post(&url))
+                .set("Content-Type", "application/json")
+                .set("Accept", "text/event-stream")
+                .send_json(body)
+        })
+    }
+
     /// Fails before the request when the provider needs a key it does not have.
     fn ensure_key(&self) -> Result<()> {
-        if self.cfg.kind.needs_key() && self.cfg.api_key.as_deref().unwrap_or("").is_empty() {
+        let has_oauth = self.cfg.auth == AuthMode::Oauth && self.cfg.oauth.is_some();
+        if self.cfg.kind.needs_key()
+            && !has_oauth
+            && self.cfg.api_key.as_deref().unwrap_or("").is_empty()
+        {
             return Err(ProviderError::NoKey);
         }
         Ok(())
@@ -207,6 +267,9 @@ impl Client {
         if self.cfg.protocol == Protocol::Anthropic {
             return crate::anthropic::complete(self, req, cancel);
         }
+        if self.cfg.protocol == Protocol::Responses {
+            return crate::codex::complete(self, req, cancel);
+        }
         let resp = self.post("chat/completions", &body(req, false), cancel)?;
         let text = resp
             .into_string()
@@ -228,6 +291,9 @@ impl Client {
         self.ensure_key()?;
         if self.cfg.protocol == Protocol::Anthropic {
             return crate::anthropic::stream(self, req, cancel, &mut on_event);
+        }
+        if self.cfg.protocol == Protocol::Responses {
+            return crate::codex::stream(self, req, cancel, &mut on_event);
         }
         let resp = self.post("chat/completions", &body(req, true), cancel)?;
         let mut state = OpenAiStream::default();
@@ -415,5 +481,57 @@ mod tests {
             parse_completion("{}"),
             Err(ProviderError::Malformed(_))
         ));
+    }
+
+    #[test]
+    fn oauth_mode_sends_bearer_and_the_anthropic_beta_header() {
+        let mut cfg = ProviderConfig::new(crate::config::ProviderKind::Anthropic);
+        cfg.base_url = "http://127.0.0.1:9".into();
+        cfg.auth = AuthMode::Oauth;
+        cfg.oauth = Some(crate::config::OAuthCredential {
+            access_token: "tok-123".into(),
+            refresh_token: Some("ref-456".into()),
+            expires_at: 4_000_000_000,
+            account_id: None,
+            tool: OAuthTool::ClaudeCode,
+        });
+        let client = Client::new(cfg).unwrap();
+        let h = client.headers();
+        assert_eq!(
+            h.get("authorization").map(String::as_str),
+            Some("Bearer tok-123")
+        );
+        assert_eq!(
+            h.get("anthropic-beta").map(String::as_str),
+            Some("oauth-2025-04-20")
+        );
+        assert_eq!(h.get("x-api-key"), None);
+        assert!(client.ensure_key().is_ok());
+    }
+
+    #[test]
+    fn api_key_mode_keeps_x_api_key_and_no_beta_header() {
+        let mut cfg = ProviderConfig::new(crate::config::ProviderKind::Anthropic);
+        cfg.base_url = "http://127.0.0.1:9".into();
+        cfg.api_key = Some("sk-ant-1".into());
+        let h = Client::new(cfg).unwrap().headers();
+        assert_eq!(h.get("x-api-key").map(String::as_str), Some("sk-ant-1"));
+        assert_eq!(h.get("authorization"), None);
+        assert_eq!(h.get("anthropic-beta"), None);
+    }
+
+    /// A `{:?}` of the config must never be enough to steal the session.
+    #[test]
+    fn debug_of_a_credential_hides_the_tokens() {
+        let cred = crate::config::OAuthCredential {
+            access_token: "secret-access".into(),
+            refresh_token: Some("secret-refresh".into()),
+            expires_at: 1,
+            account_id: None,
+            tool: OAuthTool::Codex,
+        };
+        let dbg = format!("{cred:?}");
+        assert!(!dbg.contains("secret-access"));
+        assert!(!dbg.contains("secret-refresh"));
     }
 }

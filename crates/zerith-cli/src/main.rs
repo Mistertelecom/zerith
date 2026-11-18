@@ -100,7 +100,9 @@ usage:
   zerith secret set <name> [value] | get <name> | delete <name>
   zerith login <claude-code|codex|antigravity> [--account <id>] [--import] [--no-browser]
   zerith import hermes [--profile <name>] [--jsonl <file>]
-  zerith import detect"
+  zerith import detect
+  zerith import hermes-skills [nome..]   (copia skills do Hermes, ativas)
+  zerith mcp import-hermes [nome..]      (servidores de config.yaml do Hermes)"
 }
 
 /// `%USERPROFILE%` on Windows, `$HOME` elsewhere: where the CLIs write the
@@ -188,6 +190,27 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         ("tokensaver", _) => cmds::tokensaver_cmd(&paths, args)?,
         ("chat", _) => chat(&paths, args)?,
         ("import", Some("hermes")) => import_hermes(&paths, args)?,
+        ("import", Some("hermes-skills")) => {
+            let home =
+                zerith_importers::hermes_setup::hermes_home().ok_or("Hermes não encontrado")?;
+            let lib = zerith_skills::Library::open(paths.skills())?;
+            let found = zerith_importers::hermes_setup::hermes_skills(&home, &lib);
+            let names: Vec<String> = match args.get(2) {
+                Some(_) => args[2..].to_vec(),
+                None => found.iter().map(|s| s.name.clone()).collect(),
+            };
+            let r = zerith_importers::hermes_setup::import_hermes_skills(&home, &lib, &names);
+            println!(
+                "{} skills no Hermes: {} importadas, {} já existiam, {} com erro",
+                found.len(),
+                r.imported.len(),
+                r.existed.len(),
+                r.failed.len()
+            );
+            for f in &r.failed {
+                eprintln!("  {f}");
+            }
+        }
         ("export", _) => cmds::export_cmd(&paths, args)?,
         ("search", _) => cmds::search_cmd(&paths, args)?,
         ("checkpoints", _) => cmds::checkpoints_cmd(&paths, args)?,

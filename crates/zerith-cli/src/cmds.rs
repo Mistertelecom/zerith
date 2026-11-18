@@ -261,6 +261,13 @@ pub fn mcp_cmd(paths: &Paths, args: &[String]) -> Res {
                     ))
                 );
             }
+            for s in &loaded.disabled {
+                println!(
+                    "{:<16} {:<8} desligado",
+                    s.name,
+                    if s.is_http() { "http" } else { "stdio" }
+                );
+            }
             for s in &loaded.unapproved {
                 println!(
                     "{:<16} {:<8} do projeto, NÃO aprovado: zerith mcp approve {}",
@@ -333,6 +340,28 @@ pub fn mcp_cmd(paths: &Paths, args: &[String]) -> Res {
             }
         }
         "tools" | "call" => legacy_mcp(args)?,
+        "import-hermes" => {
+            let home = zerith_importers::hermes_setup::hermes_home()
+                .ok_or("Hermes não encontrado (HERMES_HOME, ~/.hermes, %LOCALAPPDATA%\\hermes)")?;
+            let found = zerith_importers::hermes_setup::hermes_mcp(&home, paths)?;
+            let names: Vec<String> = match args.get(2) {
+                Some(_) => args[2..].to_vec(),
+                None => found.iter().map(|(m, _)| m.name.clone()).collect(),
+            };
+            for (m, st) in &found {
+                println!("{:<22} {}", m.name, st.as_str());
+            }
+            let r = zerith_importers::hermes_setup::import_hermes_mcp(&home, paths, &names)?;
+            println!(
+                "{} importados, {} já existiam, {} com erro",
+                r.imported.len(),
+                r.existed.len(),
+                r.failed.len()
+            );
+            for f in &r.failed {
+                eprintln!("  {f}");
+            }
+        }
         other => return Err(format!("comando desconhecido: mcp {other}").into()),
     }
     Ok(())

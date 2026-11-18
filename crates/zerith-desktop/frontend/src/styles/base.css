@@ -574,6 +574,11 @@ textarea.input,
   font-weight: 550;
   color: var(--label-primary);
 }
+.setting-tech {
+  font-size: var(--fs-small);
+  font-weight: 400;
+  color: var(--label-secondary);
+}
 .setting-control {
   display: flex;
   align-items: center;
@@ -702,6 +707,18 @@ textarea.input,
 .stat .cap {
   font-size: var(--fs-small);
   color: var(--label-tertiary);
+}
+.saver-split {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 20px;
+  margin: 0;
+  font-size: var(--fs-small);
+  color: var(--label-secondary);
+}
+.saver-split strong {
+  color: var(--label-primary);
+  font-weight: 600;
 }
 
 /* ---- empty states --------------------------------------------------- */

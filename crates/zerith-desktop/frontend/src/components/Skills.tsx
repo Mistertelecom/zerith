@@ -13,6 +13,7 @@ import {
   FolderOpen,
   GitBranch,
   Globe,
+  Import,
   Info,
   Package,
   Plug,
@@ -34,6 +35,8 @@ import {
   api,
   type Catalogue,
   type Finding,
+  type HermesSkill,
+  type SetupImport,
   type PluginView,
   type RemoteRepo,
   type RemoteSkill,
@@ -104,6 +107,7 @@ export function SkillsTab() {
   const [selected, setSelected] = useState<string | null>(null);
   const [from, setFrom] = useState("");
   const [showFolder, setShowFolder] = useState(false);
+  const [showHermes, setShowHermes] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -225,9 +229,14 @@ export function SkillsTab() {
         </div>
         <span className="pn-spacer" />
         {tab === "Instaladas" ? (
-          <button className="btn btn-sm" aria-expanded={showFolder} onClick={() => setShowFolder((v) => !v)}>
-            <FolderInput size={14} strokeWidth={2} /> Instalar de uma pasta…
-          </button>
+          <>
+            <button className="btn btn-sm" aria-expanded={showHermes} onClick={() => setShowHermes((v) => !v)}>
+              <Import size={14} strokeWidth={2} /> Importar do Hermes
+            </button>
+            <button className="btn btn-sm" aria-expanded={showFolder} onClick={() => setShowFolder((v) => !v)}>
+              <FolderInput size={14} strokeWidth={2} /> Instalar de uma pasta…
+            </button>
+          </>
         ) : null}
       </div>
       {error ? (
@@ -251,6 +260,7 @@ export function SkillsTab() {
 
       {tab === "Instaladas" ? (
         <>
+          {showHermes ? <HermesSkills onImported={setSkills} onClose={() => setShowHermes(false)} /> : null}
           {showFolder ? (
             <Card title="Instalar de uma pasta" icon={FolderInput} description="Aponte para a pasta que contém o SKILL.md.">
               <div className="pn-inline">
@@ -616,6 +626,169 @@ export function SkillsTab() {
         </Card>
       ) : null}
     </div>
+  );
+}
+
+/** "N importadas, M já existiam, K com erro" */
+export const importLine = (r: SetupImport) =>
+  `${r.imported.length} ${r.imported.length === 1 ? "importada" : "importadas"}, ${r.existed.length} já ${
+    r.existed.length === 1 ? "existia" : "existiam"
+  }, ${r.failed.length} com erro`;
+
+/** The Hermes skills folder, grouped by category, picked with checkboxes. */
+function HermesSkills(props: { onImported: (list: SkillView[]) => void; onClose: () => void }) {
+  const [list, setList] = useState<HermesSkill[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
+  const [picked, setPicked] = useState<Set<string>>(new Set());
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<SetupImport | null>(null);
+
+  const load = useCallback(() => {
+    api
+      .hermesSkills()
+      .then((l) => {
+        setList(l);
+        setError(null);
+      })
+      .catch((e) => setError(String(e)));
+  }, []);
+  useEffect(load, [load]);
+
+  const q = query.trim().toLowerCase();
+  const shown = (list ?? []).filter((s) => !q || matches(q, s.name, s.category, s.description));
+  const pickable = shown.filter((s) => !s.installed && !s.error);
+  const all = pickable.length > 0 && pickable.every((s) => picked.has(s.name));
+  const groups = [...new Set(shown.map((s) => s.category))];
+  const flip = (name: string, on: boolean) =>
+    setPicked((p) => {
+      const n = new Set(p);
+      if (on) n.add(name);
+      else n.delete(name);
+      return n;
+    });
+
+  const run = async () => {
+    setBusy(true);
+    try {
+      const r = await api.hermesSkillsImport([...picked]);
+      setResult(r);
+      props.onImported(r.skills);
+      setPicked(new Set());
+      load();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Card
+      title="Importar do Hermes"
+      icon={Import}
+      description={
+        list
+          ? `${list.length} skills no Hermes · ${(n => `${n} ${n === 1 ? "já está" : "já estão"}`)(list.filter((s) => s.installed).length)} aqui. Os arquivos são copiados (references, scripts e templates juntos) e chegam ativos.`
+          : "Lendo a pasta de skills do Hermes…"
+      }
+      actions={
+        <button className="icon-btn" aria-label="Fechar importação" title="Fechar" onClick={props.onClose}>
+          <X size={16} strokeWidth={1.75} />
+        </button>
+      }
+    >
+      {error ? (
+        <div className="pn-callout danger">
+          <CircleAlert size={14} strokeWidth={2} />
+          <span>{error}</span>
+        </div>
+      ) : null}
+      {list === null && !error ? <Loading text="Procurando skills do Hermes…" /> : null}
+      {list?.length ? (
+        <>
+          <div className="pn-toolbar">
+            <label className="pn-affix">
+              <span className="pn-affix-icon">
+                <Search size={16} strokeWidth={1.75} />
+              </span>
+              <input
+                className="input"
+                type="search"
+                value={query}
+                placeholder="Buscar por nome, categoria ou descrição"
+                aria-label="Buscar skills do Hermes"
+                onChange={(e) => setQuery(e.target.value)}
+              />
+            </label>
+            <label className="check">
+              <input
+                type="checkbox"
+                checked={all}
+                disabled={!pickable.length}
+                onChange={(e) => pickable.forEach((s) => flip(s.name, e.target.checked))}
+              />
+              Selecionar todos
+            </label>
+            <button className="btn btn-primary btn-sm" disabled={busy || picked.size === 0} onClick={() => void run()}>
+              {busy ? <span className="spinner" /> : <Download size={14} strokeWidth={2} />}
+              {busy ? "Importando…" : `Importar ${picked.size || ""}`.trim()}
+            </button>
+          </div>
+          {result ? (
+            <div className={"pn-callout" + (result.failed.length ? " danger" : " note")} role="status">
+              {result.failed.length ? <AlertTriangle size={14} strokeWidth={2} /> : <CircleCheck size={14} strokeWidth={2} />}
+              <span>
+                <strong>{importLine(result)}</strong>
+                {result.failed.length ? " · " + result.failed.join(" · ") : ""}
+              </span>
+            </div>
+          ) : null}
+          <div className="pn-scroll pn-hermes-list">
+            {groups.map((g) => {
+              const rows = shown.filter((s) => s.category === g);
+              return (
+                <Fragment key={g || "-"}>
+                  <div className="pn-group-label">
+                    <FolderOpen size={12} strokeWidth={2} /> {g || "Sem categoria"} <span className="pn-count">{rows.length}</span>
+                  </div>
+                  {rows.map((s) => (
+                    <label key={g + "/" + s.name} className={"pn-item pn-hermes-row" + (s.installed || s.error ? " dim" : "")}>
+                      <input
+                        type="checkbox"
+                        checked={s.installed || picked.has(s.name)}
+                        disabled={s.installed || !!s.error}
+                        aria-label={`Importar ${s.name}`}
+                        onChange={(e) => flip(s.name, e.target.checked)}
+                      />
+                      <span className="pn-body">
+                        <span className="pn-title">{s.name}</span>
+                        <span className="pn-sub" title={s.error ?? s.description}>
+                          {s.error ?? s.description}
+                        </span>
+                      </span>
+                      {s.installed ? (
+                        <span className="badge">
+                          <Check size={12} strokeWidth={2} /> Já existe
+                        </span>
+                      ) : s.error ? (
+                        <span className="badge danger">
+                          <AlertTriangle size={12} strokeWidth={2} /> Inválida
+                        </span>
+                      ) : null}
+                    </label>
+                  ))}
+                </Fragment>
+              );
+            })}
+            {!shown.length ? <EmptyState icon={Search} title="Nada encontrado" text="Tente outro termo." /> : null}
+          </div>
+        </>
+      ) : null}
+      {list?.length === 0 ? (
+        <EmptyState icon={Puzzle} title="Nenhuma skill no Hermes" text="A pasta skills do Hermes está vazia." />
+      ) : null}
+    </Card>
   );
 }
 

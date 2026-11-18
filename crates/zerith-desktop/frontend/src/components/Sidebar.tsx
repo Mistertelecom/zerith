@@ -131,7 +131,7 @@ export function Sidebar(props: {
                   }
                   aria-current={s.id === props.selected ? "page" : undefined}
                   onClick={() => props.onSelect(s.id)}
-                  title={s.title}
+                  title={s.workspace ? `${s.title}\n${s.workspace}` : s.title}
                 >
                   <Logo id={s.provider ?? s.model} size={16} />
                   <span className="side-row-title">{s.title}</span>

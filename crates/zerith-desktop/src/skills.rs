@@ -234,3 +234,71 @@ pub async fn skill_remove(
     .await
     .map_err(|e| e.to_string())?
 }
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HermesSkillView {
+    name: String,
+    category: String,
+    description: String,
+    installed: bool,
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HermesSkillsImport {
+    imported: Vec<String>,
+    existed: Vec<String>,
+    failed: Vec<String>,
+    skills: Vec<SkillView>,
+}
+
+fn hermes_home() -> Result<PathBuf, String> {
+    zerith_importers::hermes_setup::hermes_home()
+        .ok_or_else(|| "Hermes não encontrado neste computador".to_string())
+}
+
+/// Every skill in the Hermes home, with whether it is already here.
+#[tauri::command]
+pub async fn hermes_skills(state: State<'_, AppState>) -> Result<Vec<HermesSkillView>, String> {
+    let root = library(&state);
+    tauri::async_runtime::spawn_blocking(move || {
+        let lib = open_library(&root)?;
+        Ok(
+            zerith_importers::hermes_setup::hermes_skills(&hermes_home()?, &lib)
+                .into_iter()
+                .map(|s| HermesSkillView {
+                    name: s.name,
+                    category: s.category,
+                    description: s.description,
+                    installed: s.installed,
+                    error: s.error,
+                })
+                .collect(),
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Copies the chosen Hermes skills in, enabled, through the normal install.
+#[tauri::command]
+pub async fn hermes_skills_import(
+    state: State<'_, AppState>,
+    names: Vec<String>,
+) -> Result<HermesSkillsImport, String> {
+    let root = library(&state);
+    tauri::async_runtime::spawn_blocking(move || {
+        let lib = open_library(&root)?;
+        let r = zerith_importers::hermes_setup::import_hermes_skills(&hermes_home()?, &lib, &names);
+        Ok(HermesSkillsImport {
+            imported: r.imported,
+            existed: r.existed,
+            failed: r.failed,
+            skills: all(&lib, &root)?,
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}

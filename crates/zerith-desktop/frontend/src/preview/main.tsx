@@ -49,6 +49,11 @@ async function drive() {
     // Skills: &sub=Catálogo opens a sub-tab, &repo=owner/name opens a repository.
     const sub = q.get("sub");
     if (sub) (await until(() => byText(sub, ".pn-toolbar")))?.click();
+    // &click=<button text>: one more click in the panel (Importar do Hermes, Testar codebase-memory-mcp).
+    for (const c of q.getAll("click")) {
+      (await until(() => byText(c, ".settings-body")))?.click();
+      await wait(300);
+    }
     const repo = q.get("repo");
     if (repo) (await until(() => byText(`Abrir ${repo}`)))?.click();
     // Delegação: &pick=Modelo: Principal opens that picker; &scroll=<px|bottom> scrolls the body.

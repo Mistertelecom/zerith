@@ -38,6 +38,7 @@ import { Composer, type CommandName } from "./components/Composer";
 import { Logo, ZerithMark } from "./components/ui";
 import { catalogEntry, NOT_CHAT } from "./lib/catalog";
 import { TitleBar } from "./components/TitleBar";
+import { FolderPill } from "./components/FolderPill";
 
 const MODEL_KEY = "zerith.model";
 // Models the user took out of the chat menu (`account:model` values).
@@ -140,6 +141,29 @@ export default function App() {
   const [settings, setSettings] = useState<SettingsTab | null>(null);
   const [status, setStatus] = useState("");
   const [inspector, setInspector] = useState(true);
+  // Folders used before (newest first, from the store) and the one picked for
+  // a conversation that does not exist yet.
+  const [recent, setRecent] = useState<string[]>([]);
+  const [newFolder, setNewFolder] = useState<string | null>(null);
+  const current = sessions.find((s) => s.id === selected) ?? null;
+  // The open conversation's folder; a new one starts in the last used.
+  const folder = (selected ? current?.workspace : newFolder) ?? recent[0] ?? "";
+  // A change applies to the next turn, even mid-conversation.
+  const pickFolder = useCallback(
+    (path: string) => {
+      setRecent((r) => [path, ...r.filter((x) => x !== path)]);
+      if (!selected) return setNewFolder(path);
+      api
+        .setSessionWorkspace(selected, path)
+        .then(() =>
+          setSessions((list) =>
+            list.map((s) => (s.id === selected ? { ...s, workspace: path } : s)),
+          ),
+        )
+        .catch((e) => setStatus(`Não consegui trocar a pasta: ${e}`));
+    },
+    [selected],
+  );
   const draftRef = useRef<HTMLTextAreaElement>(null);
 
   // First frame: one call decides everything the window needs.
@@ -150,6 +174,10 @@ export default function App() {
         setBoot(b);
         setSessions(b.sessions);
         setMemoryPaused(b.memory_paused);
+        void api
+          .recentWorkspaces()
+          .then(setRecent)
+          .catch(() => undefined);
         void api
           .routing()
           .then((r) => (loadProfiles(r), r))
@@ -196,11 +224,18 @@ export default function App() {
           .catch(() => undefined);
   }, [accounts, liveModels]);
 
+  const fresh = useRef<string | null>(null);
   // Transcript of the conversation that is open.
   useEffect(() => {
     if (!selected) {
       setMessages([]);
       setTurn(emptyTurn);
+      return;
+    }
+    // A conversation `send` just created already holds its first message and
+    // turn; reading the (still empty) store here would wipe both.
+    if (fresh.current === selected) {
+      fresh.current = null;
       return;
     }
     api
@@ -211,25 +246,51 @@ export default function App() {
   }, [selected]);
 
   // Turn events. The subscription is per conversation, so a stale stream can
-  // never write into the next one.
+  // never write into the next one. `send` subscribes a brand-new conversation
+  // itself before starting its first turn (the effect would subscribe after
+  // the next render, and the first events, approval card included, would be
+  // lost); the effect then reuses that subscription.
+  const listening = useRef<{ id: string; ready: Promise<() => void> } | null>(
+    null,
+  );
+  const subscribe = useCallback((id: string) => {
+    if (listening.current?.id === id) return listening.current.ready;
+    const ready = onTurnEvent(id, (ev: TurnEvent) => {
+      // applyEvent mutates and returns the same object; React skips a render
+      // when the reference does not change, so it gets a copy.
+      setTurn((prev) =>
+        ev.type === "autoCompacted"
+          ? {
+              ...prev,
+              blocks: [
+                ...prev.blocks,
+                {
+                  kind: "note",
+                  text: `Conversa resumida automaticamente (${num(ev.before)} → ${num(ev.after)} tokens)`,
+                },
+              ],
+            }
+          : applyEvent(structuredClone(prev), ev),
+      );
+    });
+    listening.current = { id, ready };
+    return ready;
+  }, []);
   useEffect(() => {
     if (!selected) return;
     let stop = false;
     let unlisten: (() => void) | undefined;
-    onTurnEvent(selected, (ev: TurnEvent) => {
-      // applyEvent mutates and returns the same object; React skips a render
-      // when the reference does not change, so it gets a copy.
-      setTurn((prev) => applyEvent(structuredClone(prev), ev));
-    }).then((u) => (stop ? u() : (unlisten = u)));
+    void subscribe(selected).then((u) => (stop ? u() : (unlisten = u)));
     const done = onTurnDone((id) => {
       if (id === selected) setTurn((prev) => ({ ...prev, busy: false }));
     });
     return () => {
       stop = true;
       unlisten?.();
+      if (listening.current?.id === selected) listening.current = null;
       void done.then((u) => u());
     };
-  }, [selected]);
+  }, [selected, subscribe]);
 
   const send = useCallback(async () => {
     const prompt = draft.trim();
@@ -243,9 +304,11 @@ export default function App() {
     let id = selected;
     try {
       if (!id) {
-        const created = await api.createSession(prompt.slice(0, 48));
+        const created = await api.createSession(prompt.slice(0, 48), folder);
         setSessions((prev) => [created, ...prev]);
         id = created.id;
+        await subscribe(id);
+        fresh.current = id;
         setSelected(id);
         setMessages([]);
       }
@@ -265,7 +328,7 @@ export default function App() {
       setError(String(e));
       setTurn((prev) => ({ ...prev, busy: false }));
     }
-  }, [draft, model, mode, selected, turn.blocks]);
+  }, [draft, model, mode, selected, turn.blocks, folder, subscribe]);
 
   // A provider saved in Ajustes changes the models the composer can offer, so
   // the boot payload is re-read when the panel closes.
@@ -507,7 +570,6 @@ export default function App() {
     );
   }
 
-  const current = sessions.find((s) => s.id === selected) ?? null;
   const hero = !selected && surface.length === 0;
   // The route the core reported, or the one the next turn will take.
   const pinned = accounts.find((a) => model.startsWith(a.id + ":")) ?? null;
@@ -618,7 +680,25 @@ export default function App() {
                 hidden={hidden}
                 onToggleHidden={toggleHidden}
                 hint={status || error || "/ comandos  ·  @ arquivos"}
-                files={() => api.workspaceFiles()}
+                files={() => api.workspaceFiles(folder || undefined)}
+                folder={
+                  <FolderPill
+                    value={folder}
+                    recent={recent}
+                    onPick={pickFolder}
+                    onBrowse={() =>
+                      void api
+                        .pickFolder(folder || null)
+                        .then((p) => p && pickFolder(p))
+                        .catch((e) => setStatus(String(e)))
+                    }
+                    onReveal={() =>
+                      void api
+                        .revealWorkspace(folder)
+                        .catch((e) => setStatus(String(e)))
+                    }
+                  />
+                }
               />
               {hero ? (
                 <div className="hero-grid">

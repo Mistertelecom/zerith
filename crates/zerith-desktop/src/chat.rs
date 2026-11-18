@@ -76,7 +76,7 @@ pub fn send_turn(
     let setup = Setup {
         root: state.root().to_path_buf(),
         db: state.db(),
-        workspace: turn::workspace(),
+        workspace: turn::session_workspace(&state.db(), &args.session_id),
         mode: turn::parse_mode(&args.mode),
         memory_paused: crate::wire::memory_paused(&state.db()),
         agent: args.agent.clone(),

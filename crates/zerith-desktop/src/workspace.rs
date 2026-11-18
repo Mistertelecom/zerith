@@ -58,13 +58,14 @@ fn walk(root: &Path, cap: usize) -> Vec<String> {
     out
 }
 
-/// The workspace a turn runs in: the folder the app was started from, which is
-/// the same one `turn::workspace()` hands the agent.
+/// Files of `root` (the open conversation's folder), else of the folder a new
+/// conversation would get.
 #[tauri::command]
-pub async fn workspace_files(root: Option<String>) -> Cmd<Vec<String>> {
+pub async fn workspace_files(state: State<'_, AppState>, root: Option<String>) -> Cmd<Vec<String>> {
+    let db = state.db();
     let root = match root {
         Some(r) if !r.trim().is_empty() => PathBuf::from(r),
-        _ => crate::turn::workspace(),
+        _ => crate::turn::last_workspace(&db),
     };
     tauri::async_runtime::spawn_blocking(move || walk(&root, FILE_CAP))
         .await
@@ -106,7 +107,46 @@ fn image_path(raw: &str) -> PathBuf {
     if p.is_absolute() {
         p
     } else {
-        crate::turn::workspace().join(p)
+        // ponytail: relative image paths resolve against the newest folder,
+        // not the open conversation's; pass the session id if two differ.
+        crate::turn::default_workspace().join(p)
+    }
+}
+
+/// The native folder picker, without a dialog crate: PowerShell's
+/// FolderBrowserDialog on an STA thread, no console window. The start folder
+/// travels in an env var, never inside the script, so a path cannot inject
+/// code. `Ok(None)`: cancelled.
+// ponytail: PowerShell start-up costs ~1 s and the dialog is the classic tree;
+// use IFileOpenDialog via the `windows` crate if it ever becomes a dependency.
+pub fn pick_folder(start: Option<&str>) -> Cmd<Option<String>> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const SCRIPT: &str = "[Console]::OutputEncoding = [Text.Encoding]::UTF8; \
+Add-Type -AssemblyName System.Windows.Forms; \
+$d = New-Object System.Windows.Forms.FolderBrowserDialog; \
+$d.Description = 'Pasta da conversa'; $d.ShowNewFolderButton = $true; \
+if ($env:ZERITH_PICK_START) { $d.SelectedPath = $env:ZERITH_PICK_START }; \
+$f = New-Object System.Windows.Forms.Form -Property @{TopMost = $true}; \
+if ($d.ShowDialog($f) -eq 'OK') { $d.SelectedPath }";
+        let out = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-STA", "-Command", SCRIPT])
+            .env("ZERITH_PICK_START", start.unwrap_or(""))
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map_err(|e| format!("Não consegui abrir o seletor de pasta: {e}"))?;
+        if !out.status.success() {
+            return Err("O seletor de pasta falhou".into());
+        }
+        let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        Ok((!path.is_empty()).then_some(path))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = start;
+        Err("Escolher pasta pelo seletor só existe no Windows por enquanto".into())
     }
 }
 

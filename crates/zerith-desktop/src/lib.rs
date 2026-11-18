@@ -4,9 +4,11 @@
 //! core crates, so the same rules the CLI applies hold in the GUI.
 
 pub mod agents;
+pub mod attachments;
 pub mod chat;
 pub mod commands;
 pub mod history;
+pub mod mcp;
 pub mod media;
 pub mod memory;
 pub mod prefs;
@@ -179,6 +181,10 @@ pub fn run() {
             commands::set_memory_paused,
             commands::search_sessions,
             commands::reveal_root,
+            commands::set_session_workspace,
+            commands::recent_workspaces,
+            commands::pick_folder,
+            commands::reveal_workspace,
             providers::presets,
             providers::provider_save,
             providers::provider_test,
@@ -204,6 +210,16 @@ pub fn run() {
             skills::skill_install_remote,
             skills::skill_toggle,
             skills::skill_remove,
+            skills::hermes_skills,
+            skills::hermes_skills_import,
+            mcp::mcp_list,
+            mcp::mcp_add,
+            mcp::mcp_remove,
+            mcp::mcp_toggle,
+            mcp::mcp_approve,
+            mcp::mcp_test,
+            mcp::mcp_hermes_preview,
+            mcp::mcp_hermes_import,
             agents::agents_list,
             agents::agent_create,
             agents::agent_toggle,
@@ -231,6 +247,7 @@ pub fn run() {
             workspace::compact,
             workspace::read_image,
             workspace::open_image,
+            attachments::save_attachment,
         ])
         .run(tauri::generate_context!())
         .expect("erro ao iniciar a janela do Zerith");

@@ -155,7 +155,7 @@ pub fn write_agent(dir: &Path, f: &AgentForm) -> Result<PathBuf, String> {
 /// Every definition the window should show, sorted by name: the visible ones
 /// plus the disabled ones, which only appear here — a turn never sees them.
 pub fn all(root: &Path) -> Vec<AgentView> {
-    let cwd = std::env::current_dir().ok();
+    let cwd = Some(crate::turn::last_workspace(&Paths::with_root(root).db()));
     let extra = zerith_plugins::Library::open(&root.join("plugins"))
         .and_then(|l| l.contributions())
         .map(|c| c.agents)

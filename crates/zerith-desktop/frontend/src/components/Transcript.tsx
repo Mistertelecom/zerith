@@ -25,6 +25,7 @@ import { ZerithMark } from "./ui";
 import { parseBlocks, type Inline, type MdBlock } from "./markdown";
 
 const isWeb = (src: string) => /^(https?:|data:)/i.test(src);
+const USER_IMG = /^!\[([^\]\n]*)\]\(<([^>\n]+)>\)\s*$/gm;
 
 /** Full-window view of one image; Esc or a click outside closes it. */
 function Lightbox({ src, url, alt, onClose }: { src: string; url: string; alt: string; onClose: () => void }) {
@@ -368,9 +369,19 @@ export function Transcript(props: { blocks: Block[]; tail?: React.ReactNode }) {
         ) : null}
         {props.blocks.map((b, i) => {
           if (b.kind === "user") {
+            // Attached images arrive as `![nome](<path>)` lines (Composer).
+            const imgs = [...b.text.matchAll(USER_IMG)];
+            const text = imgs.length ? b.text.replace(USER_IMG, "").trim() : b.text;
             return (
               <div key={i} className="msg-user">
-                {b.text}
+                {imgs.length ? (
+                  <div className="msg-user-imgs">
+                    {imgs.map((m, j) => (
+                      <MdImage key={j} src={m[2]} alt={m[1]} />
+                    ))}
+                  </div>
+                ) : null}
+                {text}
               </div>
             );
           }

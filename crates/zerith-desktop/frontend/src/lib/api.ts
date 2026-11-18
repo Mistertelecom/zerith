@@ -17,6 +17,8 @@ export interface Session {
   created_at: number;
   updated_at: number;
   archived: boolean;
+  /** The folder this conversation works in; null for old/CLI sessions. */
+  workspace?: string | null;
 }
 
 export interface ProviderView {
@@ -91,6 +93,7 @@ export type TurnEvent =
   | { type: "approval"; id: number; tool: string; summary: string }
   | { type: "usage"; input: number; output: number }
   | { type: "compacted"; before: number; after: number }
+  | { type: "autoCompacted"; before: number; after: number }
   | { type: "tasks"; items: Todo[] }
   | {
       type: "subagent";
@@ -215,6 +218,9 @@ export interface UsageSummary {
   total_prompt_tokens: number;
   total_completion_tokens: number;
   total_saved_tokens: number;
+  total_saved_rtk_tokens: number;
+  total_saved_ponytail_tokens: number;
+  total_saved_caveman_tokens: number;
   total_requests: number;
   active_account: string | null;
   active_model: string | null;
@@ -288,6 +294,43 @@ export interface RemoteRepo {
   branch: string;
   fetched_at: number;
   skills: RemoteSkill[];
+}
+
+/** A skill folder in the Hermes home (`skills/<categoria>/<nome>`). */
+export interface HermesSkill {
+  name: string;
+  category: string;
+  description: string;
+  installed: boolean;
+  error: string | null;
+}
+
+/** What an import from Hermes did, by name. */
+export interface SetupImport {
+  imported: string[];
+  existed: string[];
+  failed: string[];
+}
+
+/** A configured MCP server. Env/headers come back as keys only (values may be secrets). */
+export interface McpServer {
+  name: string;
+  transport: "stdio" | "http";
+  target: string;
+  enabled: boolean;
+  approved: boolean;
+  project: boolean;
+  envKeys: string[];
+  headerKeys: string[];
+}
+
+export interface HermesMcp {
+  name: string;
+  transport: "stdio" | "http";
+  target: string;
+  status: "importavel" | "nao-encontrado" | "oauth" | "existe" | "invalido";
+  enabled: boolean;
+  envKeys: string[];
 }
 
 export interface PluginView {
@@ -446,8 +489,16 @@ export interface ReportView {
 export const api = {
   boot: () => invoke<Boot>("boot"),
   listSessions: (limit = 200) => invoke<Session[]>("list_sessions", { limit }),
-  createSession: (title: string) =>
-    invoke<Session>("create_session", { title }),
+  createSession: (title: string, workspace?: string | null) =>
+    invoke<Session>("create_session", { title, workspace: workspace ?? null }),
+  setSessionWorkspace: (id: string, workspace: string) =>
+    invoke<void>("set_session_workspace", { id, workspace }),
+  /** Folders used before, newest first; the first is a new chat's default. */
+  recentWorkspaces: () => invoke<string[]>("recent_workspaces"),
+  /** The OS folder picker; null when cancelled. */
+  pickFolder: (start?: string | null) =>
+    invoke<string | null>("pick_folder", { start: start ?? null }),
+  revealWorkspace: (path: string) => invoke<void>("reveal_workspace", { path }),
   sessionMessages: (id: string, limit = 400) =>
     invoke<ChatMessage[]>("session_messages", { id, limit }),
   setArchived: (id: string, archived: boolean) =>
@@ -517,11 +568,25 @@ export const api = {
     invoke<RemoteRepo>("skills_remote", { repo, force }),
   skillInstallRemote: (repo: string, branch: string, path: string) =>
     invoke<SkillView[]>("skill_install_remote", { repo, branch, path }),
+  hermesSkills: () => invoke<HermesSkill[]>("hermes_skills"),
+  hermesSkillsImport: (names: string[]) =>
+    invoke<SetupImport & { skills: SkillView[] }>("hermes_skills_import", { names }),
+  mcpList: () => invoke<McpServer[]>("mcp_list"),
+  mcpAdd: (form: { name: string; command: string; url: string; env: string; headers: string }) =>
+    invoke<McpServer[]>("mcp_add", form),
+  mcpRemove: (name: string) => invoke<McpServer[]>("mcp_remove", { name }),
+  mcpToggle: (name: string, enabled: boolean) => invoke<McpServer[]>("mcp_toggle", { name, enabled }),
+  mcpApprove: (name: string) => invoke<McpServer[]>("mcp_approve", { name }),
+  mcpTest: (name: string) => invoke<{ name: string; description: string }[]>("mcp_test", { name }),
+  mcpHermesPreview: () => invoke<HermesMcp[]>("mcp_hermes_preview"),
+  mcpHermesImport: (names: string[]) => invoke<SetupImport>("mcp_hermes_import", { names }),
   workspaceFiles: (root?: string) =>
     invoke<string[]>("workspace_files", { root: root ?? null }),
   /** A local image from the transcript (`![](C:/x.png)`) as a data URL. */
   readImage: (path: string) => invoke<string>("read_image", { path }),
   openImage: (path: string) => invoke<void>("open_image", { path }),
+  /** An attached image (data URL) saved under `<root>/attachments`; returns its path. */
+  saveAttachment: (data: string) => invoke<string>("save_attachment", { data }),
   checkpoints: (sessionId: string) =>
     invoke<number[]>("checkpoints", { sessionId }),
   rewind: (sessionId: string) =>

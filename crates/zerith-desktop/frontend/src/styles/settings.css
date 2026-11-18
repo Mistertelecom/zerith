@@ -1439,3 +1439,27 @@ button.item-row {
     display: none;
   }
 }
+
+/* ---- Hermes import lists (Skills, MCP) and MCP tool chips ------------ */
+
+.pn-hermes-list {
+  max-height: 420px;
+}
+.pn-hermes-row {
+  cursor: pointer;
+}
+.pn-hermes-row > input[type="checkbox"] {
+  flex: none;
+  width: 15px;
+  height: 15px;
+  accent-color: var(--accent);
+}
+/* A field whose control is not an input (segmented): no stretch to the row. */
+.pn-field-top {
+  align-content: start;
+  justify-items: start;
+}
+.pn-mcp-tools {
+  padding: 0 8px 12px 52px;
+  gap: 4px;
+}

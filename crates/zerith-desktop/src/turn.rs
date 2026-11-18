@@ -70,6 +70,12 @@ pub enum TurnEvent {
         before: usize,
         after: usize,
     },
+    /// The history was summarized before the turn because it neared the
+    /// model's context window.
+    AutoCompacted {
+        before: usize,
+        after: usize,
+    },
     Tasks {
         items: Vec<zerith_sessions::Todo>,
     },
@@ -256,6 +262,10 @@ pub fn run(
         zerith_core::agents::find_with_extra(&paths, Some(&setup.workspace), extra, n)
     });
 
+    auto_compact(
+        &store, &settings, &client, session_id, model, setup, cancel, on,
+    );
+
     let result = run_agent_turn(
         &store,
         &client,
@@ -315,6 +325,55 @@ pub fn run(
     }
 }
 
+/// Summarizes the history before the turn when it passed 75% of the model's
+/// window, with the model and account the turn is routed to. Never fails the
+/// turn: the runtime still trims under pressure if this did not run.
+#[allow(clippy::too_many_arguments)]
+fn auto_compact(
+    store: &Store,
+    settings: &zerith_core::Settings,
+    client: &Client,
+    session_id: &str,
+    model: &str,
+    setup: &Setup,
+    cancel: &Cancel,
+    on: &mut dyn FnMut(TurnEvent),
+) {
+    let first = zerith_runtime::resolve_gateway(settings, model, client.config())
+        .0
+        .candidates
+        .into_iter()
+        .next();
+    let limit = first
+        .as_ref()
+        .and_then(|c| c.config.context_limit)
+        .or(client.config().context_limit);
+    let routed = first.and_then(|c| Client::new(c.config).ok().map(|cl| (cl, c.model)));
+    let (sum_client, sum_model) = match &routed {
+        Some((cl, m)) => (cl, m.as_str()),
+        None => (client, model),
+    };
+    let summarizer = zerith_runtime::compact::ClientSummarizer {
+        client: sum_client,
+        model: sum_model,
+    };
+    match zerith_runtime::compact::auto_compact(
+        store,
+        session_id,
+        setup.history,
+        limit,
+        &summarizer,
+        cancel,
+    ) {
+        Ok(Some(r)) => on(TurnEvent::AutoCompacted {
+            before: r.tokens_before,
+            after: r.tokens_after,
+        }),
+        Ok(None) => {}
+        Err(e) => eprintln!("zerith-desktop: resumo automático falhou: {e}"),
+    }
+}
+
 /// The mode a stored value means. Unknown strings fall back to the safest one.
 pub fn parse_mode(s: &str) -> Mode {
     match s {
@@ -326,7 +385,110 @@ pub fn parse_mode(s: &str) -> Mode {
     }
 }
 
-/// The folder the window's tools act on.
-pub fn workspace() -> PathBuf {
-    std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf())
+/// Where a conversation with no folder of its own starts: the folder the app
+/// was launched from, unless that folder means nothing (the exe's own folder or
+/// System32, which is what the Start menu hands a process), then the home.
+pub fn default_workspace() -> PathBuf {
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(".").to_path_buf());
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(Path::to_path_buf));
+    launch_dir(std::env::current_dir().ok(), exe_dir.as_deref(), home)
+}
+
+fn launch_dir(cwd: Option<PathBuf>, exe_dir: Option<&Path>, home: PathBuf) -> PathBuf {
+    let meaningless = |d: &Path| {
+        let s = d.to_string_lossy().to_ascii_lowercase();
+        Some(d) == exe_dir || s.ends_with("system32") || s.ends_with("syswow64")
+    };
+    match cwd {
+        Some(d) if !meaningless(&d) => d,
+        _ => home,
+    }
+}
+
+/// The folder a new conversation gets: the newest one still on disk, else
+/// [`default_workspace`].
+pub fn last_workspace(db: &Path) -> PathBuf {
+    // Never create a database just to read a folder name.
+    if !db.is_file() {
+        return default_workspace();
+    }
+    Store::open(db)
+        .and_then(|st| st.recent_workspaces(10))
+        .unwrap_or_default()
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|p| p.is_dir())
+        .unwrap_or_else(default_workspace)
+}
+
+/// The folder a turn of `session` runs in: its own, else [`last_workspace`]
+/// (sessions made before folders existed, or whose folder was deleted).
+pub fn session_workspace(db: &Path, session: &str) -> PathBuf {
+    Store::open(db)
+        .and_then(|st| st.workspace(session))
+        .ok()
+        .flatten()
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(|| last_workspace(db))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zerith_sessions::SessionSource;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let d = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-scratch")
+            .join(tag);
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Each conversation runs in its own folder; one without a folder (or
+    /// whose folder is gone) takes the newest folder still on disk.
+    #[test]
+    fn a_turn_runs_in_its_sessions_folder() {
+        let d = scratch("session-workspace");
+        let (a, b) = (d.join("a"), d.join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let db = d.join("zerith.db");
+        let st = Store::open(&db).unwrap();
+        let s1 = st.create_session("um", SessionSource::Native).unwrap();
+        let s2 = st.create_session("dois", SessionSource::Native).unwrap();
+        st.set_workspace(&s1.id, &a.to_string_lossy()).unwrap();
+        assert_eq!(session_workspace(&db, &s1.id), a);
+        assert_eq!(session_workspace(&db, &s2.id), a, "sem pasta: a última");
+        st.set_workspace(&s2.id, &b.to_string_lossy()).unwrap();
+        assert_eq!(session_workspace(&db, &s2.id), b);
+        assert_eq!(session_workspace(&db, &s1.id), a, "cada uma a sua");
+        std::fs::remove_dir_all(&b).unwrap();
+        assert_eq!(session_workspace(&db, &s2.id), a, "pasta apagada");
+    }
+
+    #[test]
+    fn the_start_menu_folder_falls_back_to_home() {
+        let home = PathBuf::from("home");
+        let exe = PathBuf::from("app");
+        let proj = PathBuf::from("proj");
+        let sys = PathBuf::from("C:/Windows/System32");
+        assert_eq!(
+            launch_dir(Some(proj.clone()), Some(&exe), home.clone()),
+            proj
+        );
+        assert_eq!(
+            launch_dir(Some(exe.clone()), Some(&exe), home.clone()),
+            home
+        );
+        assert_eq!(launch_dir(Some(sys), Some(&exe), home.clone()), home);
+        assert_eq!(launch_dir(None, None, home.clone()), home);
+    }
 }

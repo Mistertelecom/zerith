@@ -4,6 +4,8 @@
 //! Everything blocking is `async` so Tauri runs it off the UI thread: a
 //! SQLite query or a keyring read must never stall a frame.
 
+use std::path::{Path, PathBuf};
+
 use serde::{Deserialize, Serialize};
 use zerith_sessions::{Session, SessionSource, Store};
 
@@ -13,6 +15,30 @@ use crate::wire;
 
 type Cmd<T> = Result<T, String>;
 
+/// A session as the window lists it: the stored row plus its folder.
+#[derive(Serialize)]
+pub struct SessionView {
+    #[serde(flatten)]
+    pub session: Session,
+    pub workspace: Option<String>,
+}
+
+fn with_workspaces(st: &Store, list: Vec<Session>) -> Vec<SessionView> {
+    let mut dirs = st.workspaces().unwrap_or_default();
+    list.into_iter()
+        .map(|s| SessionView {
+            workspace: dirs.remove(&s.id),
+            session: s,
+        })
+        .collect()
+}
+
+fn list(db: &Path, limit: usize) -> Cmd<Vec<SessionView>> {
+    let st = Store::open(db).map_err(|e| e.to_string())?;
+    let v = st.list_sessions(limit).map_err(|e| e.to_string())?;
+    Ok(with_workspaces(&st, v))
+}
+
 /// Everything the window needs to draw its first frame.
 #[derive(Serialize)]
 pub struct Boot {
@@ -21,7 +47,7 @@ pub struct Boot {
     pub theme: Theme,
     pub profile: Profile,
     pub reduce_motion: bool,
-    pub sessions: Vec<Session>,
+    pub sessions: Vec<SessionView>,
     pub providers: Vec<ProviderView>,
     pub memory_paused: bool,
 }
@@ -32,9 +58,7 @@ pub async fn boot(state: tauri::State<'_, AppState>) -> Cmd<Boot> {
     let db = state.db();
     state.ensure().map_err(|e| e.to_string())?;
     let prefs = wire::load_prefs(&root);
-    let sessions = Store::open(&db)
-        .and_then(|st| st.list_sessions(200))
-        .map_err(|e| e.to_string())?;
+    let sessions = list(&db, 200)?;
     Ok(Boot {
         root: root.display().to_string(),
         db: db.display().to_string(),
@@ -54,29 +78,95 @@ pub async fn boot(state: tauri::State<'_, AppState>) -> Cmd<Boot> {
 pub async fn list_sessions(
     state: tauri::State<'_, AppState>,
     limit: Option<usize>,
-) -> Cmd<Vec<Session>> {
+) -> Cmd<Vec<SessionView>> {
+    list(&state.db(), limit.unwrap_or(200))
+}
+
+/// A folder the window sent, checked: it must be an existing directory.
+fn folder(raw: &str) -> Cmd<PathBuf> {
+    let p = PathBuf::from(raw.trim());
+    if raw.trim().is_empty() || !p.is_dir() {
+        return Err(format!("Pasta não encontrada: {}", raw.trim()));
+    }
+    Ok(p)
+}
+
+/// A new conversation, in `workspace` when given, else in the last folder used.
+#[tauri::command]
+pub async fn create_session(
+    state: tauri::State<'_, AppState>,
+    title: String,
+    workspace: Option<String>,
+) -> Cmd<SessionView> {
     let db = state.db();
-    Store::open(&db)
-        .and_then(|st| st.list_sessions(limit.unwrap_or(200)))
+    let title: String = title.trim().chars().take(80).collect();
+    let dir = match workspace.as_deref() {
+        Some(w) if !w.trim().is_empty() => folder(w)?,
+        _ => crate::turn::last_workspace(&db),
+    };
+    let st = Store::open(&db).map_err(|e| e.to_string())?;
+    let s = st
+        .create_session(
+            if title.is_empty() {
+                "Nova conversa"
+            } else {
+                &title
+            },
+            SessionSource::Native,
+        )
+        .map_err(|e| e.to_string())?;
+    let dir = dir.display().to_string();
+    st.set_workspace(&s.id, &dir).map_err(|e| e.to_string())?;
+    Ok(SessionView {
+        session: s,
+        workspace: Some(dir),
+    })
+}
+
+/// Moves a conversation to another folder; the next turn runs there.
+#[tauri::command]
+pub async fn set_session_workspace(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    workspace: String,
+) -> Cmd<()> {
+    let dir = folder(&workspace)?;
+    Store::open(state.db())
+        .and_then(|st| st.set_workspace(&id, &dir.display().to_string()))
         .map_err(|e| e.to_string())
 }
 
+/// Folders used before, newest first, only those still on disk. Never empty:
+/// the first one is where a new conversation starts.
 #[tauri::command]
-pub async fn create_session(state: tauri::State<'_, AppState>, title: String) -> Cmd<Session> {
+pub async fn recent_workspaces(state: tauri::State<'_, AppState>) -> Cmd<Vec<String>> {
     let db = state.db();
-    let title: String = title.trim().chars().take(80).collect();
-    Store::open(&db)
-        .and_then(|st| {
-            st.create_session(
-                if title.is_empty() {
-                    "Nova conversa"
-                } else {
-                    &title
-                },
-                SessionSource::Native,
-            )
-        })
-        .map_err(|e| e.to_string())
+    let mut out: Vec<String> = Store::open(&db)
+        .and_then(|st| st.recent_workspaces(8))
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| Path::new(p).is_dir())
+        .collect();
+    if out.is_empty() {
+        out.push(crate::turn::last_workspace(&db).display().to_string());
+    }
+    Ok(out)
+}
+
+/// The OS folder picker. `None`: the person cancelled.
+#[tauri::command]
+pub async fn pick_folder(start: Option<String>) -> Cmd<Option<String>> {
+    tauri::async_runtime::spawn_blocking(move || crate::workspace::pick_folder(start.as_deref()))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Opens a conversation's folder in the file manager.
+#[tauri::command]
+pub async fn reveal_workspace(path: String) -> Cmd<()> {
+    // Native separators: `explorer C:/a/b` opens Documents instead.
+    let native: PathBuf = folder(&path)?.components().collect();
+    wire::reveal(&native)
 }
 
 #[tauri::command]

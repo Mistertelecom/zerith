@@ -64,6 +64,7 @@ import { HistoryTab } from "./History";
 import { MediaTab } from "./Media";
 import { MemoryTab } from "./Memory";
 import { SkillsTab } from "./Skills";
+import { McpTab } from "./Mcp";
 import { RoutingTab } from "./Routing";
 
 const TABS = [
@@ -73,6 +74,7 @@ const TABS = [
   "Delegação",
   "Memória",
   "Skills",
+  "MCP",
   "Mídia",
   "Agentes",
   "Histórico",
@@ -133,6 +135,7 @@ const NAV: {
         icon: Puzzle,
         hint: "Habilidades e plugins instalados.",
       },
+      { tab: "MCP", icon: Server, hint: "Servidores MCP: ferramentas externas do agente." },
       { tab: "Agentes", icon: Bot, hint: "Subagentes especializados." },
     ],
   },
@@ -618,6 +621,7 @@ export function Settings({
               {tab === "Geral" ? <GeneralTab {...general} /> : null}
               {tab === "Memória" ? <MemoryTab /> : null}
               {tab === "Skills" ? <SkillsTab /> : null}
+              {tab === "MCP" ? <McpTab /> : null}
               {tab === "Mídia" ? <MediaTab /> : null}
               {tab === "Agentes" ? <AgentsTab /> : null}
               {tab === "Histórico" ? <HistoryTab /> : null}
@@ -2110,6 +2114,20 @@ function UsageTab(p: { usage: UsageSummary | null; presets: Preset[] }) {
           tone="ok"
         />
       </div>
+      <p className="saver-split">
+        {(
+          [
+            ["Saídas resumidas", "RTK", u.total_saved_rtk_tokens],
+            ["Código enxuto", "Ponytail", u.total_saved_ponytail_tokens],
+            ["Respostas curtas", "Caveman", u.total_saved_caveman_tokens],
+          ] as const
+        ).map(([what, tech, n]) => (
+          <span key={tech}>
+            {what} <span className="setting-tech">({tech})</span>{" "}
+            <strong>{fmt(n)}</strong>
+          </span>
+        ))}
+      </p>
       <Card
         title="Por conta"
         icon={KeyRound}

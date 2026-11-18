@@ -98,7 +98,8 @@ export function applyEvent(state: TurnState, ev: TurnEvent): TurnState {
       state.route = { provider: ev.provider, model: ev.model };
       return state;
     case "saved":
-      state.saved += Math.max(0, ev.before - ev.after);
+      // RTK reports bytes; the runtime counts 4 bytes per token
+      state.saved += Math.floor(Math.max(0, ev.before - ev.after) / 4);
       return state;
     case "compacted":
       state.blocks.push({ kind: "note", text: "Contexto compactado" });
@@ -112,6 +113,8 @@ export function applyEvent(state: TurnState, ev: TurnEvent): TurnState {
     case "done": {
       const a = assistant(state);
       a.streaming = false;
+      // the turn's full saving: RTK plus the Ponytail/Caveman estimates
+      state.saved = Math.max(state.saved, ev.savedTokens);
       if (!a.text && ev.text) a.text = ev.text;
       return state;
     }

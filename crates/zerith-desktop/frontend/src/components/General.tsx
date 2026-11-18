@@ -225,6 +225,7 @@ function SaverRows() {
       ) : null}
       <Row
         label="Código enxuto"
+        tech="Ponytail"
         hint="Pede ao agente o mínimo que resolve: reaproveitar o que já existe, sem camadas a mais. Nível mais alto, diff menor."
       >
         <Segmented
@@ -236,6 +237,7 @@ function SaverRows() {
       </Row>
       <Row
         label="Respostas curtas"
+        tech="Caveman"
         hint="O agente explica em poucas palavras. Código, caminhos, comandos e avisos de segurança continuam completos."
       >
         <Segmented
@@ -247,6 +249,7 @@ function SaverRows() {
       </Row>
       <Row
         label="Resumir saídas longas"
+        tech="RTK"
         hint="Comandos como git, build e grep podem imprimir milhares de linhas. Só o essencial vai ao modelo; o texto completo continua no terminal."
       >
         <Switch label="Resumir saídas longas" checked={saver.rtkEnabled} onChange={(v) => patch({ rtkEnabled: v })} />

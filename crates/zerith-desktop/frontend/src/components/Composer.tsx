@@ -21,14 +21,24 @@ import {
   History,
   ListChecks,
   Minimize2,
+  Paperclip,
   RotateCcw,
   ShieldCheck,
   Sparkles,
   Square,
   SquarePen,
+  X,
   type LucideIcon,
 } from "lucide-react";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { api } from "../lib/api";
 import { Logo } from "./ui";
+
+/// An image waiting to go with the next message: saved already, so `path` is
+/// what the prompt cites and `url` (data URL) is only the chip's thumbnail.
+type Attached = { name: string; path: string; url: string };
+const IMAGE_CAP = 20 * 1024 * 1024;
+const isImagePath = (p: string) => /\.(png|jpe?g|webp|gif)$/i.test(p);
 
 /// What `/` offers. The names are the old window's, so muscle memory carries
 /// over; `run` is handled by App, which owns the state each one touches.
@@ -108,12 +118,93 @@ export function Composer(props: {
   onToggleHidden: (v: string) => void;
   hint: string;
   files: () => Promise<string[]>;
+  /** Extra pill at the head of the toolbar (the conversation's folder). */
+  folder?: ReactNode;
 }) {
   const box = useRef<HTMLTextAreaElement>(null);
   const [caret, setCaret] = useState(0);
   const [list, setList] = useState<string[] | null>(null);
   const [active, setActive] = useState(0);
   const [dismissed, setDismissed] = useState<string | null>(null);
+  const [images, setImages] = useState<Attached[]>([]);
+  const [note, setNote] = useState<string | null>(null);
+  const [dropping, setDropping] = useState(false);
+  const [queued, setQueued] = useState(false);
+  const picker = useRef<HTMLInputElement>(null);
+
+  // Saved on attach, not on send: a bad file is refused while the user is
+  // still looking at it, and sending stays a plain text prompt.
+  const attach = (name: string, dataUrl: string) =>
+    api.saveAttachment(dataUrl).then(
+      (path) => {
+        setNote(null);
+        setImages((l) =>
+          l.some((i) => i.path === path) ? l : [...l, { name, path, url: dataUrl }],
+        );
+      },
+      (e) => setNote(String(e)),
+    );
+  const addFiles = (files: Iterable<File>) => {
+    for (const f of files) {
+      if (!f.type.startsWith("image/")) continue;
+      if (f.size > IMAGE_CAP) {
+        setNote(`${f.name}: imagem maior que 20 MB`);
+        continue;
+      }
+      const r = new FileReader();
+      r.onload = () => void attach(f.name || "imagem", String(r.result));
+      r.readAsDataURL(f);
+    }
+  };
+
+  // The window takes OS file drops itself (Tauri), so the HTML drop below
+  // never sees those files: the webview event hands over paths instead.
+  useEffect(() => {
+    let off: (() => void) | undefined;
+    let live = true;
+    try {
+      void getCurrentWebview()
+        .onDragDropEvent(({ payload: p }) => {
+          if (p.type === "leave") return setDropping(false);
+          if (p.type !== "drop") return setDropping(true);
+          setDropping(false);
+          for (const path of p.paths.filter(isImagePath)) {
+            api
+              .readImage(path)
+              .then((url) => attach(path.split(/[\\/]/).pop() ?? "imagem", url))
+              .catch((e) => setNote(String(e)));
+          }
+        })
+        .then((u) => (live ? (off = u) : u()));
+    } catch {
+      // the browser preview has no Tauri window; the HTML drop covers it
+    }
+    return () => {
+      live = false;
+      off?.();
+    };
+  }, []);
+
+  // Images ride as `![nome](<path>)` lines: the providers turn them into
+  // image input and the transcript shows them, with no change to the store.
+  // App sends its own draft, so the lines go in first and the send waits one
+  // render for them.
+  const send = () => {
+    if (!images.length) return props.onSend();
+    if (props.busy) return;
+    const lines = images.map(
+      (i) => `![${i.name.replace(/[[\]\n]/g, "")}](<${i.path}>)`,
+    );
+    props.onDraft([props.draft.trim(), ...lines].filter(Boolean).join("\n"));
+    setImages([]);
+    setNote(null);
+    setQueued(true);
+  };
+  useEffect(() => {
+    if (!queued) return;
+    setQueued(false);
+    props.onSend();
+  }, [queued, props]);
 
   const trigger = useMemo(
     () => (props.draft === dismissed ? null : tokenAt(props.draft, caret)),
@@ -185,12 +276,46 @@ export function Composer(props: {
     props.modes.find(([v]) => v === props.mode)?.[1] ?? props.mode;
   const current = props.models.find((m) => m.value === props.model);
   const provider = current?.label.split(" · ")[0] ?? props.model;
-  const canSend = !props.busy && !!props.draft.trim();
+  const canSend = !props.busy && (!!props.draft.trim() || images.length > 0);
 
   return (
     <div className="composer">
       <div className="composer-inner">
-        <div className="draft">
+        <div
+          className={"draft" + (dropping ? " dropping" : "")}
+          onDragOver={(e) => {
+            if (!e.dataTransfer.types.includes("Files")) return;
+            e.preventDefault();
+            setDropping(true);
+          }}
+          onDragLeave={() => setDropping(false)}
+          onDrop={(e) => {
+            if (!e.dataTransfer.files.length) return;
+            e.preventDefault();
+            setDropping(false);
+            addFiles(e.dataTransfer.files);
+          }}
+        >
+          {images.length ? (
+            <div className="attach-row" aria-label="Imagens anexadas">
+              {images.map((im, i) => (
+                <div className="attach-chip" key={im.path} title={im.name}>
+                  <img src={im.url} alt={im.name} />
+                  <button
+                    type="button"
+                    className="attach-x"
+                    aria-label={`Remover ${im.name}`}
+                    title="Remover"
+                    onClick={() =>
+                      setImages((l) => l.filter((_, j) => j !== i))
+                    }
+                  >
+                    <X size={12} strokeWidth={2.25} />
+                  </button>
+                </div>
+              ))}
+            </div>
+          ) : null}
           {trigger && rows.length > 0 ? (
             <div
               className="popover popup"
@@ -259,6 +384,15 @@ export function Composer(props: {
               setCaret(e.target.selectionStart ?? e.target.value.length);
               setDismissed(null);
             }}
+            onPaste={(e) => {
+              const files = [...e.clipboardData.files].filter((f) =>
+                f.type.startsWith("image/"),
+              );
+              // Word/Excel put a picture of the copied text beside it: text wins
+              if (!files.length || e.clipboardData.getData("text/plain")) return;
+              e.preventDefault();
+              addFiles(files);
+            }}
             onKeyDown={(e) => {
               if (rows.length && trigger) {
                 if (e.key === "ArrowDown") {
@@ -284,15 +418,36 @@ export function Composer(props: {
               }
               if (e.key === "Enter" && !e.shiftKey) {
                 e.preventDefault();
-                props.onSend();
+                send();
               }
             }}
           />
           <div className="draft-row">
+            <button
+              type="button"
+              className="icon-btn sm"
+              aria-label="Anexar imagem"
+              title="Anexar imagem (ou cole / arraste)"
+              onClick={() => picker.current?.click()}
+            >
+              <Paperclip size={16} strokeWidth={2} />
+            </button>
+            <input
+              ref={picker}
+              type="file"
+              accept="image/png,image/jpeg,image/webp,image/gif"
+              multiple
+              hidden
+              onChange={(e) => {
+                addFiles(e.target.files ?? []);
+                e.target.value = "";
+              }}
+            />
             {/* Native selects under a pill: the pill shows the choice, the
                 transparent select on top keeps the real control and its menu. */}
             {/* Own menus, not native <select>: WebView2 draws that popup as a
                 white OS window that spills out of the frame (and down). */}
+            {props.folder}
             <PillMenu
               label="Permissões"
               icon={<ShieldCheck size={14} strokeWidth={2} />}
@@ -336,7 +491,7 @@ export function Composer(props: {
               <button
                 className={"btn btn-primary send" + (canSend ? " ready" : "")}
                 disabled={!canSend}
-                onClick={props.onSend}
+                onClick={send}
                 aria-label="Enviar"
                 title="Enviar"
               >
@@ -346,7 +501,7 @@ export function Composer(props: {
           </div>
         </div>
         <div className="hint">
-          <span className="hint-text">{props.hint}</span>
+          <span className="hint-text">{note ?? props.hint}</span>
           <span className="hint-keys">
             <kbd className="kbd">Enter</kbd> enviar
             <span className="hint-sep" />

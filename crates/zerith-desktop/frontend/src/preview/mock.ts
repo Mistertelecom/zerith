@@ -720,6 +720,42 @@ export function installMock(theme: string) {
           return catalog;
         case "skills_plugins":
           return plugins;
+        case "hermes_skills":
+          return [
+            ["", "ab-testing", "Plan and run A/B tests and experiments."],
+            ["", "brainstorming", "Explore intent before any creative work."],
+            ["mlops/inference", "llama-cpp", "llama.cpp local GGUF inference + HF Hub model discovery."],
+            ["mlops/inference", "serving-llms-vllm", "Serve LLMs with vLLM."],
+            ["networking", "mikrotik-routeros-cli", "Use when accessing a MikroTik RouterOS device via SSH."],
+            ["software-development", "zerith-harness", "Use when working in the Zerith Rust agent harness."],
+          ].map(([category, name, description]) => ({
+            name,
+            category,
+            description,
+            installed: name === "brainstorming",
+            error: null,
+          }));
+        case "hermes_skills_import":
+          return { imported: a.names as string[], existed: [], failed: [], skills: [...allSkills] };
+        case "mcp_list":
+          return [
+            { name: "codebase-memory-mcp", transport: "stdio", target: "npx --yes codebase-memory-mcp", enabled: true, approved: true, project: false, envKeys: [], headerKeys: [] },
+            { name: "github", transport: "stdio", target: "npx -y @modelcontextprotocol/server-github", enabled: true, approved: true, project: false, envKeys: ["GITHUB_TOKEN"], headerKeys: [] },
+            { name: "docs", transport: "http", target: "https://exemplo.test/mcp", enabled: false, approved: true, project: false, envKeys: [], headerKeys: ["Authorization"] },
+          ];
+        case "mcp_test":
+          return [
+            { name: "search_graph", description: "Find symbols" },
+            { name: "query_graph", description: "Cypher" },
+            { name: "trace_path", description: "Callers/callees" },
+          ];
+        case "mcp_hermes_preview":
+          return [
+            { name: "centauri", transport: "stdio", target: "/Users/apple/.local/share/pycentauri/centauri-mcp.sh", status: "nao-encontrado", enabled: false, envKeys: [] },
+            { name: "vercel", transport: "http", target: "https://mcp.vercel.com", status: "oauth", enabled: true, envKeys: [] },
+            { name: "codebase-memory-mcp", transport: "stdio", target: "npx --yes codebase-memory-mcp", status: "existe", enabled: true, envKeys: [] },
+            { name: "rea", transport: "stdio", target: "C:\\Program Files\\nodejs\\node.exe rea.mjs mcp", status: "importavel", enabled: true, envKeys: ["GHIDRA_INSTALL_DIR", "JAVA_HOME"] },
+          ];
         case "token_saver":
           return { ponytail: "full", caveman: "off", rtkEnabled: true };
         case "storage":
@@ -771,6 +807,18 @@ export function installMock(theme: string) {
           ];
         case "checkpoints":
           return [1, 2];
+        case "read_image":
+          return PREVIEW_IMG;
+        case "save_attachment":
+          return `C:/Users/Joao/AppData/Roaming/Zerith/attachments/${String(a.data).length}.png`;
+        case "recent_workspaces":
+          return [
+            "C:/Users/Joao/Documents/PROJETOS PESSOAIS/zerith",
+            "C:/Users/Joao/Documents/PROJETOS PESSOAIS/site-provedor",
+            "C:/Users/Joao/Documents/notas",
+          ];
+        case "pick_folder":
+          return null;
         case "workspace_files":
           return [
             "crates/zerith-providers/src/openai.rs",

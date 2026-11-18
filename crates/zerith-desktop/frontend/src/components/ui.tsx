@@ -139,11 +139,21 @@ export function Card(props: {
 }
 
 /** Label and explanation on the left, the control on the right. */
-export function Row(props: { label: string; hint?: ReactNode; stacked?: boolean; children: ReactNode }) {
+export function Row(props: {
+  label: string;
+  /** The technique behind the setting, shown small for developers. */
+  tech?: string;
+  hint?: ReactNode;
+  stacked?: boolean;
+  children: ReactNode;
+}) {
   return (
     <div className={"setting-row" + (props.stacked ? " stacked" : "")}>
       <div className="setting-text">
-        <span className="setting-label">{props.label}</span>
+        <span className="setting-label">
+          {props.label}
+          {props.tech ? <span className="setting-tech"> ({props.tech})</span> : null}
+        </span>
         {props.hint ? <span className="field-hint">{props.hint}</span> : null}
       </div>
       <div className="setting-control">{props.children}</div>

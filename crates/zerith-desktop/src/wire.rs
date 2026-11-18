@@ -24,8 +24,10 @@ pub fn memory_scope() -> Scope {
 }
 
 fn load(root: &Path) -> Settings {
-    let cwd = std::env::current_dir().ok();
-    Settings::load(&Paths::with_root(root), cwd.as_deref()).settings
+    let paths = Paths::with_root(root);
+    // The project layer of the folder conversations use, not the launch dir.
+    let dir = crate::turn::last_workspace(&paths.db());
+    Settings::load(&paths, Some(&dir)).settings
 }
 
 fn kind_of(name: &str) -> ProviderKind {

@@ -122,8 +122,10 @@ fn keyboard_shortcuts_switch_screens_start_chats_and_stop_turns() {
         },
     };
     assert!(on_key(&mut shell, &cmd('5'), &mut tx));
+    assert_eq!(shell.screen, Screen::Media);
+    assert!(on_key(&mut shell, &cmd('6'), &mut tx));
     assert_eq!(shell.screen, Screen::Memory);
-    assert!(on_key(&mut shell, &cmd('7'), &mut tx));
+    assert!(on_key(&mut shell, &cmd('8'), &mut tx));
     assert_eq!(shell.screen, Screen::Settings);
     assert!(on_key(&mut shell, &cmd('k'), &mut tx));
     assert_eq!(shell.screen, Screen::History);

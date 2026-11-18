@@ -329,7 +329,13 @@ pub fn view(s: &Shell, u: &Ui) -> El {
         Load::Failed(e) => col()
             .w_full()
             .gap(12.0)
-            .child(widgets::error_line(format!("Memória indisponível: {e}"), u))
+            .child(widgets::error_line(
+                format!(
+                    "Memória indisponível: {}",
+                    crate::folders::with_cause(&s.root(), e)
+                ),
+                u,
+            ))
             .child(widgets::button(
                 "memory-retry",
                 "Tentar de novo",

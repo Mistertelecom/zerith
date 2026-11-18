@@ -9,7 +9,21 @@ use zerith_ui::agentwork::{
     Item, Question, QuestionSet, SubState, Subagent, TaskItem, TaskState, ToolRow, ToolState,
     WorkEvent,
 };
+use zerith_ui::screens::providers::Tab as ProvTab;
+use zerith_ui::screens::settings::Tab as SetTab;
 use zerith_ui::{spec, Line, Screen, Shell, Theme};
+
+fn providers_tab(s: &mut Shell, t: ProvTab) {
+    go(s, Screen::Providers);
+    s.inline = true;
+    zerith_ui::screens::providers::set_tab(s, t);
+    s.inline = false;
+}
+
+fn settings_tab(s: &mut Shell, t: SetTab) {
+    go(s, Screen::Settings);
+    zerith_ui::screens::settings::set_tab(s, t);
+}
 
 fn go(s: &mut Shell, to: Screen) {
     // Scenes follow `--theme` so one scene snaps in both appearances.
@@ -93,11 +107,41 @@ fn demo_work(s: &mut Shell) {
     );
 }
 
+/// The Media screen over the fake catalogue: a saved image model with fixed
+/// parameters, a connected key, nothing from the network or the keyring.
+fn demo_media(s: &mut Shell) {
+    use zerith_providers::media::Kind;
+    use zerith_ui::screens::media::{self, demo};
+    let (backend, _) = demo::backend(Some(media::KeySource::Keyring));
+    s.media = media::MediaState::with_backend(backend, String::new());
+    let m = demo::model(Kind::Image, 6);
+    s.media.image.model_id = m.id.clone();
+    s.media.image.saved = [
+        ("aspect_ratio".to_string(), "16:9".into()),
+        ("n".to_string(), 1.into()),
+        ("quality".to_string(), "high".into()),
+    ]
+    .into_iter()
+    .collect();
+    s.media.video.model_id = demo::model(Kind::Video, 2).id;
+    s.media.video.saved = [("duration".to_string(), 6.into())].into_iter().collect();
+    go(s, Screen::Media);
+}
+
 type Scene = (&'static str, fn(&mut Shell));
 
 const SCENES: &[Scene] = &[
     ("chat", |s| go(s, Screen::Chat)),
     ("new-chat", |s| {
+        s.new_chat();
+        s.theme = Theme::System;
+    }),
+    ("new-chat-model", |s| {
+        // A provider that needs no key, but no model chosen yet.
+        s.providers = zerith_ui::ProvidersState::new(vec![zerith_providers::ProviderConfig::new(
+            zerith_providers::ProviderKind::Ollama,
+        )]);
+        s.chat.model.clear();
         s.new_chat();
         s.theme = Theme::System;
     }),
@@ -183,10 +227,79 @@ const SCENES: &[Scene] = &[
     }),
     ("history", |s| go(s, Screen::History)),
     ("agents", |s| go(s, Screen::Agents)),
+    ("agent-new", |s| {
+        go(s, Screen::Agents);
+        s.agents.form = Some(zerith_ui::NewAgent::demo());
+    }),
     ("skills", |s| go(s, Screen::Skills)),
     ("memory", |s| go(s, Screen::Memory)),
     ("providers", |s| go(s, Screen::Providers)),
+    ("providers-accounts", |s| {
+        providers_tab(s, ProvTab::Accounts)
+    }),
+    ("providers-routing", |s| providers_tab(s, ProvTab::Routing)),
+    ("providers-usage", |s| providers_tab(s, ProvTab::Usage)),
     ("settings", |s| go(s, Screen::Settings)),
+    ("settings-tokens", |s| settings_tab(s, SetTab::Tokens)),
+    ("settings-storage", |s| settings_tab(s, SetTab::Storage)),
+    ("media", |s| {
+        demo_media(s);
+    }),
+    ("media-search", |s| {
+        use zerith_providers::media::Kind;
+        demo_media(s);
+        s.inline = true;
+        zerith_ui::screens::media::set_kind(s, Kind::Image);
+        s.media.image.query = rune::TextEdit::new("flux");
+        s.media.image.picking = true;
+        zerith_ui::screens::media::search_now(s, Kind::Image);
+        s.inline = false;
+    }),
+    ("media-chat", |s| {
+        demo_work(s);
+        let dir = s.media_dir.clone();
+        let img = dir.join("2026-11-16-gato.png");
+        s.images
+            .seed(&img, 480, 300, zerith_ui::mediaout::demo_pixels(480, 300));
+        let vid = dir.join("2026-11-16-clipe.mp4");
+        let slash = |p: &std::path::Path| p.display().to_string().replace('\\', "/");
+        let p = slash(&img);
+        let result = format!(
+            "Imagem gerada com black-forest-labs/flux-2.0-6.\nParâmetros enviados: aspect_ratio=16:9, n=1\nCusto: US$ 0,0400\nArquivo: {p} (image/png, 212 KB)\n![um gato de óculos]({p})\n"
+        );
+        let video = format!(
+            "Vídeo gerado com google/veo-3.\nParâmetros enviados: duration=6\nCusto: US$ 1,2000\nArquivo: {} (video/mp4, 4096 KB)\n",
+            slash(&vid)
+        );
+        let tool = |id: &str, name: &str, arg: &str, preview: String, ms| {
+            Line::item(Item::Tool(ToolRow {
+                id: id.into(),
+                name: name.into(),
+                arg: arg.into(),
+                state: ToolState::Ok,
+                millis: Some(ms),
+                started: None,
+                preview,
+                diff: None,
+            }))
+        };
+        s.chat.lines = vec![
+            Line::new("user", "Gere um gato de óculos e depois um clipe curto."),
+            tool("1", "generate_image", "um gato de óculos", result, 8_200),
+            Line::new(
+                "assistant",
+                format!("Pronto, a imagem está acima.\n\n![gato](<{p}>)\n\n![remota](https://exemplo.invalid/x.png)"),
+            ),
+            tool("2", "generate_video", "gato andando", video, 94_000),
+        ];
+        s.chat.tasks.clear();
+        s.chat.rewind = false;
+    }),
+    ("media-video", |s| {
+        use zerith_providers::media::Kind;
+        demo_media(s);
+        zerith_ui::screens::media::set_kind(s, Kind::Video);
+    }),
     ("catalog", |s| {
         go(s, Screen::Skills);
         s.inline = true;
@@ -216,11 +329,28 @@ const SCENES: &[Scene] = &[
 fn main() {
     let mut spec = spec();
     spec.scenes = SCENES;
-    let app = rune::App::new(spec);
+    let app = zerith_ui::app_with(spec);
     let me = app.handle();
-    let paths = Paths::resolve();
-    if let Err(e) = paths.ensure() {
-        eprintln!("zerith-ui: cannot prepare {}: {e}", paths.root().display());
+    let mut paths = Paths::resolve();
+    let writable = paths.ensure().is_ok()
+        && zerith_sessions::Store::open(paths.db()).is_ok();
+    if !writable {
+        let fallback = Paths::with_root(std::env::temp_dir().join("zerith-ui-home"));
+        if fallback.ensure().is_ok() {
+            paths = fallback;
+        } else if let Err(e) = paths.ensure() {
+            eprintln!("zerith-ui: cannot prepare {}: {e}", paths.root().display());
+        }
+    }
+    // First start: the skills that ship with the app arrive disabled. Quiet on
+    // success; a failure is only a stderr note, never a reason to not open.
+    if let Some(bundle) = paths.bundled_skills() {
+        match zerith_skills::Library::open(paths.skills()).and_then(|l| l.seed_disabled(&bundle)) {
+            Ok((_, failed)) => failed
+                .iter()
+                .for_each(|f| eprintln!("zerith-ui: skill embutida ignorada: {f}")),
+            Err(e) => eprintln!("zerith-ui: não consegui preparar as skills embutidas: {e}"),
+        }
     }
     let db = paths.db();
     let ready = me.clone();

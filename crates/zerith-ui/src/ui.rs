@@ -15,6 +15,9 @@ use rune::{Color, CubicBezier, Curve, Easing, Icon, TextStyle};
 pub struct Ui {
     /// Which ladder this is; the kit and the theme toggle read it.
     pub dark: bool,
+    /// The sheet is narrow (window under ~900 pt): screens stack instead of
+    /// sitting side by side. Set by `view` from the measured sheet width.
+    pub compact: bool,
     /// The window behind everything.
     pub canvas: Color,
     /// The frame the sidebar sits on.
@@ -61,6 +64,8 @@ pub struct Ui {
     pub ok: Color,
     /// `state-warn`.
     pub warn: Color,
+    /// Warning as text: `warn` is a mark colour and is too pale to read on the light sheet.
+    pub warn_text: Color,
     /// `state-error`.
     pub danger: Color,
     /// `state-done` (violet): a finished subagent or plan.
@@ -85,42 +90,44 @@ fn a(s: &str, alpha: f32) -> Color {
     c(s).alpha(alpha)
 }
 
-/// Dark ladder: bluish-neutral 950 base, layers 875 / 850 / 800.
+/// Dark ladder: carbon-slate 950 base with restrained depth and WCAG 4.5+ labels.
 pub fn dark() -> Ui {
     Ui {
         dark: true,
-        canvas: c("#1b1b1c"),
-        chrome: c("#1b1b1c"),
-        surface: c("#151517"),
-        muted: c("#232324"),
-        layer2: c("#2c2c2e"),
-        layer3: c("#353638"),
-        selected: c("#2c2c2e"),
-        hover: a("#ffffff", 0.07),
-        active: a("#ffffff", 0.12),
-        line: a("#ffffff", 0.10),
-        line_strong: a("#ffffff", 0.18),
-        content: c("#f1f3f5"),
-        secondary: c("#cfd3d6"),
-        muted_text: c("#adb2b8"),
-        faint: c("#81858c"),
-        primary: c("#f9fafb"),
-        primary_press: c("#ebeef2"),
-        inverted: c("#0f1115"),
-        accent: c("#3b82f6"),
-        accent_text: c("#60a5fa"),
-        accent_soft: a("#3b82f6", 0.18),
+        compact: false,
+        canvas: c("#0b0d11"),
+        chrome: c("#090b0f"),
+        surface: c("#0f1217"),
+        muted: c("#161a22"),
+        layer2: c("#1c212b"),
+        layer3: c("#222834"),
+        selected: c("#1a2030"),
+        hover: a("#ffffff", 0.055),
+        active: a("#ffffff", 0.095),
+        line: a("#ffffff", 0.075),
+        line_strong: a("#ffffff", 0.15),
+        content: c("#f1f5f9"),
+        secondary: c("#cbd5e1"),
+        muted_text: c("#aab5c4"),
+        faint: c("#8792a2"),
+        primary: c("#f1f5f9"),
+        primary_press: c("#dfe6ef"),
+        inverted: c("#0f1217"),
+        accent: c("#6366f1"),
+        accent_text: c("#a5b4fc"),
+        accent_soft: a("#6366f1", 0.16),
         ok: c("#22c55e"),
         warn: c("#f59e0b"),
-        danger: c("#f25a5a"),
+        warn_text: c("#f59e0b"),
+        danger: c("#f56e6e"),
         done: c("#a78bfa"),
-        idle: c("#545557"),
+        idle: c("#545b68"),
         warn_soft: a("#f59e0b", 0.12),
-        danger_soft: a("#f25a5a", 0.12),
-        diff_add: c("#1f3124"),
-        diff_del: c("#3c1f1b"),
+        danger_soft: a("#f56e6e", 0.12),
+        diff_add: c("#172d22"),
+        diff_del: c("#381c1d"),
         diff_add_ink: c("#41c977"),
-        diff_del_ink: c("#fa423e"),
+        diff_del_ink: c("#f87171"),
     }
 }
 
@@ -128,6 +135,7 @@ pub fn dark() -> Ui {
 pub fn light() -> Ui {
     Ui {
         dark: false,
+        compact: false,
         canvas: c("#f9fafb"),
         chrome: c("#f9fafb"),
         surface: c("#ffffff"),
@@ -140,22 +148,23 @@ pub fn light() -> Ui {
         line: a("#000000", 0.08),
         line_strong: a("#000000", 0.14),
         content: c("#0f1115"),
-        secondary: c("#61666b"),
-        muted_text: c("#81858c"),
-        faint: c("#adb2b8"),
+        secondary: c("#4b5056"),
+        muted_text: c("#5a5f65"),
+        faint: c("#666b71"),
         primary: c("#0f1115"),
         primary_press: c("#43454a"),
         inverted: c("#ffffff"),
-        accent: c("#3b82f6"),
-        accent_text: c("#2563eb"),
-        accent_soft: a("#3b82f6", 0.12),
+        accent: c("#4f46e5"),
+        accent_text: c("#4338ca"),
+        accent_soft: a("#4f46e5", 0.11),
         ok: c("#22c55e"),
         warn: c("#f59e0b"),
-        danger: c("#ec1313"),
+        warn_text: c("#a14a08"),
+        danger: c("#d31212"),
         done: c("#7c3aed"),
         idle: c("#d4d4d4"),
         warn_soft: a("#f59e0b", 0.12),
-        danger_soft: a("#ec1313", 0.08),
+        danger_soft: a("#d31212", 0.08),
         diff_add: c("#e6f4e7"),
         diff_del: c("#fce6e2"),
         diff_add_ink: c("#01a241"),
@@ -336,6 +345,11 @@ glyph!(
     r#"<path d="M3 5h5.5M11.5 5H13M3 11h1.5M7.5 11H13"/><circle cx="10" cy="5" r="1.5"/><circle cx="6" cy="11" r="1.5"/>"#
 );
 glyph!(
+    icon_media,
+    "nav-media",
+    r#"<rect x="2.75" y="3.5" width="10.5" height="9" rx="1.75"/><circle cx="6" cy="6.75" r="1"/><path d="M3.5 11.5l3-3 2 2 1.5-1.5 2.5 2.5"/>"#
+);
+glyph!(
     icon_search,
     "search",
     r#"<circle cx="7.25" cy="7.25" r="3.75"/><path d="M10 10l3 3"/>"#
@@ -412,3 +426,80 @@ glyph!(
     r#"<circle cx="8" cy="8" r="5.5"/><path d="M6.5 6.5a1.6 1.6 0 1 1 2.3 1.45c-.5.3-.8.65-.8 1.3M8 11.25h.01"/>"#
 );
 glyph!(icon_cross, "cross", r#"<path d="M5 5l6 6M11 5l-6 6"/>"#);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// WCAG relative luminance. `Color` is already linear sRGB.
+    fn lum(c: Color) -> f32 {
+        0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b
+    }
+
+    /// WCAG contrast ratio of two opaque colours.
+    pub(crate) fn ratio(a: Color, b: Color) -> f32 {
+        let (x, y) = (lum(a), lum(b));
+        let (hi, lo) = if x > y { (x, y) } else { (y, x) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    fn fills(u: &Ui) -> [(&'static str, Color); 6] {
+        [
+            ("surface", u.surface),
+            ("chrome", u.chrome),
+            ("muted", u.muted),
+            ("layer2", u.layer2),
+            ("layer3", u.layer3),
+            ("selected", u.selected),
+        ]
+    }
+
+    #[test]
+    fn the_wcag_helper_matches_known_values() {
+        assert!((ratio(Color::BLACK, Color::WHITE) - 21.0).abs() < 0.01);
+        assert!((ratio(hex("#767676").unwrap(), Color::WHITE) - 4.54).abs() < 0.02);
+    }
+
+    #[test]
+    fn body_text_tokens_reach_4_5_on_every_fill_in_both_themes() {
+        for u in [light(), dark()] {
+            let theme = if u.dark { "dark" } else { "light" };
+            // The label ladder holds body-size text on any layer.
+            for (name, fg) in [
+                ("content", u.content),
+                ("secondary", u.secondary),
+                ("muted_text", u.muted_text),
+                ("faint", u.faint),
+            ] {
+                for (bg_name, bg) in fills(&u) {
+                    let r = ratio(fg, bg);
+                    assert!(r >= 4.5, "{theme}: {name} on {bg_name} is {r:.2}:1");
+                }
+            }
+            // Coloured text sits on the sheet, the chrome, inputs and raised rows.
+            for (name, fg) in [
+                ("accent_text", u.accent_text),
+                ("danger", u.danger),
+                ("warn_text", u.warn_text),
+                ("done", u.done),
+            ] {
+                for (bg_name, bg) in fills(&u).into_iter().take(4) {
+                    let r = ratio(fg, bg);
+                    assert!(r >= 4.5, "{theme}: {name} on {bg_name} is {r:.2}:1");
+                }
+            }
+            let r = ratio(u.inverted, u.primary);
+            assert!(r >= 4.5, "{theme}: primary button ink is {r:.2}:1");
+        }
+    }
+
+    #[test]
+    fn the_label_ladder_keeps_its_order() {
+        for u in [light(), dark()] {
+            let on = u.surface;
+            assert!(ratio(u.content, on) > ratio(u.secondary, on));
+            assert!(ratio(u.secondary, on) > ratio(u.muted_text, on));
+            assert!(ratio(u.muted_text, on) > ratio(u.faint, on));
+        }
+    }
+}

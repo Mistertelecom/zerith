@@ -6,10 +6,12 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use zerith_core::settings::{self, ProviderEntry, WireProtocol};
+use zerith_core::settings::{self, AuthMode as AuthModeSettings, ProviderEntry, WireProtocol};
 use zerith_core::{Paths, Settings};
 use zerith_memory::Scope;
-use zerith_providers::{infer_provider, ModelSpec, Protocol, ProviderConfig, ProviderKind};
+use zerith_providers::{
+    infer_provider, AuthMode, ModelSpec, OAuthTool, Protocol, ProviderConfig, ProviderKind,
+};
 use zerith_runtime::{Approval as RtApproval, ApprovalSender};
 use zerith_sessions::{Store, UsageSummary};
 
@@ -232,10 +234,17 @@ pub fn configured_providers(root: &Path) -> Vec<ProviderConfig> {
 pub fn save_provider(root: &Path, cfg: &ProviderConfig) -> Result<(), String> {
     let entry = ProviderEntry {
         name: cfg.name.clone(),
-        protocol: Some(match cfg.protocol {
-            Protocol::OpenAi => WireProtocol::OpenAi,
-            Protocol::Anthropic => WireProtocol::Anthropic,
-        }),
+        protocol: match cfg.protocol {
+            Protocol::OpenAi => Some(WireProtocol::OpenAi),
+            Protocol::Anthropic => Some(WireProtocol::Anthropic),
+            // Responses (codex) is implied by the provider kind; the settings
+            // field only knows the two historical protocols.
+            Protocol::Responses => None,
+        },
+        auth: match cfg.auth {
+            AuthMode::ApiKey => AuthModeSettings::ApiKey,
+            AuthMode::Oauth => AuthModeSettings::Oauth,
+        },
         base_url: Some(cfg.base_url.clone()),
         default_model: cfg.default_model.clone(),
         timeout_ms: Some(cfg.timeout_ms),
@@ -291,6 +300,76 @@ pub fn save_account(
 }
 
 /// Removes a gateway account by id from the user settings layer.
+/// Provider an OAuth tool speaks: Codex has its own preset, Claude Code rides
+/// the Anthropic one, Antigravity the Google one.
+pub fn oauth_provider(tool: OAuthTool) -> &'static str {
+    match tool {
+        OAuthTool::ClaudeCode => "anthropic",
+        OAuthTool::Codex => "codex",
+        OAuthTool::Antigravity => "antigravity",
+    }
+}
+
+/// Full browser login: PKCE, loopback, exchange, cofre, settings.
+///
+/// Blocking by design — it waits for the human in the browser, so the caller
+/// runs it on the worker thread, never on the UI thread.
+pub fn oauth_login(root: &Path, tool: OAuthTool, account: &str) -> Result<String, String> {
+    use zerith_providers::oauth;
+
+    let account = account.trim();
+    if account.is_empty() {
+        return Err("Informe o ID da conta antes de entrar".into());
+    }
+    oauth::ready(tool)?;
+    let pkce = oauth::Pkce::generate();
+    let state = oauth::random_state();
+    // bind before the browser: a busy fixed port fails here, not after consent
+    let (listener, port) = oauth::bind(tool).map_err(|e| e.to_string())?;
+    let url = oauth::authorize_url(tool, &pkce, &state, port);
+    if let Err(e) = oauth::open_browser(&url) {
+        return Err(format!(
+            "não consegui abrir o navegador ({e}); abra esta URL:\n{url}"
+        ));
+    }
+    let code = oauth::wait_for_code(listener, oauth::redirect_path(tool), &state)
+        .map_err(|e| e.to_string())?;
+    let cred = oauth::exchange(
+        tool,
+        &code,
+        &pkce.verifier,
+        &oauth::redirect_uri(tool, port),
+    )
+    .map_err(|e| e.to_string())?;
+
+    zerith_core::secrets::save_oauth(&zerith_core::secrets::OsKeyring, account, &cred)
+        .map_err(|e| e.to_string())?;
+    let acc = settings::AccountEntry {
+        id: account.to_string(),
+        provider: oauth_provider(tool).to_string(),
+        auth: AuthModeSettings::Oauth,
+        oauth_tool: Some(tool.as_str().to_string()),
+        ..Default::default()
+    };
+    save_account(root, &acc, None)?;
+
+    let minutes = (cred.expires_at - oauth::now_secs()).max(0) / 60;
+    Ok(format!(
+        "conta {account} conectada via {} (expira em {minutes} min)",
+        tool.as_str()
+    ))
+}
+
+/// Where an account's credential stands, for the pill: which tool and how many
+/// minutes are left. `None` = no credential in the cofre.
+pub fn oauth_status(account: &str) -> Option<(OAuthTool, i64)> {
+    let cred = zerith_core::secrets::load_oauth(&zerith_core::secrets::OsKeyring, account)
+        .ok()
+        .flatten()?;
+    let minutes = (cred.expires_at - zerith_providers::oauth::now_secs()).max(0) / 60;
+    Some((cred.tool, minutes))
+}
+
 pub fn delete_account(root: &Path, id: &str) -> Result<(), String> {
     Settings::save_user(&Paths::with_root(root), |s| {
         s.accounts.retain(|a| a.id != id);
@@ -490,6 +569,98 @@ pub fn reveal(path: &Path) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+// ------------------------------------------------------------------ media
+
+use zerith_core::MediaSettings;
+use zerith_providers::media::{Kind as MediaKind, OpenRouter};
+
+use crate::screens::media::{Backend, KeySource};
+
+/// The saved `[media]` section (model and fixed parameters per kind).
+pub fn media_load(root: &Path) -> MediaSettings {
+    load(root).media
+}
+
+/// Writes one kind's model and parameters to the user settings layer.
+pub fn media_save(
+    root: &Path,
+    kind: MediaKind,
+    model: &str,
+    params: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Result<(), String> {
+    let (model, params) = (model.to_string(), params.clone());
+    Settings::save_user(&Paths::with_root(root), |s| {
+        let slot = match kind {
+            MediaKind::Image => &mut s.media.image,
+            MediaKind::Video => &mut s.media.video,
+        };
+        slot.model = model;
+        slot.params = params;
+    })
+    .map_err(|e| e.to_string())
+}
+
+/// The folder generated files go to (`media.output_dir`, else `<root>/media`).
+pub fn media_dir(root: &Path) -> PathBuf {
+    let paths = Paths::with_root(root);
+    load(root).media.resolve_output_dir(&paths)
+}
+
+/// Opens a generated file with the OS default app. Refuses anything that is
+/// not a file under `dir`: no URL, no relative path, no `..`.
+pub fn open_media(dir: &Path, path: &Path) -> Result<(), String> {
+    if !crate::mediaout::is_under(dir, path) {
+        return Err("Só abro arquivos da pasta de mídia.".into());
+    }
+    // Native separators: `explorer C:/a/b.png` does not find the file.
+    let native: PathBuf = path.components().collect();
+    if !native.is_file() {
+        return Err(format!("O arquivo não existe mais: {}", native.display()));
+    }
+    reveal(&native)
+}
+
+/// The real media backend: OpenRouter for the catalogue and the key check, the
+/// OS keyring (`openrouter` entry) for the key. The key is read at the moment
+/// of a request and never stored in the window's state.
+pub fn media_backend(base_url: String) -> Backend {
+    use std::sync::Arc;
+    let url = move || Some(base_url.clone()).filter(|u| !u.trim().is_empty());
+    let (u1, u2) = (url.clone(), url);
+    Backend {
+        // Listing models needs no key.
+        models: Arc::new(move |kind, q, off, lim| {
+            OpenRouter::new(None, u1())
+                .models(kind, q, off, lim)
+                .map_err(|e| e.to_string())
+        }),
+        resolve_key: Arc::new(|| {
+            if std::env::var(zerith_core::secrets::OPENROUTER_ENV)
+                .is_ok_and(|v| !v.trim().is_empty())
+            {
+                return Ok(Some(KeySource::Env));
+            }
+            match zerith_core::secrets::resolve_openrouter_key() {
+                Ok(Some(_)) => Ok(Some(KeySource::Keyring)),
+                Ok(None) => Ok(None),
+                Err(e) => Err(e.to_string()),
+            }
+        }),
+        save_key: Arc::new(|key| {
+            zerith_core::secrets::set_secret(zerith_core::secrets::OPENROUTER_ENTRY, key)
+                .map_err(|e| e.to_string())
+        }),
+        check_key: Arc::new(move || {
+            let key = zerith_core::secrets::resolve_openrouter_key()
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "Nenhuma chave salva.".to_string())?;
+            OpenRouter::new(Some(key), u2())
+                .check_key()
+                .map_err(|e| e.to_string())
+        }),
+    }
+}
+
 // ------------------------------------------------------------ agent work
 
 /// Whether the store can rewind a turn: the checkpoints module exists in
@@ -551,7 +722,8 @@ pub fn compact_now(
     model: &str,
 ) -> Result<usize, String> {
     let store = Store::open(db).map_err(|e| e.to_string())?;
-    let client = zerith_providers::Client::new(cfg).map_err(|e| e.to_string())?;
+    let client =
+        zerith_providers::Client::new(cfg).map_err(|e| zerith_providers::explain::headline(&e))?;
     zerith_runtime::compact_now(
         &store,
         &client,
@@ -561,7 +733,10 @@ pub fn compact_now(
         None,
     )
     .map(|r| r.map_or(0, |r| r.summarized))
-    .map_err(|e| e.to_string())
+    .map_err(|e| match e {
+        zerith_runtime::RunError::Provider(p) => zerith_providers::explain::headline(&p),
+        other => other.to_string(),
+    })
 }
 
 /// Price of a model in USD per million tokens.
@@ -766,5 +941,27 @@ pub fn run_hermes_import(
             only_ids.as_deref(),
         )
         .map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The account's provider string must resolve to a real preset, otherwise
+    /// the runtime treats it as `Custom` with no endpoint and the login is dead
+    /// weight.
+    #[test]
+    fn oauth_provider_resolves_to_a_known_preset() {
+        assert_eq!(oauth_provider(OAuthTool::ClaudeCode), "anthropic");
+        assert_eq!(oauth_provider(OAuthTool::Codex), "codex");
+        for tool in [OAuthTool::ClaudeCode, OAuthTool::Codex] {
+            assert_ne!(
+                ProviderKind::parse(oauth_provider(tool)),
+                ProviderKind::Custom,
+                "{} não vira preset",
+                tool.as_str()
+            );
+        }
     }
 }

@@ -1,13 +1,15 @@
-//! Appearance, privacy, storage, execution profile, about.
+//! Settings in three tabs: `Geral` (appearance, privacy, profile, about),
+//! `Economia de tokens` and `Armazenamento`. Titles say what a setting does;
+//! the stored names appear only as small muted hints.
 
-use rune::{col, row, text, El, ScrollSpec, Tx};
+use rune::{col, el, text, El, Tx};
 use rune_kit::{SegmentedControl, Switch};
 use zerith_core::{CavemanLevel, PonytailLevel, TokenSaverSettings};
 use zerith_sessions::{Store, UsageSummary};
 
 use crate::agentwork;
 use crate::ui::{self, Ui};
-use crate::widgets::{self, button, section, setting, Load, Tone};
+use crate::widgets::{self, button, section, setting, setting_full, Load, Tone};
 use crate::{wire, Profile, Shell, Theme};
 
 /// What the storage section reports.
@@ -18,7 +20,33 @@ pub struct Storage {
     pub messages: i64,
 }
 
+/// The three tabs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Tab {
+    #[default]
+    General,
+    Tokens,
+    Storage,
+}
+
+impl Tab {
+    pub const ALL: [Tab; 3] = [Tab::General, Tab::Tokens, Tab::Storage];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Tab::General => "Geral",
+            Tab::Tokens => "Economia de tokens",
+            Tab::Storage => "Armazenamento",
+        }
+    }
+}
+
+pub fn set_tab(s: &mut Shell, t: Tab) {
+    s.settings.tab = t;
+}
+
 pub struct SettingsState {
+    pub tab: Tab,
     pub profile: Profile,
     pub token_saver: TokenSaverSettings,
     pub savings: Load<UsageSummary>,
@@ -30,6 +58,7 @@ pub struct SettingsState {
 impl SettingsState {
     pub fn new(profile: Profile, token_saver: TokenSaverSettings) -> Self {
         Self {
+            tab: Tab::default(),
             profile,
             token_saver,
             savings: Load::Idle,
@@ -56,7 +85,9 @@ fn save_token_saver(s: &mut Shell) {
         move || wire::save_token_saver(&root, &ts),
         |s, r| {
             if let Err(e) = r {
-                s.settings.notice = Some(Err(format!("Não consegui salvar o Token Saver: {e}")));
+                s.settings.notice = Some(Err(format!(
+                    "Não consegui salvar a economia de tokens: {e}"
+                )));
             }
         },
     );
@@ -139,7 +170,7 @@ fn savings_detail(savings: &Load<UsageSummary>) -> String {
         Load::Failed(e) => format!("indisponível: {e}"),
         Load::Ready(u) => {
             if u.total_saved_tokens == 0 {
-                "Nenhuma economia registrada ainda".to_string()
+                "Nada poupado ainda: ligue uma das opções acima e converse.".to_string()
             } else {
                 let consumed = u
                     .total_prompt_tokens
@@ -151,19 +182,29 @@ fn savings_detail(savings: &Load<UsageSummary>) -> String {
                     0
                 };
                 format!(
-                    "RTK: {} tok · Ponytail: {} tok · Caveman: {} tok · Total: {} tok (-{}%)",
+                    "Poupou {} tokens (-{}%): {} em saídas de ferramentas, {} em código enxuto, {} em respostas curtas.",
+                    agentwork::compact_count(u.total_saved_tokens),
+                    pct,
                     agentwork::compact_count(u.total_saved_rtk_tokens),
                     agentwork::compact_count(u.total_saved_ponytail_tokens),
                     agentwork::compact_count(u.total_saved_caveman_tokens),
-                    agentwork::compact_count(u.total_saved_tokens),
-                    pct
                 )
             }
         }
     }
 }
 
-pub fn view(s: &Shell, u: &Ui, system_reduced: bool) -> El {
+fn card(body: El, u: &Ui) -> El {
+    col()
+        .w_full()
+        .padding(16.0)
+        .radius(ui::R_MD)
+        .fill(u.muted)
+        .border(1.0, u.line)
+        .child(body)
+}
+
+fn general(s: &Shell, u: &Ui, system_reduced: bool) -> El {
     let kit = ui::kit(u);
     let st = &s.settings;
     let theme_idx = match s.theme {
@@ -176,7 +217,7 @@ pub fn view(s: &Shell, u: &Ui, system_reduced: bool) -> El {
         vec![
             setting(
                 "Tema",
-                "Sistema segue a aparência do sistema operacional.",
+                "“Sistema” acompanha o modo claro ou escuro do computador.",
                 SegmentedControl::new(&["Escuro", "Claro", "Sistema"], Some(theme_idx))
                     .label("Tema")
                     .fit()
@@ -205,35 +246,198 @@ pub fn view(s: &Shell, u: &Ui, system_reduced: bool) -> El {
         u,
     );
 
-    let root = s.root();
     let privacy = section(
         "Privacidade",
+        vec![setting(
+            "Pausar memória",
+            "Enquanto estiver ligado, as próximas conversas não leem nem gravam lembranças.",
+            Switch::new(s.memory.paused)
+                .label("Pausar memória")
+                .hide_label()
+                .on_toggle(|s: &mut Shell| {
+                    crate::screens::memory::toggle_pause(s);
+                })
+                .build(&kit),
+            u,
+        )],
+        u,
+    );
+
+    let prof_idx = match st.profile {
+        Profile::Economy => 0,
+        Profile::Balanced => 1,
+        Profile::Performance => 2,
+    };
+    // The real numbers, so the choice says what it changes.
+    let lim = wire::profile_limits(st.profile);
+    let profile_detail = format!(
+        "Quanto o agente lê e delega por turno: {} mensagens de histórico e até {} subagentes em planos. Vale para a janela e para o terminal.",
+        lim.history_window, lim.max_subagents
+    );
+    let profile = section(
+        "Perfil de execução",
+        vec![setting(
+            "Perfil",
+            &profile_detail,
+            SegmentedControl::new(&["Economia", "Balanceado", "Desempenho"], Some(prof_idx))
+                .label("Perfil de execução")
+                .fit()
+                .on_pick(|s: &mut Shell, i: usize, _: &mut Tx| {
+                    s.set_profile([Profile::Economy, Profile::Balanced, Profile::Performance][i]);
+                })
+                .build(&kit),
+            u,
+        )],
+        u,
+    );
+
+    let about = section(
+        "Sobre",
         vec![
+            setting("Versão", env!("CARGO_PKG_VERSION"), el(), u),
+            setting("Licença", "GPL-3.0-only", el(), u),
             setting(
-                "Pausar memória",
-                "Novos turnos deixam de consultar e gravar fatos.",
-                Switch::new(s.memory.paused)
-                    .label("Pausar memória")
-                    .hide_label()
-                    .on_toggle(|s: &mut Shell| {
-                        crate::screens::memory::toggle_pause(s);
-                    })
-                    .build(&kit),
-                u,
-            ),
-            setting(
-                "Pasta de dados",
-                &root.display().to_string(),
-                button("open-data", "Abrir pasta", Tone::Plain, true, u, |s, _| {
-                    let r = wire::reveal(&s.root());
-                    s.settings.notice = Some(r.map(|_| "Pasta aberta".into()));
-                }),
+                "Créditos",
+                "Rune (interface nativa), Agent Skills (formato de skills), Hermes (importação de sessões). Design inspirado no OpenHuman.",
+                el(),
                 u,
             ),
         ],
         u,
     );
+    col()
+        .w_full()
+        .max_w(640.0)
+        .gap(16.0)
+        .pb(24.0)
+        .child(card(appearance, u))
+        .child(card(privacy, u))
+        .child(card(profile, u))
+        .child(card(about, u))
+}
 
+fn tokens(s: &Shell, u: &Ui) -> El {
+    let kit = ui::kit(u);
+    let st = &s.settings;
+    let pt_idx = match st.token_saver.ponytail {
+        PonytailLevel::Off => 0,
+        PonytailLevel::Lite => 1,
+        PonytailLevel::Full => 2,
+        PonytailLevel::Ultra => 3,
+    };
+    let cv_idx = match st.token_saver.caveman {
+        CavemanLevel::Off => 0,
+        CavemanLevel::Lite => 1,
+        CavemanLevel::Full => 2,
+        CavemanLevel::Ultra => 3,
+        CavemanLevel::Wenyan => 4,
+    };
+    let savings_line = savings_detail(&st.savings);
+    let intro = text(
+        "Três jeitos de gastar menos tokens, e portanto menos dinheiro ou cota. Todos são opcionais e valem para a próxima mensagem.",
+    )
+    .wrap()
+    .font(ui::SMALL)
+    .color(u.muted_text);
+    let rows = section(
+        "Como economizar",
+        vec![
+            setting_full(
+                "Código enxuto",
+                "Pede ao agente o mínimo que resolve: reaproveitar o que já existe, sem camadas a mais. Nível mais alto, diff menor.",
+                "Guardado como token_saver.ponytail",
+                SegmentedControl::new(&["Desligado", "Leve", "Médio", "Máximo"], Some(pt_idx))
+                    .label("Código enxuto")
+                    .fit()
+                    .on_pick(|s: &mut Shell, i: usize, _: &mut Tx| {
+                        let level = [
+                            PonytailLevel::Off,
+                            PonytailLevel::Lite,
+                            PonytailLevel::Full,
+                            PonytailLevel::Ultra,
+                        ][i];
+                        set_ponytail(s, level);
+                    })
+                    .build(&kit),
+                true,
+                u,
+            ),
+            setting_full(
+                "Respostas curtas",
+                "O agente explica em poucas palavras. Código, caminhos, comandos e avisos de segurança continuam completos. “Wenyan” escreve em chinês clássico, ainda mais curto e difícil de ler.",
+                "Guardado como token_saver.caveman",
+                SegmentedControl::new(
+                    &["Desligado", "Leve", "Médio", "Máximo", "Wenyan"],
+                    Some(cv_idx),
+                )
+                .label("Respostas curtas")
+                .fit()
+                .on_pick(|s: &mut Shell, i: usize, _: &mut Tx| {
+                    let level = [
+                        CavemanLevel::Off,
+                        CavemanLevel::Lite,
+                        CavemanLevel::Full,
+                        CavemanLevel::Ultra,
+                        CavemanLevel::Wenyan,
+                    ][i];
+                    set_caveman(s, level);
+                })
+                .build(&kit),
+                true,
+                u,
+            ),
+            setting_full(
+                "Resumir saídas longas",
+                "Comandos como git, build e grep podem imprimir milhares de linhas. Só o essencial vai ao modelo; o texto completo continua no terminal.",
+                "Guardado como token_saver.rtk_enabled (RTK)",
+                Switch::new(st.token_saver.rtk_enabled)
+                    .label("Resumir saídas longas")
+                    .hide_label()
+                    .on_toggle(|s: &mut Shell| {
+                        let next = !s.settings.token_saver.rtk_enabled;
+                        set_rtk_enabled(s, next);
+                    })
+                    .build(&kit),
+                false,
+                u,
+            ),
+        ],
+        u,
+    );
+    let result = section(
+        "O que já foi poupado",
+        vec![setting(
+            "Últimas 24 horas",
+            &savings_line,
+            button(
+                "settings-usage-refresh",
+                if st.savings.is_loading() {
+                    "Atualizando…"
+                } else {
+                    "Atualizar"
+                },
+                Tone::Plain,
+                !st.savings.is_loading(),
+                u,
+                |s, _| load_usage(s),
+            ),
+            u,
+        )],
+        u,
+    );
+    col()
+        .w_full()
+        .max_w(640.0)
+        .gap(16.0)
+        .pb(24.0)
+        .child(intro)
+        .child(card(rows, u))
+        .child(card(result, u))
+}
+
+fn storage(s: &Shell, u: &Ui) -> El {
+    let st = &s.settings;
+    let root = s.root();
     let (size_line, counts) = match &st.storage {
         Load::Idle | Load::Loading => ("calculando…".to_string(), String::new()),
         Load::Failed(e) => (format!("indisponível: {e}"), String::new()),
@@ -244,25 +448,36 @@ pub fn view(s: &Shell, u: &Ui, system_reduced: bool) -> El {
     };
     let backup_detail = match &st.backup {
         Load::Idle => {
-            "Cópia consistente do banco em backups/, feita com o banco aberto.".to_string()
+            "Cópia consistente do banco na pasta backups/, feita com o app aberto.".to_string()
         }
         Load::Loading => "Copiando…".to_string(),
         Load::Ready(p) => format!("Backup salvo em {p}"),
         Load::Failed(e) => format!("Backup falhou: {e}"),
     };
-    let storage = section(
-        "Armazenamento",
+    let rows = section(
+        "Seus dados",
         vec![
-            setting(
-                "Banco de dados",
-                &s.db().display().to_string(),
-                text(if counts.is_empty() {
+            setting_full(
+                "Pasta de dados",
+                "Conversas, memória, skills e configurações ficam aqui, só no seu computador.",
+                &root.display().to_string(),
+                button("open-data", "Abrir pasta", Tone::Plain, true, u, |s, _| {
+                    let r = wire::reveal(&s.root());
+                    s.settings.notice = Some(r.map(|_| "Pasta aberta".into()));
+                }),
+                false,
+                u,
+            ),
+            setting_full(
+                "Banco de conversas",
+                &if counts.is_empty() {
                     size_line.clone()
                 } else {
                     format!("{size_line} · {counts}")
-                })
-                .font(ui::LABEL)
-                .color(u.muted_text),
+                },
+                &s.db().display().to_string(),
+                el(),
+                false,
                 u,
             ),
             setting(
@@ -285,158 +500,42 @@ pub fn view(s: &Shell, u: &Ui, system_reduced: bool) -> El {
         ],
         u,
     );
-
-    let prof_idx = match st.profile {
-        Profile::Economy => 0,
-        Profile::Balanced => 1,
-        Profile::Performance => 2,
-    };
-    // The real numbers, so the choice says what it changes.
-    let lim = wire::profile_limits(st.profile);
-    let profile_detail = format!(
-        "{} mensagens de histórico por turno, até {} subagentes em planos. Vale para a janela e o CLI.",
-        lim.history_window, lim.max_subagents
-    );
-    let profile = section(
-        "Perfil de execução",
-        vec![setting(
-            "Perfil",
-            &profile_detail,
-            SegmentedControl::new(&["Economia", "Balanceado", "Desempenho"], Some(prof_idx))
-                .label("Perfil de execução")
-                .fit()
-                .on_pick(|s: &mut Shell, i: usize, _: &mut Tx| {
-                    s.set_profile([Profile::Economy, Profile::Balanced, Profile::Performance][i]);
-                })
-                .build(&kit),
-            u,
-        )],
-        u,
-    );
-
-    let pt_idx = match st.token_saver.ponytail {
-        PonytailLevel::Off => 0,
-        PonytailLevel::Lite => 1,
-        PonytailLevel::Full => 2,
-        PonytailLevel::Ultra => 3,
-    };
-    let cv_idx = match st.token_saver.caveman {
-        CavemanLevel::Off => 0,
-        CavemanLevel::Lite => 1,
-        CavemanLevel::Full => 2,
-        CavemanLevel::Ultra => 3,
-        CavemanLevel::Wenyan => 4,
-    };
-    let savings_line = savings_detail(&st.savings);
-    let token_saver = section(
-        "Token Saver (Economia de Tokens)",
-        vec![
-            setting(
-                "Ponytail (Lazy Senior Dev)",
-                "Instrui o agente a escrever o mínimo necessário com YAGNI e código nativo.",
-                SegmentedControl::new(&["Off", "Lite", "Full", "Ultra"], Some(pt_idx))
-                    .label("Ponytail (Lazy Senior Dev)")
-                    .fit()
-                    .on_pick(|s: &mut Shell, i: usize, _: &mut Tx| {
-                        let level = [
-                            PonytailLevel::Off,
-                            PonytailLevel::Lite,
-                            PonytailLevel::Full,
-                            PonytailLevel::Ultra,
-                        ][i];
-                        set_ponytail(s, level);
-                    })
-                    .build(&kit),
-                u,
-            ),
-            setting(
-                "Caveman (Compressão de Resposta)",
-                "Compacta explicações mantendo código, caminhos, comandos e alertas intactos.",
-                SegmentedControl::new(&["Off", "Lite", "Full", "Ultra", "Wenyan"], Some(cv_idx))
-                    .label("Caveman (Compressão de Resposta)")
-                    .fit()
-                    .on_pick(|s: &mut Shell, i: usize, _: &mut Tx| {
-                        let level = [
-                            CavemanLevel::Off,
-                            CavemanLevel::Lite,
-                            CavemanLevel::Full,
-                            CavemanLevel::Ultra,
-                            CavemanLevel::Wenyan,
-                        ][i];
-                        set_caveman(s, level);
-                    })
-                    .build(&kit),
-                u,
-            ),
-            setting(
-                "RTK (Compressão de Ferramentas)",
-                "Comprime saídas grandes de git, build, grep e logs antes de enviar ao modelo.",
-                Switch::new(st.token_saver.rtk_enabled)
-                    .label("RTK (Compressão de Ferramentas)")
-                    .hide_label()
-                    .on_toggle(|s: &mut Shell| {
-                        let next = !s.settings.token_saver.rtk_enabled;
-                        set_rtk_enabled(s, next);
-                    })
-                    .build(&kit),
-                u,
-            ),
-            setting(
-                "Economia registrada (24h)",
-                &savings_line,
-                button(
-                    "settings-usage-refresh",
-                    if st.savings.is_loading() {
-                        "Atualizando…"
-                    } else {
-                        "Atualizar"
-                    },
-                    Tone::Plain,
-                    !st.savings.is_loading(),
-                    u,
-                    |s, _| load_usage(s),
-                ),
-                u,
-            ),
-        ],
-        u,
-    );
-
-    let about = section(
-        "Sobre",
-        vec![
-            setting("Versão", env!("CARGO_PKG_VERSION"), col(), u),
-            setting("Licença", "GPL-3.0-only", col(), u),
-            setting(
-                "Créditos",
-                "Rune (interface nativa), Agent Skills (formato de skills), Hermes (importação de sessões). Design inspirado no OpenHuman.",
-                col(),
-                u,
-            ),
-        ],
-        u,
-    );
-
-    let mut body = col()
+    col()
         .w_full()
-        .max_w(720.0)
-        .gap(28.0)
+        .max_w(640.0)
+        .gap(16.0)
         .pb(24.0)
-        .child(appearance)
-        .child(privacy)
-        .child(storage)
-        .child(profile)
-        .child(token_saver)
-        .child(about);
-    if let Some(Err(e)) = &st.notice {
+        .child(card(rows, u))
+}
+
+pub fn view(s: &Shell, u: &Ui, system_reduced: bool) -> El {
+    let idx = Tab::ALL
+        .iter()
+        .position(|t| *t == s.settings.tab)
+        .unwrap_or(0);
+    let labels: Vec<&str> = Tab::ALL.iter().map(|t| t.label()).collect();
+    let mut body = match s.settings.tab {
+        Tab::General => general(s, u, system_reduced),
+        Tab::Tokens => tokens(s, u),
+        Tab::Storage => storage(s, u),
+    };
+    if let Some(Err(e)) = &s.settings.notice {
         body = body.child(widgets::error_line(e.clone(), u));
     }
     widgets::page(
         "Configurações",
-        row(),
-        body.scroll(ScrollSpec {
-            stick_bottom: false,
-        }),
+        el(),
+        col()
+            .w_full()
+            .gap(16.0)
+            .child(widgets::tabs(
+                &labels,
+                idx,
+                "Seção das configurações",
+                u,
+                |s, i| set_tab(s, Tab::ALL[i]),
+            ))
+            .child(widgets::scroll_body("settings-scroll", body, u)),
         u,
     )
 }

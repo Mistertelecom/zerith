@@ -4,6 +4,7 @@
 pub mod agents;
 pub mod chat;
 pub mod history;
+pub mod media;
 pub mod memory;
 pub mod providers;
 pub mod settings;

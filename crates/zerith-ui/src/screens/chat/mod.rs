@@ -21,7 +21,7 @@ use zerith_tools::Registry;
 
 use crate::agentwork::{self, ContextMeter, Item, PermissionMode, Price, QuestionState, TaskItem};
 use crate::ui::{self, Ui};
-use crate::widgets::{chip, dot, pill, Load};
+use crate::widgets::{button, chip, dot, pill, Load, Tone};
 use crate::{row_of, wire, Shell};
 
 pub use actions::*;
@@ -332,13 +332,18 @@ pub fn decide(s: &mut Shell, d: Decision) {
     }
 }
 
-fn fail(s: &mut Shell, error: String) {
+/// Ends the turn with `error`. Public so the window's own tests can drive it.
+pub fn fail(s: &mut Shell, error: String) {
     let c = &mut s.chat;
     c.busy = false;
     c.cancel = None;
     c.approvals = None;
     c.pending_approval = None;
-    c.status = error.clone();
+    // The footer keeps one short line; the full sentence is in the transcript.
+    c.status = error.chars().take(80).collect::<String>();
+    if error.chars().count() > 80 {
+        c.status.push('…');
+    }
     c.lines.push(Line::new("error", error));
 }
 
@@ -364,7 +369,7 @@ pub fn fetch_models(s: &mut Shell) {
         move || {
             Client::new(cfg)
                 .and_then(|c| c.models())
-                .map_err(|e| e.to_string())
+                .map_err(|e| zerith_providers::explain::headline(&e))
         },
         |s, r| {
             s.chat.link = match &r {
@@ -384,12 +389,28 @@ pub fn send(s: &mut Shell) {
     if prompt.is_empty() {
         return;
     }
-    if s.chat.model.is_empty() {
-        fail(
-            s,
-            "Nenhum modelo: escolha um no seletor ou defina ZERITH_MODEL".into(),
-        );
+    // Never let the first message fail with "no model": settle what is missing
+    // first and keep the draft so nothing is lost.
+    if !provider_usable(s) {
+        s.chat.status = "Configure um provedor para conversar".into();
         return;
+    }
+    if s.chat.model.is_empty() {
+        match s
+            .providers
+            .active()
+            .default_model
+            .clone()
+            .filter(|m| !m.trim().is_empty())
+        {
+            Some(m) => s.chat.model = m,
+            None => {
+                s.chat.status = "Escolha um modelo para enviar".into();
+                s.chat.model_menu = true;
+                fetch_models(s);
+                return;
+            }
+        }
     }
 
     // The session row is created on the UI thread: one local insert, and the
@@ -442,7 +463,7 @@ pub fn send(s: &mut Shell) {
     std::thread::spawn(move || {
         let prepared = (|| -> Result<(Store, Client), String> {
             let store = Store::open(&db).map_err(|e| e.to_string())?;
-            let client = Client::new(cfg).map_err(|e| e.to_string())?;
+            let client = Client::new(cfg).map_err(|e| zerith_providers::explain::headline(&e))?;
             Ok((store, client))
         })();
         let (store, client) = match prepared {
@@ -497,6 +518,21 @@ pub fn send(s: &mut Shell) {
             tools.register(g.enter_plan_mode_tool());
             tools.register(g.exit_plan_mode_tool());
         }
+        // The model may write a skill or an agent for you to review. Built with
+        // the tools and mode of THIS turn, so what it writes can never have
+        // more power than it has now. Top level only: a subagent registry drops
+        // them (`child_registry`).
+        if let Some(p) = policy.as_ref() {
+            let have: Vec<String> = tools.specs().iter().map(|s| s.name.clone()).collect();
+            for t in zerith_tools::authoring_tools(zerith_tools::Authoring {
+                paths: zerith_core::Paths::with_root(&root),
+                project_dir: Some(workspace.clone()),
+                tools: have,
+                mode: p.mode().settings_name().to_string(),
+            }) {
+                tools.register(t);
+            }
+        }
         let skills = zerith_skills::Library::open(db.parent().unwrap_or(&db).join("skills"))
             .ok()
             .map(|l| {
@@ -520,6 +556,9 @@ pub fn send(s: &mut Shell) {
                 skills: skills.as_ref(),
                 agent: agent.as_ref(),
                 settings: Some(&settings),
+                // The folder the tools act on is also where AGENTS.md is read.
+                project_dir: Some(&workspace),
+                no_project_instructions: false,
             },
             AgentOptions {
                 tools: policy.is_some().then_some(&tools),
@@ -547,7 +586,12 @@ pub fn send(s: &mut Shell) {
                 });
             }
             Err(e) => {
-                let msg = e.to_string();
+                // The raw `http 401: {...}` is for logs; the window says what
+                // happened and what to do about it.
+                let msg = match &e {
+                    zerith_runtime::RunError::Provider(p) => zerith_providers::explain::headline(p),
+                    other => other.to_string(),
+                };
                 handle.update(move |s: &mut Shell, _| {
                     s.chat.link = Link::Down(msg.clone());
                     fail(s, msg);
@@ -571,37 +615,179 @@ pub const SUGGESTIONS: [&str; 3] = [
     "Planeje uma tarefa em passos",
 ];
 
-fn empty_state(u: &Ui) -> El {
-    let mut chips = row().gap(8.0).flex_wrap().justify_center();
-    for (i, label) in SUGGESTIONS.iter().enumerate() {
-        chips = chips.child(chip(
-            format!("suggest-{i}"),
-            label,
-            u,
-            move |s: &mut Shell| {
-                s.chat.draft = TextEdit::new(*label);
-                s.chat.draft.focused = true;
-            },
-        ));
+/// What the empty chat has to tell the user.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmptyKind {
+    /// No provider can answer: no key where one is needed.
+    NoProvider,
+    /// A provider works but no model is chosen.
+    NoModel,
+    /// Ready to talk.
+    Ready,
+}
+
+/// Whether the active provider can be called: it has an endpoint and, when it
+/// needs one, a key.
+pub fn provider_usable(s: &Shell) -> bool {
+    s.providers.active().validate().is_ok()
+}
+
+pub fn empty_kind(s: &Shell) -> EmptyKind {
+    if !provider_usable(s) {
+        EmptyKind::NoProvider
+    } else if s.chat.model.trim().is_empty() {
+        EmptyKind::NoModel
+    } else {
+        EmptyKind::Ready
     }
+}
+
+/// "Escolher modelo": opens the model menu, listing models first if needed.
+pub fn pick_model(s: &mut Shell) {
+    s.chat.model_menu = true;
+    fetch_models(s);
+}
+
+fn setup_card(
+    key: &'static str,
+    title: &'static str,
+    extra: El,
+    body: String,
+    action: El,
+    u: &Ui,
+) -> El {
+    col()
+        .key(key)
+        .role("group")
+        .label(title)
+        .w_full()
+        .max_w(480.0)
+        .padding(20.0)
+        .gap(12.0)
+        .items_center()
+        .radius(ui::R_LG)
+        .fill(u.muted)
+        .border(1.0, u.line_strong)
+        .child(extra)
+        .child(text(title).font(ui::TITLE).color(u.content))
+        .child(
+            text(body)
+                .wrap()
+                .font(ui::SMALL)
+                .color(u.muted_text)
+                .selectable(true),
+        )
+        .child(action.mt(2.0))
+}
+
+fn empty_state(s: &Shell, u: &Ui) -> El {
+    let head = col()
+        .gap(12.0)
+        .items_center()
+        .child(crate::brand::zerith(48.0, &s.images))
+        .child(
+            text("Como posso ajudar?")
+                .font(rune::TextStyle::new(21.0, 600.0).lh(28.0))
+                .color(u.content),
+        );
+    let mid = match empty_kind(s) {
+        EmptyKind::NoProvider => {
+            let logos = row()
+                .gap(8.0)
+                .center()
+                .a11y_hidden()
+                .child(crate::brand::logo("openai", 28.0, &s.images, u))
+                .child(crate::brand::logo("anthropic", 28.0, &s.images, u))
+                .child(crate::brand::logo("deepseek", 28.0, &s.images, u))
+                .child(crate::brand::logo("ollama", 28.0, &s.images, u));
+            setup_card(
+                "chat-setup-provider",
+                "Falta conectar um provedor",
+                logos,
+                "Conecte OpenAI, Anthropic, DeepSeek, Ollama ou qualquer endpoint compatível. A chave fica salva apenas no cofre do sistema.".into(),
+                button(
+                    "chat-setup-provider-go",
+                    "Configurar provedor",
+                    Tone::Primary,
+                    true,
+                    u,
+                    |s, _| s.navigate(crate::Screen::Providers),
+                ),
+                u,
+            )
+        }
+        EmptyKind::NoModel => {
+            let failed = matches!(s.chat.models, Load::Failed(_));
+            setup_card(
+                "chat-setup-model",
+                "Escolha um modelo",
+                crate::brand::logo(&s.providers.active().name, 32.0, &s.images, u),
+                if failed {
+                    "Não consegui listar os modelos do provedor. Defina um modelo padrão em Provedores ou tente de novo.".into()
+                } else {
+                    format!(
+                        "O provedor {} está pronto, mas nenhum modelo foi escolhido. Escolha um para enviar a primeira mensagem.",
+                        s.providers.active().name
+                    )
+                },
+                row()
+                    .gap(8.0)
+                    .child(button(
+                        "chat-pick-model",
+                        "Escolher modelo",
+                        Tone::Primary,
+                        true,
+                        u,
+                        |s, _| pick_model(s),
+                    ))
+                    .child(if failed {
+                        button(
+                            "chat-setup-model-go",
+                            "Abrir Provedores",
+                            Tone::Plain,
+                            true,
+                            u,
+                            |s, _| s.navigate(crate::Screen::Providers),
+                        )
+                    } else {
+                        el()
+                    }),
+                u,
+            )
+        }
+        EmptyKind::Ready => {
+            let mut chips = row().gap(8.0).flex_wrap().justify_center();
+            for (i, label) in SUGGESTIONS.iter().enumerate() {
+                chips = chips.child(chip(
+                    format!("suggest-{i}"),
+                    label,
+                    u,
+                    move |s: &mut Shell| {
+                        s.chat.draft = TextEdit::new(*label);
+                        s.chat.draft.focused = true;
+                    },
+                ));
+            }
+            col()
+                .gap(16.0)
+                .items_center()
+                .child(
+                    text("O turno roda aqui, na sua máquina, com o provedor que você escolher.")
+                        .wrap()
+                        .font(ui::SMALL)
+                        .color(u.muted_text),
+                )
+                .child(chips)
+        }
+    };
     col()
         .key("chat-empty")
         .w_full()
         .grow(1.0)
         .center()
-        .gap(8.0)
-        .child(
-            text("Como posso ajudar?")
-                .font(ui::TITLE.lh(24.0))
-                .color(u.content),
-        )
-        .child(
-            text("O turno roda aqui, na sua máquina, com o provedor que você escolher.")
-                .wrap()
-                .font(ui::SMALL)
-                .color(u.muted_text),
-        )
-        .child(chips.mt(16.0))
+        .gap(14.0)
+        .child(head)
+        .child(mid)
 }
 
 fn header(s: &Shell, u: &Ui) -> El {
@@ -613,6 +799,7 @@ fn header(s: &Shell, u: &Ui) -> El {
         .map(|r| r.title.clone())
         .unwrap_or_else(|| "Nova conversa".to_string());
     let (color, word) = match &c.link {
+        Link::Unknown if !provider_usable(s) => (u.warn, "sem chave de API".to_string()),
         Link::Unknown => (u.idle, "não verificado".to_string()),
         Link::Checking => (u.warn, "verificando".to_string()),
         Link::Up => (u.ok, "conectado".to_string()),
@@ -642,8 +829,9 @@ fn header(s: &Shell, u: &Ui) -> El {
                 .label(format!("{route_label}: {word}"))
                 .gap(6.0)
                 .center_y()
-                .child(dot(color))
-                .child(text(route_label).font(ui::LABEL).color(u.muted_text)),
+                .child(crate::brand::logo(&route_label, 18.0, &s.images, u))
+                .child(text(route_label).font(ui::LABEL).color(u.muted_text))
+                .child(dot(color)),
         )
         .child(if model_label.is_empty() {
             el()
@@ -655,7 +843,7 @@ fn header(s: &Shell, u: &Ui) -> El {
 pub fn view(s: &Shell, u: &Ui, layer: &mut Vec<El>) -> El {
     let c = &s.chat;
     let body = if c.lines.is_empty() {
-        empty_state(u)
+        empty_state(s, u)
     } else {
         transcript::list(s, u)
     };

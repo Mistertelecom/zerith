@@ -6,25 +6,162 @@
 use rune::{col, el, icon, row, rule, text, El, GrowthSpec, Icon, ScrollSpec};
 use rune_kit::Markdown;
 
+use std::path::PathBuf;
+
 use super::{Line, Shell};
 use crate::agentwork::{
     format_duration, turn_changes, DiffKind, DiffSummary, Item, SubState, Subagent, ToolRow,
     ToolState, TurnChanges,
 };
+use crate::mediaout::{self, Clip, Images, MediaOut, Picture};
 use crate::ui::{self, Ui};
 use crate::widgets::{self, button, Tone};
 
-/// A mark for a state: spinner, check or cross, 14 pt, never colour alone
-/// (callers also put the state in the row's label).
+/// A mark for a running state: a small ring with a turning arc (the kit's
+/// pixel-grid spinner turns to a blob at this size). Never colour alone:
+/// callers also put the state in the row's label.
 pub fn spinner(u: &Ui, color: rune::Color) -> El {
-    rune_kit::Spinner::new()
-        .size(13.0)
-        .color(color)
-        .build(&ui::kit(u))
+    widgets::spinner(color, 14.0, u)
+}
+
+/// What the transcript needs to show generated media: the folder it may show
+/// files from and the decoder for them.
+#[derive(Clone)]
+pub struct MediaCtx {
+    pub dir: PathBuf,
+    pub images: std::rc::Rc<Images>,
+}
+
+impl MediaCtx {
+    pub fn of(s: &Shell) -> Self {
+        Self {
+            dir: s.media_dir.clone(),
+            images: s.images.clone(),
+        }
+    }
+}
+
+/// Longest side, in points, a generated picture is drawn at in the chat.
+const PICTURE_MAX: f32 = 360.0;
+
+fn open_file(path: PathBuf) -> impl Fn(&mut Shell) + 'static {
+    move |s: &mut Shell| {
+        s.chat.status = match crate::wire::open_media(&s.media_dir, &path) {
+            Ok(()) => String::new(),
+            Err(e) => e,
+        };
+    }
+}
+
+/// A picture the user can click to open with the OS viewer. One still
+/// decoding shows a quiet line with its alt text.
+fn picture(p: &Picture, ctx: &MediaCtx, u: &Ui) -> El {
+    let alt = if p.alt.is_empty() {
+        "Imagem gerada".to_string()
+    } else {
+        p.alt.clone()
+    };
+    let image = ctx.images.get(&p.path);
+    let size = image
+        .size()
+        .filter(|_| image.is_ready() && image.error().is_none());
+    let Some([w, _]) = size else {
+        return row()
+            .role("image")
+            .label(alt.clone())
+            .h(28.0)
+            .gap(8.0)
+            .center_y()
+            .child(
+                text(if image.error().is_some() {
+                    format!("Não consegui abrir a imagem: {alt}")
+                } else {
+                    format!("Carregando imagem: {alt}")
+                })
+                .font(ui::SMALL)
+                .color(u.muted_text)
+                .truncate(),
+            );
+    };
+    el().key(format!("pic-{}", p.path.display()))
+        .role("button")
+        .label(format!("Abrir imagem: {alt}"))
+        .focusable(true)
+        .w_full()
+        .max_w((w as f32).min(PICTURE_MAX))
+        .pixels(image.pixels())
+        .radius(ui::R_SM)
+        .cursor(rune::Cursor::Pointer)
+        .help("Abrir com o visualizador do sistema")
+        .on_press(open_file(p.path.clone()))
+}
+
+fn video_card(c: &Clip, u: &Ui) -> El {
+    let name = c
+        .path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let open = open_file(c.path.clone());
+    row()
+        .key(format!("clip-{name}"))
+        .role("group")
+        .label(format!("Vídeo gerado: {name} {}", c.size))
+        .w_full()
+        .max_w(PICTURE_MAX + 60.0)
+        .gap(10.0)
+        .px(12.0)
+        .py(8.0)
+        .center_y()
+        .radius(ui::R_MD)
+        .fill(u.muted)
+        .border(1.0, u.line)
+        .child(icon(ui::icon_media(), 16.0).color(u.muted_text))
+        .child(
+            col()
+                .grow(1.0)
+                .min_w(0.0)
+                .child(
+                    text(name.clone())
+                        .font(ui::SMALL)
+                        .color(u.content)
+                        .truncate(),
+                )
+                .child(
+                    text(if c.size.is_empty() {
+                        "vídeo".to_string()
+                    } else {
+                        format!("vídeo · {}", c.size)
+                    })
+                    .font(ui::LABEL)
+                    .color(u.muted_text),
+                ),
+        )
+        .child(button(
+            format!("clip-open-{name}"),
+            "Abrir",
+            Tone::Plain,
+            true,
+            u,
+            move |s, _| open(s),
+        ))
+}
+
+/// Pictures and clips of a generation result, under its tool row.
+fn media_block(m: &MediaOut, ctx: &MediaCtx, u: &Ui) -> El {
+    let mut c = col().w_full().gap(8.0);
+    for p in &m.pictures {
+        c = c.child(picture(p, ctx, u));
+    }
+    for v in &m.clips {
+        c = c.child(video_card(v, u));
+    }
+    c
 }
 
 fn tool_icon(name: &str) -> &'static Icon {
     match name {
+        "generate_image" | "generate_video" => ui::icon_media(),
         "shell" => ui::icon_terminal(),
         "read_file" | "write_file" => ui::icon_file(),
         "edit_file" => ui::icon_edit(),
@@ -157,7 +294,13 @@ fn diff_panel(d: &DiffSummary, u: &Ui) -> El {
 
 /// One tool call as a one-liner: icon, tool, short argument, duration. A diff
 /// or live running output opens by default; finished output opens on demand.
-fn tool_row(index: usize, t: &ToolRow, toggled: bool, u: &Ui) -> El {
+fn tool_row(index: usize, t: &ToolRow, toggled: bool, ctx: &MediaCtx, u: &Ui) -> El {
+    let title = mediaout::tool_title(&t.name);
+    // Only a finished generation has files to show.
+    let media = title
+        .filter(|_| t.state == ToolState::Ok)
+        .map(|_| mediaout::parse(&t.preview, &ctx.dir))
+        .filter(|m| !m.is_empty());
     let has_body = t.diff.is_some() || !t.preview.is_empty();
     let open = has_body
         && ((t.diff.is_some() || (t.state == ToolState::Running && !t.preview.is_empty()))
@@ -174,21 +317,52 @@ fn tool_row(index: usize, t: &ToolRow, toggled: bool, u: &Ui) -> El {
             (Some(d), _) => text(format!("+{} −{}", d.adds, d.dels))
                 .font(ui::LABEL)
                 .color(u.faint),
+            // A paid call: the cost is the number worth reading.
+            (None, ms) if media.as_ref().is_some_and(|m| m.cost.is_some()) => {
+                let cost = media
+                    .as_ref()
+                    .and_then(|m| m.cost.clone())
+                    .unwrap_or_default();
+                text(match ms {
+                    Some(ms) => format!("Custo {cost} · {}", format_duration(ms)),
+                    None => format!("Custo {cost}"),
+                })
+                .font(ui::LABEL)
+                .color(u.muted_text)
+            }
             (None, Some(ms)) => text(format_duration(ms)).font(ui::LABEL).color(u.faint),
             _ => el(),
         },
     };
     let head = disclosure(
         format!("tool-{}", t.id),
-        format!("{} {}, {state_word}", t.name, t.arg),
+        format!("{} {}, {state_word}", title.unwrap_or(&t.name), t.arg),
         open,
         has_body,
         index,
         u,
         vec![
             chevron(open, has_body, u),
-            icon(tool_icon(&t.name), 14.0).color(u.faint),
-            text(t.name.clone()).font(ui::SMALL).color(u.secondary),
+            el().size(20.0, 20.0)
+                .radius(ui::R_XS)
+                .fill(if t.state == ToolState::Failed {
+                    u.danger_soft
+                } else {
+                    u.layer2
+                })
+                .center()
+                .child(icon(tool_icon(&t.name), 12.0).color(
+                    if t.state == ToolState::Failed {
+                        u.danger
+                    } else if t.state == ToolState::Running {
+                        u.accent_text
+                    } else {
+                        u.muted_text
+                    },
+                )),
+            text(title.map_or_else(|| t.name.clone(), str::to_string))
+                .font(ui::SMALL)
+                .color(u.content),
             text(t.arg.clone())
                 .font(ui::MONO)
                 .color(if t.state == ToolState::Failed {
@@ -203,7 +377,18 @@ fn tool_row(index: usize, t: &ToolRow, toggled: bool, u: &Ui) -> El {
         ],
     );
     let mut c = col().w_full().pb(2.0).child(head);
-    if open {
+    if let Some(m) = &media {
+        // The files are the result: shown without opening the row.
+        c = c.child(
+            col()
+                .w_full()
+                .pl(28.0)
+                .pt(4.0)
+                .pb(8.0)
+                .child(media_block(m, ctx, u)),
+        );
+    }
+    if open && media.is_none() {
         let body = match (&t.diff, t.preview.is_empty()) {
             (Some(d), _) => diff_panel(d, u),
             (None, _) => code_panel(u).child(
@@ -241,12 +426,22 @@ fn sub_mark(state: SubState, u: &Ui) -> El {
 }
 
 /// A subagent: name, state, one-line summary; opens to the whole summary.
-/// Parallel ones are consecutive rows, each its own hairline card.
+/// Parallel ones are consecutive rows with a clear left state bar.
 fn subagent_row(index: usize, a: &Subagent, open: bool, u: &Ui) -> El {
     let state_word = match a.state {
         SubState::Running => "em execução",
         SubState::Done => "concluído",
         SubState::Error => "com erro",
+    };
+    let bar_color = match a.state {
+        SubState::Running => u.accent,
+        SubState::Done => u.done,
+        SubState::Error => u.danger,
+    };
+    let border_color = match a.state {
+        SubState::Running => u.accent.alpha(0.35),
+        SubState::Error => u.danger.alpha(0.35),
+        SubState::Done => u.line,
     };
     let has_body = !a.summary.trim().is_empty();
     let first = a.summary.lines().next().unwrap_or_default().to_string();
@@ -258,8 +453,10 @@ fn subagent_row(index: usize, a: &Subagent, open: bool, u: &Ui) -> El {
         index,
         u,
         vec![
+            el().size(3.0, 14.0).radius(1.5).fill(bar_color).a11y_hidden(),
             sub_mark(a.state, u),
             text(a.name.clone()).font(ui::TITLE).color(u.content),
+            widgets::pill("subagente", u),
             text(if first.is_empty() {
                 state_word.to_string()
             } else {
@@ -280,22 +477,26 @@ fn subagent_row(index: usize, a: &Subagent, open: bool, u: &Ui) -> El {
     let mut card = col()
         .w_full()
         .radius(ui::R_MD)
-        .border(1.0, u.line)
+        .fill(u.muted)
+        .border(1.0, border_color)
         .py(2.0)
+        .px(4.0)
         .child(head);
     if open && has_body {
-        card = card.child(
-            text(a.summary.clone())
-                .wrap()
-                .font(ui::SMALL)
-                .color(u.secondary)
-                .selectable(true)
-                .px(34.0)
-                .pb(10.0)
-                .pt(2.0),
-        );
+        card = card
+            .child(rule(1.0, u.line).w_full().my(2.0))
+            .child(
+                text(a.summary.clone())
+                    .wrap()
+                    .font(ui::SMALL)
+                    .color(u.secondary)
+                    .selectable(true)
+                    .px(12.0)
+                    .pb(6.0)
+                    .pt(2.0),
+            );
     }
-    col().w_full().pb(8.0).child(card)
+    col().w_full().pb(4.0).child(card)
 }
 
 fn note_row(msg: &str, u: &Ui) -> El {
@@ -339,6 +540,7 @@ fn thinking_row(index: usize, content: &str, open: bool, u: &Ui) -> El {
     c
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn line_row(
     index: usize,
     line: &Line,
@@ -347,23 +549,25 @@ pub fn line_row(
     open: bool,
     rewind: bool,
     changes: Option<TurnChanges>,
+    ctx: &MediaCtx,
 ) -> El {
     if let Some(item) = &line.item {
         return match item {
-            Item::Tool(t) => tool_row(index, t, open, u),
+            Item::Tool(t) => tool_row(index, t, open, ctx, u),
             Item::Subagent(a) => subagent_row(index, a, open, u),
             Item::Note(n) => note_row(n, u),
         };
     }
     match line.role {
         "user" => {
-            let mut c = col().w_full().pb(20.0).items_end().gap(4.0).child(
+            let mut c = col().w_full().pb(8.0).items_end().gap(4.0).child(
                 col()
-                    .max_w(560.0)
-                    .py(10.0)
-                    .px(14.0)
+                    .max_w(580.0)
+                    .py(8.0)
+                    .px(12.0)
                     .radius(ui::R_LG)
                     .fill(u.muted)
+                    .border(1.0, u.line)
                     .child(
                         text(line.content.clone())
                             .wrap()
@@ -395,7 +599,7 @@ pub fn line_row(
         "thinking" => thinking_row(index, &line.content, open, u),
         "error" => col()
             .w_full()
-            .pb(18.0)
+            .pb(8.0)
             .child(widgets::error_line(line.content.clone(), u)),
         "assistant" => {
             let body = if line.content.is_empty() {
@@ -403,16 +607,34 @@ pub fn line_row(
             } else {
                 line.content.clone()
             };
-            col().w_full().pb(20.0).child(
+            // Images in an answer: local files under the media folder only
+            // (the generate tools tell the model to paste them). Anything
+            // else, a URL included, stays alt text: the window never fetches.
+            let (dir, images) = (ctx.dir.clone(), ctx.images.clone());
+            col().w_full().pb(8.0).child(
                 Markdown::new(body)
                     .streaming(live)
                     .selectable(true)
+                    .images(move |src| images.for_markdown(&dir, src))
+                    .image_frame(move |e, f| {
+                        let alt = if f.alt.is_empty() {
+                            "Imagem gerada"
+                        } else {
+                            f.alt
+                        };
+                        e.max_w(PICTURE_MAX)
+                            .role("button")
+                            .label(format!("Abrir imagem: {alt}"))
+                            .focusable(true)
+                            .cursor(rune::Cursor::Pointer)
+                            .on_press(open_file(PathBuf::from(f.src.trim())))
+                    })
                     .build(&ui::kit(u)),
             )
         }
         _ => col()
             .w_full()
-            .pb(18.0)
+            .pb(8.0)
             .gap(4.0)
             .child(widgets::eyebrow("Sistema", u))
             .child(
@@ -425,15 +647,50 @@ pub fn line_row(
     }
 }
 
-/// The scrolling, virtualized message list.
+fn build_row(
+    s: &Shell,
+    i: usize,
+    busy: bool,
+    last_user: Option<usize>,
+    ctx: &MediaCtx,
+    u: &Ui,
+) -> El {
+    let line = &s.chat.lines[i];
+    let live = busy && i + 1 == s.chat.lines.len();
+    // Rebobinar sits under the last user message only: the
+    // latest checkpoint is that turn's.
+    let rewind = s.chat.rewind && !s.chat.busy && last_user == Some(i);
+    let changes = rewind.then(|| {
+        turn_changes(s.chat.lines[i + 1..].iter().filter_map(|l| match &l.item {
+            Some(Item::Tool(t)) => Some(t),
+            _ => None,
+        }))
+    });
+    line_row(
+        i,
+        line,
+        u,
+        live,
+        s.chat.open.contains(&i),
+        rewind,
+        changes,
+        ctx,
+    )
+}
+
+/// The scrolling message list. Uses exact layout measurement for normal-sized
+/// conversations so expanded diffs and subagents never clip at the top, falling
+/// back to `virtual_rows` only on very long transcripts.
 pub fn list(s: &Shell, u: &Ui) -> El {
     let c = &s.chat;
     let n = c.lines.len();
     let busy = c.busy;
     let uu = *u;
-    let mut inner = col().w_full();
+    let ctx = MediaCtx::of(s);
+    let last_user = c.lines.iter().rposition(|l| l.role == "user");
+    let mut inner = col().w_full().pt(2.0).pb(4.0);
     if c.more {
-        inner = inner.child(row().w_full().pb(16.0).justify_center().child(button(
+        inner = inner.child(row().w_full().pb(14.0).justify_center().child(button(
             "older",
             "Carregar mensagens anteriores",
             Tone::Plain,
@@ -442,42 +699,36 @@ pub fn list(s: &Shell, u: &Ui) -> El {
             |s, _| super::load_all(s),
         )));
     }
-    inner = inner.child(
-        col()
+    if n <= 120 {
+        let mut messages = col()
             .key("transcript")
             .w_full()
-            .growth(GrowthSpec::default())
-            .virtual_rows(
-                n,
-                64.0,
-                |_: &Shell, i| format!("line-{i}").into(),
-                move |s: &Shell, i| {
-                    let line = &s.chat.lines[i];
-                    let live = busy && i + 1 == s.chat.lines.len();
-                    // Rebobinar sits under the last user message only: the
-                    // latest checkpoint is that turn's.
-                    let last_user = s.chat.lines.iter().rposition(|l| l.role == "user");
-                    let rewind = s.chat.rewind && !s.chat.busy && last_user == Some(i);
-                    let changes = rewind.then(|| {
-                        turn_changes(s.chat.lines[i + 1..].iter().filter_map(|l| match &l.item {
-                            Some(Item::Tool(t)) => Some(t),
-                            _ => None,
-                        }))
-                    });
-                    line_row(
-                        i,
-                        line,
-                        &uu,
-                        live,
-                        s.chat.open.contains(&i),
-                        rewind,
-                        changes,
-                    )
-                },
-            ),
-    );
+            .gap(2.0)
+            .role("log")
+            .label("Mensagens");
+        for i in 0..n {
+            messages = messages.child(build_row(s, i, busy, last_user, &ctx, &uu));
+        }
+        inner = inner.child(messages);
+    } else {
+        inner = inner.child(
+            col()
+                .key("transcript")
+                .w_full()
+                .growth(GrowthSpec::default())
+                .virtual_rows(
+                    n,
+                    64.0,
+                    |_: &Shell, i| format!("line-{i}").into(),
+                    move |s: &Shell, i| build_row(s, i, busy, last_user, &ctx, &uu),
+                ),
+        );
+    }
     inner
         .scroll(ScrollSpec { stick_bottom: true })
+        // The newest content stays at the bottom; a soft fade at the edges
+        // signals continuing messages without slicing headers mid-line.
+        .scroll_edge_fade(10.0)
         .grow(1.0)
         .min_h(0.0)
 }

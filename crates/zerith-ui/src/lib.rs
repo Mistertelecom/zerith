@@ -10,6 +10,9 @@
 //! happens inside a frame.
 
 pub mod agentwork;
+pub mod brand;
+mod folders;
+pub mod mediaout;
 pub mod screens;
 mod ui;
 mod widgets;
@@ -18,7 +21,7 @@ mod wire;
 use std::path::{Path, PathBuf};
 
 use rune::{
-    col, el, icon, row, rule, text, AppHandle, Cx, El, GrowthSpec, KeyEvent, ScrollSpec, Tx,
+    col, el, icon, row, rule, text, AppHandle, Color, Cx, El, GrowthSpec, KeyEvent, ScrollSpec, Tx,
 };
 use rune_kit::{Badge, BadgeVariant};
 use ui::Ui;
@@ -26,11 +29,12 @@ use zerith_providers::{Cancel, ProviderConfig};
 use zerith_runtime::RunEvent;
 use zerith_sessions::{Session, Store};
 
-pub use screens::agents::AgentsState;
+pub use screens::agents::{AgentsState, NewAgent};
 pub use screens::chat::{Approval, ChatState, Decision, Line};
 pub use screens::history::{
     day_bucket, filter_rows, group_by_day, Bucket, HistoryState, SourceFilter,
 };
+pub use screens::media::MediaState;
 pub use screens::memory::MemoryState;
 pub use screens::providers::ProvidersState;
 pub use screens::settings::SettingsState;
@@ -38,33 +42,39 @@ pub use screens::skills::SkillsState;
 pub use widgets::Load;
 
 /// The navigation column: 240 pt, like `SIDEBAR_WIDTH` in OpenHuman's shell.
-const SIDEBAR: f32 = 240.0;
+const SIDEBAR: f32 = 248.0;
+/// The title band the window draws for itself, in points.
+const TITLEBAR: f32 = 44.0;
 /// The sheet's inset from the window edge, OpenHuman's `m-2`.
 const INSET: f32 = 8.0;
+/// A sheet narrower than this many points is `compact` (a ~915 pt window).
+const COMPACT_SHEET: f32 = 660.0;
 /// `rounded-2xl`.
 const SHEET_RADIUS: f32 = ui::R_LG;
 /// Sessions read per page. The list is virtualized, so this bounds memory and
 /// query time, not what is drawn.
 pub const SESSION_PAGE: usize = 200;
 
-/// The seven places the window can show. Order is the Ctrl+1..7 order.
+/// The eight places the window can show. Order is the Ctrl+1..8 order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Screen {
     Chat,
     History,
     Agents,
     Skills,
+    Media,
     Memory,
     Providers,
     Settings,
 }
 
 impl Screen {
-    pub const ALL: [Screen; 7] = [
+    pub const ALL: [Screen; 8] = [
         Screen::Chat,
         Screen::History,
         Screen::Agents,
         Screen::Skills,
+        Screen::Media,
         Screen::Memory,
         Screen::Providers,
         Screen::Settings,
@@ -76,6 +86,7 @@ impl Screen {
             Screen::History => "Histórico",
             Screen::Agents => "Agentes",
             Screen::Skills => "Skills",
+            Screen::Media => "Mídia",
             Screen::Memory => "Memória",
             Screen::Providers => "Provedores",
             Screen::Settings => "Configurações",
@@ -88,6 +99,7 @@ impl Screen {
             Screen::History => ui::icon_history(),
             Screen::Agents => ui::icon_agents(),
             Screen::Skills => ui::icon_skills(),
+            Screen::Media => ui::icon_media(),
             Screen::Memory => ui::icon_memory(),
             Screen::Providers => ui::icon_providers(),
             Screen::Settings => ui::icon_settings(),
@@ -166,6 +178,7 @@ pub struct Shell {
     pub history: HistoryState,
     pub memory: MemoryState,
     pub skills: SkillsState,
+    pub media: MediaState,
     pub providers: ProvidersState,
     pub settings: SettingsState,
     pub agents: AgentsState,
@@ -176,6 +189,10 @@ pub struct Shell {
     /// When true, worker jobs run on the calling thread. Tests set it so a
     /// state transition finishes before the assertion.
     pub inline: bool,
+    /// Where generated files live: only files under it are shown or opened.
+    pub media_dir: PathBuf,
+    /// Decoder for the pictures of generated media (local files only).
+    pub images: std::rc::Rc<mediaout::Images>,
     db: PathBuf,
     me: AppHandle<Shell>,
 }
@@ -215,6 +232,7 @@ impl Shell {
             history: HistoryState::default(),
             memory: MemoryState::new(wire::memory_paused(&db)),
             skills: SkillsState::default(),
+            media: MediaState::open(&root),
             providers: ProvidersState::with_gateway(providers, accounts, routing),
             settings: SettingsState::new(prefs.profile, token_saver),
             agents: AgentsState::default(),
@@ -222,9 +240,18 @@ impl Shell {
             theme: prefs.theme,
             reduce_motion: prefs.reduce_motion,
             inline: false,
+            media_dir: wire::media_dir(&root),
+            images: std::rc::Rc::new(mediaout::Images::new({
+                let h = me.clone();
+                std::sync::Arc::new(move || h.wake())
+            })),
             db,
             me,
         };
+        let handle = shell.me.clone();
+        shell
+            .media
+            .set_waker(std::sync::Arc::new(move || handle.wake()));
         shell.reload();
         shell
     }
@@ -267,7 +294,10 @@ impl Shell {
         let store = match Store::open(&self.db) {
             Ok(s) => s,
             Err(e) => {
-                self.chat.status = format!("Banco indisponível ({}): {e}", self.db.display());
+                self.chat.status = folders::with_cause(
+                    &self.root(),
+                    &format!("Banco indisponível ({}): {e}", self.db.display()),
+                );
                 return;
             }
         };
@@ -329,6 +359,8 @@ impl Shell {
             Screen::Memory if self.memory.facts.is_idle() => self.load_facts(),
             Screen::Skills if self.skills.installed.is_idle() => self.load_skills(),
             Screen::Agents if self.agents.list.is_idle() => self.load_agents(),
+            Screen::Media => screens::media::opened(self),
+            // Accounts (cooldown badges) and Usage both read it.
             Screen::Providers => screens::providers::load_usage(self),
             Screen::Settings => {
                 if self.settings.storage.is_idle() {
@@ -457,7 +489,7 @@ pub(crate) fn row_of(s: Session) -> Row {
 }
 
 /// The window's keyboard map, for keys no focused control took:
-/// Ctrl+1..7 switch screens, Ctrl+N starts a chat, Ctrl+K focuses search and
+/// Ctrl+1..8 switch screens, Ctrl+N starts a chat, Ctrl+K focuses search and
 /// Escape stops the turn (or closes what is open).
 pub fn on_key(s: &mut Shell, ev: &KeyEvent, tx: &mut Tx) -> bool {
     for (i, screen) in Screen::ALL.iter().enumerate() {
@@ -509,20 +541,34 @@ fn nav_item(screen: Screen, current: Screen, u: &Ui) -> El {
         .focusable(true)
         .focus_selected(on)
         .w_full()
-        .h(30.0)
-        .px(8.0)
+        .h(36.0)
+        .pl(4.0)
+        .pr(10.0)
         .gap(10.0)
         .center_y()
-        .radius(8.0)
+        .radius(ui::R_SM)
         .fill(if on { u.selected } else { u.chrome })
         .hover(u.hover)
         .press(u.active)
         .on_press(move |s: &mut Shell| s.navigate(screen))
-        .child(icon(screen.icon(), 16.0).color(if on { u.content } else { u.muted_text }))
+        // The accent bar marks where you are; idle rows keep the same indent.
+        .child(el().size(3.0, 16.0).radius(2.0).fill(if on {
+            u.accent
+        } else {
+            Color::TRANSPARENT
+        }))
+        .child(
+            el().size(26.0, 26.0)
+                .radius(7.0)
+                .center()
+                .fill(if on { u.layer2 } else { Color::TRANSPARENT })
+                .child(icon(screen.icon(), 16.0).color(if on { u.content } else { u.muted_text })),
+        )
         .child(
             text(screen.label())
                 .font(ui::SMALL)
-                .color(if on { u.content } else { u.secondary }),
+                .color(if on { u.content } else { u.secondary })
+                .grow(1.0),
         )
 }
 
@@ -674,16 +720,25 @@ fn sidebar(s: &Shell, u: &Ui) -> El {
     let mut column = col()
         .w_full()
         .h_full()
-        .padding(12.0)
-        .gap(12.0)
+        .px(12.0)
+        .pb(12.0)
+        .pt(6.0)
+        .gap(10.0)
         .child(
             row()
                 .w_full()
-                .h(28.0)
+                .h(TITLEBAR - 12.0)
                 .pl(6.0)
                 .center_y()
-                .gap(6.0)
-                .child(text("Zerith").font(ui::TITLE).color(u.content).grow(1.0))
+                .gap(10.0)
+                .window_drag()
+                .child(brand::zerith(24.0, &s.images))
+                .child(
+                    text("Zerith")
+                        .font(rune::TextStyle::new(15.0, 650.0).lh(20.0))
+                        .color(u.content)
+                        .grow(1.0),
+                )
                 .child(widgets::icon_button(
                     "new",
                     "Nova conversa (Ctrl+N)",
@@ -719,8 +774,15 @@ pub fn view(s: &Shell, cx: &mut Cx<Shell>) -> El {
     if s.reduce_motion {
         cx.reduced_motion(true);
     }
-    let u = ui::pick(dark);
+    let mut u = ui::pick(dark);
+    // Under ~900 pt of window (the sheet is the window minus the sidebar and
+    // insets) screens stack instead of sitting side by side.
+    u.compact = cx
+        .layout_with("sheet", |r| r[2] < COMPACT_SHEET)
+        .unwrap_or(false);
     cx.foreground(u.content);
+    cx.caption_color(u.secondary);
+    let insets = cx.chrome_insets();
     cx.focus_ring(2.0, 2.0, u.accent.alpha(0.7));
 
     let mut layer = Vec::new();
@@ -729,6 +791,7 @@ pub fn view(s: &Shell, cx: &mut Cx<Shell>) -> El {
         Screen::History => screens::history::view(s, &u),
         Screen::Agents => screens::agents::view(s, &u),
         Screen::Skills => screens::skills::view(s, &u),
+        Screen::Media => screens::media::view(s, &u),
         Screen::Memory => screens::memory::view(s, &u),
         Screen::Providers => screens::providers::view(s, &u),
         Screen::Settings => screens::settings::view(s, &u, cx.system_reduced_motion()),
@@ -762,20 +825,57 @@ pub fn view(s: &Shell, cx: &mut Cx<Shell>) -> El {
                         .grow(1.0)
                         .min_w(0.0)
                         .h_full()
-                        .padding(INSET)
-                        .child(sheet),
+                        .child(
+                            row()
+                                .key("titleband")
+                                .w_full()
+                                .h(TITLEBAR - INSET)
+                                .pr(insets.trailing)
+                                .window_drag(),
+                        )
+                        .child(
+                            col()
+                                .grow(1.0)
+                                .min_h(0.0)
+                                .w_full()
+                                .px(INSET)
+                                .pb(INSET)
+                                .child(sheet),
+                        ),
                 ),
         );
     rune_kit::root(base, layer)
+}
+
+/// Once per frame: takes what the typing timers have landed. Costs a lock
+/// per timer and returns false when nothing is due, so an idle window draws
+/// nothing.
+pub fn poll(s: &mut Shell, _clock: f64, _tx: &mut Tx) -> bool {
+    screens::media::poll(s)
 }
 
 /// The spec main and tests share, so the keyboard map is the same in both.
 pub fn spec() -> rune::AppSpec<Shell> {
     rune::AppSpec {
         on_key: Some(on_key),
+        poll: Some(poll),
         min_size: Some((760.0, 520.0)),
-        ..rune::AppSpec::new("Zerith", (1100.0, 720.0), || unreachable!(), view)
+        ..rune::AppSpec::new("Zerith", (1180.0, 760.0), || unreachable!(), view)
     }
+}
+
+/// The app with its own title band instead of the native frame. On Windows
+/// Rune paints the caption buttons over the band's trailing edge and the window
+/// keeps its resize edges and Aero Snap; `cx.chrome_insets()` says what the
+/// buttons take. The band is the top of the sidebar and of the content column.
+pub fn app_with(spec: rune::AppSpec<Shell>) -> rune::App<Shell> {
+    rune::App::new(spec).titlebar(rune::Titlebar::new(TITLEBAR))
+}
+
+/// Test hook for the media opener's guard: it refuses anything outside `dir`
+/// before it asks the OS to open it.
+pub fn open_media_for_test(dir: &Path, path: &Path) -> Result<(), String> {
+    wire::open_media(dir, path)
 }
 
 /// Used by `Cancel` users outside the crate (tests drive `stop`).

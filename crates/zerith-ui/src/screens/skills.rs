@@ -216,11 +216,15 @@ fn installed_list(s: &Shell, list: &[Entry], u: &Ui) -> El {
                                 .truncate(),
                         )
                         .child(
-                            text(if n == 0 {
-                                "sem alertas".to_string()
-                            } else {
-                                format!("{n} alerta(s)")
-                            })
+                            text(format!(
+                                "{}{}",
+                                origin_tag(&e.installed.source),
+                                if n == 0 {
+                                    "sem alertas".to_string()
+                                } else {
+                                    format!("{n} alerta(s)")
+                                }
+                            ))
                             .font(ui::LABEL)
                             .color(u.faint),
                         ),
@@ -250,6 +254,19 @@ fn installed_list(s: &Shell, list: &[Entry], u: &Ui) -> El {
         );
     }
     c
+}
+
+/// Where a skill came from, as a short prefix for its list row. The person
+/// reads this before turning a skill on: a model-written one in particular is
+/// text nobody has reviewed yet.
+fn origin_tag(source: &str) -> &'static str {
+    if source.starts_with(zerith_skills::author::AI_SOURCE) {
+        "criada pela IA · "
+    } else if source.starts_with("bundled:") {
+        "inclusa no Zerith · "
+    } else {
+        ""
+    }
 }
 
 fn detail(s: &Shell, e: &Entry, u: &Ui) -> El {

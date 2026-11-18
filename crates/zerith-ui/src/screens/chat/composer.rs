@@ -1,8 +1,8 @@
 //! The composer: input row, `/` and `@` popups, and the footer (model,
 //! agent, permission mode, context meter, turn cost).
 
-use rune::{col, el, row, text, text_input, Align, El, Key, KeyEvent, Side, Tx};
-use rune_kit::{Placement, PopupItem, PopupList, Select};
+use rune::{col, el, row, text, text_input, El, GrowthSpec, Key, KeyEvent, Tx};
+use rune_kit::{popover, Placement, Select};
 
 use super::actions::{self, Rows};
 use super::{toggle_agents, toggle_models, Shell};
@@ -23,9 +23,10 @@ fn model_select(s: &Shell, u: &Ui, layer: &mut Vec<El>) -> El {
         options.insert(0, c.model.clone());
     }
     let placeholder = match &c.models {
+        _ if !super::provider_usable(s) => "conecte um provedor",
         Load::Loading => "carregando modelos…",
         Load::Failed(_) => "modelos indisponíveis",
-        _ => "escolher modelo",
+        _ => "sem modelo",
     };
     Select::new("model", &options)
         .label("Modelo")
@@ -143,15 +144,20 @@ fn footer(s: &Shell, u: &Ui, layer: &mut Vec<El>) -> El {
         .child(model_select(s, u, layer))
         .child(agent_select(s, u, layer))
         .child(mode_select(s, u, layer));
-    if let Load::Failed(e) = &c.models {
-        foot = foot.child(
-            text(e.clone())
-                .font(ui::LABEL)
-                .color(u.faint)
-                .truncate()
-                .shrink()
-                .min_w(0.0),
-        );
+    // While the empty screen already displays the setup card (e.g. missing API
+    // key), repeating a raw HTTP 401 line in the composer footer only adds noise.
+    let suppress_model_err = c.lines.is_empty() && !super::provider_usable(s);
+    if !suppress_model_err {
+        if let Load::Failed(e) = &c.models {
+            foot = foot.child(
+                text(e.clone())
+                    .font(ui::LABEL)
+                    .color(u.faint)
+                    .truncate()
+                    .shrink()
+                    .min_w(0.0),
+            );
+        }
     }
     foot = foot.child(el().grow(1.0));
     if !c.status.is_empty() {
@@ -183,21 +189,43 @@ fn footer(s: &Shell, u: &Ui, layer: &mut Vec<El>) -> El {
     foot.px(2.0)
 }
 
-/// The `/` and `@` popups, anchored above the input frame.
-fn popup(s: &Shell, u: &Ui, layer: &mut Vec<El>) {
-    let Some(a) = actions::active(s) else { return };
-    if s.chat.draft.focused.then_some(()).is_none() {
-        return;
-    }
-    let rows = actions::rows(s, &a);
-    let k = ui::kit(u);
-    let (key, label, empty, items): (&str, &str, String, Vec<PopupItem>) = match &rows {
+/// One row of a popup: a command or a file.
+struct PopRow {
+    id: String,
+    label: String,
+    detail: String,
+}
+
+/// The accessible key of option `id` in popup `key`.
+fn option_key(key: &str, id: &str) -> String {
+    format!("{key}-option-{id}")
+}
+
+/// What the `/` or `@` popup shows right now, if it is open.
+struct Pop {
+    key: &'static str,
+    label: &'static str,
+    empty: String,
+    rows: Vec<PopRow>,
+    active: Option<usize>,
+    trigger: Trigger,
+    anchor: agentwork::Active,
+}
+
+fn pop(s: &Shell) -> Option<Pop> {
+    let a = actions::active(s)?;
+    s.chat.draft.focused.then_some(())?;
+    let (key, label, empty, rows): (&str, &str, String, Vec<PopRow>) = match actions::rows(s, &a) {
         Rows::Slash(v) => (
             "slash",
             "Comandos",
             "Nenhum comando".into(),
             v.iter()
-                .map(|c| PopupItem::new(c.name, format!("/{}", c.name)).description(c.detail))
+                .map(|c| PopRow {
+                    id: c.name.to_string(),
+                    label: format!("/{}", c.name),
+                    detail: c.detail.to_string(),
+                })
                 .collect(),
         ),
         Rows::Files(v) => (
@@ -211,32 +239,155 @@ fn popup(s: &Shell, u: &Ui, layer: &mut Vec<El>) {
             v.iter()
                 .map(|p| {
                     let (dir, name) = p.rsplit_once('/').unwrap_or(("", p));
-                    PopupItem::new(p.clone(), name.to_string()).description(dir)
+                    PopRow {
+                        id: p.clone(),
+                        label: name.to_string(),
+                        detail: dir.to_string(),
+                    }
                 })
                 .collect(),
         ),
     };
-    let n = items.len();
-    let trigger = a.trigger;
-    let a2 = a.clone();
-    PopupList::<Shell>::new(key, BOX)
-        .anchored(BOX, Side::Top, Align::Start, 6.0)
-        .width(if trigger == Trigger::Slash {
-            420.0
+    let n = rows.len();
+    Some(Pop {
+        key: if key == "slash" { "slash" } else { "files" },
+        label: if label == "Comandos" {
+            "Comandos"
         } else {
-            480.0
-        })
-        .max_height(260.0)
-        .items(items)
-        .active((n > 0).then(|| s.chat.popup_active.min(n - 1)))
-        .empty_message(empty)
-        .label(label)
-        .on_active(|s: &mut Shell, i| s.chat.popup_active = i)
-        .on_choose(move |s: &mut Shell, id: &str, _: &mut Tx| match trigger {
-            Trigger::Slash => actions::run_command(s, id),
-            Trigger::File => actions::insert_file(s, &a2, id),
-        })
-        .build(&k, layer);
+            "Arquivos"
+        },
+        empty,
+        active: (n > 0).then(|| s.chat.popup_active.min(n - 1)),
+        trigger: a.trigger,
+        rows,
+        anchor: a,
+    })
+}
+
+/// The `/` and `@` popups, anchored above the input frame.
+///
+/// A combobox popup: the field keeps keyboard focus (Up, Down, Enter, Tab and
+/// Esc are handled in `on_field_key`), the container is a labelled listbox and
+/// each row an option, and the field points at the highlighted option with
+/// `active_descendant`, so a screen reader reads the row as it moves. Built
+/// from the kit's public popover pieces rather than `PopupList`, whose
+/// container announces itself as an unnamed button.
+fn popup(s: &Shell, u: &Ui, layer: &mut Vec<El>) {
+    let Some(p) = pop(s) else { return };
+    let k = ui::kit(u);
+    let n = p.rows.len();
+    let mut rows = col()
+        .key("rows")
+        .w_full()
+        .growth(GrowthSpec::default())
+        .virtualize(28.0)
+        .reveal_selected(true);
+    for (i, r) in p.rows.iter().enumerate() {
+        let on = p.active == Some(i);
+        let (trigger, anchor, id) = (p.trigger, p.anchor.clone(), r.id.clone());
+        let mut item = row()
+            .key(option_key(p.key, &r.id))
+            .role("option")
+            .label(r.label.clone())
+            .description(r.detail.clone())
+            .position_in_set(i + 1, n)
+            .focus_selected(on)
+            .checked(on)
+            .w_full()
+            .h(28.0)
+            .px(8.0)
+            .gap(8.0)
+            .center_y()
+            .radius(ui::R_XS)
+            .fill(if on {
+                u.hover
+            } else {
+                rune::Color::TRANSPARENT
+            })
+            .on_hover(move |s: &mut Shell| s.chat.popup_active = i)
+            .on_press_tx(move |s: &mut Shell, _: &mut Tx| match trigger {
+                Trigger::Slash => actions::run_command(s, &id),
+                Trigger::File => actions::insert_file(s, &anchor, &id),
+            })
+            .child(
+                text(r.label.clone())
+                    .font(k.ty.ui_compact)
+                    .color(u.content)
+                    .shrink()
+                    .truncate()
+                    .a11y_hidden(),
+            );
+        if !r.detail.is_empty() {
+            item = item.child(
+                text(r.detail.clone())
+                    .font(k.ty.ui_compact)
+                    .color(u.muted_text)
+                    .grow(1.0)
+                    .shrink()
+                    .truncate()
+                    .a11y_hidden(),
+            );
+        }
+        rows = rows.child(item);
+    }
+    let empty = n == 0;
+    let viewport = popover::fit_scroll(rows)
+        .key("viewport")
+        .role("listbox")
+        .label(p.label)
+        .h((n as f32 * 28.0).min(260.0))
+        .min_h(if empty { 0.0 } else { 28.0 })
+        .clip_soft(0.0);
+    let list = col()
+        .key("list")
+        .preserve_focus_on_press(true)
+        .w_full()
+        .shrink()
+        .min_h(0.0)
+        .child(
+            rune_kit::scroll_bar(&k, &format!("{}-scroll-area", p.key), "viewport", viewport)
+                .w_full()
+                .shrink()
+                .min_h(0.0),
+        )
+        .child(
+            el().key("empty")
+                .h(if empty { 28.0 } else { 0.0 })
+                .px(8.0)
+                .center_y()
+                .clip_soft(0.0)
+                .opacity(if empty { 1.0 } else { 0.0 })
+                .child(text(p.empty).font(k.ty.ui_compact).color(u.muted_text)),
+        );
+    let width = if p.trigger == Trigger::Slash {
+        420.0
+    } else {
+        480.0
+    };
+    // `group`, not a button: the surface is a container, only rows act.
+    let content = col()
+        .key(format!("{}-content", p.key))
+        .role("group")
+        .label(p.label)
+        .preserve_focus_on_press(true)
+        .w(width)
+        .padding(4.0)
+        .instant_changes()
+        .child(list);
+    layer.push(popover::anchored(
+        &k,
+        popover::raised(&k, content, k.radius.md),
+        BOX,
+        Placement::TopStart,
+        6.0,
+    ));
+}
+
+/// Key of the highlighted option, for the field's `active_descendant`.
+fn active_option(s: &Shell) -> String {
+    pop(s)
+        .and_then(|p| p.active.map(|i| option_key(p.key, &p.rows[i].id)))
+        .unwrap_or_default()
 }
 
 /// Keys the field must see before its editor does: the popup's navigation,
@@ -275,7 +426,7 @@ fn on_field_key(s: &mut Shell, ev: &KeyEvent, tx: &mut Tx) -> bool {
     }
     let global = (ev.key == Key::Escape
         && (s.chat.cancel.is_some() || s.chat.model_menu || s.chat.agent_menu || s.chat.mode_menu))
-        || "1234567nk".chars().any(|c| ev.is_command(c));
+        || "12345678nk".chars().any(|c| ev.is_command(c));
     global && crate::on_key(s, ev, tx)
 }
 
@@ -290,6 +441,7 @@ pub fn composer(s: &Shell, u: &Ui, layer: &mut Vec<El>) -> El {
         .label("Mensagem para o Zerith")
         .description("Digite / para comandos e @ para arquivos")
         .placeholder("Pergunte algo, / comandos, @ arquivos", u.faint)
+        .active_descendant(active_option(s))
         .on_edit(|s: &mut Shell| &mut s.chat.draft)
         .on_submit(|s: &mut Shell, _: &mut Tx| super::send(s))
         .on_input_key(on_field_key);

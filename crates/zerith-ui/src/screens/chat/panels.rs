@@ -32,12 +32,22 @@ fn card(key: &'static str, role: &'static str, label: String, u: &Ui) -> El {
 fn task_mark(t: &TaskItem, u: &Ui) -> El {
     match t.state {
         TaskState::Pending => el()
-            .size(14.0, 14.0)
+            .size(16.0, 16.0)
             .center()
             .child(el().size(8.0, 8.0).radius(4.0).border(1.0, u.faint))
             .a11y_hidden(),
-        TaskState::InProgress => spinner(u, u.accent),
-        TaskState::Completed => icon(ui::icon_check(), 14.0).color(u.ok),
+        TaskState::InProgress => el()
+            .size(16.0, 16.0)
+            .center()
+            .child(spinner(u, u.accent))
+            .a11y_hidden(),
+        TaskState::Completed => el()
+            .size(16.0, 16.0)
+            .radius(8.0)
+            .fill(u.ok.alpha(0.16))
+            .center()
+            .child(icon(ui::icon_check(), 11.0).color(u.ok))
+            .a11y_hidden(),
     }
 }
 
@@ -48,20 +58,16 @@ fn task_row(i: usize, t: &TaskItem, u: &Ui) -> El {
         TaskState::Completed => "concluída",
     };
     let shown = t.shown().to_string();
-    let done = t.state == TaskState::Completed;
-    let mut label = text(shown.clone())
+    let label = text(shown.clone())
         .font(ui::SMALL)
         .color(match t.state {
-            TaskState::Completed => u.faint,
+            TaskState::Completed => u.muted_text,
             TaskState::InProgress => u.content,
             TaskState::Pending => u.secondary,
         })
         .grow(1.0)
         .min_w(0.0)
         .wrap();
-    if done {
-        label = label.strike(0, shown.len(), None);
-    }
     row()
         .key(format!("task-{i}"))
         .role("listitem")
@@ -69,7 +75,14 @@ fn task_row(i: usize, t: &TaskItem, u: &Ui) -> El {
         .w_full()
         .gap(10.0)
         .center_y()
-        .py(3.0)
+        .px(6.0)
+        .py(2.5)
+        .radius(ui::R_SM)
+        .fill(if t.state == TaskState::InProgress {
+            u.accent_soft
+        } else {
+            rune::Color::TRANSPARENT
+        })
         .child(task_mark(t, u))
         .child(label)
 }
@@ -82,6 +95,11 @@ pub fn tasks(s: &Shell, u: &Ui) -> Option<El> {
         return None;
     }
     let (done, total) = task_progress(&c.tasks);
+    let frac = if total > 0 {
+        (done as f32 / total as f32).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
     let current = c
         .tasks
         .iter()
@@ -96,15 +114,29 @@ pub fn tasks(s: &Shell, u: &Ui) -> Option<El> {
         .expanded(open)
         .focusable(true)
         .w_full()
-        .h(32.0)
+        .h(30.0)
         .px(14.0)
-        .gap(8.0)
+        .gap(10.0)
         .center_y()
         .hover(u.hover)
         .press(u.active)
         .on_press(|s: &mut Shell| actions::toggle_tasks(s))
         .child(icon(ui::icon_list(), 14.0).color(u.faint))
-        .child(text(title).font(ui::SMALL).color(u.secondary))
+        .child(text(title).font(ui::SMALL).color(u.content))
+        .child(
+            row()
+                .w(72.0)
+                .h(5.0)
+                .radius(2.5)
+                .fill(u.layer3)
+                .child(
+                    el().w((72.0 * frac).max(if done > 0 { 5.0 } else { 0.0 }))
+                        .h(5.0)
+                        .radius(2.5)
+                        .fill(if done == total { u.ok } else { u.accent }),
+                )
+                .a11y_hidden(),
+        )
         .child(
             text(if open {
                 String::new()
@@ -136,6 +168,7 @@ pub fn tasks(s: &Shell, u: &Ui) -> Option<El> {
         .w_full()
         .radius(ui::R_MD)
         .clip_rounded(ui::R_MD)
+        .fill(u.muted)
         .border(1.0, u.line)
         .child(head);
     if open {
@@ -143,9 +176,9 @@ pub fn tasks(s: &Shell, u: &Ui) -> Option<El> {
             .role("list")
             .label("Tarefas")
             .w_full()
-            .px(14.0)
-            .pb(10.0)
-            .gap(0.0);
+            .px(10.0)
+            .pb(6.0)
+            .gap(1.0);
         for (i, t) in c.tasks.iter().enumerate() {
             list = list.child(task_row(i, t, u));
         }
@@ -153,8 +186,10 @@ pub fn tasks(s: &Shell, u: &Ui) -> Option<El> {
             list.scroll(ScrollSpec {
                 stick_bottom: false,
             })
-            .max_h(180.0)
-            .pt(6.0),
+            // A short window keeps the checklist to three rows so the
+            // transcript above it keeps room.
+            .max_h(if u.compact { 92.0 } else { 180.0 })
+            .pt(4.0),
         );
     }
     Some(panel)

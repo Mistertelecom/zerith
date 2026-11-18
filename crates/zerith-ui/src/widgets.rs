@@ -2,8 +2,8 @@
 //! from `Ui` and announces a role and a label, so a screen built from these is
 //! keyboard- and screen-reader-usable without remembering to be.
 
-use rune::{col, el, icon, row, rule, text, text_input, Color, El, Icon, TextEdit, Tx};
-use rune_kit::Spinner;
+use rune::{col, el, icon, row, rule, text, text_input, Color, El, Icon, ScrollSpec, TextEdit, Tx};
+use rune_kit::Loader;
 
 use crate::ui::{self, Ui};
 use crate::Shell;
@@ -171,8 +171,15 @@ pub fn field(
         .gap(8.0)
         .center_y()
         .radius(10.0)
-        .fill(u.muted)
-        .border(1.0, if edit.focused { u.line_strong } else { u.line });
+        .fill(u.layer2)
+        .border(
+            1.0,
+            if edit.focused {
+                u.accent.alpha(0.75)
+            } else {
+                u.line_strong
+            },
+        );
     if let Some(i) = leading {
         r = r.child(icon(i, 16.0).color(u.faint));
     }
@@ -189,30 +196,176 @@ pub fn labelled(label: &'static str, control: El, u: &Ui) -> El {
 }
 
 /// A settings row: name and explanation on the left, control on the right,
-/// a hairline under it. Rows, not boxes.
+/// a hairline under it. Rows, not boxes. In a narrow window the control moves
+/// under the text instead of squeezing it.
 pub fn setting(label: &str, detail: &str, control: El, u: &Ui) -> El {
-    col().w_full().child(
+    setting_full(label, detail, "", control, false, u)
+}
+
+/// [`setting`] with the real setting name in a small muted hint under the
+/// explanation, and an option to always stack the control under the text (for
+/// wide controls such as a five-way selector).
+pub fn setting_full(
+    label: &str,
+    detail: &str,
+    hint_text: &str,
+    control: El,
+    stacked: bool,
+    u: &Ui,
+) -> El {
+    let mut words = col()
+        .grow(1.0)
+        .min_w(0.0)
+        .gap(2.0)
+        .child(text(label.to_string()).font(ui::BODY).color(u.content))
+        .child(
+            text(detail.to_string())
+                .wrap()
+                .font(ui::SMALL)
+                .color(u.muted_text)
+                .selectable(true),
+        );
+    if !hint_text.is_empty() {
+        words = words.child(hint(hint_text, u));
+    }
+    let body = if stacked || u.compact {
+        col()
+            .w_full()
+            .py(12.0)
+            .gap(10.0)
+            .child(words)
+            .child(control)
+    } else {
         row()
             .w_full()
             .py(12.0)
             .gap(16.0)
             .center_y()
-            .child(
-                col()
-                    .grow(1.0)
-                    .min_w(0.0)
-                    .gap(2.0)
-                    .child(text(label.to_string()).font(ui::BODY).color(u.content))
-                    .child(
-                        text(detail.to_string())
-                            .wrap()
-                            .font(ui::SMALL)
-                            .color(u.muted_text)
-                            .selectable(true),
-                    ),
-            )
-            .child(control),
-    )
+            .child(words)
+            .child(control)
+    };
+    col().w_full().child(body)
+}
+
+/// A small muted line for the real name of a setting or a file format. Never
+/// a title: the title says what it does, this says what it is called on disk.
+pub fn hint(msg: impl Into<String>, u: &Ui) -> El {
+    text(msg.into())
+        .wrap()
+        .font(ui::LABEL)
+        .color(u.faint)
+        .selectable(true)
+}
+
+/// A path or setting key in code style: muted fill, mono, one line. The full
+/// text is the tooltip when it is cut.
+pub fn code_line(msg: impl Into<String>, u: &Ui) -> El {
+    let msg = msg.into();
+    row()
+        .w_full()
+        .h(24.0)
+        .px(8.0)
+        .center_y()
+        .radius(ui::R_XS)
+        .fill(u.muted)
+        .border(1.0, u.line)
+        .min_w(0.0)
+        .clip_soft(0.0)
+        .child(
+            text(msg.clone())
+                .font(ui::MONO)
+                .color(u.muted_text)
+                .truncate()
+                .shrink()
+                .min_w(0.0)
+                .selectable(true)
+                .help_when_truncated(msg),
+        )
+}
+
+/// Page-level horizontal navigation tabs, visually distinct from form segmented controls.
+pub fn tabs(
+    labels: &[&str],
+    idx: usize,
+    label: &str,
+    u: &Ui,
+    on_pick: impl Fn(&mut Shell, usize) + Clone + 'static,
+) -> El {
+    let mut bar = row()
+        .role("tablist")
+        .label(label.to_string())
+        .focus_group()
+        .gap(4.0)
+        .center_y();
+    let n = labels.len();
+    for (i, title) in labels.iter().enumerate() {
+        let on = i == idx;
+        let pick = on_pick.clone();
+        bar = bar.child(
+            col()
+                .key(format!("tab-{i}-{title}"))
+                .role("tab")
+                .label((*title).to_string())
+                .position_in_set(i + 1, n)
+                .checked(on)
+                .focusable(true)
+                .focus_selected(on)
+                .px(12.0)
+                .pt(6.0)
+                .pb(4.0)
+                .gap(4.0)
+                .items_center()
+                .radius(ui::R_SM)
+                .fill(if on { u.muted } else { Color::TRANSPARENT })
+                .border(1.0, if on { u.line_strong } else { Color::TRANSPARENT })
+                .hover(u.hover)
+                .press(u.active)
+                .on_press(move |s: &mut Shell| pick(s, i))
+                .child(text((*title).to_string()).font(ui::SMALL).color(if on {
+                    u.content
+                } else {
+                    u.muted_text
+                }))
+                .child(el().w(24.0).h(2.0).radius(1.0).fill(if on {
+                    u.accent
+                } else {
+                    Color::TRANSPARENT
+                })),
+        );
+    }
+    col().w_full().gap(8.0).child(bar).child(rule(1.0, u.line).w_full())
+}
+
+/// A tab body that scrolls when it must, and says so: a scroll bar over the
+/// right edge and a soft fade where content continues.
+pub fn scroll_body(key: &'static str, body: El, u: &Ui) -> El {
+    let viewport = body
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        })
+        .scroll_edge_fade(14.0)
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0);
+    rune_kit::scroll_bar(&ui::kit(u), &format!("{key}-area"), key, viewport)
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+}
+
+/// Two blocks side by side, or stacked in a narrow window.
+pub fn split(left: El, right: El, gap: f32, u: &Ui) -> El {
+    if u.compact {
+        col().w_full().gap(gap.min(14.0)).child(left).child(right)
+    } else {
+        row().w_full().gap(gap).items_start().child(left).child(right)
+    }
+}
+
+/// A 13 pt progress ring: the kit's loader (a ring with a turning arc), which
+/// stays clean at small sizes and holds still under reduced motion.
+pub fn spinner(color: Color, size: f32, u: &Ui) -> El {
+    Loader::new().size(size).color(color).build(&ui::kit(u))
 }
 
 /// A section of a settings-like page: eyebrow, then rows split by hairlines.
@@ -301,7 +454,7 @@ pub fn loading(what: impl Into<String>, u: &Ui) -> El {
         .center()
         .role("status")
         .label(what.into())
-        .child(Spinner::new().size(14.0).color(u.faint).build(&ui::kit(u)))
+        .child(spinner(u.faint, 14.0, u))
         .child(text("Carregando…").font(ui::SMALL).color(u.muted_text))
 }
 

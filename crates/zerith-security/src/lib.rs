@@ -853,7 +853,7 @@ mod tests {
         std::fs::write(&inside, "x").unwrap();
         assert_eq!(policy.check(&Action::Write(inside)), Verdict::Allow);
         assert!(matches!(
-            policy.check(&Action::Write(PathBuf::from("C:/Windows/system.ini"))),
+            policy.check(&Action::Write(outside("system.ini"))),
             Verdict::Ask(_)
         ));
     }
@@ -865,6 +865,12 @@ mod tests {
             policy.check(&Action::Write(PathBuf::from("a"))),
             Verdict::Deny(_)
         ));
+    }
+
+    /// An absolute path outside any test workspace on this OS (`C:/Windows/x`
+    /// is a relative path on Linux, so it would land inside the workspace).
+    fn outside(name: &str) -> PathBuf {
+        PathBuf::from(if cfg!(windows) { "C:/Windows" } else { "/etc" }).join(name)
     }
 
     fn scratch_dir() -> tempfile::TempDir {
@@ -879,7 +885,7 @@ mod tests {
         let dir = scratch_dir();
         let ws = preset("workspace-write").unwrap();
         let file = Action::Write(dir.path().join("a.txt"));
-        let read_out = Action::Read(PathBuf::from("C:/Windows/win.ini"));
+        let read_out = Action::Read(outside("win.ini"));
         let shell = Action::Shell("cargo test".into());
 
         let p = Policy::new(ws, Mode::Default, dir.path());

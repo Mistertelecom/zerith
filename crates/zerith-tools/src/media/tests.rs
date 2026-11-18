@@ -343,7 +343,7 @@ fn local_references_outside_the_workspace_are_not_uploaded() {
     let tool = &tools_with_key(&s, &paths, "k".into())[0];
     let e = run_tool(
         tool.as_ref(),
-        &json!({"prompt": LONG, "reference_images": ["C:/Windows/win.ini"]}),
+        &json!({"prompt": LONG, "reference_images": [if cfg!(windows) { "C:/Windows/win.ini" } else { "/etc/hosts" }]}),
         &root,
     )
     .unwrap_err();

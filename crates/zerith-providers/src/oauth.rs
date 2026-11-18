@@ -61,7 +61,9 @@ pub struct Provider {
 // at consent with "Invalid request format".
 const CLAUDE: Provider = Provider {
     client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
-    authorize_url: "https://claude.com/cai/oauth/authorize",
+    // The CLI bundle names claude.com/cai, but at runtime it opens claude.ai
+    // directly; the redirect hop is where validation started failing.
+    authorize_url: "https://claude.ai/oauth/authorize",
     token_url: "https://platform.claude.com/v1/oauth/token",
     scopes: &[
         "org:create_api_key",
@@ -182,8 +184,10 @@ impl Pkce {
     }
 }
 
+/// 32 bytes (43 chars), like Claude Code: claude.ai answers "Invalid request
+/// format" after consent to a shorter state (16 bytes was rejected).
 pub fn random_state() -> String {
-    b64url(&random_bytes::<16>())
+    b64url(&random_bytes::<32>())
 }
 
 pub fn redirect_path(tool: OAuthTool) -> &'static str {
@@ -1292,6 +1296,11 @@ mod tests {
         assert!(!url.contains("127.0.0.1"), "{url}");
         assert!(needs_pasted_code(OAuthTool::ClaudeCode));
         assert!(!needs_pasted_code(OAuthTool::Codex));
+    }
+
+    #[test]
+    fn the_state_is_as_long_as_claude_codes() {
+        assert_eq!(random_state().len(), 43);
     }
 
     #[test]

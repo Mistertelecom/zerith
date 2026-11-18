@@ -1,1 +1,10 @@
 target/
+node_modules/
+dist/
+# WebView2 profile and scratch data roots used when running from a checkout
+_wv*/
+_data/
+# Tauri generated ACL schemas
+crates/zerith-desktop/gen/
+.settings*.json
+*.log

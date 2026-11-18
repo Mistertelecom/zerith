@@ -1,0 +1,181 @@
+/* Zerith Desktop tokens. One place for every colour, shadow, radius, size
+   and motion value; components only ever read these (see DESIGN.md).
+   Dark is pure black with white type; light is white with black type. The
+   accent is monochrome (white on dark, black on light): colour is reserved for
+   state (ok / warn / danger). Contrast of every label token against base and
+   layer-1 is >= 4.5:1 (primary >= 7:1). */
+
+:root {
+  /* our window title bar (decorations: false) */
+  --titlebar-h: 34px;
+  /* surfaces */
+  --bg-chrome: #000000;
+  --bg-base: #000000;
+  --layer-1: #0a0a0a;
+  --layer-2: #121212;
+  --layer-3: #161616;
+  --bg-mask: rgba(0, 0, 0, 0.72);
+  --hover: rgba(255, 255, 255, 0.06);
+  --active: rgba(255, 255, 255, 0.1);
+
+  /* hairlines */
+  --line-faint: rgba(255, 255, 255, 0.06);
+  --line: rgba(255, 255, 255, 0.1);
+  --line-strong: rgba(255, 255, 255, 0.16);
+
+  /* labels */
+  --label-primary: #ffffff;
+  --label-secondary: #b4b4b4;
+  --label-tertiary: #8f8f8f;
+  --label-caption: #808080;
+
+  /* accent: sapphire. The fill is dark enough for white text (4.5:1). */
+  --accent: #ffffff;
+  --accent-hover: #e6e6e6;
+  --accent-text: #ffffff;
+  --accent-soft: rgba(255, 255, 255, 0.1);
+  --accent-softer: rgba(255, 255, 255, 0.05);
+  --ring: rgba(255, 255, 255, 0.6);
+  --on-accent: #000000;
+
+  /* state */
+  --ok: #4cc764;
+  --ok-text: #6fd987;
+  --ok-soft: rgba(76, 199, 100, 0.14);
+  --warn: #e9ad3f;
+  --warn-text: #f1c06a;
+  --warn-soft: rgba(233, 173, 63, 0.14);
+  --danger: #ff6b6b;
+  --danger-text: #ff8a8a;
+  --danger-soft: rgba(255, 107, 107, 0.13);
+  --on-danger: #ffffff;
+  --done: #b39dfa;
+  --done-soft: rgba(179, 157, 250, 0.14);
+
+  /* colour PNG logos sit on white in both themes (dark marks vanish on black) */
+  --logo-tile: #ffffff;
+
+  /* code */
+  --code-bg: #0a0a0a;
+  --code-banner: #111111;
+
+  /* shadows */
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.6);
+  --shadow-2: 0 0 0 1px rgba(255, 255, 255, 0.04), 0 8px 24px rgba(0, 0, 0, 0.6);
+  --shadow-3: 0 0 0 1px rgba(255, 255, 255, 0.06), 0 24px 64px rgba(0, 0, 0, 0.8);
+  --shadow-composer: 0 0 0 1px rgba(255, 255, 255, 0.03), 0 12px 40px rgba(0, 0, 0, 0.7);
+  --glow-accent: 0 0 0 3px rgba(255, 255, 255, 0.12);
+  --inset-edge: inset 0 1px 0 rgba(255, 255, 255, 0.05);
+
+  /* radius */
+  --r-xs: 6px;
+  --r-sm: 8px;
+  --r-md: 12px;
+  --r-lg: 16px;
+  --r-xl: 22px;
+  --r-full: 999px;
+
+  /* type */
+  --font: "Inter", "Segoe UI Variable Text", "Segoe UI", ui-sans-serif, system-ui, -apple-system,
+    sans-serif;
+  --mono: "JetBrains Mono", "Cascadia Code", "Cascadia Mono", Consolas, ui-monospace, monospace;
+  --fs-caption: 11px;
+  --fs-small: 12px;
+  --fs-ui: 13px;
+  --fs-body: 14px;
+  --fs-title: 15px;
+  --fs-h2: 18px;
+  --fs-hero: 26px;
+
+  /* motion */
+  --ease: cubic-bezier(0.4, 0, 0.2, 1);
+  --t-fast: 0.1s;
+  --t-base: 0.15s;
+  --t-slow: 0.3s;
+
+  /* layout */
+  --sidebar-w: 264px;
+  --rail-w: 288px;
+  --inset: 8px;
+
+  /* the select arrow, drawn in --label-tertiary */
+  --chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%238f8f8f' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+
+  color-scheme: dark;
+}
+
+:root[data-theme="light"] {
+  --bg-chrome: #fafafa;
+  --bg-base: #ffffff;
+  --layer-1: #fafafa;
+  --layer-2: #f3f3f3;
+  --layer-3: #ffffff;
+  --bg-mask: rgba(0, 0, 0, 0.28);
+  --hover: rgba(0, 0, 0, 0.045);
+  --active: rgba(0, 0, 0, 0.08);
+
+  --line-faint: rgba(0, 0, 0, 0.05);
+  --line: rgba(0, 0, 0, 0.09);
+  --line-strong: rgba(0, 0, 0, 0.15);
+
+  --label-primary: #0a0a0a;
+  --label-secondary: #404040;
+  --label-tertiary: #5c5c5c;
+  --label-caption: #6b6b6b;
+
+  --accent: #0a0a0a;
+  --accent-hover: #262626;
+  --accent-text: #0a0a0a;
+  --accent-soft: rgba(0, 0, 0, 0.06);
+  --accent-softer: rgba(0, 0, 0, 0.035);
+  --ring: rgba(0, 0, 0, 0.5);
+  --on-accent: #ffffff;
+
+  --ok: #1f9d4a;
+  --ok-text: #12733a;
+  --ok-soft: rgba(31, 157, 74, 0.1);
+  --warn: #d48a0b;
+  --warn-text: #9a5b00;
+  --warn-soft: rgba(212, 138, 11, 0.12);
+  --danger: #d92d38;
+  --danger-text: #c4202b;
+  --danger-soft: rgba(217, 45, 56, 0.08);
+  --done: #7c4ce8;
+  --done-soft: rgba(124, 76, 232, 0.1);
+
+  --code-bg: #fafafa;
+  --code-banner: #f3f3f3;
+
+  --shadow-1: 0 1px 2px rgba(15, 23, 42, 0.06);
+  --shadow-2: 0 1px 2px rgba(15, 23, 42, 0.05), 0 4px 14px rgba(15, 23, 42, 0.07);
+  --shadow-3: 0 2px 6px rgba(15, 23, 42, 0.06), 0 20px 48px rgba(15, 23, 42, 0.16);
+  --shadow-composer: 0 1px 2px rgba(15, 23, 42, 0.05), 0 10px 30px rgba(15, 23, 42, 0.09);
+  --glow-accent: 0 0 0 3px rgba(0, 0, 0, 0.08);
+  --inset-edge: inset 0 1px 0 rgba(255, 255, 255, 0.6);
+
+  --chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%235c5c5c' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+
+  color-scheme: light;
+}
+
+/* Legacy names the pre-redesign CSS still reads. Every surface file drops
+   them as it is rewritten; delete this block once `grep -E "var\(--(canvas|
+   chrome|surface|muted|layer2|layer3|selected|content|secondary|muted-text|
+   faint|primary|primary-press|inverted)\)" src` comes back empty. */
+:root {
+  --canvas: var(--bg-chrome);
+  --chrome: var(--bg-chrome);
+  --surface: var(--bg-base);
+  --muted: var(--layer-1);
+  --layer2: var(--layer-2);
+  --layer3: var(--layer-3);
+  --selected: var(--accent-soft);
+  --content: var(--label-primary);
+  --secondary: var(--label-secondary);
+  --muted-text: var(--label-tertiary);
+  --faint: var(--label-caption);
+  --primary: var(--label-primary);
+  --primary-press: var(--label-secondary);
+  --inverted: var(--bg-base);
+  --fs-large: var(--fs-h2);
+}

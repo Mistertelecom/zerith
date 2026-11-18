@@ -1,0 +1,464 @@
+import {
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
+import {
+  ArrowUp,
+  Bot,
+  Check,
+  Layers,
+  Brain,
+  ChevronDown,
+  Cpu,
+  FileText,
+  Gauge,
+  History,
+  ListChecks,
+  Minimize2,
+  RotateCcw,
+  ShieldCheck,
+  Sparkles,
+  Square,
+  SquarePen,
+  type LucideIcon,
+} from "lucide-react";
+import { Logo } from "./ui";
+
+/// What `/` offers. The names are the old window's, so muscle memory carries
+/// over; `run` is handled by App, which owns the state each one touches.
+export const COMMANDS = [
+  ["compact", "Resumir o histórico para caber no contexto"],
+  ["context", "Quanto do contexto já foi usado"],
+  ["rewind", "Voltar ao último ponto de restauração"],
+  ["plan", "Entrar em modo plano"],
+  ["mode", "Trocar o modo de permissões"],
+  ["model", "Escolher o modelo"],
+  ["clear", "Começar uma conversa nova"],
+  ["resume", "Abrir o histórico"],
+  ["agents", "Ver os agentes"],
+  ["skills", "Ver as skills"],
+  ["memory", "Ver a memória"],
+] as const;
+
+export type CommandName = (typeof COMMANDS)[number][0];
+
+const COMMAND_ICONS: Record<CommandName, LucideIcon> = {
+  compact: Minimize2,
+  context: Gauge,
+  rewind: RotateCcw,
+  plan: ListChecks,
+  mode: ShieldCheck,
+  model: Cpu,
+  clear: SquarePen,
+  resume: History,
+  agents: Bot,
+  skills: Sparkles,
+  memory: Brain,
+};
+
+type Trigger = {
+  kind: "slash" | "file";
+  start: number;
+  end: number;
+  text: string;
+};
+
+/// The token under the caret, if it is something a popup should offer: a
+/// leading `/word` at the start of the draft, or an `@word` anywhere.
+function tokenAt(draft: string, caret: number): Trigger | null {
+  const before = draft.slice(0, caret);
+  const at = before.lastIndexOf(" ");
+  const start = at + 1;
+  const word = before.slice(start);
+  if (word.startsWith("/") && start === 0) {
+    return { kind: "slash", start, end: caret, text: word.slice(1) };
+  }
+  const atSign = word.lastIndexOf("@");
+  if (atSign >= 0) {
+    return {
+      kind: "file",
+      start: start + atSign,
+      end: caret,
+      text: word.slice(atSign + 1),
+    };
+  }
+  return null;
+}
+
+export function Composer(props: {
+  draft: string;
+  onDraft: (v: string) => void;
+  onSend: () => void;
+  onRun: (name: CommandName) => void;
+  busy: boolean;
+  onCancel: () => void;
+  mode: string;
+  modes: readonly (readonly [string, string])[];
+  onMode: (v: string) => void;
+  model: string;
+  models: { value: string; label: string }[];
+  onModel: (v: string) => void;
+  hint: string;
+  files: () => Promise<string[]>;
+}) {
+  const box = useRef<HTMLTextAreaElement>(null);
+  const [caret, setCaret] = useState(0);
+  const [list, setList] = useState<string[] | null>(null);
+  const [active, setActive] = useState(0);
+  const [dismissed, setDismissed] = useState<string | null>(null);
+
+  const trigger = useMemo(
+    () => (props.draft === dismissed ? null : tokenAt(props.draft, caret)),
+    [props.draft, caret, dismissed],
+  );
+
+  // The file list is asked once, on the first `@`; the workspace walk is
+  // cheap but not free, and the popup closes and reopens constantly.
+  useEffect(() => {
+    if (trigger?.kind !== "file") {
+      setList(null);
+      return;
+    }
+    if (list) return;
+    void props
+      .files()
+      .then(setList)
+      .catch(() => setList([]));
+  }, [trigger?.kind, list, props]);
+
+  useEffect(() => {
+    setActive(0);
+  }, [trigger?.text]);
+
+  const rows = useMemo(() => {
+    if (!trigger) return [];
+    const q = trigger.text.toLowerCase();
+    if (trigger.kind === "slash") {
+      return COMMANDS.filter(([n]) => n.startsWith(q)).map(
+        ([n, d]) => `${n}\u0000${d}`,
+      );
+    }
+    return (list ?? [])
+      .filter((f) => f.toLowerCase().includes(q))
+      .slice(0, 40)
+      .map((f) => `${f}\u0000`);
+  }, [trigger, list]);
+
+  const accept = (i: number) => {
+    if (!trigger || !rows[i]) return;
+    const [name] = rows[i].split("\u0000");
+    if (trigger.kind === "slash") {
+      props.onDraft("");
+      setCaret(0);
+      props.onRun(name as CommandName);
+      box.current?.focus();
+      return;
+    }
+    const next =
+      props.draft.slice(0, trigger.start) +
+      "@" +
+      name +
+      " " +
+      props.draft.slice(trigger.end);
+    props.onDraft(next);
+    setCaret(trigger.start + name.length + 2);
+    box.current?.focus();
+  };
+
+  // The draft grows with its text up to the CSS max-height, then scrolls.
+  useLayoutEffect(() => {
+    const el = box.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = el.scrollHeight + "px";
+  }, [props.draft]);
+
+  const modeLabel =
+    props.modes.find(([v]) => v === props.mode)?.[1] ?? props.mode;
+  const current = props.models.find((m) => m.value === props.model);
+  const provider = current?.label.split(" · ")[0] ?? props.model;
+  const canSend = !props.busy && !!props.draft.trim();
+
+  return (
+    <div className="composer">
+      <div className="composer-inner">
+        <div className="draft">
+          {trigger && rows.length > 0 ? (
+            <div
+              className="popover popup"
+              role="listbox"
+              aria-label={trigger.kind === "slash" ? "Comandos" : "Arquivos"}
+            >
+              <div className="popup-head">
+                {trigger.kind === "slash"
+                  ? "Comandos"
+                  : "Arquivos do workspace"}
+              </div>
+              {rows.map((r, i) => {
+                const [name, desc] = r.split("\u0000");
+                const Icon =
+                  trigger.kind === "slash"
+                    ? COMMAND_ICONS[name as CommandName]
+                    : FileText;
+                const cut = name.lastIndexOf("/");
+                return (
+                  <button
+                    key={name + i}
+                    role="option"
+                    aria-selected={i === active}
+                    ref={
+                      i === active
+                        ? (el) => el?.scrollIntoView({ block: "nearest" })
+                        : undefined
+                    }
+                    className={"popup-row" + (i === active ? " on" : "")}
+                    onMouseEnter={() => setActive(i)}
+                    onClick={() => accept(i)}
+                  >
+                    <span className="popup-icon">
+                      <Icon size={14} strokeWidth={2} />
+                    </span>
+                    {trigger.kind === "slash" ? (
+                      <>
+                        <span className="popup-key">/{name}</span>
+                        <span className="popup-desc">{desc}</span>
+                      </>
+                    ) : (
+                      <span className="popup-file">
+                        <span className="popup-base">
+                          {name.slice(cut + 1)}
+                        </span>
+                        {cut > 0 ? (
+                          <span className="popup-dir">
+                            {name.slice(0, cut)}
+                          </span>
+                        ) : null}
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          ) : null}
+          <textarea
+            ref={box}
+            rows={1}
+            value={props.draft}
+            aria-label="Mensagem"
+            placeholder="Pergunte algo ao Zerith…"
+            onChange={(e) => {
+              props.onDraft(e.target.value);
+              setCaret(e.target.selectionStart ?? e.target.value.length);
+              setDismissed(null);
+            }}
+            onKeyDown={(e) => {
+              if (rows.length && trigger) {
+                if (e.key === "ArrowDown") {
+                  e.preventDefault();
+                  setActive((i) => (i + 1) % rows.length);
+                  return;
+                }
+                if (e.key === "ArrowUp") {
+                  e.preventDefault();
+                  setActive((i) => (i - 1 + rows.length) % rows.length);
+                  return;
+                }
+                if (e.key === "Enter" || e.key === "Tab") {
+                  e.preventDefault();
+                  accept(active);
+                  return;
+                }
+                if (e.key === "Escape") {
+                  e.preventDefault();
+                  setDismissed(props.draft);
+                  return;
+                }
+              }
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                props.onSend();
+              }
+            }}
+          />
+          <div className="draft-row">
+            {/* Native selects under a pill: the pill shows the choice, the
+                transparent select on top keeps the real control and its menu. */}
+            {/* Own menus, not native <select>: WebView2 draws that popup as a
+                white OS window that spills out of the frame (and down). */}
+            <PillMenu
+              label="Permissões"
+              icon={<ShieldCheck size={14} strokeWidth={2} />}
+              text={modeLabel}
+              value={props.mode}
+              options={props.modes.map(([v, label]) => ({ value: v, label }))}
+              onPick={props.onMode}
+            />
+            <PillMenu
+              label="Modelo"
+              icon={
+                provider === "Perfil" ? (
+                  <Layers size={16} strokeWidth={1.75} />
+                ) : (
+                  <Logo id={provider || null} size={16} />
+                )
+              }
+              text={
+                current?.label.split(" · ")[1] ??
+                (props.model || "Escolha um modelo")
+              }
+              value={props.model}
+              options={props.models}
+              onPick={props.onModel}
+              search
+              wide
+            />
+            <span className="spacer" />
+            {props.busy ? (
+              <button
+                className="send stop"
+                onClick={props.onCancel}
+                aria-label="Parar"
+                title="Parar"
+              >
+                <Square size={12} strokeWidth={2} fill="currentColor" />
+              </button>
+            ) : (
+              <button
+                className={"btn btn-primary send" + (canSend ? " ready" : "")}
+                disabled={!canSend}
+                onClick={props.onSend}
+                aria-label="Enviar"
+                title="Enviar"
+              >
+                <ArrowUp size={16} strokeWidth={2.25} />
+              </button>
+            )}
+          </div>
+        </div>
+        <div className="hint">
+          <span className="hint-text">{props.hint}</span>
+          <span className="hint-keys">
+            <kbd className="kbd">Enter</kbd> enviar
+            <span className="hint-sep" />
+            <kbd className="kbd">Shift</kbd>
+            <kbd className="kbd">Enter</kbd> nova linha
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** A pill that opens a list above itself. Search filters long lists (models). */
+function PillMenu(props: {
+  label: string;
+  icon: ReactNode;
+  text: string;
+  value: string;
+  options: { value: string; label: string }[];
+  onPick: (v: string) => void;
+  search?: boolean;
+  wide?: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const [q, setQ] = useState("");
+  const root = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const away = (e: MouseEvent) =>
+      !root.current?.contains(e.target as Node) && setOpen(false);
+    const esc = (e: KeyboardEvent) =>
+      e.key === "Escape" && (e.stopPropagation(), setOpen(false));
+    window.addEventListener("mousedown", away);
+    window.addEventListener("keydown", esc, true);
+    return () => {
+      window.removeEventListener("mousedown", away);
+      window.removeEventListener("keydown", esc, true);
+    };
+  }, [open]);
+  const needle = q.trim().toLowerCase();
+  const shown = needle
+    ? props.options.filter((o) => o.label.toLowerCase().includes(needle))
+    : props.options;
+  return (
+    <div className="pill-menu" ref={root}>
+      <button
+        type="button"
+        className={"pill" + (open ? " open" : "")}
+        title={props.label}
+        aria-label={props.label}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        onClick={() => {
+          setOpen((o) => !o);
+          setQ("");
+        }}
+      >
+        {props.icon}
+        <span className="pill-text">{props.text}</span>
+        <ChevronDown size={14} strokeWidth={2} className="pill-chev" />
+      </button>
+      {open ? (
+        <div
+          className={"popover pill-list" + (props.wide ? " wide" : "")}
+          role="listbox"
+          aria-label={props.label}
+        >
+          {props.search ? (
+            <input
+              className="input pill-search"
+              autoFocus
+              placeholder="Buscar modelo ou conta…"
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+            />
+          ) : null}
+          <div className="pill-options">
+            {shown.length === 0 ? (
+              <div className="pill-empty">Nada encontrado</div>
+            ) : null}
+            {shown.map((o) => {
+              const [who, what] = o.label.includes(" · ")
+                ? o.label.split(" · ")
+                : ["", o.label];
+              return (
+                <button
+                  type="button"
+                  key={o.value}
+                  role="option"
+                  aria-selected={o.value === props.value}
+                  className={
+                    "pill-option" + (o.value === props.value ? " on" : "")
+                  }
+                  onClick={() => {
+                    props.onPick(o.value);
+                    setOpen(false);
+                  }}
+                >
+                  {who === "Perfil" ? (
+                    <Layers
+                      size={16}
+                      strokeWidth={1.75}
+                      className="pill-option-icon"
+                    />
+                  ) : who ? (
+                    <Logo id={who} size={16} />
+                  ) : null}
+                  <span className="pill-option-text">{what}</span>
+                  {who ? <span className="pill-option-who">{who}</span> : null}
+                  {o.value === props.value ? (
+                    <Check size={14} strokeWidth={2} />
+                  ) : null}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}

@@ -14,6 +14,7 @@ members = [
     "crates/zerith-plugins",
     "crates/zerith-security",
     "crates/zerith-tools",
+    "crates/zerith-desktop",
 ]
 
 [workspace.package]

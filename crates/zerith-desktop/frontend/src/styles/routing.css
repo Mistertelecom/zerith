@@ -1,0 +1,604 @@
+/* Delegação (components/Routing.tsx): a top-down diagram of who delegates to
+   whom, plus the model picker. Colours only from tokens.css (DESIGN.md). */
+
+/* ---- flow ----------------------------------------------------------- */
+
+.dg-flow {
+  container-type: inline-size;
+  display: grid;
+  min-width: 0;
+}
+
+.dg-you {
+  justify-self: center;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 14px 0 11px;
+  border-radius: var(--r-full);
+  border: 1px solid var(--line-strong);
+  background: var(--bg-base);
+  font-size: var(--fs-ui);
+  color: var(--label-tertiary);
+}
+.dg-you strong {
+  font-weight: 600;
+  color: var(--label-primary);
+}
+
+/* vertical connector with an arrow head */
+.dg-stem {
+  position: relative;
+  justify-self: center;
+  width: 0;
+  height: 22px;
+  border-left: 1.5px solid var(--label-caption);
+}
+.dg-stem:not(.bus)::after {
+  content: "";
+  position: absolute;
+  bottom: 0;
+  left: -5px;
+  border: 4px solid transparent;
+  border-top: 6px solid var(--label-caption);
+  border-bottom: 0;
+}
+
+/* fan-out: a bus from the first to the last column centre, a stub per node */
+.dg-fan {
+  position: relative;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  padding-top: 20px;
+}
+.dg-fan::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: calc((100% - 24px) / 6);
+  right: calc((100% - 24px) / 6);
+  border-top: 1.5px solid var(--label-caption);
+}
+.dg-fan > .dg-node::before {
+  content: "";
+  position: absolute;
+  top: -21px;
+  left: 50%;
+  height: 20px;
+  border-left: 1.5px solid var(--label-caption);
+}
+.dg-fan > .dg-node::after {
+  content: "";
+  position: absolute;
+  top: -6px;
+  left: calc(50% - 4px);
+  border: 4px solid transparent;
+  border-top: 6px solid var(--label-caption);
+  border-bottom: 0;
+}
+
+/* ---- role node ------------------------------------------------------ */
+
+.dg-node {
+  position: relative;
+  display: grid;
+  gap: 10px;
+  /* picker right under the text: space-between left a hole in the shorter nodes */
+  align-content: start;
+  min-width: 0;
+  padding: 12px;
+  border-radius: var(--r-md);
+  background: var(--layer-2);
+  border: 1px solid var(--line);
+}
+.dg-node.inherit {
+  border-style: dashed;
+  border-color: var(--line-strong);
+}
+.dg-node.dg-main {
+  justify-self: center;
+  width: 100%;
+  max-width: 440px;
+  border-color: var(--line-strong);
+  box-shadow: var(--shadow-2);
+}
+.dg-node-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  min-width: 0;
+}
+.dg-node-icon,
+.dg-agent-icon {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 30px;
+  height: 30px;
+  border-radius: var(--r-sm);
+  background: var(--bg-base);
+  border: 1px solid var(--line);
+  color: var(--label-primary);
+}
+.dg-node.dg-main .dg-node-icon {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
+}
+.dg-node-text {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+.dg-node-title {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  font-size: var(--fs-ui);
+  font-weight: 600;
+  color: var(--label-primary);
+  line-height: 1.35;
+}
+.dg-node-title .badge {
+  font-weight: 500;
+  color: var(--label-tertiary);
+}
+.dg-node-hint {
+  font-size: var(--fs-small);
+  color: var(--label-tertiary);
+  line-height: 1.4;
+}
+
+/* ---- agents branch (hangs from Subagentes, the first column) -------- */
+
+.dg-agents {
+  position: relative;
+  margin-top: 22px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg-base);
+}
+.dg-agents::before {
+  content: "";
+  position: absolute;
+  top: -23px;
+  left: calc((100% - 24px) / 6);
+  height: 22px;
+  border-left: 1.5px solid var(--label-caption);
+}
+.dg-agents::after {
+  content: "";
+  position: absolute;
+  top: -6px;
+  left: calc((100% - 24px) / 6 - 4px);
+  border: 4px solid transparent;
+  border-top: 6px solid var(--label-caption);
+  border-bottom: 0;
+}
+.dg-agents-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line-faint);
+  font-size: var(--fs-small);
+  color: var(--label-tertiary);
+  min-width: 0;
+}
+.dg-agents-head svg {
+  flex: none;
+  color: var(--label-secondary);
+}
+.dg-agents-head strong {
+  font-weight: 600;
+  color: var(--label-primary);
+}
+.dg-agents-head span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dg-agents-note {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 14px 12px;
+  font-size: var(--fs-small);
+  color: var(--label-tertiary);
+}
+.dg-agent {
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr) minmax(200px, 270px);
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  transition: opacity var(--t-base) var(--ease);
+}
+.dg-agent + .dg-agent {
+  border-top: 1px solid var(--line-faint);
+}
+.dg-agent.off {
+  opacity: 0.6;
+}
+.dg-agent-icon {
+  background: var(--layer-2);
+  color: var(--label-secondary);
+}
+.dg-agent-text {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+.dg-agent-name {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  font-size: var(--fs-ui);
+  font-weight: 600;
+  color: var(--label-primary);
+}
+.dg-agent-desc {
+  font-size: var(--fs-small);
+  color: var(--label-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* the agent file pins its own model: shown, not editable here */
+.dg-fixed {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  min-height: 44px;
+  padding: 6px 10px 6px 8px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--line);
+  background: var(--layer-1);
+}
+
+/* ---- picker --------------------------------------------------------- */
+
+.dg-pick {
+  position: relative;
+  min-width: 0;
+}
+.dg-trigger {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 44px;
+  padding: 6px 10px 6px 8px;
+  border-radius: var(--r-sm);
+  background: var(--bg-base);
+  border: 1px solid var(--line-strong);
+  text-align: left;
+  transition:
+    border-color var(--t-base) var(--ease),
+    box-shadow var(--t-base) var(--ease),
+    background var(--t-base) var(--ease);
+}
+.dg-trigger:hover {
+  background: linear-gradient(var(--hover), var(--hover)), var(--bg-base);
+}
+.dg-trigger[aria-expanded="true"] {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.dg-trigger.inherit {
+  border-style: dashed;
+}
+.dg-trigger.inherit .dg-model {
+  color: var(--label-secondary);
+  font-weight: 500;
+}
+.dg-faded {
+  display: inline-flex;
+  opacity: 0.55;
+}
+.dg-text {
+  display: grid;
+  min-width: 0;
+  flex: 1;
+}
+.dg-model {
+  font-size: var(--fs-ui);
+  font-weight: 600;
+  color: var(--label-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dg-sub {
+  font-size: var(--fs-caption);
+  color: var(--label-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dg-sub svg {
+  vertical-align: -2px;
+  margin-right: 4px;
+}
+.dg-chev {
+  flex: none;
+  color: var(--label-tertiary);
+}
+.dg-tile {
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  border-radius: var(--r-xs);
+  background: var(--layer-2);
+  box-shadow: inset 0 0 0 1px var(--line);
+  color: var(--label-secondary);
+}
+
+.dg-pop {
+  position: absolute;
+  z-index: 30;
+  top: calc(100% + 6px);
+  left: 0;
+  width: max(100%, 340px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  scroll-margin-bottom: 40px; /* clear the dialog body's bottom fade */
+  animation: none; /* opens instantly; also keeps headless prints from freezing it mid-fade */
+  /* ponytail: opens downward only; add flip/portal if a picker ever sits at the dialog's bottom edge */
+}
+.dg-pop.end {
+  left: auto;
+  right: 0;
+}
+.dg-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 40px;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--line);
+  color: var(--label-tertiary);
+}
+/* the ring moves to the row's bottom edge */
+.dg-search:focus-within {
+  box-shadow: inset 0 -2px 0 var(--ring);
+}
+.dg-search input {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  background: none;
+  border: 0;
+  outline: none;
+  font-size: var(--fs-ui);
+  color: var(--label-primary);
+}
+.dg-search input::placeholder {
+  color: var(--label-caption);
+}
+.dg-list {
+  position: relative;
+  max-height: 320px;
+  overflow-y: auto;
+  padding: 4px;
+}
+.dg-ghead {
+  position: sticky;
+  top: -4px;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 8px 4px;
+  background: var(--layer-3);
+  font-size: var(--fs-caption);
+  color: var(--label-tertiary);
+}
+.dg-ghead strong {
+  font-size: var(--fs-small);
+  font-weight: 600;
+  color: var(--label-primary);
+}
+.dg-opt {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  padding: 5px 8px;
+  border-radius: var(--r-xs);
+  font-size: var(--fs-ui);
+  color: var(--label-secondary);
+  cursor: pointer;
+}
+.dg-opt-in {
+  padding-left: 34px;
+}
+.dg-opt.at {
+  background: var(--hover);
+  color: var(--label-primary);
+}
+.dg-opt[aria-selected="true"] {
+  color: var(--label-primary);
+  font-weight: 600;
+}
+.dg-opt-icon {
+  flex: none;
+  color: var(--label-tertiary);
+}
+.dg-opt-name {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dg-opt code {
+  flex: 0 1 auto;
+  min-width: 0;
+  margin-left: auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mono);
+  font-size: var(--fs-caption);
+  font-weight: 400;
+  color: var(--label-caption);
+}
+.dg-check {
+  flex: none;
+  margin-left: auto;
+  color: var(--accent-text);
+}
+.dg-opt code + .dg-check {
+  margin-left: 0;
+}
+.dg-empty {
+  padding: 14px 8px;
+  text-align: center;
+  font-size: var(--fs-small);
+  color: var(--label-tertiary);
+}
+.dg-other {
+  display: flex;
+  gap: 6px;
+  padding: 6px 4px 4px;
+}
+.dg-other .input {
+  height: 30px;
+  font-size: var(--fs-small);
+}
+
+/* ---- combos --------------------------------------------------------- */
+
+.dg-combos {
+  display: grid;
+  gap: 8px;
+}
+.dg-section-title {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  font-size: var(--fs-small);
+  font-weight: 600;
+  color: var(--label-primary);
+}
+.dg-section-title span {
+  font-weight: 400;
+  color: var(--label-tertiary);
+}
+.dg-combo {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 10px 12px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--line);
+  background: var(--bg-base);
+}
+.dg-combo-name {
+  margin-right: 4px;
+  font-family: var(--mono);
+  font-size: var(--fs-small);
+  font-weight: 600;
+  color: var(--label-primary);
+}
+.dg-combo-step {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.dg-arrow {
+  flex: none;
+  color: var(--label-caption);
+}
+.dg-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 220px;
+  height: 30px;
+  padding: 0 10px 0 4px;
+  border-radius: var(--r-full);
+  border: 1px solid var(--line);
+  background: var(--layer-2);
+  font-size: var(--fs-small);
+  color: var(--label-primary);
+}
+.dg-chip > span:last-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---- legend --------------------------------------------------------- */
+
+.dg-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line-faint);
+  font-size: var(--fs-caption);
+  color: var(--label-tertiary);
+}
+.dg-legend > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.dg-lg-line {
+  width: 18px;
+  border-top: 1.5px solid var(--label-caption);
+}
+.dg-lg-box {
+  width: 16px;
+  height: 11px;
+  border-radius: 3px;
+  border: 1px solid var(--line-strong);
+  background: var(--layer-2);
+}
+.dg-lg-box.dashed {
+  border-style: dashed;
+  background: none;
+}
+.dg-lg-box.off {
+  opacity: 0.6;
+  border-style: dotted;
+}
+
+/* ---- narrow column: stack the fan, drop the bus --------------------- */
+
+@container (max-width: 600px) {
+  .dg-fan {
+    grid-template-columns: minmax(0, 1fr);
+    padding-top: 0;
+    gap: 22px;
+  }
+  .dg-fan::before,
+  .dg-fan > .dg-node:first-child::before,
+  .dg-fan > .dg-node:first-child::after {
+    display: none;
+  }
+  .dg-agents::before {
+    left: 50%;
+  }
+  .dg-agents::after {
+    left: calc(50% - 4px);
+  }
+  .dg-agent {
+    grid-template-columns: 30px minmax(0, 1fr);
+  }
+  .dg-agent > :last-child {
+    grid-column: 2 / -1;
+  }
+}

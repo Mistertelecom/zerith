@@ -1,0 +1,642 @@
+/* Geral, Memória, Skills, Agentes, Mídia e Histórico: the panels inside the
+   settings body. Built on base.css primitives (.card, .badge, .btn, .input,
+   .stat, .switch, .segmented, .list-row); only the list/grid vocabulary those
+   panels share lives here. Colour only through tokens (DESIGN.md); spacing
+   on a 4/8 scale. */
+
+/* ---- panel stack ---------------------------------------------------- */
+
+.pn {
+  display: grid;
+  gap: 16px;
+  align-content: start;
+  min-width: 0;
+}
+
+.pn-inline {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.pn-inline.wrap {
+  flex-wrap: wrap;
+}
+.pn-end {
+  justify-content: flex-end;
+}
+.pn-spacer {
+  flex: 1;
+  min-width: 0;
+}
+
+.pn-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+}
+.pn-toolbar > .pn-affix {
+  flex: 1 1 240px;
+}
+
+.pn-hint {
+  font-size: var(--fs-small);
+  color: var(--label-tertiary);
+  line-height: 1.5;
+}
+
+.pn-num {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.pn-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 32px 0;
+  font-size: var(--fs-ui);
+  color: var(--label-tertiary);
+}
+
+/* A count riding inside a segment ("Instaladas 3"). */
+.seg .pn-count {
+  display: inline-grid;
+  place-items: center;
+  min-width: 18px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: var(--r-full);
+  background: var(--active);
+  font-size: var(--fs-caption);
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  color: var(--label-tertiary);
+}
+.seg.on .pn-count {
+  color: var(--label-primary);
+}
+
+/* ---- input with a leading icon/logo (search, model) ----------------- */
+
+.pn-affix {
+  position: relative;
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+.pn-affix > .input {
+  padding-left: 34px;
+}
+.pn-affix-icon {
+  position: absolute;
+  left: 10px;
+  display: flex;
+  color: var(--label-caption);
+  pointer-events: none;
+}
+.pn-affix > .kbd {
+  position: absolute;
+  right: 8px;
+  pointer-events: none;
+}
+.pn-affix > .input:has(~ .kbd) {
+  padding-right: 64px;
+}
+
+/* ---- stats strip ---------------------------------------------------- */
+
+.pn-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 12px;
+}
+/* Inside a card a tile sinks one step instead of stacking another layer. */
+.card .stat {
+  background: var(--bg-base);
+  box-shadow: none;
+}
+
+/* ---- rows inside a card -------------------------------------------- */
+
+.pn-list {
+  display: grid;
+  margin: -4px -8px;
+}
+
+.pn-item {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  padding: 12px 8px;
+  border-radius: var(--r-sm);
+  transition: background var(--t-base) var(--ease);
+}
+button.pn-item {
+  width: 100%;
+  text-align: left;
+}
+.pn-item + .pn-item::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 8px;
+  right: 8px;
+  height: 1px;
+  background: var(--line-faint);
+}
+.pn-item:hover {
+  background: var(--hover);
+}
+.pn-item.on {
+  background: var(--active);
+}
+.pn-item:hover::before,
+.pn-item:hover + .pn-item::before,
+.pn-item.on::before,
+.pn-item.on + .pn-item::before {
+  opacity: 0;
+}
+
+.pn-ico {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 32px;
+  height: 32px;
+  border-radius: var(--r-sm);
+  background: var(--layer-2);
+  border: 1px solid var(--line);
+  color: var(--label-secondary);
+}
+.pn-ico.accent {
+  background: var(--accent-soft);
+  border-color: transparent;
+  color: var(--accent-text);
+}
+.pn-ico.lg {
+  width: 40px;
+  height: 40px;
+  border-radius: var(--r-md);
+}
+
+.pn-body {
+  display: grid;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+.pn-title {
+  font-size: var(--fs-ui);
+  font-weight: 600;
+  color: var(--label-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pn-sub {
+  font-size: var(--fs-small);
+  color: var(--label-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pn-sub.mono,
+.pn-sub .mono {
+  font-size: 11.5px;
+}
+.pn-text {
+  font-size: var(--fs-ui);
+  color: var(--label-primary);
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.pn-h {
+  font-size: var(--fs-title);
+  font-weight: 600;
+  color: var(--label-primary);
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.pn-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 4px;
+  flex: none;
+}
+.pn-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+}
+
+.pn-item.dim .pn-ico,
+.pn-item.dim .pn-body,
+.pn-item.dim .logo,
+.list-row.dim .pn-ico,
+.list-row.dim .pn-body {
+  opacity: 0.55;
+}
+
+/* A severity mark in a list row: colour plus a tooltip. */
+.pn-sev {
+  flex: none;
+  color: var(--warn);
+}
+.pn-sev.danger {
+  color: var(--danger);
+}
+
+/* ---- master / detail inside one card -------------------------------- */
+
+.pn-split {
+  display: grid;
+  grid-template-columns: 240px minmax(0, 1fr);
+}
+.pn-split-list {
+  display: grid;
+  align-content: start;
+  gap: 2px;
+  padding: 8px;
+  border-right: 1px solid var(--line);
+  min-width: 0;
+}
+.pn-split-list .list-row {
+  min-height: 48px;
+  padding: 8px;
+}
+.pn-split-detail {
+  display: grid;
+  align-content: start;
+  gap: 16px;
+  padding: 20px 24px 24px;
+  min-width: 0;
+}
+.pn-detail-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  min-width: 0;
+}
+.pn-detail-foot {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line-faint);
+}
+.pn-dl {
+  display: grid;
+  grid-template-columns: 88px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px 16px;
+  margin: 0;
+  font-size: var(--fs-small);
+}
+.pn-dl dt {
+  color: var(--label-tertiary);
+}
+.pn-dl dd {
+  margin: 0;
+  min-width: 0;
+  display: flex;
+  color: var(--label-secondary);
+}
+.pn-dl .mono-path {
+  max-width: 100%;
+}
+
+/* ---- tile grid ------------------------------------------------------ */
+
+.pn-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 12px;
+}
+.pn-grid.wide {
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+}
+
+.pn-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+  padding: 16px;
+  border-radius: var(--r-md);
+  background: var(--layer-1);
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow-1);
+  text-align: left;
+  transition:
+    background var(--t-base) var(--ease),
+    border-color var(--t-base) var(--ease),
+    box-shadow var(--t-base) var(--ease),
+    opacity var(--t-base) var(--ease),
+    transform var(--t-fast) var(--ease);
+}
+.card .pn-tile {
+  background: var(--bg-base);
+  box-shadow: none;
+}
+button.pn-tile:hover {
+  border-color: var(--line-strong);
+  box-shadow: var(--shadow-2);
+}
+button.pn-tile:active {
+  transform: translateY(1px);
+}
+/* Selected = a lifted surface and a stronger hairline, not a bright ring. */
+.pn-tile.on,
+button.pn-tile.on:hover {
+  background: var(--hover);
+  border-color: var(--accent);
+  box-shadow: none;
+}
+/* Off: the icon and the details fade, the name stays readable. */
+.pn-tile.dim .pn-ico,
+.pn-tile.dim .pn-sub,
+.pn-tile.dim .pn-desc,
+.pn-tile.dim .pn-tile-foot {
+  opacity: 0.55;
+}
+
+.pn-tile-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+.pn-tile-foot {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: auto;
+  min-width: 0;
+}
+.pn-desc {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  font-size: var(--fs-small);
+  color: var(--label-tertiary);
+  line-height: 1.5;
+}
+
+.pn-scroll {
+  max-height: 344px;
+  overflow: auto;
+  margin: -4px;
+  padding: 4px;
+}
+
+/* ---- small pieces --------------------------------------------------- */
+
+.pn-usage {
+  display: grid;
+  gap: 8px;
+}
+
+.pn-meter {
+  height: 6px;
+  border-radius: var(--r-full);
+  background: var(--active);
+  overflow: hidden;
+}
+.pn-meter > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width var(--t-slow) var(--ease);
+}
+.pn-meter.warn > span {
+  background: var(--warn);
+}
+.pn-meter.danger > span {
+  background: var(--danger);
+}
+
+/* A file shown as-is (SKILL.md, an agent's .md, a list preview): mono on
+   layer-1 behind a hairline, with an optional filename banner. */
+.pn-code {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--code-bg);
+  overflow: hidden;
+}
+.pn-code-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 32px;
+  padding: 0 12px;
+  background: var(--code-banner);
+  border-bottom: 1px solid var(--line-faint);
+  font-family: var(--mono);
+  font-size: var(--fs-caption);
+  color: var(--label-tertiary);
+}
+.pn-code .pn-md-h {
+  color: var(--label-primary);
+  font-weight: 600;
+}
+.pn-code .pn-md-mark {
+  color: var(--label-caption);
+  font-weight: 400;
+}
+.pn-code pre {
+  margin: 0;
+  max-height: 280px;
+  overflow: auto;
+  padding: 12px 16px;
+  color: var(--label-secondary);
+  font-family: var(--mono);
+  font-size: var(--fs-small);
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.pn-callout {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: var(--r-sm);
+  background: var(--warn-soft);
+  color: var(--warn-text);
+  font-size: var(--fs-ui);
+  line-height: 1.5;
+}
+.pn-callout svg {
+  flex: none;
+  margin-top: 2px;
+}
+.pn-callout > span {
+  color: var(--label-primary);
+  overflow-wrap: anywhere;
+}
+.pn-callout.danger {
+  background: var(--danger-soft);
+  color: var(--danger-text);
+}
+.pn-callout.note {
+  background: var(--layer-2);
+  color: var(--label-tertiary);
+}
+
+.pn-form {
+  display: grid;
+  gap: 16px;
+}
+.pn-row2 {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px 16px;
+}
+.field-label.mono {
+  font-size: 11.5px;
+}
+
+.pn-link {
+  color: inherit;
+}
+.pn-link:hover {
+  color: var(--accent-text);
+  text-decoration: underline;
+}
+.btn.pn-link:hover {
+  text-decoration: none;
+}
+
+/* A path has to stay selectable and must not push the control out of the
+   row, so it ellipsises from the left where the useful part lives. */
+.mono-path {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--label-tertiary);
+  direction: rtl;
+  text-align: left;
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  user-select: text;
+}
+
+/* ---- skills: defaults banner, grouped list, catalogue ---------------- */
+
+/* `.pn >` outranks the dialog rule that strips card padding. */
+.pn > .card.pn-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 16px;
+}
+
+/* Caps label over a group of rows or tiles ("Padrão do Zerith"). */
+.pn-group-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 8px 4px;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--label-caption);
+}
+.pn > .pn-group-label {
+  padding: 4px 0 0;
+}
+.pn-group-label .pn-count {
+  display: inline-grid;
+  place-items: center;
+  min-width: 18px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: var(--r-full);
+  background: var(--active);
+  letter-spacing: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.pn-split.wide-list {
+  grid-template-columns: 300px minmax(0, 1fr);
+}
+/* A selectable row that also carries its own switch. */
+.pn-skill-row {
+  padding: 0 8px 0 0;
+  min-height: 48px;
+}
+.pn-row-main {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1;
+  min-width: 0;
+  padding: 8px;
+  color: inherit;
+  text-align: left;
+}
+.pn-skill-row.dim .switch {
+  opacity: 1;
+}
+
+.pn > .card.pn-repo-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  padding: 16px;
+}
+.pn-repo-head .pn-body {
+  gap: 6px;
+}
+
+.pn-tile-cta {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  font-size: var(--fs-small);
+  font-weight: 600;
+  color: var(--label-secondary);
+}
+button.pn-tile:hover .pn-tile-cta {
+  color: var(--label-primary);
+}
+.pn-tile.installed {
+  border-color: var(--line-strong);
+}
+.pn-tile .pn-callout {
+  font-size: var(--fs-small);
+}
+
+@media (max-width: 900px) {
+  .pn-row2,
+  .pn-split,
+  .pn-split.wide-list {
+    grid-template-columns: 1fr;
+  }
+  .pn-split-list {
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+  }
+  .mono-path {
+    max-width: 100%;
+  }
+}

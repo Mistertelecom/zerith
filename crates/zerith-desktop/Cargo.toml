@@ -1,0 +1,36 @@
+[package]
+name = "zerith-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Zerith desktop shell: Tauri 2 window over the Rust core"
+
+[lib]
+name = "zerith_desktop"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[[bin]]
+name = "zerith-desktop"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+zerith-core = { path = "../zerith-core" }
+zerith-sessions = { path = "../zerith-sessions" }
+zerith-providers = { path = "../zerith-providers" }
+zerith-memory = { path = "../zerith-memory" }
+zerith-skills = { path = "../zerith-skills" }
+zerith-runtime = { path = "../zerith-runtime" }
+zerith-tools = { path = "../zerith-tools" }
+zerith-plugins = { path = "../zerith-plugins" }
+zerith-security = { path = "../zerith-security" }
+zerith-mcp = { path = "../zerith-mcp" }
+zerith-importers = { path = "../zerith-importers" }
+tauri = { version = "2", features = [] }
+serde.workspace = true
+serde_json.workspace = true
+rusqlite.workspace = true
+base64 = "0.22"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }

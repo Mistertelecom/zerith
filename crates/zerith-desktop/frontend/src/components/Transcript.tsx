@@ -24,6 +24,7 @@ import {
 } from "lucide-react";
 import type { Block, ToolRow } from "../lib/turn";
 import { ZerithMark } from "./ui";
+import { TurnChanges } from "./Changes";
 import { parseBlocks, type Inline, type MdBlock } from "./markdown";
 
 /** "Aprendi: …" under an answer, with one undo for everything it saved. */
@@ -304,7 +305,7 @@ function ToolLine({ row }: { row: ToolRow }) {
   );
 }
 
-function AssistantBlock(props: { block: Block & { kind: "assistant" } }) {
+function AssistantBlock(props: { block: Block & { kind: "assistant" }; sessionId?: string | null }) {
   const [showReasoning, setShowReasoning] = useState(false);
   const b = props.block;
   const thinking = b.streaming && !b.text && b.tools.length === 0;
@@ -349,6 +350,9 @@ function AssistantBlock(props: { block: Block & { kind: "assistant" } }) {
             </div>
           </div>
         ) : null}
+        {props.sessionId && b.stored && !b.streaming ? (
+          <TurnChanges sessionId={props.sessionId} messageId={b.stored} />
+        ) : null}
         {b.text && !b.streaming ? (
           <div className="msg-actions">
             <CopyButton text={b.text} label="Copiar" />
@@ -359,7 +363,7 @@ function AssistantBlock(props: { block: Block & { kind: "assistant" } }) {
   );
 }
 
-export function Transcript(props: { blocks: Block[]; tail?: React.ReactNode }) {
+export function Transcript(props: { blocks: Block[]; tail?: React.ReactNode; sessionId?: string | null }) {
   const box = useRef<HTMLDivElement>(null);
   const pinned = useRef(true);
 
@@ -429,7 +433,7 @@ export function Transcript(props: { blocks: Block[]; tail?: React.ReactNode }) {
               </div>
             );
           }
-          return <AssistantBlock key={i} block={b} />;
+          return <AssistantBlock key={i} block={b} sessionId={props.sessionId} />;
         })}
         {props.tail}
       </div>

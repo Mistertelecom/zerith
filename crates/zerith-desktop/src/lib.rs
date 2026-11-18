@@ -5,6 +5,7 @@
 
 pub mod agents;
 pub mod attachments;
+pub mod changes;
 pub mod chat;
 pub mod commands;
 pub mod history;
@@ -253,6 +254,8 @@ pub fn run() {
             workspace::read_image,
             workspace::open_image,
             attachments::save_attachment,
+            changes::turn_changes,
+            changes::turn_undo,
             learn::learning,
             learn::set_learning,
             learn::learn_undo,

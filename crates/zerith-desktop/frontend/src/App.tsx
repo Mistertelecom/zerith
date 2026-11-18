@@ -97,6 +97,7 @@ function toBlocks(list: ChatMessage[]): Block[] {
           reasoning: m.reasoning ?? "",
           tools: [],
           streaming: false,
+          stored: m.role === "assistant" ? m.id : undefined,
         } as Block),
   );
 }
@@ -705,7 +706,7 @@ export default function App() {
                   </p>
                 </div>
               ) : (
-                <Transcript blocks={surface} tail={tail} />
+                <Transcript blocks={surface} tail={tail} sessionId={selected} />
               )}
               <Composer
                 draft={draft}

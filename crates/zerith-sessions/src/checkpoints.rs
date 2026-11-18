@@ -20,7 +20,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::migrations::now_ms;
@@ -396,27 +396,8 @@ pub fn restore(
         for t in &turns {
             let dir = turn_dir(data_root, session, *t);
             for e in read_manifest(&dir)?.entries {
-                if !done.insert(e.path.clone()) {
-                    continue;
-                }
-                let target = PathBuf::from(&e.path);
-                let outcome = match (&e.blob, e.existed) {
-                    (Some(blob), true) => {
-                        if let Some(parent) = target.parent() {
-                            let _ = std::fs::create_dir_all(parent);
-                        }
-                        std::fs::copy(dir.join(blob), &target).map(|_| true)
-                    }
-                    _ => match std::fs::remove_file(&target) {
-                        Ok(()) => Ok(false),
-                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                        Err(err) => Err(err),
-                    },
-                };
-                match outcome {
-                    Ok(true) => report.files_restored += 1,
-                    Ok(false) => report.files_removed += 1,
-                    Err(err) => report.errors.push(format!("{}: {err}", e.path)),
+                if done.insert(e.path.clone()) {
+                    put_back(&dir, &e, &mut report);
                 }
             }
         }
@@ -467,6 +448,160 @@ pub fn restore(
     Ok(report)
 }
 
+/// Puts one recorded file back to its pre-turn state (or removes it when the
+/// turn created it). Failures land in the report.
+fn put_back(dir: &Path, e: &Entry, report: &mut RestoreReport) {
+    let target = PathBuf::from(&e.path);
+    let outcome = match (&e.blob, e.existed) {
+        (Some(blob), true) => {
+            if let Some(parent) = target.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            std::fs::copy(dir.join(blob), &target).map(|_| true)
+        }
+        _ => match std::fs::remove_file(&target) {
+            Ok(()) => Ok(false),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+            Err(err) => Err(err),
+        },
+    };
+    match outcome {
+        Ok(true) => report.files_restored += 1,
+        Ok(false) => report.files_removed += 1,
+        Err(err) => report.errors.push(format!("{}: {err}", e.path)),
+    }
+}
+
+/// The checkpoint turn whose final answer is `message_id`, if any.
+///
+/// The turn is the newest checkpoint opened before the message, provided no
+/// other prompt came in between (a turn without tools opens no checkpoint)
+/// and the message is the last assistant row before the next prompt (the
+/// intermediate tool-call steps do not own the diff). Prompts are user rows
+/// without `raw`; steering, hook/tool context and summaries are tagged there.
+pub fn turn_for_message(store: &Store, session: &str, message_id: i64) -> Result<Option<i64>> {
+    let found: Option<(i64, i64)> = store
+        .conn()
+        .query_row(
+            "SELECT turn, boundary_message_id FROM checkpoints
+             WHERE session_id = ?1 AND boundary_message_id < ?2
+             ORDER BY boundary_message_id DESC, turn DESC LIMIT 1",
+            params![session, message_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((turn, boundary)) = found else {
+        return Ok(None);
+    };
+    let (answer, prompts, later): (bool, i64, i64) = store.conn().query_row(
+        "SELECT
+           EXISTS(SELECT 1 FROM messages WHERE id = ?2 AND session_id = ?1
+                  AND role = 'assistant' AND superseded = 0),
+           (SELECT COUNT(*) FROM messages WHERE session_id = ?1 AND superseded = 0
+              AND role = 'user' AND raw IS NULL AND id > ?3 AND id < ?2),
+           (SELECT COUNT(*) FROM messages WHERE session_id = ?1 AND superseded = 0
+              AND role = 'assistant' AND id > ?2
+              AND id < COALESCE((SELECT MIN(id) FROM messages WHERE session_id = ?1
+                  AND superseded = 0 AND role = 'user' AND raw IS NULL AND id > ?2),
+                  9223372036854775807))",
+        params![session, message_id, boundary],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    Ok((answer && prompts <= 1 && later == 0).then_some(turn))
+}
+
+/// A file one turn recorded, for a per-turn diff.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnFile {
+    /// Absolute path as the tool saw it.
+    pub path: String,
+    /// Copy of the file from before the turn; `None` = the turn created it.
+    pub before: Option<PathBuf>,
+    /// What the turn left, known when a later live turn saved the file before
+    /// editing it again: `Some(None)` = it did not exist then. `None` = no
+    /// later turn touched it; the disk is the best answer.
+    pub after: Option<Option<PathBuf>>,
+}
+
+/// The files `turn` recorded, with the copies a diff needs. Empty once the
+/// turn's files were restored (the copies are consumed).
+pub fn turn_files(
+    store: &Store,
+    data_root: &Path,
+    session: &str,
+    turn: i64,
+) -> Result<Vec<TurnFile>> {
+    let dir = turn_dir(data_root, session, turn);
+    let mut out: Vec<TurnFile> = read_manifest(&dir)?
+        .entries
+        .into_iter()
+        .map(|e| TurnFile {
+            before: e.blob.filter(|_| e.existed).map(|b| dir.join(b)),
+            path: e.path,
+            after: None,
+        })
+        .collect();
+    let later: Vec<i64> = {
+        let mut st = store.conn().prepare(
+            "SELECT turn FROM checkpoints WHERE session_id = ?1 AND turn > ?2 AND rewound = 0 ORDER BY turn",
+        )?;
+        let rows = st.query_map(params![session, turn], |r| r.get(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for t in later {
+        let dir = turn_dir(data_root, session, t);
+        for e in read_manifest(&dir)?.entries {
+            if let Some(f) = out
+                .iter_mut()
+                .find(|f| f.path == e.path && f.after.is_none())
+            {
+                f.after = Some(e.blob.filter(|_| e.existed).map(|b| dir.join(b)));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Puts back only the files `turn` recorded, each to its state before that
+/// turn. Later turns and the conversation stay as they are; the caller checks
+/// that a later edit is not about to be overwritten (see [`turn_files`]).
+pub fn restore_turn(
+    store: &Store,
+    data_root: &Path,
+    session: &str,
+    turn: i64,
+) -> Result<RestoreReport> {
+    store
+        .conn()
+        .query_row(
+            "SELECT 1 FROM checkpoints WHERE session_id = ?1 AND turn = ?2",
+            params![session, turn],
+            |_| Ok(()),
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => CheckpointError::NoCheckpoint {
+                session: session.to_string(),
+                turn,
+            },
+            other => other.into(),
+        })?;
+    let dir = turn_dir(data_root, session, turn);
+    let mut report = RestoreReport::default();
+    for e in read_manifest(&dir)?.entries {
+        put_back(&dir, &e, &mut report);
+    }
+    // Consumed, as in `restore`: re-applying these copies would clobber work.
+    if report.errors.is_empty() {
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+    }
+    store.conn().execute(
+        "UPDATE checkpoints SET rewound = ?3 WHERE session_id = ?1 AND turn = ?2",
+        params![session, turn, report.errors.is_empty() as i64],
+    )?;
+    Ok(report)
+}
+
 /// Hard-deletes the messages a conversation rewind set aside. Irreversible;
 /// the CLI gates it behind an explicit flag.
 pub fn purge_superseded(store: &Store, session: &str) -> Result<usize> {
@@ -483,4 +618,133 @@ pub fn delete_all(data_root: &Path, session: &str) -> Result<()> {
         std::fs::remove_dir_all(dir)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{NewMessage, Role, SessionSource};
+
+    fn scratch(tag: &str) -> PathBuf {
+        let d = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-scratch")
+            .join(format!("cp-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn add(st: &Store, s: &str, role: Role, raw: Option<serde_json::Value>) -> i64 {
+        st.append(
+            s,
+            &NewMessage {
+                raw,
+                ..NewMessage::new(role, "x")
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_final_answer_of_a_turn_finds_its_checkpoint() {
+        let root = scratch("lookup");
+        let st = Store::open_in_memory().unwrap();
+        let s = st.create_session("t", SessionSource::Native).unwrap().id;
+        Checkpoint::begin(&st, &root, &s, 1).unwrap();
+        let p1 = add(&st, &s, Role::User, None);
+        let step = add(&st, &s, Role::Assistant, None);
+        let tool = add(&st, &s, Role::Tool, None);
+        let a1 = add(&st, &s, Role::Assistant, None);
+        // a turn without tools opens no checkpoint
+        add(&st, &s, Role::User, None);
+        let a2 = add(&st, &s, Role::Assistant, None);
+        Checkpoint::begin(&st, &root, &s, 2).unwrap();
+        add(&st, &s, Role::User, None);
+        add(
+            &st,
+            &s,
+            Role::User,
+            Some(serde_json::json!({"tool_context": true})),
+        );
+        let a3 = add(&st, &s, Role::Assistant, None);
+
+        assert_eq!(turn_for_message(&st, &s, a1).unwrap(), Some(1));
+        assert_eq!(turn_for_message(&st, &s, a3).unwrap(), Some(2));
+        assert_eq!(
+            turn_for_message(&st, &s, step).unwrap(),
+            None,
+            "not the final answer"
+        );
+        assert_eq!(
+            turn_for_message(&st, &s, a2).unwrap(),
+            None,
+            "another prompt in between"
+        );
+        assert_eq!(
+            turn_for_message(&st, &s, p1).unwrap(),
+            None,
+            "a prompt is not an answer"
+        );
+        assert_eq!(turn_for_message(&st, &s, tool).unwrap(), None);
+        assert_eq!(turn_for_message(&st, "other", a1).unwrap(), None);
+    }
+
+    #[test]
+    fn restore_turn_puts_back_one_turn_and_reports_what_it_left() {
+        let root = scratch("turn");
+        let work = root.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let (a, b) = (work.join("a.txt"), work.join("b.txt"));
+        std::fs::write(&a, "v0").unwrap();
+        let st = Store::open_in_memory().unwrap();
+        let s = st.create_session("t", SessionSource::Native).unwrap().id;
+
+        let t1 = Checkpoint::begin(&st, &root, &s, 1).unwrap();
+        t1.record_file(&a).unwrap();
+        std::fs::write(&a, "v1").unwrap();
+        t1.record_file(&b).unwrap();
+        std::fs::write(&b, "novo").unwrap();
+        let t2 = Checkpoint::begin(&st, &root, &s, 2).unwrap();
+        t2.record_file(&a).unwrap();
+        std::fs::write(&a, "v2").unwrap();
+
+        let files = turn_files(&st, &root, &s, 1).unwrap();
+        assert_eq!(files.len(), 2);
+        let fa = files.iter().find(|f| f.path.ends_with("a.txt")).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(fa.before.as_ref().unwrap()).unwrap(),
+            "v0"
+        );
+        let left = fa.after.clone().unwrap().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(left).unwrap(),
+            "v1",
+            "what turn 1 left"
+        );
+        let fb = files.iter().find(|f| f.path.ends_with("b.txt")).unwrap();
+        assert_eq!((fb.before.clone(), fb.after.clone()), (None, None));
+        assert!(turn_files(&st, &root, &s, 2).unwrap()[0].after.is_none());
+
+        let r = restore_turn(&st, &root, &s, 1).unwrap();
+        assert_eq!(
+            (r.files_restored, r.files_removed, r.errors.len()),
+            (1, 1, 0)
+        );
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "v0");
+        assert!(!b.exists());
+        assert!(
+            turn_files(&st, &root, &s, 1).unwrap().is_empty(),
+            "copies consumed"
+        );
+        let restored: Vec<bool> = list(&st, &root, &s)
+            .unwrap()
+            .iter()
+            .map(|c| c.code_restored)
+            .collect();
+        assert_eq!(restored, vec![true, false], "turn 2 untouched");
+        assert!(matches!(
+            restore_turn(&st, &root, &s, 9),
+            Err(CheckpointError::NoCheckpoint { .. })
+        ));
+    }
 }

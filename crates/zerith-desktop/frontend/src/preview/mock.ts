@@ -504,6 +504,7 @@ const mediaModels = {
 const messages: Record<
   string,
   {
+    id?: number;
     role: string;
     content: string;
     reasoning: string | null;
@@ -519,6 +520,7 @@ const messages: Record<
       tool_name: null,
     },
     {
+      id: 2,
       role: "assistant",
       content:
         "Vou ler o cliente atual, trocar a implementação e rodar os testes.\n\n## O que muda\n\n1. `openai.rs` passa a usar `http::client(timeout)`\n2. A URL é montada com `join(base, path)`\n3. **Nenhuma** mudança na API pública\n\n```rust\nlet client = http::client(timeout);\nlet url = join(base, path);\nsend(client)\n```\n\nRisco: a mudança toca o fluxo de *streaming* — vou rodar `cargo test -p zerith-providers` no fim." +
@@ -531,6 +533,43 @@ const messages: Record<
     },
   ],
 };
+
+const PREVIEW_CHANGES = [
+  {
+    path: "C:/Users/Joao/Documents/PROJETOS PESSOAIS/zerith/crates/zerith-providers/src/openai.rs",
+    rel: "crates/zerith-providers/src/openai.rs",
+    status: "alterado",
+    added: 4,
+    removed: 3,
+    diff:
+      "@@ -10,8 +10,9 @@\n use crate::http;\n \n pub fn send(base: &str, path: &str) -> Result<String> {\n-    let agent = ureq::agent();\n-    let url = format!(\"{base}{path}\");\n+    let client = http::client(timeout);\n+    let url = join(base, path);\n+    // um cliente só por processo\n-    agent.get(&url).call()?.into_string()\n+    client.get(&url).call()?.into_string()\n }\n \n",
+    note: null,
+    truncated: false,
+    changedSince: false,
+  },
+  {
+    path: "C:/Users/Joao/Documents/PROJETOS PESSOAIS/zerith/crates/zerith-providers/src/http.rs",
+    rel: "crates/zerith-providers/src/http.rs",
+    status: "criado",
+    added: 4,
+    removed: 0,
+    diff: "@@ -0,0 +1,4 @@\n+//! Cliente HTTP compartilhado.\n+pub fn client(timeout: u64) -> ureq::Agent {\n+    ureq::AgentBuilder::new().timeout_read(timeout).build()\n+}\n",
+    note: null,
+    truncated: false,
+    changedSince: null,
+  },
+  {
+    path: "C:/Users/Joao/Documents/PROJETOS PESSOAIS/zerith/docs/logo.png",
+    rel: "docs/logo.png",
+    status: "alterado",
+    added: 0,
+    removed: 0,
+    diff: null,
+    note: "arquivo binário: sem diff",
+    truncated: false,
+    changedSince: true,
+  },
+];
 
 let state = { theme: "dark", memory_paused: false };
 
@@ -815,6 +854,10 @@ export function installMock(theme: string) {
           ];
         case "checkpoints":
           return [1, 2];
+        case "turn_changes":
+          return a.messageId === 2 ? PREVIEW_CHANGES : [];
+        case "turn_undo":
+          return { done: true, conflicts: [], filesRestored: 1, filesRemoved: 1, errors: [] };
         case "read_image":
           return PREVIEW_IMG;
         case "save_attachment":

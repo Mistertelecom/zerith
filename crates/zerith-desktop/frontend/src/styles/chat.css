@@ -1189,3 +1189,205 @@
   color: var(--danger-text);
   text-decoration: none;
 }
+
+/* ---- per-answer file changes (Changes.tsx) ---------------------------- */
+
+.changes {
+  align-self: stretch;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--layer-1);
+  overflow: hidden;
+}
+.changes-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  height: 34px;
+  padding: 0 12px;
+  text-align: left;
+  color: var(--label-secondary);
+  font-size: var(--fs-ui);
+  transition: background var(--t-base) var(--ease);
+}
+.changes-head:hover {
+  background: var(--hover);
+  color: var(--label-primary);
+}
+.changes-head:focus-visible,
+.change-row:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: -2px;
+}
+.changes-head > svg:first-child {
+  color: var(--label-tertiary);
+}
+.changes-title {
+  font-weight: 550;
+}
+.changes-head .chev {
+  margin-left: auto;
+}
+.changes.undone .changes-title {
+  color: var(--label-tertiary);
+  text-decoration: line-through;
+}
+.changes-count {
+  font-family: var(--mono);
+  font-size: var(--fs-small);
+  font-variant-numeric: tabular-nums;
+}
+.changes-count.add {
+  color: var(--ok-text);
+}
+.changes-count.del {
+  color: var(--danger-text);
+}
+.changes-body {
+  border-top: 1px solid var(--line-faint);
+  padding: 4px;
+}
+.change-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  height: 30px;
+  padding: 0 8px;
+  border-radius: var(--r-sm);
+  text-align: left;
+  transition: background var(--t-base) var(--ease);
+}
+.change-row:hover,
+.change.on .change-row {
+  background: var(--hover);
+}
+.change-row > svg {
+  flex: none;
+  color: var(--label-tertiary);
+}
+.change-path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mono);
+  font-size: var(--fs-small);
+  color: var(--label-primary);
+}
+.changes-diff {
+  margin: 4px 0 6px;
+  border: 1px solid var(--line-faint);
+  border-radius: var(--r-sm);
+  background: var(--bg-base);
+  max-height: 360px;
+  overflow: auto;
+}
+.diff-lines {
+  display: table;
+  min-width: 100%;
+  font-family: var(--mono);
+  font-variant-ligatures: none;
+  font-size: var(--fs-small);
+  line-height: 1.6;
+}
+.diff-line {
+  display: table-row;
+  color: var(--label-secondary);
+}
+.diff-line > span {
+  display: table-cell;
+  white-space: pre;
+}
+.diff-ln {
+  width: 1%;
+  min-width: 32px;
+  padding: 0 8px;
+  text-align: right;
+  color: var(--label-caption);
+  user-select: none;
+}
+.diff-sign {
+  width: 1%;
+  padding-right: 6px;
+  user-select: none;
+}
+.diff-text {
+  padding-right: 12px;
+}
+.diff-line.add {
+  background: var(--ok-soft);
+  color: var(--label-primary);
+}
+.diff-line.add .diff-sign {
+  color: var(--ok-text);
+}
+.diff-line.del {
+  background: var(--danger-soft);
+  color: var(--label-primary);
+}
+.diff-line.del .diff-sign {
+  color: var(--danger-text);
+}
+.diff-line.hunk {
+  background: var(--layer-2);
+  color: var(--label-tertiary);
+}
+.diff-line.hunk .diff-text {
+  padding: 2px 8px;
+}
+.changes-diff-note {
+  margin: 4px 8px 6px;
+  color: var(--label-tertiary);
+  font-size: var(--fs-small);
+}
+.changes-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 4px 2px;
+}
+.changes-foot .spinner {
+  width: 13px;
+  height: 13px;
+}
+.changes-note {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--ok-text);
+  font-size: var(--fs-small);
+}
+.changes-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 6px 4px 2px;
+  color: var(--danger-text);
+  font-size: var(--fs-small);
+}
+.changes-error svg {
+  flex: none;
+  margin-top: 2px;
+}
+.change-row .changes-count {
+  min-width: 4ch;
+  text-align: right;
+}
+.change-row .changes-count.bin {
+  min-width: 8ch;
+  color: var(--label-tertiary);
+}
+.changes-count.zero {
+  color: var(--label-caption);
+}
+.change-status {
+  justify-content: center;
+  min-width: 68px;
+}
+.changes.undone .change,
+.changes.undone .changes-head .changes-count {
+  opacity: 0.55;
+}

@@ -36,6 +36,7 @@ export interface ProviderView {
 }
 
 export interface ChatMessage {
+  id?: number;
   role: string;
   content: string;
   reasoning: string | null;
@@ -741,3 +742,32 @@ export function onTurnLearned(
     handler(e.payload[0], e.payload[1]),
   );
 }
+
+/** One file an answer changed (`turn_changes`). `diff` = unified hunks. */
+export interface FileChange {
+  path: string;
+  rel: string;
+  status: "criado" | "alterado" | "apagado";
+  added: number;
+  removed: number;
+  diff: string | null;
+  note: string | null;
+  truncated: boolean;
+  /** The file differs from what the answer left; null = unknown. */
+  changedSince: boolean | null;
+}
+export interface UndoView {
+  /** False = refused because `conflicts` changed after the answer. */
+  done: boolean;
+  conflicts: string[];
+  filesRestored: number;
+  filesRemoved: number;
+  errors: string[];
+}
+
+export const changesApi = {
+  list: (sessionId: string, messageId: number) =>
+    invoke<FileChange[]>("turn_changes", { sessionId, messageId }),
+  undo: (sessionId: string, messageId: number, force = false) =>
+    invoke<UndoView>("turn_undo", { sessionId, messageId, force }),
+};

@@ -181,6 +181,7 @@ pub async fn session_messages(
         .map(|v| {
             v.into_iter()
                 .map(|m| ChatMessage {
+                    id: m.id,
                     role: m.role.as_str().to_string(),
                     content: m.content,
                     reasoning: m.reasoning,

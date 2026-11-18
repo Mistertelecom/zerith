@@ -186,6 +186,9 @@ impl ProviderView {
 /// A message as the transcript draws it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChatMessage {
+    /// Row id: what `turn_changes` takes for an answer's diff.
+    #[serde(default)]
+    pub id: i64,
     pub role: String,
     pub content: String,
     pub reasoning: Option<String>,

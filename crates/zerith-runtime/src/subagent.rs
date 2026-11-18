@@ -819,4 +819,8 @@ impl Services for Runtime {
             allowed_tools: lib.allowed_tools(name).ok().flatten(),
         })
     }
+
+    fn skills_root(&self) -> Option<PathBuf> {
+        self.skills_root.clone()
+    }
 }

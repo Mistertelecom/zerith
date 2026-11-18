@@ -50,6 +50,34 @@ pub struct Settings {
     pub memory: MemorySettings,
     #[serde(skip_serializing_if = "MediaSettings::is_empty")]
     pub media: MediaSettings,
+    #[serde(default, skip_serializing_if = "LearningSettings::is_default")]
+    pub learning: LearningSettings,
+}
+
+/// Learning after a turn (`zerith_runtime::learn`): a background review that
+/// may save memory or write/patch an AI skill, only when the turn had a signal.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LearningSettings {
+    pub enabled: bool,
+    /// `conta:modelo` for the review; empty = the turn's routed model.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub model: String,
+}
+
+impl Default for LearningSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            model: String::new(),
+        }
+    }
+}
+
+impl LearningSettings {
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
 }
 
 fn default_true() -> bool {
@@ -1329,5 +1357,19 @@ provider = "openai"
         let text = toml::to_string(&acc).unwrap();
         assert!(!text.contains("auth"));
         assert!(!text.contains("oauth_tool"));
+    }
+
+    /// The default `[learning]` is not written, so old files stay byte-identical.
+    #[test]
+    fn learning_is_written_only_when_changed() {
+        let text = toml::to_string(&Settings::default()).unwrap();
+        assert!(!text.contains("learning"), "{text}");
+        let mut s = Settings::default();
+        s.learning.enabled = false;
+        let text = toml::to_string(&s).unwrap();
+        assert!(text.contains("[learning]\nenabled = false"), "{text}");
+        let back: Settings = toml::from_str(&text).unwrap();
+        assert!(!back.learning.enabled);
+        assert!(toml::from_str::<Settings>("").unwrap().learning.enabled);
     }
 }

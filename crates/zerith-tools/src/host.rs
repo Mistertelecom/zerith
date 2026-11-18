@@ -87,6 +87,11 @@ pub trait Services: Send + Sync {
 
     /// The body of an enabled skill.
     fn skill(&self, name: &str) -> std::result::Result<SkillLoad, String>;
+
+    /// The skills library of this turn, for `skill_search`. `None`: no library.
+    fn skills_root(&self) -> Option<PathBuf> {
+        None
+    }
 }
 
 struct Bound {

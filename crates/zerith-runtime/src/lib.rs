@@ -17,6 +17,7 @@ pub mod agent;
 pub mod compact;
 pub mod events;
 pub mod guards;
+pub mod learn;
 pub mod pipeline;
 pub mod plan;
 pub mod question;
@@ -149,7 +150,21 @@ pub const MEMORY_HITS: usize = 12;
 
 /// How much of the prompt skills may occupy. Metadata for many, bodies for
 /// the few the user named.
-pub const SKILLS_BUDGET_CHARS: usize = 3000;
+///
+/// ponytail: 4000 chars ≈ 1000 tokens at the same 4-chars-per-token rule as
+/// memory. Room for ~25 full descriptions; past that the section lists the
+/// [`SKILLS_TOP_K`] skills that match the request (~2.5k chars) and points to
+/// `skill_search`, so the cost stays flat as the library grows (Hermes' list of
+/// every name + 60-char description grows: ~23.7k chars ≈ 5.9k tokens for 307).
+/// Raise it only with a measured miss rate.
+pub const SKILLS_BUDGET_CHARS: usize = 4000;
+
+/// How many skills a library too big for the budget shows: the ones the
+/// request names, then the best BM25 matches.
+pub const SKILLS_TOP_K: usize = 12;
+
+/// A ranked line's description is cut here, so twelve fit in the budget.
+const SKILL_DESC_CHARS: usize = 160;
 
 /// Everything a turn may consult besides the conversation itself.
 ///
@@ -355,7 +370,7 @@ pub(crate) fn system_prompt(
     }
     if let Some(lib) = ctx.skills {
         let block = if skill_tool {
-            skills_index(lib, SKILLS_BUDGET_CHARS)
+            skills_index(lib, prompt, SKILLS_BUDGET_CHARS)
         } else {
             skills_block(lib, prompt, SKILLS_BUDGET_CHARS)
         };
@@ -1019,39 +1034,51 @@ pub(crate) fn tool_guidance(tools: &zerith_tools::Registry) -> String {
 }
 
 /// The skills index for a turn with the `skill` tool: name and description of
-/// each enabled skill, capped at `budget`, and how to load one. Bodies are never
-/// inlined; that is what the tool is for.
-pub fn skills_index(lib: &zerith_skills::Library, budget: usize) -> String {
+/// each enabled skill when they all fit `budget`, otherwise the ones relevant
+/// to `prompt` plus a pointer to `skill_search`. Bodies are never inlined; that
+/// is what the tool is for.
+///
+/// The section changes with the request only for libraries past the budget;
+/// recalled memory already varies per turn just above it, so the provider's
+/// prefix cache is not made worse.
+pub fn skills_index(lib: &zerith_skills::Library, prompt: &str, budget: usize) -> String {
     let Ok(catalog) = lib.catalog() else {
         return String::new();
     };
     if catalog.is_empty() {
         return String::new();
     }
+    let total = catalog.len();
     let mut out = String::from(
         "# Skills disponíveis\nPara usar uma, chame a ferramenta `skill` com o nome e siga as instruções que ela devolver.",
     );
-    let mut cut = 0;
-    for (name, description) in &catalog {
-        let line = format!("\n- {name}: {description}");
-        if out.len() + line.len() > budget {
-            cut = catalog.len() - out.matches("\n- ").count();
+    let footer = format!(
+        "\nHá {total} skills instaladas; use skill_search para achar outras (palavras-chave em inglês e português)."
+    );
+    let (picked, partial) = pick_skills(lib, catalog, prompt, budget.saturating_sub(out.len()));
+    if partial && !picked.is_empty() {
+        out.push_str("\nAs mais ligadas a este pedido:");
+    }
+    let reserve = if partial { footer.len() } else { 0 };
+    for line in skill_lines(&picked, partial) {
+        if out.len() + line.len() + reserve > budget {
             break;
         }
         out.push_str(&line);
     }
-    if cut > 0 {
-        out.push_str(&format!("\n[+{cut} skills omitidas pelo limite do prompt]"));
+    if partial {
+        out.push_str(&footer);
     }
     out
 }
 
-/// The skills section of the system prompt.
+/// The skills section of the system prompt for a turn without the `skill`
+/// tool.
 ///
 /// The spec is specific: do not load every skill body into context. So this
-/// lists name and description for enabled skills only, and inlines the body
-/// of a skill only when the user named it. Until the tool loop exists that is
-/// the only honest reading of "load on demand".
+/// lists name and description for enabled skills only (the relevant ones when
+/// the library is past the budget), and inlines the body of a skill only when
+/// the user named it, the only way a tool-less turn can use one.
 pub fn skills_block(lib: &zerith_skills::Library, prompt: &str, budget: usize) -> String {
     let catalog = match lib.catalog() {
         Ok(c) => c,
@@ -1060,32 +1087,94 @@ pub fn skills_block(lib: &zerith_skills::Library, prompt: &str, budget: usize) -
     if catalog.is_empty() {
         return String::new();
     }
-    let lower = prompt.to_ascii_lowercase();
+    let total = catalog.len();
     let mut out = String::from("# Skills disponíveis");
+    let (picked, partial) = pick_skills(lib, catalog, prompt, budget);
     let mut spent = 0usize;
-    for (name, description) in &catalog {
-        let line = format!("\n- {name}: {description}");
+    for line in skill_lines(&picked, partial) {
         if spent + line.len() > budget {
             break;
         }
         spent += line.len();
         out.push_str(&line);
-        // Named in the request: the body is what the user is asking for.
-        if lower.contains(&name.to_ascii_lowercase()) {
-            if let Ok(body) = lib.load_body(name) {
-                let room = budget.saturating_sub(spent);
-                let take: String = body.chars().take(room).collect();
-                if !take.is_empty() {
-                    out.push_str("\n\n## ");
-                    out.push_str(name);
-                    out.push('\n');
-                    out.push_str(&take);
-                    spent += take.len();
-                }
+    }
+    if partial {
+        out.push_str(&format!(
+            "\nHá {total} skills instaladas; cite o nome de uma no pedido para carregá-la."
+        ));
+    }
+    // Named in the request: the body is what the user is asking for.
+    for (name, _) in picked.iter().filter(|(n, _)| names_skill(prompt, n)) {
+        if let Ok(body) = lib.load_body(name) {
+            let room = budget.saturating_sub(spent);
+            let take: String = body.chars().take(room).collect();
+            if !take.is_empty() {
+                out.push_str("\n\n## ");
+                out.push_str(name);
+                out.push('\n');
+                out.push_str(&take);
+                spent += take.len();
             }
         }
     }
     out
+}
+
+/// Which skills a section lists, and whether that is only part of them.
+/// All of them when every `- name: description` line fits `room`; else the
+/// ones `prompt` names, then the best BM25 matches, up to [`SKILLS_TOP_K`].
+fn pick_skills(
+    lib: &zerith_skills::Library,
+    catalog: Vec<(String, String)>,
+    prompt: &str,
+    room: usize,
+) -> (Vec<(String, String)>, bool) {
+    let full: usize = catalog.iter().map(|(n, d)| n.len() + d.len() + 5).sum();
+    if full <= room {
+        return (catalog, false);
+    }
+    let mut picked: Vec<(String, String)> = catalog
+        .into_iter()
+        .filter(|(n, _)| names_skill(prompt, n))
+        .take(SKILLS_TOP_K)
+        .collect();
+    let hits = zerith_skills::search::search(lib, prompt, SKILLS_TOP_K);
+    // ponytail: a hit under a fifth of the best one matched only a common
+    // word; listing it costs tokens and points the model the wrong way.
+    let floor = hits.first().map_or(0.0, |h| h.score / 5.0);
+    for h in hits.into_iter().filter(|h| h.score >= floor) {
+        if picked.len() >= SKILLS_TOP_K {
+            break;
+        }
+        if !picked.iter().any(|(n, _)| *n == h.name) {
+            picked.push((h.name, h.description));
+        }
+    }
+    (picked, true)
+}
+
+fn skill_lines(picked: &[(String, String)], clip: bool) -> Vec<String> {
+    picked
+        .iter()
+        .map(|(name, d)| {
+            if clip && d.chars().count() > SKILL_DESC_CHARS {
+                let cut: String = d.chars().take(SKILL_DESC_CHARS - 1).collect();
+                format!("\n- {name}: {}…", cut.trim_end())
+            } else {
+                format!("\n- {name}: {d}")
+            }
+        })
+        .collect()
+}
+
+/// `name` appears in `prompt` as a whole word (`ads` is not in `downloads`).
+fn names_skill(prompt: &str, name: &str) -> bool {
+    let p = prompt.to_lowercase();
+    let n = name.to_lowercase();
+    let edge = |c: Option<char>| c.is_none_or(|c| !(c.is_alphanumeric() || c == '-' || c == '_'));
+    !n.is_empty()
+        && p.match_indices(&n)
+            .any(|(i, _)| edge(p[..i].chars().next_back()) && edge(p[i + n.len()..].chars().next()))
 }
 
 #[cfg(test)]
@@ -1141,6 +1230,93 @@ mod skills_tests {
         lib.set_status("demo", zerith_skills::Status::Disabled)
             .unwrap();
         assert!(skills_block(&lib, "demo", 2000).is_empty());
+    }
+
+    /// 40 filler skills plus the ones a request should find: past the budget.
+    fn big_library(tmp: &std::path::Path) -> zerith_skills::Library {
+        let lib = zerith_skills::Library::open(tmp.join("skills")).unwrap();
+        let add = |name: String, desc: &str| {
+            let src = tmp.join("src").join(&name);
+            std::fs::create_dir_all(&src).unwrap();
+            std::fs::write(
+                src.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: \"{desc}\"\n---\n\nCORPO-{name}\n"),
+            )
+            .unwrap();
+            lib.install(&src, "t").unwrap();
+        };
+        for i in 0..40 {
+            add(
+                format!("filler-{i:02}"),
+                "Use when doing a generic marketing chore that has nothing to do with anything else here, written long on purpose so the list overflows.",
+            );
+        }
+        add(
+            "mikrotik-routeros-cli".into(),
+            "Use when accessing a MikroTik RouterOS device via SSH.",
+        );
+        add(
+            "video-subtitles".into(),
+            "Use when generating subtitles for video files.",
+        );
+        lib
+    }
+
+    #[test]
+    fn a_small_library_is_listed_whole() {
+        let tmp = tempfile::tempdir_in(scratch()).unwrap();
+        let src = tmp.path().join("src");
+        skill(&src, "demo", "x");
+        let lib = zerith_skills::Library::open(tmp.path().join("skills")).unwrap();
+        lib.install(&src, "t").unwrap();
+        let idx = skills_index(&lib, "qualquer coisa", SKILLS_BUDGET_CHARS);
+        assert!(idx.contains("- demo: d-demo"), "{idx}");
+        assert!(!idx.contains("skill_search"));
+    }
+
+    #[test]
+    fn a_big_library_lists_what_the_request_needs_within_budget() {
+        let tmp = tempfile::tempdir_in(scratch()).unwrap();
+        let lib = big_library(tmp.path());
+        let idx = skills_index(
+            &lib,
+            "Como entro numa MikroTik por SSH e listo as interfaces?",
+            SKILLS_BUDGET_CHARS,
+        );
+        assert!(idx.len() <= SKILLS_BUDGET_CHARS, "{}", idx.len());
+        let first = idx.lines().find(|l| l.starts_with("- ")).unwrap();
+        assert!(first.starts_with("- mikrotik-routeros-cli:"), "{idx}");
+        assert!(!idx.contains("video-subtitles"));
+        assert!(idx.ends_with(
+            "Há 42 skills instaladas; use skill_search para achar outras (palavras-chave em inglês e português)."
+        ));
+        // A prompt that matches nothing still says how to find them.
+        let none = skills_index(&lib, "oi", SKILLS_BUDGET_CHARS);
+        assert!(
+            none.contains("Há 42 skills") && !none.contains("- filler"),
+            "{none}"
+        );
+        // Tiny budgets are honoured too.
+        assert!(skills_index(&lib, "mikrotik ssh", 600).len() <= 600);
+    }
+
+    #[test]
+    fn a_big_library_without_the_tool_ranks_and_inlines_the_named_skill() {
+        let tmp = tempfile::tempdir_in(scratch()).unwrap();
+        let lib = big_library(tmp.path());
+        let block = skills_block(&lib, "legenda de vídeo com video-subtitles", 3000);
+        assert!(block.contains("- video-subtitles:"), "{block}");
+        assert!(block.contains("CORPO-video-subtitles"), "{block}");
+        assert!(!block.contains("filler-00"));
+        assert!(block.contains("Há 42 skills instaladas"));
+    }
+
+    #[test]
+    fn a_skill_is_named_only_as_a_whole_word() {
+        assert!(names_skill("use a skill ads agora", "ads"));
+        assert!(names_skill("rode video-subtitles.", "video-subtitles"));
+        assert!(!names_skill("faça downloads", "ads"));
+        assert!(!names_skill("my-ads-x", "ads"));
     }
 }
 

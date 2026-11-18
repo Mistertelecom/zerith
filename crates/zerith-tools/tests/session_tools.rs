@@ -523,6 +523,7 @@ fn the_new_tools_are_in_the_default_registry() {
         "agent",
         "agent_result",
         "skill",
+        "skill_search",
         "ask_user",
         "shell_output",
         "shell_kill",

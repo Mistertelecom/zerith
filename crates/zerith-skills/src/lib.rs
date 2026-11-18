@@ -14,6 +14,7 @@ pub mod frontmatter;
 pub mod install;
 pub mod remote;
 pub mod scan;
+pub mod search;
 
 pub use frontmatter::{parse, Frontmatter, FrontmatterError};
 pub use install::{Installed, Library, Status};

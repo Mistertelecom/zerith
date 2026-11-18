@@ -391,6 +391,7 @@ pub fn oauth_login(
         &code,
         &pkce.verifier,
         &oauth::redirect_uri(tool, port),
+        &state,
     )
     .map_err(|e| e.to_string())?;
 

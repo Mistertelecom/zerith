@@ -56,11 +56,21 @@ pub struct Provider {
     pub manual_redirect: Option<&'static str>,
 }
 
+// Mirrors Claude Code 2.1.x (`an()` config in the CLI bundle): the hosts moved
+// to platform.claude.com and the old console.anthropic.com callback now fails
+// at consent with "Invalid request format".
 const CLAUDE: Provider = Provider {
     client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
-    authorize_url: "https://claude.ai/oauth/authorize",
-    token_url: "https://api.anthropic.com/v1/oauth/token",
-    scopes: &["org:create_api_key", "user:profile", "user:inference"],
+    authorize_url: "https://claude.com/cai/oauth/authorize",
+    token_url: "https://platform.claude.com/v1/oauth/token",
+    scopes: &[
+        "org:create_api_key",
+        "user:profile",
+        "user:inference",
+        "user:sessions:claude_code",
+        "user:mcp_servers",
+        "user:file_upload",
+    ],
     fixed_port: None,
     refresh_encoding: Encoding::Json,
     extra_authorize: &[("code", "true")],
@@ -185,7 +195,7 @@ pub fn redirect_path(tool: OAuthTool) -> &'static str {
 
 /// Claude's registered callback. A loopback port is not accepted by the
 /// client: the page shows a code (`code#state`) for the user to paste.
-pub const CLAUDE_MANUAL_REDIRECT: &str = "https://console.anthropic.com/oauth/code/callback";
+pub const CLAUDE_MANUAL_REDIRECT: &str = "https://platform.claude.com/oauth/code/callback";
 
 pub fn redirect_uri(tool: OAuthTool, port: u16) -> String {
     if let Some(uri) = provider(tool).manual_redirect {
@@ -429,9 +439,12 @@ pub fn exchange(
     code: &str,
     verifier: &str,
     redirect: &str,
+    state: &str,
 ) -> Result<OAuthCredential> {
     let p = provider(tool);
     let body = match p.refresh_encoding {
+        // Claude's token endpoint answers 400 "Invalid request format" when
+        // `state` is missing from the body (checked live).
         Encoding::Json => post_json(
             p.token_url,
             serde_json::json!({
@@ -440,6 +453,7 @@ pub fn exchange(
                 "code_verifier": verifier,
                 "redirect_uri": redirect,
                 "client_id": client_id(tool),
+                "state": state,
             }),
         )?,
         Encoding::Form => post_form(
@@ -1271,7 +1285,7 @@ mod tests {
         assert!(url.contains("code=true"), "{url}");
         assert!(
             url.contains(
-                "redirect_uri=https%3A%2F%2Fconsole.anthropic.com%2Foauth%2Fcode%2Fcallback"
+                "redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback"
             ),
             "{url}"
         );

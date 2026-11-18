@@ -2318,13 +2318,28 @@ pub fn login_cmd_with(
         if !a.no_browser {
             let _ = oauth::open_browser(&url);
         }
-        println!("Aguardando o retorno em http://127.0.0.1:{port} …");
-        let code = oauth::wait_for_code(listener, oauth::redirect_path(a.tool), &state)?;
+        let code = if oauth::needs_pasted_code(a.tool) {
+            // Claude shows the code on its own page: no callback will arrive.
+            drop(listener);
+            print!("Depois de autorizar, cole aqui o código que o Claude mostrou: ");
+            std::io::Write::flush(&mut std::io::stdout())?;
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)?;
+            let (code, pasted_state) = oauth::pasted_code(&line);
+            if pasted_state.is_some_and(|s| s != state) {
+                return Err("o código é de outra tentativa (state não confere)".into());
+            }
+            code.to_string()
+        } else {
+            println!("Aguardando o retorno em http://127.0.0.1:{port} …");
+            oauth::wait_for_code(listener, oauth::redirect_path(a.tool), &state)?
+        };
         oauth::exchange(
             a.tool,
             &code,
             &pkce.verifier,
             &oauth::redirect_uri(a.tool, port),
+            &state,
         )?
     };
 

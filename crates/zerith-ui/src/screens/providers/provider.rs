@@ -156,7 +156,7 @@ fn form(s: &Shell, u: &Ui) -> El {
         );
     }
     let proto_idx = match f.protocol {
-        Protocol::OpenAi | Protocol::Responses => 0,
+        Protocol::OpenAi | Protocol::Responses | Protocol::Gemini => 0,
         Protocol::Anthropic => 1,
     };
     let name = labelled(

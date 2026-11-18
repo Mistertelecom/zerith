@@ -237,9 +237,10 @@ pub fn save_provider(root: &Path, cfg: &ProviderConfig) -> Result<(), String> {
         protocol: match cfg.protocol {
             Protocol::OpenAi => Some(WireProtocol::OpenAi),
             Protocol::Anthropic => Some(WireProtocol::Anthropic),
-            // Responses (codex) is implied by the provider kind; the settings
-            // field only knows the two historical protocols.
-            Protocol::Responses => None,
+            // Responses (codex) and Gemini (antigravity) are implied by the
+            // provider kind; the settings field only knows the two historical
+            // protocols.
+            Protocol::Responses | Protocol::Gemini => None,
         },
         auth: match cfg.auth {
             AuthMode::ApiKey => AuthModeSettings::ApiKey,

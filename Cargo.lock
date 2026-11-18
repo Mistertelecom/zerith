@@ -7756,7 +7756,9 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "zerith-core",
+ "zerith-mcp",
  "zerith-sessions",
+ "zerith-skills",
 ]
 
 [[package]]

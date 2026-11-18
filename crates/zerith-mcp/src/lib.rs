@@ -10,7 +10,7 @@ pub mod config;
 pub mod protocol;
 pub mod tools;
 
-pub use config::{load_servers, Loaded, Origin, ServerConfig};
+pub use config::{load_servers, Extra, Loaded, Origin, ServerConfig};
 pub use protocol::{
     CallResult, PromptArgument, PromptGet, PromptInfo, ResourceContent, ResourceInfo, RpcError,
     ToolInfo, ToolsList, PROTOCOL_VERSION,
@@ -66,6 +66,7 @@ enum Transport {
         agent: ureq::Agent,
         url: String,
         session: Option<String>,
+        headers: Vec<(String, String)>,
     },
 }
 
@@ -94,8 +95,22 @@ impl Client {
         args: &[String],
         timeout: Duration,
     ) -> Result<Self> {
-        let mut child = Command::new(command)
+        Self::connect_env(name, command, args, &[], timeout)
+    }
+
+    /// Like `connect_with_timeout`, with extra environment for the child.
+    /// `npx`-style names resolve through `PATHEXT` on Windows (`npx.cmd`).
+    pub fn connect_env(
+        name: &str,
+        command: &str,
+        args: &[String],
+        env: &[(String, String)],
+        timeout: Duration,
+    ) -> Result<Self> {
+        let program = which(command).unwrap_or_else(|| command.into());
+        let mut child = Command::new(program)
             .args(args)
+            .envs(env.iter().map(|(k, v)| (k, v)))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -135,11 +150,17 @@ impl Client {
 
     /// Connects to a Streamable HTTP endpoint (one URL, POST per message).
     pub fn connect_http(name: &str, url: &str) -> Result<Self> {
+        Self::connect_http_with(name, url, &[])
+    }
+
+    /// Streamable HTTP with extra request headers (an `Authorization` token).
+    pub fn connect_http_with(name: &str, url: &str, headers: &[(String, String)]) -> Result<Self> {
         Self::handshake(Self {
             transport: Transport::Http {
                 agent: ureq::AgentBuilder::new().build(),
                 url: url.to_string(),
                 session: None,
+                headers: headers.to_vec(),
             },
             next_id: AtomicU64::new(1),
             timeout: DEFAULT_TIMEOUT,
@@ -227,6 +248,7 @@ impl Client {
             agent,
             url,
             session,
+            headers,
         } = &mut self.transport
         else {
             return Err(McpError::Protocol("not an http transport".into()));
@@ -236,6 +258,9 @@ impl Client {
             .timeout(timeout)
             .set("Content-Type", "application/json")
             .set("Accept", "application/json, text/event-stream");
+        for (k, v) in headers.iter() {
+            req = req.set(k, v);
+        }
         if let Some(s) = session.as_deref() {
             req = req.set("Mcp-Session-Id", s);
         }
@@ -309,6 +334,32 @@ impl Drop for Client {
             let _ = child.wait();
         }
     }
+}
+
+/// Where `command` would run from: an existing path as is, else the first
+/// `PATH` hit, trying `PATHEXT` (`.exe`, `.cmd`...) on Windows. `None` when it
+/// is nowhere, which is what "comando não encontrado" means.
+pub fn which(command: &str) -> Option<std::path::PathBuf> {
+    let p = std::path::Path::new(command);
+    let exts: Vec<String> = if cfg!(windows) && p.extension().is_none() {
+        std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into())
+            .split(';')
+            .filter(|e| !e.is_empty())
+            .map(str::to_string)
+            .collect()
+    } else {
+        vec![String::new()]
+    };
+    let hit = |base: &std::path::Path| {
+        exts.iter()
+            .map(|e| std::path::PathBuf::from(format!("{}{e}", base.display())))
+            .find(|c| c.is_file())
+    };
+    if p.components().count() > 1 || p.is_absolute() {
+        return hit(p);
+    }
+    std::env::split_paths(&std::env::var_os("PATH")?).find_map(|dir| hit(&dir.join(command)))
 }
 
 fn write_line(w: &mut impl Write, msg: &Value) -> Result<()> {

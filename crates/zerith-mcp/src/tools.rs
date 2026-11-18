@@ -28,7 +28,7 @@ use zerith_core::Paths;
 use zerith_security::Action;
 use zerith_tools::{CallCtx, Exec, Permission, Registry, Result, Tool, ToolError, ToolSpec};
 
-use crate::config::{load_servers, Loaded, ServerConfig};
+use crate::config::{load_servers, Extra, Loaded, ServerConfig};
 use crate::{Client, McpError, ToolInfo, DEFAULT_TIMEOUT};
 
 /// Largest resource text one `@server:resource` mention may inject.
@@ -57,6 +57,7 @@ pub fn tool_name(server: &str, tool: &str) -> String {
 /// One configured server and its (possibly absent) live connection.
 struct Server {
     cfg: ServerConfig,
+    extra: Extra,
     client: Mutex<Option<Client>>,
 }
 
@@ -70,12 +71,22 @@ impl Server {
 
     fn connect(&self) -> std::result::Result<Client, McpError> {
         let timeout = self.timeout();
+        let pairs = |m: &std::collections::BTreeMap<String, String>| {
+            m.iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect::<Vec<_>>()
+        };
         match (&self.cfg.command, &self.cfg.url) {
-            (Some(cmd), _) => {
-                Client::connect_with_timeout(&self.cfg.name, cmd, &self.cfg.args, timeout)
-            }
+            (Some(cmd), _) => Client::connect_env(
+                &self.cfg.name,
+                cmd,
+                &self.cfg.args,
+                &pairs(&self.extra.env),
+                timeout,
+            ),
             (None, Some(url)) => {
-                let mut c = Client::connect_http(&self.cfg.name, url)?;
+                let mut c =
+                    Client::connect_http_with(&self.cfg.name, url, &pairs(&self.extra.headers))?;
                 c.set_timeout(timeout);
                 Ok(c)
             }
@@ -234,6 +245,7 @@ impl McpRegistry {
                 .map(|cfg| {
                     Arc::new(Server {
                         cfg,
+                        extra: Extra::default(),
                         client: Mutex::new(None),
                     })
                 })
@@ -250,8 +262,11 @@ impl McpRegistry {
             servers,
             unapproved,
             errors,
+            extras,
+            ..
         } = load_servers(paths, project_dir);
         let mut reg = Self::new(servers);
+        reg.with_extras(&extras);
         reg.notes = errors;
         for s in unapproved {
             reg.notes.push(format!(
@@ -272,8 +287,18 @@ impl McpRegistry {
             }
             self.servers.push(Arc::new(Server {
                 cfg,
+                extra: Extra::default(),
                 client: Mutex::new(None),
             }));
+        }
+    }
+
+    /// Attaches env/headers by server name (before anything connects).
+    pub fn with_extras(&mut self, extras: &std::collections::BTreeMap<String, Extra>) {
+        for s in &mut self.servers {
+            if let (Some(x), Some(srv)) = (extras.get(&s.cfg.name), Arc::get_mut(s)) {
+                srv.extra = x.clone();
+            }
         }
     }
 

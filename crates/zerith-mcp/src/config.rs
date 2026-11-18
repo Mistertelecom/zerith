@@ -12,6 +12,7 @@
 //! user-level file (`[mcp] approved = ["name"]`, written by
 //! `zerith mcp approve`).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -78,12 +79,31 @@ impl ServerConfig {
     }
 }
 
+/// Environment (stdio) and headers (HTTP) of one server. Kept beside the
+/// definition (`[mcp.env.<name>]`, `[mcp.headers.<name>]`) so `ServerConfig`
+/// keeps the shape plugins already build. Values may be secrets: show keys,
+/// never values.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Extra {
+    pub env: BTreeMap<String, String>,
+    pub headers: BTreeMap<String, String>,
+}
+
+type Table = BTreeMap<String, BTreeMap<String, String>>;
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Section {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     servers: Vec<ServerConfig>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     approved: Vec<String>,
+    /// User servers switched off: kept, not started.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    disabled: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    env: Table,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    headers: Table,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -116,6 +136,10 @@ pub struct Loaded {
     pub servers: Vec<ServerConfig>,
     /// Project-level servers waiting for `zerith mcp approve <name>`.
     pub unapproved: Vec<ServerConfig>,
+    /// Servers the user switched off (`[mcp] disabled`): listed, never started.
+    pub disabled: Vec<ServerConfig>,
+    /// Env/headers per server name, only from the layer that defined it.
+    pub extras: BTreeMap<String, Extra>,
     /// Unreadable or invalid files and entries; the rest still loads.
     pub errors: Vec<String>,
 }
@@ -125,6 +149,8 @@ pub struct Loaded {
 pub fn load_servers(paths: &Paths, project_dir: Option<&Path>) -> Loaded {
     let mut out = Loaded::default();
     let mut approved: Vec<String> = Vec::new();
+    let mut disabled: Vec<String> = Vec::new();
+    let mut extras: BTreeMap<String, Extra> = BTreeMap::new();
     let mut layers: Vec<(PathBuf, Origin)> = vec![
         (paths.settings(), Origin::User),
         (user_file(paths), Origin::User),
@@ -142,6 +168,16 @@ pub fn load_servers(paths: &Paths, project_dir: Option<&Path>) -> Loaded {
                 // Approvals only count from the user's own files.
                 if origin == Origin::User {
                     approved.extend(f.mcp.approved);
+                    disabled.extend(f.mcp.disabled);
+                    // ponytail: env/headers only from user files, so a cloned
+                    // repo cannot inject env (PATH, NODE_OPTIONS) into a
+                    // server; project servers that need env get it by hand.
+                    for (name, env) in f.mcp.env {
+                        extras.entry(name).or_default().env = env;
+                    }
+                    for (name, h) in f.mcp.headers {
+                        extras.entry(name).or_default().headers = h;
+                    }
                 }
                 for mut s in f.mcp.servers {
                     s.origin = origin;
@@ -162,8 +198,13 @@ pub fn load_servers(paths: &Paths, project_dir: Option<&Path>) -> Loaded {
         by_name.push(s);
     }
     for s in by_name {
+        if let Some(x) = extras.get(&s.name).filter(|_| s.origin == Origin::User) {
+            out.extras.insert(s.name.clone(), x.clone());
+        }
         if s.origin == Origin::Project && !approved.contains(&s.name) {
             out.unapproved.push(s);
+        } else if disabled.contains(&s.name) {
+            out.disabled.push(s);
         } else {
             out.servers.push(s);
         }
@@ -202,8 +243,35 @@ pub fn remove_server(paths: &Paths, name: &str) -> Result<bool, String> {
         s.servers.retain(|x| x.name != name);
         found = s.servers.len() != before;
         s.approved.retain(|x| x != name);
+        s.disabled.retain(|x| x != name);
+        s.env.remove(name);
+        s.headers.remove(name);
     })?;
     Ok(found)
+}
+
+/// Switches a server on or off without forgetting it.
+pub fn set_enabled(paths: &Paths, name: &str, enabled: bool) -> Result<(), String> {
+    edit_user(paths, |s| {
+        s.disabled.retain(|x| x != name);
+        if !enabled {
+            s.disabled.push(name.to_string());
+        }
+    })
+}
+
+/// Replaces the env and headers of a server in `<root>/mcp.toml`.
+pub fn set_extra(paths: &Paths, name: &str, extra: &Extra) -> Result<(), String> {
+    edit_user(paths, |s| {
+        s.env.remove(name);
+        s.headers.remove(name);
+        if !extra.env.is_empty() {
+            s.env.insert(name.to_string(), extra.env.clone());
+        }
+        if !extra.headers.is_empty() {
+            s.headers.insert(name.to_string(), extra.headers.clone());
+        }
+    })
 }
 
 /// Lets a project-defined server of this name run.

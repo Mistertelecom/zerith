@@ -112,6 +112,17 @@ pub fn parse(text: &str) -> Result<(Frontmatter, &str), FrontmatterError> {
         // Nested `metadata:` entries are indented under the key.
         if in_metadata {
             if let Some(rest) = line.strip_prefix("  ") {
+                // A `- item` under a nested metadata key (`tags:` list):
+                // folded into the last value, as top-level lists are.
+                if let Some(item) = rest.trim_start().strip_prefix("- ") {
+                    if let Some(last) = fm.metadata.last_mut() {
+                        if !last.1.is_empty() {
+                            last.1.push_str(", ");
+                        }
+                        last.1.push_str(&unquote(item.trim()));
+                    }
+                    continue;
+                }
                 if let Some((k, v)) = rest.split_once(':') {
                     fm.metadata.push((k.trim().to_string(), unquote(v.trim())));
                     continue;
@@ -298,5 +309,13 @@ mod tests {
             ("requirements".into(), "agent-desktop, node".into())
         );
         assert_eq!(body, "body");
+    }
+
+    #[test]
+    fn lists_nested_in_metadata_parse() {
+        let doc = "---\nname: a\ndescription: d\nmetadata:\n  hermes:\n    tags:\n      - solar\n      - \"mppt\"\n    related_skills:\n      - x\n---\nbody";
+        let (fm, _) = parse(doc).unwrap();
+        assert_eq!(fm.metadata[1], ("tags".into(), "solar, mppt".into()));
+        assert_eq!(fm.metadata[2], ("related_skills".into(), "x".into()));
     }
 }

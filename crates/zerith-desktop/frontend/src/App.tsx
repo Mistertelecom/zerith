@@ -40,6 +40,8 @@ import { catalogEntry, NOT_CHAT } from "./lib/catalog";
 import { TitleBar } from "./components/TitleBar";
 
 const MODEL_KEY = "zerith.model";
+// Models the user took out of the chat menu (`account:model` values).
+const HIDDEN_KEY = "zerith.hiddenModels";
 
 const MODES = [
   ["default", "Padrão"],
@@ -109,6 +111,22 @@ export default function App() {
     () => localStorage.getItem(MODEL_KEY) ?? "",
   );
   const [accounts, setAccounts] = useState<Account[]>([]);
+  // Live lists, for the accounts that publish one (Antigravity), by account id.
+  const [liveModels, setLiveModels] = useState<
+    Record<string, { id: string; name: string }[]>
+  >({});
+  const [hidden, setHidden] = useState<string[]>(() =>
+    JSON.parse(localStorage.getItem(HIDDEN_KEY) ?? "[]"),
+  );
+  const toggleHidden = useCallback((v: string) => {
+    setHidden((prev) => {
+      const next = prev.includes(v)
+        ? prev.filter((x) => x !== v)
+        : [...prev, v];
+      localStorage.setItem(HIDDEN_KEY, JSON.stringify(next));
+      return next;
+    });
+  }, []);
   // Delegation profiles (combos with a subagent model), offered as models.
   const [profiles, setProfiles] = useState<string[]>([]);
   const loadProfiles = (r: Routing) =>
@@ -163,6 +181,20 @@ export default function App() {
   useEffect(() => {
     if (model) localStorage.setItem(MODEL_KEY, model);
   }, [model]);
+
+  // OAuth accounts that publish their models (Antigravity's Gemini 4 Hydrogen
+  // is not in any static catalogue); a failure keeps the catalogue list.
+  useEffect(() => {
+    for (const a of accounts)
+      if (a.enabled && a.auth === "oauth" && !liveModels[a.id])
+        api
+          .accountModels(a.id)
+          .then(
+            (list) =>
+              list.length && setLiveModels((m) => ({ ...m, [a.id]: list })),
+          )
+          .catch(() => undefined);
+  }, [accounts, liveModels]);
 
   // Transcript of the conversation that is open.
   useEffect(() => {
@@ -382,9 +414,11 @@ export default function App() {
         a.label || catalogEntry(a.oauth_tool || a.provider)?.name || a.id;
       const ids = [
         a.default_model,
-        ...(catalogEntry(a.oauth_tool || a.provider)?.models ?? []).map(
-          (m) => m.id,
-        ),
+        ...(
+          liveModels[a.id] ??
+          catalogEntry(a.oauth_tool || a.provider)?.models ??
+          []
+        ).map((m) => m.id),
       ];
       for (const m of [...new Set(ids)].filter(
         (m): m is string => !!m && !NOT_CHAT.test(m),
@@ -415,7 +449,7 @@ export default function App() {
       });
     }
     return out;
-  }, [boot, accounts, model, profiles]);
+  }, [boot, accounts, model, profiles, liveModels]);
 
   const surface = useMemo(() => {
     const out: Block[] = [...messages];
@@ -581,6 +615,8 @@ export default function App() {
                 model={model}
                 models={models}
                 onModel={setModel}
+                hidden={hidden}
+                onToggleHidden={toggleHidden}
                 hint={status || error || "/ comandos  ·  @ arquivos"}
                 files={() => api.workspaceFiles()}
               />

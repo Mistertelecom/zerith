@@ -14,6 +14,8 @@ import {
   Brain,
   ChevronDown,
   Cpu,
+  Eye,
+  EyeOff,
   FileText,
   Gauge,
   History,
@@ -102,6 +104,8 @@ export function Composer(props: {
   model: string;
   models: { value: string; label: string }[];
   onModel: (v: string) => void;
+  hidden: string[];
+  onToggleHidden: (v: string) => void;
   hint: string;
   files: () => Promise<string[]>;
 }) {
@@ -313,6 +317,8 @@ export function Composer(props: {
               value={props.model}
               options={props.models}
               onPick={props.onModel}
+              hidden={props.hidden}
+              onToggleHidden={props.onToggleHidden}
               search
               wide
             />
@@ -363,9 +369,20 @@ function PillMenu(props: {
   onPick: (v: string) => void;
   search?: boolean;
   wide?: boolean;
+  /** Values kept out of the list; the picked one always stays. */
+  hidden?: string[];
+  onToggleHidden?: (v: string) => void;
 }) {
   const [open, setOpen] = useState(false);
   const [q, setQ] = useState("");
+  const [showHidden, setShowHidden] = useState(false);
+  // The list opens upward; on the empty-chat screen the composer sits mid
+  // window, so its height is capped by the room above the pill.
+  const [room, setRoom] = useState<number | undefined>();
+  const hidden = props.hidden ?? [];
+  const hiddenCount = props.options.filter(
+    (o) => hidden.includes(o.value) && o.value !== props.value,
+  ).length;
   const root = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (!open) return;
@@ -381,9 +398,11 @@ function PillMenu(props: {
     };
   }, [open]);
   const needle = q.trim().toLowerCase();
-  const shown = needle
-    ? props.options.filter((o) => o.label.toLowerCase().includes(needle))
-    : props.options;
+  const shown = props.options.filter(
+    (o) =>
+      (showHidden || !hidden.includes(o.value) || o.value === props.value) &&
+      (!needle || o.label.toLowerCase().includes(needle)),
+  );
   return (
     <div className="pill-menu" ref={root}>
       <button
@@ -393,7 +412,15 @@ function PillMenu(props: {
         aria-label={props.label}
         aria-haspopup="listbox"
         aria-expanded={open}
-        onClick={() => {
+        onClick={(e) => {
+          // the conversation pane clips the popup at its own top (under the
+          // top bar); 96px is the search field, the footer and the gap
+          const pane = e.currentTarget.closest(".convo") ?? document.body;
+          setRoom(
+            e.currentTarget.getBoundingClientRect().top -
+              pane.getBoundingClientRect().top -
+              96,
+          );
           setOpen((o) => !o);
           setQ("");
         }}
@@ -417,7 +444,10 @@ function PillMenu(props: {
               onChange={(e) => setQ(e.target.value)}
             />
           ) : null}
-          <div className="pill-options">
+          <div
+            className="pill-options"
+            style={room ? { maxHeight: `min(360px, 55vh, ${room}px)` } : undefined}
+          >
             {shown.length === 0 ? (
               <div className="pill-empty">Nada encontrado</div>
             ) : null}
@@ -425,10 +455,11 @@ function PillMenu(props: {
               const [who, what] = o.label.includes(" · ")
                 ? o.label.split(" · ")
                 : ["", o.label];
+              const off = hidden.includes(o.value);
               return (
+                <div className={"pill-row" + (off ? " off" : "")} key={o.value}>
                 <button
                   type="button"
-                  key={o.value}
                   role="option"
                   aria-selected={o.value === props.value}
                   className={
@@ -454,9 +485,44 @@ function PillMenu(props: {
                     <Check size={14} strokeWidth={2} />
                   ) : null}
                 </button>
+                {props.onToggleHidden ? (
+                  <button
+                    type="button"
+                    className="pill-hide"
+                    title={off ? "Mostrar no chat" : "Ocultar do chat"}
+                    aria-label={
+                      (off ? "Mostrar no chat: " : "Ocultar do chat: ") + what
+                    }
+                    onClick={() => props.onToggleHidden?.(o.value)}
+                  >
+                    {off ? (
+                      <Eye size={14} strokeWidth={2} />
+                    ) : (
+                      <EyeOff size={14} strokeWidth={2} />
+                    )}
+                  </button>
+                ) : null}
+                </div>
               );
             })}
           </div>
+          {props.onToggleHidden && (hiddenCount > 0 || showHidden) ? (
+            <button
+              type="button"
+              className="pill-foot"
+              aria-pressed={showHidden}
+              onClick={() => setShowHidden((s) => !s)}
+            >
+              {showHidden ? (
+                <EyeOff size={14} strokeWidth={2} />
+              ) : (
+                <Eye size={14} strokeWidth={2} />
+              )}
+              {showHidden
+                ? "Esconder ocultos"
+                : `Mostrar ocultos (${hiddenCount})`}
+            </button>
+          ) : null}
         </div>
       ) : null}
     </div>

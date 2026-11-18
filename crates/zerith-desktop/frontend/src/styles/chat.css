@@ -1037,6 +1037,51 @@
   color: var(--label-caption);
   font-size: var(--fs-caption);
 }
+.pill-row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.pill-row .pill-option {
+  flex: 1;
+  min-width: 0;
+}
+.pill-row.off .pill-option {
+  color: var(--label-caption);
+}
+.pill-hide {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border-radius: var(--r-sm);
+  color: var(--label-caption);
+  opacity: 0;
+}
+.pill-row:hover .pill-hide,
+.pill-row.off .pill-hide,
+.pill-hide:focus-visible {
+  opacity: 1;
+}
+.pill-hide:hover {
+  background: var(--hover);
+  color: var(--label-primary);
+}
+.pill-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 30px;
+  padding: 4px 8px;
+  border-top: 1px solid var(--line);
+  color: var(--label-caption);
+  font-size: var(--fs-caption);
+  text-align: left;
+}
+.pill-foot:hover {
+  color: var(--label-primary);
+}
 .pill-empty {
   padding: 8px;
   color: var(--label-caption);

@@ -14,6 +14,7 @@ mod codex;
 mod config;
 pub mod explain;
 pub mod gateway;
+pub mod images;
 pub mod media;
 pub mod oauth;
 mod openai;

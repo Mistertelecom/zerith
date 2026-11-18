@@ -24,7 +24,14 @@ pub(crate) fn body(req: &ChatRequest, stream: bool) -> Value {
                 system.push(m.content.as_str());
                 continue;
             }
-            Role::User => ("user", vec![json!({"type": "text", "text": m.content})]),
+            Role::User => {
+                let mut b = vec![json!({"type": "text", "text": m.content})];
+                b.extend(crate::images::local_images(&m.content).iter().map(|i| {
+                    json!({"type": "image", "source":
+                        {"type": "base64", "media_type": i.mime, "data": i.data}})
+                }));
+                ("user", b)
+            }
             Role::Assistant => {
                 let mut b = Vec::new();
                 if !m.content.is_empty() {

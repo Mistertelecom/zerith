@@ -19,11 +19,15 @@ pub(crate) fn body(req: &ChatRequest, stream: bool) -> Value {
     for m in &req.messages {
         match m.role {
             Role::System => instructions.push(m.content.clone()),
-            Role::User => input.push(json!({
-                "type": "message",
-                "role": "user",
-                "content": [{"type": "input_text", "text": m.content}],
-            })),
+            Role::User => {
+                let mut content = vec![json!({"type": "input_text", "text": m.content})];
+                content.extend(
+                    crate::images::local_images(&m.content)
+                        .iter()
+                        .map(|i| json!({"type": "input_image", "image_url": i.data_url()})),
+                );
+                input.push(json!({"type": "message", "role": "user", "content": content}));
+            }
             Role::Assistant => {
                 if !m.content.is_empty() {
                     input.push(json!({

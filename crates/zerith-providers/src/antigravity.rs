@@ -30,7 +30,15 @@ pub(crate) fn body(req: &ChatRequest, project: Option<&str>) -> Value {
     for m in &req.messages {
         match m.role {
             Role::System => system.push(json!({"text": m.content})),
-            Role::User => contents.push(json!({"role": "user", "parts": [{"text": m.content}]})),
+            Role::User => {
+                let mut parts = vec![json!({"text": m.content})];
+                parts.extend(
+                    crate::images::local_images(&m.content)
+                        .iter()
+                        .map(|i| json!({"inlineData": {"mimeType": i.mime, "data": i.data}})),
+                );
+                contents.push(json!({"role": "user", "parts": parts}));
+            }
             Role::Assistant => {
                 let mut parts = Vec::new();
                 if !m.content.is_empty() {

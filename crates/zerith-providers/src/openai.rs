@@ -321,12 +321,25 @@ pub(crate) fn role_str(r: Role) -> &'static str {
 
 /// The request body. Built as a `Value` because the optional fields differ by
 /// message role, and a struct per role would be more code than the JSON.
-fn body(req: &ChatRequest, stream: bool) -> Value {
+pub(crate) fn body(req: &ChatRequest, stream: bool) -> Value {
     let messages: Vec<Value> = req
         .messages
         .iter()
         .map(|m| {
             let mut v = json!({"role": role_str(m.role), "content": m.content});
+            let images = match m.role {
+                Role::User => crate::images::local_images(&m.content),
+                _ => Vec::new(),
+            };
+            if !images.is_empty() {
+                let mut parts = vec![json!({"type": "text", "text": m.content})];
+                parts.extend(
+                    images
+                        .iter()
+                        .map(|i| json!({"type": "image_url", "image_url": {"url": i.data_url()}})),
+                );
+                v["content"] = json!(parts);
+            }
             if !m.tool_calls.is_empty() {
                 // `null` content beside tool calls: some servers reject "".
                 if m.content.is_empty() {

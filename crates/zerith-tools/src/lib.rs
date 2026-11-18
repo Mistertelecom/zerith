@@ -168,6 +168,14 @@ pub trait Tool: Send + Sync {
 /// head and say how much was cut, so the model knows to narrow the request.
 pub const OUTPUT_CAP_CHARS: usize = 30_000;
 
+/// `ToolSpec::source` prefix of a deferred tool: registered and runnable, but
+/// left out of the tool list sent to the model (a big MCP server's schemas cost
+/// tens of thousands of tokens per request). The model reaches it through
+/// [`DISPATCH_TOOL`], and the runtime judges that call as the real tool.
+pub const DEFERRED_SOURCE: &str = "deferred:";
+/// `{tool, arguments}`: calls a deferred tool by name (see `zerith-mcp`).
+pub const DISPATCH_TOOL: &str = "mcp_call";
+
 pub struct Registry {
     tools: Vec<Arc<dyn Tool>>,
     host: Host,

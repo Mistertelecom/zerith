@@ -26,7 +26,9 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use zerith_core::Paths;
 use zerith_security::Action;
-use zerith_tools::{CallCtx, Exec, Permission, Registry, Result, Tool, ToolError, ToolSpec};
+use zerith_tools::{
+    CallCtx, Exec, Permission, Registry, Result, Tool, ToolError, ToolSpec, DEFERRED_SOURCE,
+};
 
 use crate::config::{load_servers, Extra, Loaded, ServerConfig};
 use crate::{Client, McpError, ToolInfo, DEFAULT_TIMEOUT};
@@ -326,16 +328,24 @@ impl McpRegistry {
     /// reuses the live connections and replaces the same-named tools.
     pub fn register_into(&self, registry: &mut Registry) -> Registered {
         let mut done = Registered::default();
+        let mut listed: Vec<(&Arc<Server>, Vec<ToolInfo>)> = Vec::new();
         for server in &self.servers {
-            let listed = server.with(|c| c.tools());
-            let infos: Vec<ToolInfo> = match listed {
-                Ok(t) => t,
-                Err(e) => {
-                    done.errors
-                        .push(format!("servidor MCP {}: {e}", server.cfg.name));
-                    continue;
-                }
-            };
+            match server.with(|c| c.tools()) {
+                Ok(t) => listed.push((server, t)),
+                Err(e) => done
+                    .errors
+                    .push(format!("servidor MCP {}: {e}", server.cfg.name)),
+            }
+        }
+        let sizes: Vec<(usize, usize)> = listed
+            .iter()
+            .map(|(_, t)| (t.len(), t.iter().map(weight).sum()))
+            .collect();
+        let defer = deferred_servers(&sizes);
+        let mut hidden: Vec<McpTool> = Vec::new();
+        let mut counts: Vec<(String, usize)> = Vec::new();
+        for ((server, infos), defer) in listed.into_iter().zip(defer) {
+            let before = hidden.len();
             let mut seen: Vec<String> = Vec::new();
             for info in infos {
                 let name = tool_name(&server.cfg.name, &info.name);
@@ -347,7 +357,7 @@ impl McpRegistry {
                     continue;
                 }
                 seen.push(name.clone());
-                registry.register(Box::new(McpTool {
+                let tool = McpTool {
                     spec: ToolSpec {
                         name: name.clone(),
                         description: info.description.clone().unwrap_or_else(|| {
@@ -368,14 +378,53 @@ impl McpRegistry {
                         // timeout; a cancel is seen only between calls.
                         cancellable: false,
                         local: !server.cfg.is_http(),
-                        source: format!("mcp:{}", server.cfg.name),
+                        source: if defer {
+                            format!("{DEFERRED_SOURCE}mcp:{}", server.cfg.name)
+                        } else {
+                            format!("mcp:{}", server.cfg.name)
+                        },
                     },
                     server: Arc::clone(server),
                     remote: info.name,
-                }));
+                };
+                if defer {
+                    hidden.push(tool);
+                } else {
+                    registry.register(Box::new(tool));
+                }
                 done.tools.push(name);
             }
+            if defer {
+                counts.push((server.cfg.name.clone(), hidden.len() - before));
+            }
         }
+        if hidden.is_empty() {
+            return done;
+        }
+        let index = Arc::new(Deferred {
+            tools: hidden
+                .iter()
+                .map(|t| {
+                    (
+                        t.spec.name.clone(),
+                        t.spec.description.clone(),
+                        t.spec.parameters.clone(),
+                    )
+                })
+                .collect(),
+            counts,
+        });
+        for t in hidden {
+            registry.register(Box::new(t));
+        }
+        registry.register(Box::new(McpSearch {
+            spec: search_spec(&index.counts),
+            index: Arc::clone(&index),
+        }));
+        registry.register(Box::new(McpCall {
+            spec: call_spec(&index.counts),
+            index,
+        }));
         done
     }
 
@@ -521,6 +570,349 @@ fn cap(s: String) -> String {
     }
     let head: String = s.chars().take(RESOURCE_CAP_CHARS).collect();
     format!("{head}\n[recurso truncado em {RESOURCE_CAP_CHARS} caracteres]")
+}
+
+// ---- deferred servers (tool search) ----------------------------------------
+
+/// ponytail: fixed budget, no setting. 40 tools / 40k chars of name +
+/// description + schema (~10k tokens) is where MCP schemas start to outweigh
+/// the whole rest of the prompt (~6k tokens). Measured: codebase-memory-mcp =
+/// 17 tools / 21k chars (stays direct), rea = 170 tools / 415k chars (deferred).
+/// Make it a setting if someone needs a different line.
+pub const DIRECT_MAX_TOOLS: usize = 40;
+pub const DIRECT_MAX_CHARS: usize = 40_000;
+
+/// What one tool costs the request, in chars.
+fn weight(t: &ToolInfo) -> usize {
+    t.name.len()
+        + t.description.as_ref().map_or(0, String::len)
+        + t.input_schema.as_ref().map_or(0, |s| s.to_string().len())
+}
+
+/// Which servers (by `(tool count, chars)`) go behind `mcp_search`. Under the
+/// budget nothing changes. Over it, the biggest servers are deferred first
+/// until what stays direct fits, so a small server keeps its direct tools.
+pub fn deferred_servers(sizes: &[(usize, usize)]) -> Vec<bool> {
+    let mut defer = vec![false; sizes.len()];
+    let mut order: Vec<usize> = (0..sizes.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(sizes[i].1));
+    let (mut n, mut c): (usize, usize) = sizes.iter().fold((0, 0), |(n, c), s| (n + s.0, c + s.1));
+    for i in order {
+        if n <= DIRECT_MAX_TOOLS && c <= DIRECT_MAX_CHARS {
+            break;
+        }
+        defer[i] = true;
+        n -= sizes[i].0;
+        c -= sizes[i].1;
+    }
+    defer
+}
+
+/// The deferred tools of this registry: `(name, description, schema)`, plus
+/// `(server, tool count)` for the line that tells the model they exist.
+struct Deferred {
+    tools: Vec<(String, String, Value)>,
+    counts: Vec<(String, usize)>,
+}
+
+fn servers_line(counts: &[(String, usize)]) -> String {
+    counts
+        .iter()
+        .map(|(s, n)| format!("Servidor MCP {s}: {n} ferramentas"))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn search_spec(counts: &[(String, usize)]) -> ToolSpec {
+    ToolSpec {
+        name: "mcp_search".into(),
+        description: format!(
+            "Busca ferramentas de servidores MCP grandes, que não aparecem na sua lista de ferramentas. {} — use mcp_search para achar a ferramenta (devolve nome, descrição e esquema de entrada) e depois mcp_call para chamá-la. Busque por palavras do que quer fazer, em inglês e português.",
+            servers_line(counts)
+        ),
+        parameters: json!({"type": "object", "properties": {
+            "query": {"type": "string", "description": "o que a ferramenta deve fazer, em palavras-chave"},
+            "server": {"type": "string", "description": "limita a um servidor MCP"},
+            "limit": {"type": "integer", "description": "quantas devolver (padrão 5, máximo 20)"}
+        }, "required": ["query"]}),
+        returns: "as ferramentas que mais casam, com descrição e esquema",
+        permission: Permission::Read,
+        timeout: Duration::from_secs(5),
+        cancellable: false,
+        local: true,
+        source: "mcp".into(),
+    }
+}
+
+fn call_spec(counts: &[(String, usize)]) -> ToolSpec {
+    ToolSpec {
+        name: zerith_tools::DISPATCH_TOOL.into(),
+        description: format!(
+            "Chama uma ferramenta de servidor MCP achada com mcp_search ({}). Passe o nome completo `mcp__<servidor>__<ferramenta>` em `tool` e os argumentos do esquema dela em `arguments`. Pede a mesma aprovação que a ferramenta real.",
+            servers_line(counts)
+        ),
+        parameters: json!({"type": "object", "properties": {
+            "tool": {"type": "string", "description": "nome completo, ex.: mcp__servidor__ferramenta"},
+            "arguments": {"type": "object", "description": "argumentos conforme o esquema devolvido por mcp_search"}
+        }, "required": ["tool"]}),
+        returns: "texto devolvido pelo servidor MCP",
+        permission: Permission::Network,
+        timeout: DEFAULT_TIMEOUT,
+        cancellable: false,
+        local: false,
+        source: "mcp".into(),
+    }
+}
+
+/// Lowercase, accent-free words, split on anything not a letter or digit
+/// (so `list_procedures` is two words).
+fn words(text: &str) -> Vec<String> {
+    let fold = |c: char| match c {
+        'á' | 'à' | 'â' | 'ã' | 'ä' => 'a',
+        'é' | 'è' | 'ê' | 'ë' => 'e',
+        'í' | 'ì' | 'î' | 'ï' => 'i',
+        'ó' | 'ò' | 'ô' | 'õ' | 'ö' => 'o',
+        'ú' | 'ù' | 'û' | 'ü' => 'u',
+        'ç' => 'c',
+        c => c,
+    };
+    text.chars()
+        .flat_map(char::to_lowercase)
+        .map(fold)
+        .collect::<String>()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() >= 2)
+        .map(str::to_string)
+        .collect()
+}
+
+/// BM25 (k1 1.2, b 0.75) over name ×3 + description, best first; tools that
+/// match nothing are left out. Names are `mcp__server__tool`: the `mcp` and
+/// server words match every tool, so idf zeroes them out by itself.
+///
+/// ponytail: a copy of the core of `zerith_skills::search` (that crate is not
+/// a dependency here and its index is built from a skill library). No stems or
+/// glossary; add them if the model's queries miss.
+fn rank<'a>(
+    tools: &'a [(String, String, Value)],
+    query: &str,
+    server: Option<&str>,
+    limit: usize,
+) -> Vec<&'a (String, String, Value)> {
+    let prefix = server.map(|s| format!("mcp__{s}__"));
+    let pool: Vec<&(String, String, Value)> = tools
+        .iter()
+        .filter(|t| prefix.as_deref().is_none_or(|p| t.0.starts_with(p)))
+        .collect();
+    let docs: Vec<Vec<String>> = pool
+        .iter()
+        .map(|t| {
+            let name = words(&t.0);
+            let mut d = Vec::new();
+            for _ in 0..3 {
+                d.extend(name.iter().cloned());
+            }
+            d.extend(words(&t.1));
+            d
+        })
+        .collect();
+    let n = docs.len().max(1) as f64;
+    let avg = docs.iter().map(Vec::len).sum::<usize>() as f64 / n;
+    let q = words(query);
+    let mut scored: Vec<(f64, usize)> = docs
+        .iter()
+        .enumerate()
+        .map(|(i, d)| {
+            let mut s = 0.0;
+            for w in &q {
+                let tf = d.iter().filter(|x| *x == w).count() as f64;
+                if tf == 0.0 {
+                    continue;
+                }
+                let df = docs.iter().filter(|d| d.contains(w)).count() as f64;
+                let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
+                s += idf * tf * 2.2 / (tf + 1.2 * (0.25 + 0.75 * d.len() as f64 / avg.max(1.0)));
+            }
+            (s, i)
+        })
+        .filter(|(s, _)| *s > 0.0)
+        .collect();
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+    scored
+        .into_iter()
+        .take(limit)
+        .map(|(_, i)| pool[i])
+        .collect()
+}
+
+/// `mcp_search`: reads the in-memory index, touches no server.
+struct McpSearch {
+    spec: ToolSpec,
+    index: Arc<Deferred>,
+}
+
+impl Tool for McpSearch {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+    fn action(&self, _args: &Value, _ctx: &CallCtx<'_>) -> Result<Option<Action>> {
+        Ok(None)
+    }
+    fn concurrency_safe(&self, _args: &Value) -> bool {
+        true
+    }
+    fn run(&self, args: &Value, _ctx: &CallCtx<'_>, _exec: &Exec<'_>) -> Result<String> {
+        let query = args["query"].as_str().unwrap_or_default();
+        let limit = args["limit"].as_u64().unwrap_or(5).clamp(1, 20) as usize;
+        let hits = rank(&self.index.tools, query, args["server"].as_str(), limit);
+        if hits.is_empty() {
+            return Ok(format!(
+                "nenhuma ferramenta MCP casa com {query:?}. {}. Tente outras palavras (em inglês).",
+                servers_line(&self.index.counts)
+            ));
+        }
+        Ok(hits
+            .iter()
+            .map(|(name, desc, schema)| format!("{name} — {desc}\n  esquema: {schema}"))
+            .collect::<Vec<_>>()
+            .join("\n\n"))
+    }
+}
+
+/// `mcp_call`. The runtime pipeline swaps a call naming a deferred tool for
+/// the real tool before policy and approval, so this `run` only sees the
+/// names it must refuse (and direct `Registry::call` use, where its Network
+/// action keeps the same verdict as the real tool's).
+struct McpCall {
+    spec: ToolSpec,
+    index: Arc<Deferred>,
+}
+
+impl McpCall {
+    fn target(&self, args: &Value) -> Result<String> {
+        let tool = args["tool"].as_str().unwrap_or_default();
+        if self.index.tools.iter().any(|t| t.0 == tool) {
+            return Ok(tool.to_string());
+        }
+        Err(ToolError::BadArguments(format!(
+            "mcp_call: {tool:?} não é uma ferramenta MCP adiada; use mcp_search para achar o nome exato ({})",
+            servers_line(&self.index.counts)
+        )))
+    }
+}
+
+impl Tool for McpCall {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+    fn action(&self, args: &Value, _ctx: &CallCtx<'_>) -> Result<Option<Action>> {
+        Ok(Some(Action::Network(format!("mcp:{}", self.target(args)?))))
+    }
+    fn run(&self, args: &Value, _ctx: &CallCtx<'_>, _exec: &Exec<'_>) -> Result<String> {
+        let tool = self.target(args)?;
+        Err(ToolError::Failed(format!(
+            "mcp_call: {tool} só roda pelo laço do agente, que pede a aprovação da ferramenta real"
+        )))
+    }
+}
+
+#[cfg(test)]
+mod deferred_tests {
+    use super::*;
+
+    fn fake() -> Vec<(String, String, Value)> {
+        [
+            ("list_prompts", "List the prompts the server offers"),
+            (
+                "list_procedures",
+                "List every analyzed procedure as address/value pairs",
+            ),
+            (
+                "decompile_function",
+                "Decompile one function to pseudo code",
+            ),
+            ("open_binary", "Open a native binary for analysis (análise)"),
+            ("list_strings", "List strings found in the binary"),
+        ]
+        .iter()
+        .map(|(n, d)| {
+            (
+                tool_name("rea", n),
+                d.to_string(),
+                json!({"type": "object"}),
+            )
+        })
+        .collect()
+    }
+
+    #[test]
+    fn small_setups_stay_direct_and_the_big_server_is_deferred() {
+        // codebase-memory-mcp alone (measured): direct, as before.
+        assert_eq!(deferred_servers(&[(17, 21_000)]), [false]);
+        // with rea: only rea goes behind mcp_search.
+        assert_eq!(
+            deferred_servers(&[(17, 21_000), (170, 415_000)]),
+            [false, true]
+        );
+        // many small ones over budget: the biggest go first until the rest fit.
+        assert_eq!(
+            deferred_servers(&[(20, 15_000), (20, 30_000), (5, 1_000)]),
+            [false, true, false]
+        );
+        assert_eq!(deferred_servers(&[]), Vec::<bool>::new());
+    }
+
+    #[test]
+    fn search_ranks_the_right_tool_first() {
+        let t = fake();
+        let top = |q: &str| rank(&t, q, None, 3)[0].0.clone();
+        assert_eq!(top("list prompts"), "mcp__rea__list_prompts");
+        assert_eq!(
+            top("decompilar function pseudo code"),
+            "mcp__rea__decompile_function"
+        );
+        assert_eq!(top("abrir binário para análise"), "mcp__rea__open_binary");
+        assert!(rank(&t, "list", Some("outro"), 5).is_empty());
+        assert!(rank(&t, "zzz", None, 5).is_empty());
+    }
+
+    #[test]
+    fn call_refuses_unknown_names_and_judges_like_the_real_tool() {
+        let call = McpCall {
+            spec: call_spec(&[("rea".into(), 5)]),
+            index: Arc::new(Deferred {
+                tools: fake(),
+                counts: vec![("rea".into(), 5)],
+            }),
+        };
+        assert_eq!(call.spec.permission, Permission::Network);
+        assert!(call
+            .spec
+            .description
+            .contains("Servidor MCP rea: 5 ferramentas"));
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let policy = zerith_security::Policy::new(
+            zerith_security::preset("workspace-write").unwrap(),
+            zerith_security::Mode::Default,
+            &dir,
+        );
+        let ctx = CallCtx {
+            workspace: &dir,
+            policy: &policy,
+            memory: None,
+            scope: None,
+        };
+        for bad in ["mcp__rea__nope", "shell", "mcp__codebase__list_projects"] {
+            assert!(call.action(&json!({"tool": bad}), &ctx).is_err(), "{bad}");
+        }
+        let a = call
+            .action(&json!({"tool": "mcp__rea__list_prompts"}), &ctx)
+            .unwrap();
+        assert_eq!(
+            a,
+            Some(Action::Network("mcp:mcp__rea__list_prompts".into()))
+        );
+    }
 }
 
 #[cfg(test)]

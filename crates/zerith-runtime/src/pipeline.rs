@@ -164,6 +164,25 @@ impl Pipeline<'_> {
             }
         };
 
+        // `mcp_call` naming a deferred tool IS that tool from here on: its
+        // rules, hooks, approval card and "allow for the session" are the
+        // real tool's, never a blanket grant on the meta-tool. Any other name
+        // stays `mcp_call`, which refuses it.
+        if inv.name == zerith_tools::DISPATCH_TOOL {
+            let target = inv.args.get("tool").and_then(Value::as_str).filter(|n| {
+                tools
+                    .get(n)
+                    .is_some_and(|s| s.source.starts_with(zerith_tools::DEFERRED_SOURCE))
+            });
+            if let Some(real) = target.map(str::to_string) {
+                inv.args = match inv.args["arguments"].take() {
+                    Value::String(s) => serde_json::from_str(&s).unwrap_or(Value::String(s)),
+                    a => a,
+                };
+                inv.name = real;
+            }
+        }
+
         let mut ask: Option<String> = None;
         for m in self.middleware {
             match m.before(&mut inv) {

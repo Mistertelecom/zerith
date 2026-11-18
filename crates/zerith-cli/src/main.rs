@@ -6,6 +6,7 @@
 mod args;
 mod cmds;
 mod headless;
+mod media_cmd;
 mod schema;
 mod signals;
 
@@ -94,10 +95,21 @@ usage:
         [--max-turns N] [--max-budget-usd X --price-in P --price-out P]
         [--allowed-tools a,b] [--disallowed-tools a,b] [--permission-mode MODE]
         [--json-schema <json|file>] [--no-tools]
+  zerith media show|models|set|key|generate   (imagem e vídeo; veja `zerith media`)
   zerith config show
   zerith secret set <name> [value] | get <name> | delete <name>
+  zerith login <claude-code|codex|antigravity> [--account <id>] [--import] [--no-browser]
   zerith import hermes [--profile <name>] [--jsonl <file>]
   zerith import detect"
+}
+
+/// `%USERPROFILE%` on Windows, `$HOME` elsewhere: where the CLIs write the
+/// credentials `zerith login --import` reads.
+fn home_dir() -> std::path::PathBuf {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default()
 }
 
 fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -171,6 +183,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         ("providers", _) => providers(&paths, args)?,
         ("usage", _) | ("quota", _) => cmds::usage_cmd(&paths, args)?,
         ("accounts", _) | ("account", _) => cmds::accounts_cmd(&paths, args)?,
+        ("login", _) => cmds::login_cmd(&paths, args, &home_dir())?,
         ("routing", _) => cmds::routing_cmd(&paths, args)?,
         ("tokensaver", _) => cmds::tokensaver_cmd(&paths, args)?,
         ("chat", _) => chat(&paths, args)?,
@@ -201,6 +214,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         ("plugin", _) | ("plugins", _) => cmds::plugin_cmd(&paths, args)?,
         ("mcp", _) => cmds::mcp_cmd(&paths, args)?,
         ("plan", _) => plan(&paths, args)?,
+        ("media", _) => media_cmd::run(&paths, args)?,
         _ => {
             println!("{}", usage());
             return Err(format!("unknown command: {cmd}").into());

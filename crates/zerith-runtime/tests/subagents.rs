@@ -1293,3 +1293,30 @@ fn multi_model_delegation_routes_subagent_to_deepseek_and_tracks_roles() {
         summary.models
     );
 }
+
+/// A child must never be able to write skills or agents: what it makes would
+/// outlive it and reach the person as if it were theirs.
+#[test]
+fn a_subagent_registry_has_no_authoring_tools() {
+    use zerith_runtime::subagent::{child_registry, resolve_agent};
+    let dir = tempfile::Builder::new()
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
+    let mut base = zerith_tools::Registry::new();
+    for t in zerith_tools::authoring_tools(zerith_tools::Authoring {
+        paths: zerith_core::Paths::with_root(dir.path()),
+        project_dir: None,
+        tools: vec!["read_file".into()],
+        mode: "default".into(),
+    }) {
+        base.register(t);
+    }
+    assert!(base.get("create_agent").is_some(), "the parent has them");
+    // `general` is the broadest child: every tool of the parent, minus these.
+    let resolved = resolve_agent(dir.path(), Some("general")).unwrap();
+    let child = child_registry(&base, &resolved, 1);
+    for name in ["create_skill", "create_agent", "delete_ai_item"] {
+        assert!(child.get(name).is_none(), "{name} leaked into a subagent");
+    }
+    assert!(child.get("read_file").is_some());
+}

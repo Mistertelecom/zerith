@@ -48,6 +48,8 @@ pub struct Settings {
     pub ui: Ui,
     pub profile: Profile,
     pub memory: MemorySettings,
+    #[serde(skip_serializing_if = "MediaSettings::is_empty")]
+    pub media: MediaSettings,
 }
 
 fn default_true() -> bool {
@@ -58,11 +60,35 @@ fn default_window_hours() -> u32 {
     5
 }
 
+/// Credential path for an account or provider. `ApiKey` is the historical one;
+/// `Oauth` means the cofre holds an `OAuthCredential` instead of a key.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthMode {
+    #[default]
+    ApiKey,
+    Oauth,
+}
+
+impl AuthMode {
+    /// `skip_serializing_if` so a plain settings file keeps its old shape.
+    fn is_api_key(&self) -> bool {
+        matches!(self, AuthMode::ApiKey)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AccountEntry {
     pub id: String,
     pub provider: String,
+    /// `api_key` (default) or `oauth`. An OAuth account keeps its credential in
+    /// the cofre under `<id>.oauth`, never in this file.
+    #[serde(default, skip_serializing_if = "AuthMode::is_api_key")]
+    pub auth: AuthMode,
+    /// `claude-code` | `codex` | `antigravity`. Only meaningful with `auth = "oauth"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_tool: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -90,6 +116,8 @@ impl Default for AccountEntry {
         Self {
             id: String::new(),
             provider: String::new(),
+            auth: AuthMode::ApiKey,
+            oauth_tool: None,
             label: None,
             protocol: None,
             base_url: None,
@@ -110,6 +138,10 @@ pub struct ComboEntry {
     pub name: String,
     #[serde(default)]
     pub models: Vec<String>,
+    /// Set = a delegation profile: picking the combo in the chat makes
+    /// `models` the orchestrator and this the model its subagents use.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subagent_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -136,8 +168,9 @@ fn non_empty(v: Option<&str>) -> Option<&str> {
 impl RoutingSettings {
     /// Resolves which model a subagent should use.
     ///
-    /// Precedence: `explicit` -> `def_model` -> `role_models[agent_name]` ->
-    /// `explore_model` / `plan_model` -> `subagent_model` -> `parent_model`.
+    /// Precedence: `explicit` -> `def_model` -> the parent combo's
+    /// `subagent_model` (a profile picked in the chat) -> `role_models[agent_name]`
+    /// -> `explore_model` / `plan_model` -> `subagent_model` -> `parent_model`.
     /// Empty or whitespace-only values are treated as absent.
     pub fn resolve_subagent_model(
         &self,
@@ -153,6 +186,7 @@ impl RoutingSettings {
         };
         non_empty(explicit)
             .or_else(|| non_empty(def_model))
+            .or_else(|| non_empty(self.combo(parent_model.trim()).and_then(|c| c.subagent_model.as_deref())))
             .or_else(|| non_empty(self.role_models.get(agent_name).map(String::as_str)))
             .or_else(|| non_empty(role_specific))
             .or_else(|| non_empty(self.subagent_model.as_deref()))
@@ -254,6 +288,9 @@ impl Default for TokenSaverSettings {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ProviderEntry {
     pub name: String,
+    /// `api_key` (default) or `oauth`, for the provider used globally.
+    #[serde(default, skip_serializing_if = "AuthMode::is_api_key")]
+    pub auth: AuthMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol: Option<WireProtocol>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -468,6 +505,60 @@ impl Default for MemorySettings {
         Self {
             paused: false,
             budget_chars: 2000,
+        }
+    }
+}
+
+/// Image and video generation (see `zerith_providers::media`). The key is not
+/// here: it lives in the keyring entry `openrouter` or in `OPENROUTER_API_KEY`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MediaSettings {
+    /// Gateway override; empty means https://openrouter.ai/api/v1.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub base_url: String,
+    /// Empty means `<data root>/media`.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub output_dir: String,
+    #[serde(skip_serializing_if = "MediaSlot::is_empty")]
+    pub image: MediaSlot,
+    #[serde(skip_serializing_if = "MediaSlot::is_empty")]
+    pub video: MediaSlot,
+}
+
+/// One generator: the chosen model and the parameters fixed for it. The chat
+/// model can write the prompt but can never change these.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MediaSlot {
+    /// Empty means "not configured": the tool is not offered to the model.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub model: String,
+    /// Ints, bools and strings (`aspect_ratio = "16:9"`, `n = 1`).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub params: BTreeMap<String, serde_json::Value>,
+}
+
+impl MediaSlot {
+    pub fn is_empty(&self) -> bool {
+        self.model.is_empty() && self.params.is_empty()
+    }
+
+    pub fn configured(&self) -> bool {
+        !self.model.trim().is_empty()
+    }
+}
+
+impl MediaSettings {
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+
+    /// Where files go: `output_dir`, or `<data root>/media`.
+    pub fn resolve_output_dir(&self, paths: &Paths) -> PathBuf {
+        match self.output_dir.trim() {
+            "" => paths.root().join("media"),
+            d => PathBuf::from(d),
         }
     }
 }
@@ -818,6 +909,61 @@ mod tests {
     }
 
     #[test]
+    fn media_section_round_trips_through_save_user_and_load() {
+        let dir = scratch();
+        let paths = Paths::with_root(dir.path().join("data"));
+        // An empty media section is not written at all.
+        Settings::save_user(&paths, |s| s.ui.reduced_motion = true).unwrap();
+        assert!(!std::fs::read_to_string(paths.settings())
+            .unwrap()
+            .contains("media"));
+        Settings::save_user(&paths, |s| {
+            s.media.base_url = "http://localhost:9/v1".into();
+            s.media.image.model = "bytedance-seed/seedream-4.5".into();
+            s.media
+                .image
+                .params
+                .insert("aspect_ratio".into(), "16:9".into());
+            s.media.image.params.insert("n".into(), 1.into());
+            s.media.video.model = "x/video".into();
+            s.media.video.params.insert("duration".into(), 5.into());
+            s.media
+                .video
+                .params
+                .insert("generate_audio".into(), false.into());
+        })
+        .unwrap();
+        let l = Settings::load_with_env(&paths, None, |_| None);
+        assert!(l.errors.is_empty(), "{:?}", l.errors);
+        let m = &l.settings.media;
+        assert_eq!(m.image.model, "bytedance-seed/seedream-4.5");
+        assert_eq!(m.image.params["aspect_ratio"], "16:9");
+        assert_eq!(m.image.params["n"], 1);
+        assert_eq!(m.video.params["duration"], 5);
+        assert_eq!(m.video.params["generate_audio"], false);
+        assert!(m.image.configured() && m.video.configured());
+        assert_eq!(m.resolve_output_dir(&paths), paths.root().join("media"));
+        // The layer on disk is hand-writable TOML.
+        write(
+            &paths.settings(),
+            "[media]\noutput_dir = \"D:/m\"\n[media.image]\nmodel = \"a/b\"\n[media.image.params]\nn = 2\nquality = \"high\"\n",
+        );
+        let l = Settings::load_with_env(&paths, None, |_| None);
+        assert!(l.errors.is_empty(), "{:?}", l.errors);
+        assert_eq!(l.settings.media.image.params["n"], 2);
+        assert_eq!(
+            l.settings.media.resolve_output_dir(&paths),
+            PathBuf::from("D:/m")
+        );
+        assert!(!l.settings.media.video.configured());
+        // A wrong type skips the layer instead of stopping the app.
+        write(&paths.settings(), "[media]\nimage = 3\n");
+        let l = Settings::load_with_env(&paths, None, |_| None);
+        assert_eq!(l.errors.len(), 1);
+        assert!(!l.settings.media.image.configured());
+    }
+
+    #[test]
     fn globs_and_rules() {
         assert!(glob_match("*", ""));
         assert!(glob_match("git *", "git status"));
@@ -982,6 +1128,29 @@ models = [\"gemini-flash\"]
     }
 
     #[test]
+    fn a_delegation_profile_picks_the_model_of_its_subagents() {
+        let mut r = RoutingSettings {
+            subagent_model: Some("global".into()),
+            ..Default::default()
+        };
+        r.combos.push(ComboEntry {
+            name: "OPUS/DEEPSEEK AGENTE".into(),
+            models: vec!["claude:claude-opus-5-5".into()],
+            subagent_model: Some("openrouter:deepseek/deepseek-v4.1-flash-1017".into()),
+        });
+        let parent = "OPUS/DEEPSEEK AGENTE";
+        assert_eq!(
+            r.resolve_subagent_model("general", None, None, parent),
+            "openrouter:deepseek/deepseek-v4.1-flash-1017"
+        );
+        // an explicit model and an agent's own model still win
+        assert_eq!(r.resolve_subagent_model("general", Some("x"), None, parent), "x");
+        assert_eq!(r.resolve_subagent_model("general", None, Some("def"), parent), "def");
+        // any other chat model keeps the global setting
+        assert_eq!(r.resolve_subagent_model("general", None, None, "gpt-5"), "global");
+    }
+
+    #[test]
     fn routing_resolve_subagent_model_precedence() {
         let mut r = RoutingSettings {
             main_model: Some("main".into()),
@@ -1106,5 +1275,45 @@ models = [\"gemini-flash\"]
         }
         assert_eq!(CavemanLevel::parse(" WenYan "), Some(CavemanLevel::Wenyan));
         assert_eq!(CavemanLevel::parse("invalid"), None);
+    }
+
+    #[test]
+    fn account_auth_defaults_to_api_key_and_round_trips_oauth() {
+        let s: Settings = toml::from_str(
+            r#"
+[[accounts]]
+id = "claude-assinatura"
+provider = "anthropic"
+auth = "oauth"
+oauth_tool = "claude-code"
+"#,
+        )
+        .unwrap();
+        assert_eq!(s.accounts[0].auth, AuthMode::Oauth);
+        assert_eq!(s.accounts[0].oauth_tool.as_deref(), Some("claude-code"));
+
+        let plain: Settings = toml::from_str(
+            r#"
+[[accounts]]
+id = "x"
+provider = "openai"
+"#,
+        )
+        .unwrap();
+        assert_eq!(plain.accounts[0].auth, AuthMode::ApiKey);
+        assert!(plain.accounts[0].oauth_tool.is_none());
+    }
+
+    /// An API-key account must serialize exactly as it did before `auth` existed.
+    #[test]
+    fn an_api_key_account_does_not_write_an_auth_field() {
+        let acc = AccountEntry {
+            id: "k".into(),
+            provider: "openai".into(),
+            ..Default::default()
+        };
+        let text = toml::to_string(&acc).unwrap();
+        assert!(!text.contains("auth"));
+        assert!(!text.contains("oauth_tool"));
     }
 }

@@ -62,6 +62,12 @@ pub struct AgentDef {
     pub skills: Vec<String>,
     pub isolation: Isolation,
     pub background: bool,
+    /// `created-by: ai`: written by the model through `create_agent`. The UI
+    /// shows these with an `IA` badge; the AI may edit or delete only these.
+    pub created_by_ai: bool,
+    /// `disabled: true`: on disk but invisible to [`list`] and [`find`] until
+    /// the person enables it ([`set_disabled`]). AI-created agents start so.
+    pub disabled: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -99,6 +105,24 @@ impl AgentDef {
     }
 }
 
+/// Strips ONE matching pair of quotes. `trim_matches` would eat every quote at
+/// the ends, so a value like `disse 'x'` would lose its closing one.
+fn unquote(s: &str) -> String {
+    let b = s.as_bytes();
+    if b.len() >= 2 && (b[0] == b'"' || b[0] == b'\'') && b[b.len() - 1] == b[0] {
+        s[1..s.len() - 1].to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// Tool names with Claude Code's spellings mapped to Zerith's and any
+/// `(specifier)` dropped. Used to compare what an agent asks for with what a
+/// turn has.
+pub fn canonical_names(list: &[String]) -> Vec<String> {
+    names(list)
+}
+
 fn names(list: &[String]) -> Vec<String> {
     list.iter()
         .map(|t| canonical(t.split('(').next().unwrap_or(t).trim()))
@@ -126,12 +150,19 @@ pub fn list(paths: &Paths, project_dir: Option<&Path>) -> Vec<AgentDef> {
     list_checked(paths, project_dir).0
 }
 
+/// Like [`list`], but also the agents switched off (`disabled: true`), for the
+/// screen where the person reviews and enables them. Nothing else should use
+/// this: a disabled agent must not be reachable from a turn or a plan.
+pub fn list_all(paths: &Paths, project_dir: Option<&Path>) -> Vec<AgentDef> {
+    collect(paths, project_dir, &[], true).0
+}
+
 /// [`list`] plus one warning per name clash. Project beats user (the project
 /// definition replaces the user's); two files of the *same* layer with the
 /// same name (`a.md`, and `name: a` inside `b.md`) keep the first in
 /// file-name order and warn, so the outcome never depends on directory order.
 pub fn list_checked(paths: &Paths, project_dir: Option<&Path>) -> (Vec<AgentDef>, Vec<String>) {
-    collect_with_extra(paths, project_dir, &[])
+    collect(paths, project_dir, &[], false)
 }
 
 /// Every agent visible from `project_dir`, including plugin-contributed files.
@@ -142,13 +173,14 @@ pub fn list_with_extra(
     project_dir: Option<&Path>,
     extra_files: &[(String, PathBuf)],
 ) -> Vec<AgentDef> {
-    collect_with_extra(paths, project_dir, extra_files).0
+    collect(paths, project_dir, extra_files, false).0
 }
 
-fn collect_with_extra(
+fn collect(
     paths: &Paths,
     project_dir: Option<&Path>,
     extra_files: &[(String, PathBuf)],
+    include_disabled: bool,
 ) -> (Vec<AgentDef>, Vec<String>) {
     let mut out: Vec<AgentDef> = Vec::new();
     let mut warnings = Vec::new();
@@ -180,6 +212,12 @@ fn collect_with_extra(
                 None => out.push(def),
             }
         }
+    }
+    if !include_disabled {
+        out.retain(|a| !a.disabled);
+    }
+    if !include_disabled {
+        out.retain(|a| !a.disabled);
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     (out, warnings)
@@ -257,6 +295,8 @@ pub fn parse(name: String, text: &str, path: PathBuf, layer: &'static str) -> Ag
     let mut skills = Vec::new();
     let mut isolation = Isolation::None;
     let mut background = false;
+    let mut created_by_ai = false;
+    let mut disabled = false;
     let lines: Vec<&str> = header.lines().collect();
     let mut i = 0;
     while i < lines.len() {
@@ -270,7 +310,7 @@ pub fn parse(name: String, text: &str, path: PathBuf, layer: &'static str) -> Ag
             continue;
         };
         let raw = v.trim();
-        let v = raw.trim_matches(|c| c == '"' || c == '\'').to_string();
+        let v = unquote(raw);
         // A YAML block list: the `- item` lines that follow an empty value.
         let mut block = Vec::new();
         if raw.is_empty() {
@@ -302,6 +342,8 @@ pub fn parse(name: String, text: &str, path: PathBuf, layer: &'static str) -> Ag
                 }
             }
             "background" => background = v == "true",
+            "created-by" | "created_by" => created_by_ai = v.eq_ignore_ascii_case("ai"),
+            "disabled" => disabled = v.eq_ignore_ascii_case("true"),
             _ => {}
         }
     }
@@ -339,6 +381,8 @@ pub fn parse(name: String, text: &str, path: PathBuf, layer: &'static str) -> Ag
         skills,
         isolation,
         background,
+        created_by_ai,
+        disabled,
     }
 }
 
@@ -356,7 +400,7 @@ fn split_list(raw: &str) -> Vec<String> {
         .trim_start_matches('[')
         .trim_end_matches(']')
         .split(',')
-        .map(|x| x.trim().trim_matches(|c| c == '"' || c == '\'').to_string())
+        .map(|x| unquote(x.trim()))
         .filter(|x| !x.is_empty())
         .collect()
 }

@@ -243,21 +243,26 @@ pub fn run(conn: &mut Connection) -> rusqlite::Result<i32> {
              applied_at INTEGER NOT NULL
          );",
     )?;
-    let done: std::collections::HashSet<i32> = {
-        let mut st = conn.prepare("SELECT version FROM schema_migrations")?;
-        let rows = st.query_map([], |r| r.get(0))?;
-        rows.collect::<rusqlite::Result<_>>()?
-    };
-    let all = MIGRATIONS
+    let all: Vec<(i32, &str)> = MIGRATIONS
         .iter()
         .enumerate()
         .map(|(i, sql)| (i as i32 + 1, *sql))
-        .chain(VERSIONED.iter().copied());
+        .chain(VERSIONED.iter().copied())
+        .collect();
     for (version, sql) in all {
-        if done.contains(&version) {
+        // `BEGIN IMMEDIATE` takes the write lock first, so a second connection
+        // opening the same fresh file waits here and then sees what the first
+        // one applied. Checking "already done?" before the lock let both run
+        // the same migration ("table sessions already exists").
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let applied: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = ?1)",
+            [version],
+            |r| r.get(0),
+        )?;
+        if applied {
             continue;
         }
-        let tx = conn.transaction()?;
         tx.execute_batch(sql)?;
         tx.execute(
             "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",

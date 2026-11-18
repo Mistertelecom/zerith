@@ -110,9 +110,15 @@ impl Library {
         }
     }
 
-    fn save(&self, m: &Manifest) -> Result<()> {
+    /// Temp file + rename: a crash or a concurrent reader never sees half a
+    /// manifest.
+    pub(crate) fn save(&self, m: &Manifest) -> Result<()> {
         let path = self.root.join("manifest.json");
-        std::fs::write(path, serde_json::to_vec_pretty(m)?)?;
+        let tmp = self.root.join("manifest.json.tmp");
+        std::fs::write(&tmp, serde_json::to_vec_pretty(m)?)?;
+        std::fs::rename(&tmp, &path).inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })?;
         Ok(())
     }
 
@@ -215,6 +221,57 @@ impl Library {
             .ok_or_else(|| InstallError::Missing(name.to_string()))?;
         row.status = status;
         self.save(&m)
+    }
+
+    /// Offers a folder of ready-made skills (the ones that ship with the app)
+    /// to this library, **disabled**, once.
+    ///
+    /// - A skill already in the library is left alone: yours wins.
+    /// - A skill you removed stays removed: its name is recorded in
+    ///   `bundled-seen.json`, so the next start does not bring it back.
+    /// - Nothing is enabled and nothing runs. They show up in the Skills screen
+    ///   ready to be reviewed and switched on.
+    ///
+    /// Returns the names added. A skill that fails to install is skipped and
+    /// reported in the second value; one bad folder must not stop the rest.
+    pub fn seed_disabled(&self, bundle: &Path) -> Result<(Vec<String>, Vec<String>)> {
+        let seen_path = self.root.join("bundled-seen.json");
+        let mut seen: Vec<String> = std::fs::read(&seen_path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+        let mut added = Vec::new();
+        let mut failed = Vec::new();
+        let Ok(entries) = std::fs::read_dir(bundle) else {
+            return Ok((added, failed));
+        };
+        let mut dirs: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.join("SKILL.md").is_file())
+            .collect();
+        dirs.sort();
+        for dir in dirs {
+            let folder = dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if seen.contains(&folder) {
+                continue;
+            }
+            match self.install(&dir, &format!("bundled:{folder}")) {
+                Ok(row) => {
+                    self.set_status(&row.name, Status::Disabled)?;
+                    added.push(row.name);
+                    seen.push(folder);
+                }
+                // Already there (the user installed it first): count it as seen.
+                Err(InstallError::NameConflict(_)) => seen.push(folder),
+                Err(e) => failed.push(format!("{folder}: {e}")),
+            }
+        }
+        std::fs::write(&seen_path, serde_json::to_vec_pretty(&seen)?)?;
+        Ok((added, failed))
     }
 
     /// Removes the files and the row. The backup copies are left alone: a
@@ -342,7 +399,7 @@ pub fn validate_dir_name(name: &str) -> Result<()> {
 
 /// Recursive copy that follows no symlink and caps depth. A skill is a small
 /// directory; one that is not gets refused rather than walked forever.
-fn copy_dir(from: &Path, to: &Path) -> Result<()> {
+pub(crate) fn copy_dir(from: &Path, to: &Path) -> Result<()> {
     copy_at(from, to, 0)
 }
 
@@ -382,6 +439,14 @@ mod tests {
         p
     }
 
+    /// A fresh, empty directory per call: `scratch()` is shared by every test.
+    fn unique(tag: &str) -> PathBuf {
+        let p = scratch().join(format!("{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
     fn write_skill(dir: &Path, name: &str, body: &str) {
         std::fs::create_dir_all(dir).unwrap();
         std::fs::write(
@@ -414,6 +479,60 @@ mod tests {
             lib.install(&src, "b"),
             Err(InstallError::NameConflict(_))
         ));
+    }
+
+    /// Diagnostic: seeds the real `bundled-skills` folder into a scratch root.
+    #[test]
+    #[ignore]
+    fn seeds_the_shipped_bundle() {
+        let bundle = std::env::var_os("SEED_FROM")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../bundled-skills"));
+        let lib = Library::open(std::env::var_os("SEED_TO").map(PathBuf::from).unwrap_or_else(|| unique("real-seed"))).unwrap();
+        let r = lib.seed_disabled(&bundle);
+        eprintln!("{r:?}");
+        r.unwrap();
+    }
+
+    #[test]
+    fn bundled_skills_arrive_disabled_once_and_stay_removed() {
+        let root = unique("seed-root");
+        let bundle = unique("seed-bundle");
+        write_skill(&bundle.join("alpha"), "alpha", "body a");
+        write_skill(&bundle.join("beta"), "beta", "body b");
+        let lib = Library::open(root.join("lib")).unwrap();
+
+        let (added, failed) = lib.seed_disabled(&bundle).unwrap();
+        assert_eq!(added, vec!["alpha", "beta"]);
+        assert!(failed.is_empty());
+        // Present, but off: nothing is offered to the model until reviewed.
+        assert!(lib.enabled().unwrap().is_empty());
+        assert_eq!(lib.manifest().unwrap().skills.len(), 2);
+
+        // A skill the user removed is not brought back by the next start.
+        lib.remove("alpha").unwrap();
+        let (again, _) = lib.seed_disabled(&bundle).unwrap();
+        assert!(again.is_empty(), "{again:?}");
+        assert!(!lib
+            .manifest()
+            .unwrap()
+            .skills
+            .iter()
+            .any(|s| s.name == "alpha"));
+    }
+
+    #[test]
+    fn a_skill_the_user_already_has_is_not_overwritten_by_the_bundle() {
+        let root = unique("keep-root");
+        let bundle = unique("keep-bundle");
+        write_skill(&bundle.join("alpha"), "alpha", "bundled body");
+        let lib = Library::open(root.join("lib")).unwrap();
+        let src = unique("keep-src");
+        write_skill(&src.join("alpha"), "alpha", "my own body");
+        lib.install(&src.join("alpha"), "mine").unwrap();
+        let (added, _) = lib.seed_disabled(&bundle).unwrap();
+        assert!(added.is_empty());
+        assert!(lib.load_body("alpha").unwrap().contains("my own body"));
     }
 
     #[test]

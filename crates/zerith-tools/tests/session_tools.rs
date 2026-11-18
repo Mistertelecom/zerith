@@ -581,3 +581,51 @@ fn shell_runs_jailed_and_a_timeout_kills_the_tree() {
         "timeout did not stop the tree: {err}"
     );
 }
+
+/// The point of shipping a program with a skill: the model's shell finds it
+/// with no install step and without touching the user's own PATH. Uses a tiny
+/// stand-in program so the test needs no real tool.
+#[test]
+#[cfg(windows)]
+fn the_shell_finds_a_program_that_ships_with_the_app() {
+    use zerith_providers::Cancel;
+    use zerith_security::{Mode, Policy, PRESETS};
+
+    let dir = tempfile::Builder::new()
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
+    let tools = dir.path().join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    // A batch file named like a program: `zerith-bundled-probe` on PATH.
+    std::fs::write(
+        tools.join("zerith-bundled-probe.cmd"),
+        "@echo bundled-ok\r\n",
+    )
+    .unwrap();
+
+    let policy = Policy::new(&PRESETS[2], Mode::Bypass, dir.path());
+    let reg = zerith_tools::Registry::new();
+    let ctx = zerith_tools::CallCtx {
+        workspace: dir.path(),
+        policy: &policy,
+        memory: None,
+        scope: None,
+    };
+    let run = |cmd: &str| {
+        reg.run_approved(
+            "shell",
+            &serde_json::json!({"command": cmd}),
+            &ctx,
+            &Cancel::default(),
+        )
+    };
+
+    // Not on the user's PATH: not found.
+    assert!(run("zerith-bundled-probe").is_err());
+
+    // Same call with the bundled folder announced: found.
+    std::env::set_var("ZERITH_BUNDLED_TOOLS", &tools);
+    let out = run("zerith-bundled-probe").expect("found through the bundled folder");
+    std::env::remove_var("ZERITH_BUNDLED_TOOLS");
+    assert!(out.contains("bundled-ok"), "{out}");
+}

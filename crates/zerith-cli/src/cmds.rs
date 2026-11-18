@@ -526,8 +526,42 @@ pub fn keyring_check() -> Check {
 
 pub fn doctor(paths: &Paths, args: &[String]) -> Res {
     let offline = parse_doctor(args)?;
-    paths.ensure()?;
     let mut checks: Vec<Check> = Vec::new();
+    // First, the part that decides whether anything else can work: can every
+    // data folder be created and written? Reported per folder, not as one
+    // "Acesso negado" from whichever step happened to fail first.
+    let folders = paths.check_writable();
+    for f in &folders {
+        checks.push(Check {
+            name: "pasta de dados",
+            ok: f.ok(),
+            detail: match &f.problem {
+                None => f.dir.display().to_string(),
+                Some(p) => format!("{}: {p}", f.dir.display()),
+            },
+        });
+    }
+    if let Some(bad) = folders.iter().find(|f| !f.ok()) {
+        for c in &checks {
+            println!(
+                "{:<24} {}  {}",
+                c.name,
+                if c.ok { "ok  " } else { "FALHA" },
+                c.detail
+            );
+        }
+        println!();
+        println!("Para corrigir, revise e rode você mesmo (o Zerith não altera permissões):");
+        for step in zerith_core::diagnose::repair_steps(&paths.root) {
+            println!("  {step}");
+        }
+        return Err(format!(
+            "a pasta {} não é gravável; nada mais foi verificado",
+            bad.dir.display()
+        )
+        .into());
+    }
+    paths.ensure()?;
     let store = Store::open(paths.db())?;
     println!("db            {}", paths.db().display());
     println!("schema        v{}", store.schema_version()?);
@@ -1443,6 +1477,7 @@ pub fn routing_cmd(paths: &Paths, args: &[String]) -> Res {
             let entry = ComboEntry {
                 name: name.clone(),
                 models: models.clone(),
+                subagent_model: None,
             };
             let mut replaced = false;
             Settings::save_user(paths, |s| {
@@ -2092,5 +2127,278 @@ mod tests {
 
         usage_cmd(&paths, &v(&["usage", "--hours", "24"])).unwrap();
         usage_cmd(&paths, &v(&["quota", "--hours", "0"])).unwrap();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// login (OAuth)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct LoginArgs {
+    tool: zerith_providers::OAuthTool,
+    account: String,
+    import: bool,
+    from_9router: bool,
+    no_browser: bool,
+}
+
+fn login_args(args: &[String]) -> Result<LoginArgs, String> {
+    let tool = zerith_providers::OAuthTool::parse(args.get(1).map(String::as_str).unwrap_or(""))
+        .ok_or_else(|| {
+            "uso: zerith login <claude-code|codex|antigravity> [--account <id>] [--import | --from-9router] [--no-browser]"
+                .to_string()
+        })?;
+    let mut account = tool.as_str().to_string();
+    let mut import = false;
+    let mut no_browser = false;
+    let mut from_9router = false;
+    let mut i = 2;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--account" => {
+                account = args
+                    .get(i + 1)
+                    .filter(|s| !s.trim().is_empty())
+                    .ok_or("--account precisa de um valor")?
+                    .clone();
+                i += 2;
+                continue;
+            }
+            "--import" => import = true,
+            "--no-browser" => no_browser = true,
+            "--from-9router" => from_9router = true,
+            other => return Err(format!("flag desconhecida: {other}")),
+        }
+        i += 1;
+    }
+    Ok(LoginArgs {
+        tool,
+        account,
+        import,
+        no_browser,
+        from_9router,
+    })
+}
+
+/// The provider an OAuth tool speaks. Codex and Antigravity have their own
+/// preset (own base URL and protocol); Claude Code reuses the Anthropic one.
+fn oauth_provider(tool: zerith_providers::OAuthTool) -> &'static str {
+    match tool {
+        zerith_providers::OAuthTool::ClaudeCode => "anthropic",
+        zerith_providers::OAuthTool::Codex => "codex",
+        zerith_providers::OAuthTool::Antigravity => "antigravity",
+    }
+}
+
+pub fn login_cmd(paths: &Paths, args: &[String], home: &Path) -> Res {
+    login_cmd_with(paths, args, home, &zerith_core::secrets::OsKeyring)
+}
+
+/// Same as `login_cmd` with the cofre injected (tests use a map).
+pub fn login_cmd_with(
+    paths: &Paths,
+    args: &[String],
+    home: &Path,
+    store: &dyn zerith_core::secrets::SecretStore,
+) -> Res {
+    use zerith_providers::oauth;
+
+    let a = login_args(args)?;
+
+    let cred = if a.from_9router {
+        let db = std::env::var_os("APPDATA")
+            .map(std::path::PathBuf::from)
+            .ok_or("não sei a pasta do usuário")?
+            .join("9router/db/data.sqlite");
+        oauth::import_from_9router(a.tool, &db).ok_or_else(|| {
+            format!(
+                "o 9router não tem conexão ativa de {} em {}",
+                a.tool.as_str(),
+                db.display()
+            )
+        })?
+    } else if a.import {
+        // ponytail: an imported credential is stored as-is; the runtime renews
+        // it on the next turn, where a failed refresh falls back to failover.
+        oauth::import_local(a.tool, home).ok_or_else(|| {
+            format!(
+                "nenhuma credencial local de {} encontrada em {}",
+                a.tool.as_str(),
+                home.display()
+            )
+        })?
+    } else {
+        let pkce = oauth::Pkce::generate();
+        let state = oauth::random_state();
+        if let Err(why) = oauth::ready(a.tool) {
+            return Err(why.into());
+        }
+        // bind before the browser: a busy fixed port fails here, not after consent
+        let (listener, port) = oauth::bind(a.tool)?;
+        let url = oauth::authorize_url(a.tool, &pkce, &state, port);
+        println!("Abra no navegador:\n  {url}\n");
+        if !a.no_browser {
+            let _ = oauth::open_browser(&url);
+        }
+        println!("Aguardando o retorno em http://127.0.0.1:{port} …");
+        let code = oauth::wait_for_code(listener, oauth::redirect_path(a.tool), &state)?;
+        oauth::exchange(
+            a.tool,
+            &code,
+            &pkce.verifier,
+            &oauth::redirect_uri(a.tool, port),
+        )?
+    };
+
+    zerith_core::secrets::save_oauth(store, &a.account, &cred)?;
+
+    let id = a.account.clone();
+    let provider = oauth_provider(a.tool).to_string();
+    let tool_name = a.tool.as_str().to_string();
+    Settings::save_user(paths, |s| {
+        let entry = AccountEntry {
+            id: id.clone(),
+            provider: provider.clone(),
+            auth: zerith_core::settings::AuthMode::Oauth,
+            oauth_tool: Some(tool_name.clone()),
+            ..Default::default()
+        };
+        match s.accounts.iter_mut().find(|x| x.id == id) {
+            Some(slot) => *slot = entry,
+            None => s.accounts.push(entry),
+        }
+    })?;
+
+    let minutes = (cred.expires_at - oauth::now_secs()).max(0) / 60;
+    println!(
+        "conta {} conectada via {} (expira em {} min)",
+        a.account,
+        a.tool.as_str(),
+        minutes
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod login_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    struct Mem(RefCell<HashMap<String, String>>);
+
+    impl zerith_core::secrets::SecretStore for Mem {
+        fn get(&self, n: &str) -> Result<String, zerith_core::secrets::SecretError> {
+            self.0
+                .borrow()
+                .get(n)
+                .cloned()
+                .ok_or_else(|| zerith_core::secrets::SecretError::NotFound(n.into()))
+        }
+        fn set(&self, n: &str, v: &str) -> Result<(), zerith_core::secrets::SecretError> {
+            self.0.borrow_mut().insert(n.into(), v.into());
+            Ok(())
+        }
+        fn delete(&self, n: &str) -> Result<(), zerith_core::secrets::SecretError> {
+            self.0
+                .borrow_mut()
+                .remove(n)
+                .map(|_| ())
+                .ok_or_else(|| zerith_core::secrets::SecretError::NotFound(n.into()))
+        }
+    }
+
+    fn v(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn login_flags_parse_tool_account_import_and_no_browser() {
+        let a = login_args(&v(&[
+            "login",
+            "codex",
+            "--account",
+            "codex-work",
+            "--import",
+            "--no-browser",
+        ]))
+        .unwrap();
+        assert_eq!(a.tool, zerith_providers::OAuthTool::Codex);
+        assert_eq!(a.account, "codex-work");
+        assert!(a.import);
+        assert!(a.no_browser);
+
+        let d = login_args(&v(&["login", "claude-code"])).unwrap();
+        assert_eq!(d.account, "claude-code");
+        assert!(!d.import && !d.no_browser);
+    }
+
+    #[test]
+    fn login_rejects_an_unknown_tool_and_a_dangling_account_flag() {
+        let e = login_args(&v(&["login", "kiro"])).unwrap_err();
+        assert!(e.contains("claude-code"), "{e}");
+        assert!(login_args(&v(&["login", "codex", "--account"])).is_err());
+        assert!(login_args(&v(&["login", "codex", "--wat"])).is_err());
+    }
+
+    #[test]
+    fn import_writes_the_credential_and_an_oauth_account() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-scratch/login-import");
+        let home = root.join("home");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::fs::write(
+            home.join(".codex/auth.json"),
+            r#"{"tokens":{"access_token":"AT","refresh_token":"RT","account_id":"acc"}}"#,
+        )
+        .unwrap();
+
+        let paths = Paths::with_root(root.join("z"));
+        let store = Mem(RefCell::default());
+        login_cmd_with(
+            &paths,
+            &v(&["login", "codex", "--account", "codex-work", "--import"]),
+            &home,
+            &store,
+        )
+        .unwrap();
+
+        let cred = zerith_core::secrets::load_oauth(&store, "codex-work")
+            .unwrap()
+            .expect("credencial gravada");
+        assert_eq!(cred.access_token, "AT");
+        assert_eq!(cred.tool, zerith_providers::OAuthTool::Codex);
+
+        let settings = Settings::load(&paths, None).settings;
+        let acc = settings
+            .accounts
+            .iter()
+            .find(|a| a.id == "codex-work")
+            .expect("conta criada");
+        assert_eq!(acc.auth, zerith_core::settings::AuthMode::Oauth);
+        assert_eq!(acc.oauth_tool.as_deref(), Some("codex"));
+        assert_eq!(acc.provider, "codex");
+        // the token never lands in settings.toml
+        let text = std::fs::read_to_string(paths.settings()).unwrap();
+        assert!(!text.contains("AT"));
+    }
+
+    #[test]
+    fn import_without_a_local_credential_says_so_and_writes_nothing() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-scratch/login-nothing");
+        let home = root.join("home");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&home).unwrap();
+
+        let paths = Paths::with_root(root.join("z"));
+        let store = Mem(RefCell::default());
+        let e = login_cmd_with(&paths, &v(&["login", "codex", "--import"]), &home, &store)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("nenhuma credencial local"), "{e}");
+        assert!(zerith_core::secrets::load_oauth(&store, "codex").unwrap().is_none());
     }
 }

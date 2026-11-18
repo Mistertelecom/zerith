@@ -17,6 +17,11 @@ pub struct Frontmatter {
     /// Arbitrary `metadata:` key/value pairs, kept as strings per the spec.
     pub metadata: Vec<(String, String)>,
     pub allowed_tools: Option<String>,
+    /// Header fields the spec does not define (`tags`, `requirements`,
+    /// `version`...), kept verbatim as `(key, raw value)`. They are shown to the
+    /// person and never acted on: a skill cannot make the harness do something
+    /// by naming it here.
+    pub extra: Vec<(String, String)>,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -72,10 +77,38 @@ pub fn parse(text: &str) -> Result<(Frontmatter, &str), FrontmatterError> {
     let (header, body) = split(text)?;
     let mut fm = Frontmatter::default();
     let mut in_metadata = false;
+    // Where a continuation line (an indented value, a `- item`) belongs.
+    let mut open_extra: Option<usize> = None;
+    let mut open_folded = false;
     for line in header {
         if line.trim().is_empty() || line.trim_start().starts_with('#') {
             continue;
         }
+        let indented = line.starts_with([' ', '\t']) || line.trim_start().starts_with("- ");
+        // A folded block (`description: >`) or a list under an unknown key:
+        // the continuation lines belong to the previous field.
+        if indented && !in_metadata {
+            if open_folded {
+                let cont = line.trim();
+                if fm.description.is_empty() {
+                    fm.description = cont.to_string();
+                } else {
+                    fm.description.push(' ');
+                    fm.description.push_str(cont);
+                }
+                continue;
+            }
+            if let Some(i) = open_extra {
+                let slot = &mut fm.extra[i].1;
+                if !slot.is_empty() {
+                    slot.push_str(", ");
+                }
+                slot.push_str(line.trim().trim_start_matches("- ").trim());
+                continue;
+            }
+        }
+        open_extra = None;
+        open_folded = false;
         // Nested `metadata:` entries are indented under the key.
         if in_metadata {
             if let Some(rest) = line.strip_prefix("  ") {
@@ -93,7 +126,14 @@ pub fn parse(text: &str) -> Result<(Frontmatter, &str), FrontmatterError> {
         let value = value.trim();
         match key {
             "name" => fm.name = unquote(value),
-            "description" => fm.description = unquote(value),
+            "description" => {
+                if matches!(value, ">" | "|" | ">-" | "|-") {
+                    open_folded = true;
+                    fm.description.clear();
+                } else {
+                    fm.description = unquote(value);
+                }
+            }
             "license" => fm.license = Some(unquote(value)),
             "compatibility" => fm.compatibility = Some(unquote(value)),
             "allowed-tools" => fm.allowed_tools = Some(unquote(value)),
@@ -105,7 +145,13 @@ pub fn parse(text: &str) -> Result<(Frontmatter, &str), FrontmatterError> {
                 }
                 in_metadata = true;
             }
-            other => return Err(FrontmatterError::Unknown(other.to_string())),
+            other => {
+                // A key the spec does not define. Kept for display; a typo like
+                // `descripton` still fails because `description` is then
+                // missing and `validate` says so.
+                fm.extra.push((other.to_string(), unquote(value)));
+                open_extra = Some(fm.extra.len() - 1);
+            }
         }
     }
     validate(&fm)?;
@@ -224,9 +270,33 @@ mod tests {
             parse("---\nname: a\n---\n"),
             Err(FrontmatterError::Field(_))
         ));
+        // A key the spec does not define is kept for display, not an error.
+        let (fm, _) = parse("---\nname: a\ndescription: d\ncolor: red\n---\n").unwrap();
+        assert_eq!(fm.extra, vec![("color".to_string(), "red".to_string())]);
+    }
+
+    #[test]
+    fn a_typo_in_a_required_field_still_fails() {
+        // `descripton` becomes an extra field, so `description` is missing.
         assert!(matches!(
-            parse("---\nname: a\ndescription: d\ncolor: red\n---\n"),
-            Err(FrontmatterError::Unknown(_))
+            parse("---\nname: a\ndescripton: d\n---\n"),
+            Err(FrontmatterError::Field(_))
         ));
+    }
+
+    #[test]
+    fn folded_descriptions_and_list_fields_from_real_skills_parse() {
+        let doc = "---\nname: agent-desktop\ntags: computer-use, gui\nrequirements:\n  - agent-desktop\n  - node\ndescription: >\n  Operate desktop apps\n  through accessibility.\n---\nbody";
+        let (fm, body) = parse(doc).unwrap();
+        assert_eq!(
+            fm.description,
+            "Operate desktop apps through accessibility."
+        );
+        assert_eq!(fm.extra[0], ("tags".into(), "computer-use, gui".into()));
+        assert_eq!(
+            fm.extra[1],
+            ("requirements".into(), "agent-desktop, node".into())
+        );
+        assert_eq!(body, "body");
     }
 }

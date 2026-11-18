@@ -8,9 +8,11 @@
 //!    user takes after seeing the scan. A malicious skill cannot get code
 //!    execution from installing it.
 
+pub mod author;
 pub mod catalog;
 pub mod frontmatter;
 pub mod install;
+pub mod remote;
 pub mod scan;
 
 pub use frontmatter::{parse, Frontmatter, FrontmatterError};

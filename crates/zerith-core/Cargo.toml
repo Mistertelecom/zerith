@@ -10,6 +10,9 @@ serde_json.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 keyring.workspace = true
+# `OAuthCredential` lives with the providers: the cofre stores it, it does not
+# define it.
+zerith-providers = { path = "../zerith-providers" }
 
 [dev-dependencies]
 tempfile.workspace = true

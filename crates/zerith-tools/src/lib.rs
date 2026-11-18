@@ -12,10 +12,12 @@
 
 mod agent_tool;
 mod ask_user;
+mod authoring;
 mod builtin;
 mod fntool;
 mod host;
 mod jobs;
+mod media;
 mod skill_tool;
 mod tasks;
 mod web;
@@ -29,8 +31,10 @@ use zerith_providers::Cancel;
 use zerith_security::{Action, Policy, Verdict};
 
 pub use ask_user::{parse_questions, Question, QuestionOption};
+pub use authoring::{tools as authoring_tools, Authoring};
 pub use builtin::shell_command;
 pub use host::{AgentRequest, EventSink, Host, HostEvent, Services, SkillLoad};
+pub use media::{tools as media_tools, tools_with_key as media_tools_with_key};
 pub use skill_tool::check as check_skill_args;
 pub use tasks::{check as check_task_args, STATUSES as TASK_STATUSES};
 pub use web::SearchTool;
@@ -180,6 +184,7 @@ impl Registry {
     pub fn new() -> Self {
         let mut tools: Vec<Arc<dyn Tool>> = builtin::all().into_iter().map(Arc::from).collect();
         tools.extend(fntool::extra().into_iter().map(Arc::from));
+        tools.extend(media::all().into_iter().map(Arc::from));
         Self {
             tools,
             host: Host::default(),

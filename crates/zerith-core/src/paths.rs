@@ -5,6 +5,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::diagnose;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Paths {
     pub root: PathBuf,
@@ -58,15 +60,73 @@ impl Paths {
         self.root.join("skills")
     }
 
+    /// The ready-made skills that ship with the app: a `bundled-skills` folder
+    /// next to the executable, or `ZERITH_BUNDLED_SKILLS` to point elsewhere
+    /// (a dev checkout). `None` when there is no such folder.
+    pub fn bundled_skills(&self) -> Option<PathBuf> {
+        let explicit = std::env::var_os("ZERITH_BUNDLED_SKILLS").map(PathBuf::from);
+        let beside_exe = std::env::current_exe()
+            .ok()
+            .and_then(|e| e.parent().map(|d| d.join("bundled-skills")));
+        explicit.into_iter().chain(beside_exe).find(|p| p.is_dir())
+    }
+
+    /// Programs that ship with the app and that skills rely on (for example
+    /// `agent-desktop`): a `bundled-tools` folder next to the executable, or
+    /// `ZERITH_BUNDLED_TOOLS`. `None` when there is none.
+    pub fn bundled_tools(&self) -> Option<PathBuf> {
+        let explicit = std::env::var_os("ZERITH_BUNDLED_TOOLS").map(PathBuf::from);
+        let beside_exe = std::env::current_exe()
+            .ok()
+            .and_then(|e| e.parent().map(|d| d.join("bundled-tools")));
+        explicit.into_iter().chain(beside_exe).find(|p| p.is_dir())
+    }
+
     pub fn backups(&self) -> PathBuf {
         self.root.join("backups")
     }
 
+    /// The folders the app writes to, relative to the root.
+    pub const FOLDERS: [&'static str; 3] = ["", "skills", "backups"];
+
+    /// Creates the data folders. A failure names the folder and the operation,
+    /// because "Acesso negado" alone leaves the user guessing which of several
+    /// paths it was; the folder is also probed so the message can say why.
     pub fn ensure(&self) -> std::io::Result<()> {
-        std::fs::create_dir_all(&self.root)?;
-        std::fs::create_dir_all(self.skills())?;
-        std::fs::create_dir_all(self.backups())?;
+        for sub in Self::FOLDERS {
+            let dir = if sub.is_empty() {
+                self.root.clone()
+            } else {
+                self.root.join(sub)
+            };
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                return Err(std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "não consegui criar a pasta {}: {e}{}",
+                        dir.display(),
+                        diagnose::hint(&dir, &e)
+                    ),
+                ));
+            }
+        }
         Ok(())
+    }
+
+    /// Checks that every data folder can be created, written and deleted in,
+    /// by really doing it. Never changes permissions.
+    pub fn check_writable(&self) -> Vec<diagnose::FolderCheck> {
+        Self::FOLDERS
+            .iter()
+            .map(|sub| {
+                let dir = if sub.is_empty() {
+                    self.root.clone()
+                } else {
+                    self.root.join(sub)
+                };
+                diagnose::probe(&dir)
+            })
+            .collect()
     }
 
     pub fn is_inside(&self, path: &Path) -> bool {

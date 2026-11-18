@@ -315,11 +315,14 @@ fn filter_git_log(text: &str) -> Option<String> {
         if in_diff {
             continue;
         }
+        // `--stat` rows (` path | 12 ++-`) are what the caller asked for: keep them
+        let stat_row = line.starts_with(' ') && !line.starts_with("    ") && line.contains(" | ");
         if line.starts_with("Author:")
             || line.starts_with("Date:")
             || line.starts_with("Merge:")
             || line.contains("files changed")
             || line.contains("file changed")
+            || stat_row
         {
             kept.push(line);
         } else if line.starts_with("    ") && !line.trim().is_empty() && !kept_subject {
@@ -999,6 +1002,20 @@ fn filter_smart_truncate(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_log_keeps_the_stat_rows_it_was_asked_for() {
+        let mut log = String::new();
+        for n in 0..6 {
+            log.push_str(&format!(
+                "commit {n}abcdef1234567\nAuthor: a <a@b>\nDate:   Mon\n\n    subject {n}\n\n    body line\n\n crates/x/App.tsx | 12 ++--\n src/lib.rs | 3 +\n 2 files changed, 10 insertions(+)\n\n"
+            ));
+        }
+        let out = compress_tool_output("shell", &log);
+        assert_eq!(out.filter, Some("git-log"));
+        assert_eq!(out.text.matches("App.tsx | 12").count(), 6, "{}", out.text);
+        assert!(!out.text.contains("body line"));
+    }
 
     #[test]
     fn ponytail_and_caveman_prompts_match_levels() {

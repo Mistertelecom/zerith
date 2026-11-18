@@ -111,6 +111,16 @@ fn client(url: &str, context_limit: Option<u32>) -> Client {
     })
 }
 
+/// A turn context that does not read `AGENTS.md` from the repository these tests
+/// run in: its 50 KB would fill the context window the pressure tests size on
+/// purpose, and a test must not change with the contents of the checkout.
+fn quiet() -> TurnContext<'static> {
+    TurnContext {
+        no_project_instructions: true,
+        ..TurnContext::default()
+    }
+}
+
 fn tmp() -> tempfile::TempDir {
     tempfile::Builder::new()
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
@@ -150,7 +160,7 @@ fn run(
     let r = run_agent_turn(
         store,
         &client(&fake.url, limit),
-        TurnContext::default(),
+        quiet(),
         opts,
         sid,
         "m",
@@ -359,7 +369,7 @@ fn cancel_cause_defaults_to_user_and_can_be_a_hook() {
     let err = run_agent_turn(
         &store,
         &client(&fake.url, None),
-        TurnContext::default(),
+        quiet(),
         AgentOptions::default(),
         &sid,
         "m",
@@ -393,7 +403,7 @@ fn cancel_cause_defaults_to_user_and_can_be_a_hook() {
     let _ = run_agent_turn(
         &store,
         &client(&fake.url, None),
-        TurnContext::default(),
+        quiet(),
         AgentOptions {
             cancel_cause: Some(&slot),
             ..Default::default()
@@ -492,7 +502,7 @@ fn mw_turn(
     run_agent_turn(
         &store,
         &client(&fake.url, None),
-        TurnContext::default(),
+        quiet(),
         AgentOptions {
             tools: Some(&reg),
             policy: Some(&pol),
@@ -604,7 +614,7 @@ fn middleware_can_rewrite_arguments_and_the_policy_sees_the_rewrite() {
         run_agent_turn(
             &store,
             &client(&fake.url, None),
-            TurnContext::default(),
+            quiet(),
             AgentOptions {
                 tools: Some(&reg),
                 policy: Some(&pol),
@@ -685,7 +695,7 @@ fn parallel_turn(
     let r = run_agent_turn(
         &store,
         &client(&fake.url, None),
-        TurnContext::default(),
+        quiet(),
         AgentOptions {
             tools: Some(&reg),
             policy: Some(&pol),
@@ -816,7 +826,7 @@ fn a_big_output_spills_to_a_file_the_model_can_read_back_without_asking() {
     run_agent_turn(
         &store,
         &client(&fake.url, None),
-        TurnContext::default(),
+        quiet(),
         AgentOptions {
             tools: Some(&reg),
             policy: Some(&pol),
@@ -862,7 +872,7 @@ fn a_big_output_spills_to_a_file_the_model_can_read_back_without_asking() {
     run_agent_turn(
         &store,
         &client(&fake.url, None),
-        TurnContext::default(),
+        quiet(),
         AgentOptions {
             tools: Some(&reg),
             policy: Some(&pol),
@@ -890,7 +900,7 @@ fn a_big_output_spills_to_a_file_the_model_can_read_back_without_asking() {
     run_agent_turn(
         &store,
         &client(&fake.url, None),
-        TurnContext::default(),
+        quiet(),
         AgentOptions {
             tools: Some(&reg),
             policy: Some(&pol),
@@ -923,7 +933,7 @@ fn without_a_spill_dir_the_output_is_truncated_as_before() {
     run_agent_turn(
         &store,
         &client(&fake.url, None),
-        TurnContext::default(),
+        quiet(),
         AgentOptions {
             tools: Some(&reg),
             policy: Some(&pol),
@@ -963,7 +973,7 @@ fn old_spill_files_are_deleted_when_a_turn_opens() {
     run_agent_turn(
         &store,
         &client(&fake.url, None),
-        TurnContext::default(),
+        quiet(),
         AgentOptions {
             spill_dir: Some(root.path().to_path_buf()),
             ..Default::default()
@@ -1027,7 +1037,7 @@ fn pressure_summarizes_the_oldest_span_and_replay_shows_the_summary() {
     run_agent_turn(
         &store,
         &client(&fake.url, Some(2500)),
-        TurnContext::default(),
+        quiet(),
         AgentOptions {
             summarizer: Some(&summarizer),
             history: 100,
@@ -1089,7 +1099,7 @@ fn pressure_summarizes_the_oldest_span_and_replay_shows_the_summary() {
     run_agent_turn(
         &store,
         &client(&fake2.url, None),
-        TurnContext::default(),
+        quiet(),
         AgentOptions {
             history: 100,
             ..Default::default()
@@ -1175,7 +1185,7 @@ fn a_crash_inside_compaction_leaves_an_open_bracket_and_an_open_turn() {
             let _ = run_agent_turn(
                 &store,
                 &client(&fake.url, Some(2500)),
-                TurnContext::default(),
+                quiet(),
                 AgentOptions {
                     summarizer: Some(&Boom),
                     history: 100,
@@ -1265,7 +1275,7 @@ fn an_inbox_message_sent_mid_turn_joins_the_next_request() {
     run_agent_turn(
         &store,
         &client(&fake.url, None),
-        TurnContext::default(),
+        quiet(),
         AgentOptions {
             tools: Some(&reg),
             policy: Some(&pol),
@@ -1311,7 +1321,7 @@ fn a_steer_sent_while_the_final_answer_streams_keeps_the_turn_going() {
     let report = run_agent_turn(
         &store,
         &client(&fake.url, None),
-        TurnContext::default(),
+        quiet(),
         AgentOptions {
             inbox: Some(&rx),
             ..Default::default()
@@ -1378,7 +1388,7 @@ fn gateway_failover_switches_accounts_records_usage_and_skips_cooled_down_accoun
         &fb_client,
         TurnContext {
             settings: Some(&settings),
-            ..TurnContext::default()
+            ..quiet()
         },
         AgentOptions::default(),
         &sid,
@@ -1441,7 +1451,7 @@ fn gateway_failover_switches_accounts_records_usage_and_skips_cooled_down_accoun
         &fb_client,
         TurnContext {
             settings: Some(&settings),
-            ..TurnContext::default()
+            ..quiet()
         },
         AgentOptions::default(),
         &sid,
@@ -1535,7 +1545,7 @@ fn token_saver_full_injects_prompts_compresses_build_output_and_records_savings(
         &client(&fake.url, None),
         TurnContext {
             settings: Some(&settings),
-            ..TurnContext::default()
+            ..quiet()
         },
         AgentOptions {
             tools: Some(&reg),

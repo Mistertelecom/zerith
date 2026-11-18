@@ -165,6 +165,14 @@ pub struct TurnContext<'a> {
     /// adds its instructions after the project's.
     pub agent: Option<&'a zerith_core::agents::AgentDef>,
     pub settings: Option<&'a zerith_core::Settings>,
+    /// Where to look for `AGENTS.md` / `CLAUDE.md`. `None` uses the process
+    /// working directory, which is what a person running the app wants. A
+    /// host that runs turns for somewhere else (and the tests, whose working
+    /// directory is the repository) names the folder, or turns the lookup off
+    /// with [`TurnContext::no_project_instructions`].
+    pub project_dir: Option<&'a std::path::Path>,
+    /// Do not load project instructions at all.
+    pub no_project_instructions: bool,
 }
 
 /// The turn's outcome, with the numbers a UI needs to show it honestly.
@@ -308,12 +316,16 @@ pub(crate) fn system_prompt(
     // up to the git root, plus the user-level file. Static per project, so it
     // sits with the identity and keeps the prefix cache warm.
     let paths = zerith_core::Paths::resolve();
-    let mut prompt_text = match std::env::current_dir() {
-        Ok(cwd) => zerith_core::system_prompt_with_instructions(
+    let dir = ctx
+        .project_dir
+        .map(std::path::Path::to_path_buf)
+        .or_else(|| std::env::current_dir().ok());
+    let mut prompt_text = match dir {
+        Some(cwd) if !ctx.no_project_instructions => zerith_core::system_prompt_with_instructions(
             title,
             &zerith_core::load_instructions(&paths, &cwd),
         ),
-        Err(_) => zerith_core::system_prompt(title),
+        _ => zerith_core::system_prompt(title),
     };
     if let Some(a) = ctx.agent {
         prompt_text.push_str(&format!("\n\n# Agente: {}\n\n{}", a.name, a.instructions));
@@ -470,21 +482,20 @@ fn resolve_account_key(
     acc: &AccountEntry,
     base_url: &str,
     fallback_cfg: &ProviderConfig,
+    store: &dyn zerith_core::secrets::SecretStore,
 ) -> Option<String> {
     let key_ref = acc.api_key_ref.as_deref().or(Some(acc.id.as_str()));
-    if let Some(k) = secrets::resolve_api_key(&acc.provider, key_ref)
-        .ok()
-        .flatten()
-        .filter(|s| !s.trim().is_empty())
-    {
-        return Some(k);
-    }
-    if acc.api_key_ref.is_none() {
-        if let Some(k) = secrets::resolve_api_key(&acc.provider, None)
+    let read = |r: Option<&str>| {
+        zerith_core::secrets::resolve_api_key_with(store, |k| std::env::var(k).ok(), &acc.provider, r)
             .ok()
             .flatten()
             .filter(|s| !s.trim().is_empty())
-        {
+    };
+    if let Some(k) = read(key_ref) {
+        return Some(k);
+    }
+    if acc.api_key_ref.is_none() {
+        if let Some(k) = read(None) {
             return Some(k);
         }
         let same_url = !base_url.trim().is_empty()
@@ -501,6 +512,53 @@ fn candidate_from_account(
     acc: &AccountEntry,
     spec_model: &str,
     fallback_cfg: &ProviderConfig,
+) -> RouteCandidate {
+    candidate_from_account_with(
+        settings,
+        acc,
+        spec_model,
+        fallback_cfg,
+        &zerith_core::secrets::OsKeyring,
+    )
+}
+
+/// Reads the account's OAuth credential and renews it when inside the skew.
+///
+/// A failed refresh returns the stale credential on purpose: the provider then
+/// answers 401 and the gateway fails over to the next account — the same end
+/// state as any dead account, with no extra retry path to keep alive.
+///
+/// ponytail: renews only pre-emptively (300 s before expiry). If that ever
+/// proves tight, the upgrade is a refresher callback injected into `Gateway`.
+pub fn hydrate_oauth(
+    acc: &AccountEntry,
+    store: &dyn zerith_core::secrets::SecretStore,
+) -> Option<zerith_providers::OAuthCredential> {
+    let mut cred = zerith_core::secrets::load_oauth(store, &acc.id).ok().flatten()?;
+    if cred.needs_refresh(oauth_now()) {
+        if let Ok(fresh) = zerith_providers::oauth::refresh(cred.tool, &cred) {
+            // ponytail: a failed write only costs one extra refresh next turn.
+            let _ = zerith_core::secrets::save_oauth(store, &acc.id, &fresh);
+            cred = fresh;
+        }
+    }
+    Some(cred)
+}
+
+fn oauth_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Same as `candidate_from_account`, with the cofre injected. Test seam.
+pub fn candidate_from_account_with(
+    settings: &Settings,
+    acc: &AccountEntry,
+    spec_model: &str,
+    fallback_cfg: &ProviderConfig,
+    store: &dyn zerith_core::secrets::SecretStore,
 ) -> RouteCandidate {
     let prov_name = canonical_provider(&acc.provider);
     let entry = settings
@@ -541,7 +599,7 @@ fn candidate_from_account(
             }
         });
 
-    let api_key = resolve_account_key(acc, &base_url, fallback_cfg);
+    let api_key = resolve_account_key(acc, &base_url, fallback_cfg, store);
     let default_model = acc
         .default_model
         .as_deref()
@@ -580,6 +638,15 @@ fn candidate_from_account(
         .and_then(|e| e.context_limit)
         .or(fallback_cfg.context_limit);
     cfg.account_id = Some(acc.id.clone());
+
+    // An OAuth account carries no key: the credential replaces it, and a stale
+    // credential is left in place so the gateway fails over instead of the turn
+    // dying here.
+    if acc.auth == zerith_core::settings::AuthMode::Oauth {
+        cfg.auth = zerith_providers::AuthMode::Oauth;
+        cfg.oauth = hydrate_oauth(acc, store);
+        cfg.api_key = None;
+    }
 
     RouteCandidate {
         account_id: acc.id.clone(),
@@ -901,6 +968,11 @@ pub(crate) fn tool_guidance(tools: &zerith_tools::Registry) -> String {
             "\n\n# Edição\nLeia um arquivo com `read_file` antes de alterá-lo com `edit_file` ou `write_file`.",
         );
     }
+    if has("create_skill") || has("create_agent") {
+        out.push_str(
+            "\n\n# Criar skills e agentes\nSó crie uma skill ou um agente quando a pessoa pedir, ou quando um procedimento claramente se repetir; nunca por conta própria em silêncio. O que você cria nasce desativado e a pessoa precisa revisar e ativar. Skill: a descrição é UMA frase dizendo QUANDO usar; o corpo traz passos numerados, armadilhas e como verificar; detalhes longos vão em references/. Agente: um papel focado, o mínimo de ferramentas, um critério de parada e o formato da resposta. Nunca coloque chaves, senhas nem caminhos da pasta pessoal.",
+        );
+    }
     out
 }
 
@@ -1094,6 +1166,7 @@ mod gateway_tests {
                 "openai-b:gpt-4o-mini".into(),
                 "deepseek/deepseek-chat".into(),
             ],
+            subagent_model: None,
         });
 
         let fb = ProviderConfig::new(ProviderKind::OpenAi).with_key("fb-key");
@@ -1121,6 +1194,43 @@ mod gateway_tests {
         // Explicitly targeting a disabled account leaves candidates empty.
         let (gw, _) = resolve_gateway(&settings, "openai-disabled:gpt-4o", &fb);
         assert!(gw.candidates.is_empty());
+    }
+
+    #[test]
+    fn catalogue_account_is_reached_by_account_pin_not_by_bare_model() {
+        // What the Contas card saves for a provider the core has no preset for.
+        let groq = AccountEntry {
+            id: "groq".into(),
+            provider: "groq".into(),
+            base_url: Some("https://api.groq.com/openai/v1".into()),
+            protocol: Some(zerith_core::settings::WireProtocol::OpenAi),
+            api_key_ref: Some("groq".into()),
+            priority: 1,
+            ..Default::default()
+        };
+        let claude = AccountEntry {
+            id: "claude".into(),
+            provider: "anthropic".into(),
+            priority: 0,
+            ..Default::default()
+        };
+        let settings = Settings {
+            accounts: vec![claude, groq],
+            ..Default::default()
+        };
+        let fb = ProviderConfig::new(ProviderKind::Anthropic);
+
+        let (gw, model) = resolve_gateway(&settings, "groq:llama-3.3-70b-versatile", &fb);
+        assert_eq!(model, "llama-3.3-70b-versatile");
+        assert_eq!(gw.candidates.len(), 1);
+        assert_eq!(gw.candidates[0].account_id, "groq");
+        assert_eq!(gw.candidates[0].config.base_url, "https://api.groq.com/openai/v1");
+        assert_eq!(gw.candidates[0].config.protocol, Protocol::OpenAi);
+
+        // A bare model has no provider prefix the core knows: it rides the
+        // primary (anthropic). This is why the UI must send `account:model`.
+        let (gw, _) = resolve_gateway(&settings, "llama-3.3-70b-versatile", &fb);
+        assert_eq!(gw.candidates[0].account_id, "claude");
     }
 
     #[test]
@@ -1160,6 +1270,8 @@ mod gateway_tests {
             skills: Vec::new(),
             isolation: zerith_core::agents::Isolation::None,
             background: false,
+            created_by_ai: false,
+            disabled: false,
         };
         let prompt = system_prompt(
             "t",

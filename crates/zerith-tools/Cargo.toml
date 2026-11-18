@@ -6,6 +6,9 @@ license.workspace = true
 
 [dependencies]
 zerith-security = { path = "../zerith-security" }
+# Media tools read the `media` settings and the OpenRouter key.
+zerith-core = { path = "../zerith-core" }
+zerith-skills = { path = "../zerith-skills" }
 zerith-memory = { path = "../zerith-memory" }
 # Only for `Cancel`: the token a turn shares between the stream and its tools.
 zerith-providers = { path = "../zerith-providers" }

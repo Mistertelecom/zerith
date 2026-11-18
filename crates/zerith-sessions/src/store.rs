@@ -36,9 +36,27 @@ impl Store {
     }
 
     fn prepare(mut conn: Connection) -> Result<Self> {
-        conn.pragma_update(None, "journal_mode", "WAL")?;
+        // Several connections open the same file at once (the window opens one
+        // per screen). Without a timeout the second one fails at once with
+        // "database is locked" instead of waiting its turn.
+        conn.busy_timeout(std::time::Duration::from_secs(10))?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        // Switching to WAL needs the write lock and, on a brand new file, can
+        // lose a race to another connection doing the same. The busy timeout
+        // covers the wait; a retry covers the rare "locked" that a pragma
+        // returns without waiting.
+        let mut tries = 0;
+        loop {
+            match conn.pragma_update(None, "journal_mode", "WAL") {
+                Ok(()) => break,
+                Err(e) if is_locked(&e) && tries < 20 => {
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
         migrations::run(&mut conn)?;
         Ok(Self { conn })
     }
@@ -262,4 +280,13 @@ pub(crate) fn new_id() -> String {
     );
     let a = h.finish();
     format!("{:016x}{:016x}", a, a.rotate_left(17))
+}
+
+fn is_locked(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(f, _)
+            if f.code == rusqlite::ErrorCode::DatabaseBusy
+                || f.code == rusqlite::ErrorCode::DatabaseLocked
+    )
 }

@@ -440,8 +440,14 @@ fn grep(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
 }
 
 /// The platform shell: `cmd /C` on Windows, `sh -c` elsewhere.
+///
+/// The folder of programs that ship with the app (`bundled-tools`) is put at
+/// the end of `PATH` for this child only, so a skill that says
+/// `agent-desktop snapshot ...` works without the person installing anything
+/// or the user's own `PATH` changing. A program of the same name already on
+/// `PATH` wins.
 pub fn shell_command(cmd: &str) -> Command {
-    if cfg!(windows) {
+    let mut c = if cfg!(windows) {
         let mut c = Command::new("cmd");
         c.arg("/C").arg(cmd);
         c
@@ -449,7 +455,22 @@ pub fn shell_command(cmd: &str) -> Command {
         let mut c = Command::new("sh");
         c.arg("-c").arg(cmd);
         c
+    };
+    if let Some(dir) = zerith_core::Paths::resolve().bundled_tools() {
+        c.env("PATH", path_with(std::env::var_os("PATH"), &dir));
     }
+    c
+}
+
+/// `existing` with `dir` appended (the platform separator), unless present.
+fn path_with(existing: Option<std::ffi::OsString>, dir: &std::path::Path) -> std::ffi::OsString {
+    let mut parts: Vec<std::path::PathBuf> = existing
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    if !parts.iter().any(|p| p == dir) {
+        parts.push(dir.to_path_buf());
+    }
+    std::env::join_paths(parts).unwrap_or_default()
 }
 
 fn shell(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
@@ -571,4 +592,28 @@ pub(crate) fn kill_tree(child: &mut std::process::Child) {
     // Covers a missing taskkill/kill binary, and reaps the zombie.
     let _ = child.kill();
     let _ = child.wait();
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::path_with;
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn the_bundled_folder_goes_last_so_the_users_own_program_wins() {
+        let user = std::env::join_paths(["/usr/bin", "/opt/x"]).unwrap();
+        let got = path_with(Some(user), Path::new("/app/bundled-tools"));
+        let parts: Vec<PathBuf> = std::env::split_paths(&got).collect();
+        assert_eq!(parts.last().unwrap(), Path::new("/app/bundled-tools"));
+        assert_eq!(parts.len(), 3);
+    }
+
+    #[test]
+    fn it_is_not_added_twice_and_works_without_a_path() {
+        let once = path_with(None, Path::new("/b"));
+        let twice = path_with(Some(once.clone()), Path::new("/b"));
+        assert_eq!(once, twice);
+        assert!(!path_with(Some(OsString::new()), Path::new("/b")).is_empty());
+    }
 }

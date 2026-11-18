@@ -4,6 +4,8 @@
 //! facts every other Zerith crate needs.
 
 pub mod agents;
+pub mod agents_write;
+pub mod diagnose;
 pub mod hooks;
 pub mod instructions;
 pub mod paths;
@@ -14,8 +16,8 @@ pub mod shellparse;
 pub use instructions::{load_instructions, system_prompt_with_instructions};
 pub use paths::Paths;
 pub use settings::{
-    AccountEntry, CavemanLevel, ComboEntry, PonytailLevel, RoutingSettings, Settings,
-    TokenSaverSettings,
+    AccountEntry, CavemanLevel, ComboEntry, MediaSettings, MediaSlot, PonytailLevel,
+    RoutingSettings, Settings, TokenSaverSettings,
 };
 
 /// Product identity. One place, so a rename never means a grep.

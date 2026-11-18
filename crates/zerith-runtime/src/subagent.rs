@@ -263,6 +263,9 @@ pub fn child_registry(base: &Registry, r: &Resolved, depth: usize) -> Registry {
     let mut reg = base.subset(|n| {
         allowed.iter().any(|a| a == n)
             && n != "ask_user"
+            // A child must never be able to mint more skills or agents: what it
+            // writes would outlive it and be offered to the person as theirs.
+            && !matches!(n, "create_skill" | "create_agent" | "delete_ai_item")
             && (can_spawn || !matches!(n, "agent" | "agent_result"))
     });
     if can_spawn {

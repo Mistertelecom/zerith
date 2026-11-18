@@ -52,8 +52,8 @@ fn open_library(root: &Path) -> Result<Library, String> {
 
 fn view(root: &Path, installed: Installed) -> SkillView {
     let scanned: Option<Skill> = scan(&root.join(&installed.dir)).ok();
-    let body = std::fs::read_to_string(root.join(&installed.dir).join("SKILL.md"))
-        .unwrap_or_default();
+    let body =
+        std::fs::read_to_string(root.join(&installed.dir).join("SKILL.md")).unwrap_or_default();
     SkillView {
         findings: scanned
             .as_ref()
@@ -67,7 +67,10 @@ fn view(root: &Path, installed: Installed) -> SkillView {
                     .collect()
             })
             .unwrap_or_default(),
-        scripts: scanned.as_ref().map(|s| s.scripts.clone()).unwrap_or_default(),
+        scripts: scanned
+            .as_ref()
+            .map(|s| s.scripts.clone())
+            .unwrap_or_default(),
         inventory: scanned
             .as_ref()
             .map(|s| s.inventory.iter().map(|(k, v)| (k.clone(), *v)).collect())
@@ -79,11 +82,7 @@ fn view(root: &Path, installed: Installed) -> SkillView {
 
 fn all(lib: &Library, root: &Path) -> Result<Vec<SkillView>, String> {
     let manifest = lib.manifest().map_err(|e| e.to_string())?;
-    Ok(manifest
-        .skills
-        .into_iter()
-        .map(|i| view(root, i))
-        .collect())
+    Ok(manifest.skills.into_iter().map(|i| view(root, i)).collect())
 }
 
 #[tauri::command]
@@ -100,10 +99,7 @@ pub async fn skills_list(state: State<'_, AppState>) -> Result<Vec<SkillView>, S
 /// Reads the suggested repositories. The cached answer is used until it goes
 /// stale; force asks the network again.
 #[tauri::command]
-pub async fn skills_catalog(
-    state: State<'_, AppState>,
-    force: bool,
-) -> Result<Catalogue, String> {
+pub async fn skills_catalog(state: State<'_, AppState>, force: bool) -> Result<Catalogue, String> {
     let root = state.root().to_path_buf();
     tauri::async_runtime::spawn_blocking(move || {
         let token = std::env::var("GITHUB_TOKEN").ok();
@@ -189,8 +185,14 @@ pub async fn skill_install_remote(
     tauri::async_runtime::spawn_blocking(move || {
         let lib = open_library(&root)?;
         let token = std::env::var("GITHUB_TOKEN").ok();
-        remote::install_remote(&lib, repo.trim(), branch.trim(), path.trim(), token.as_deref())
-            .map_err(|e| e.to_string())?;
+        remote::install_remote(
+            &lib,
+            repo.trim(),
+            branch.trim(),
+            path.trim(),
+            token.as_deref(),
+        )
+        .map_err(|e| e.to_string())?;
         all(&lib, &root)
     })
     .await

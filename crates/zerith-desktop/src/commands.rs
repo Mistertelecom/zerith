@@ -62,16 +62,17 @@ pub async fn list_sessions(
 }
 
 #[tauri::command]
-pub async fn create_session(
-    state: tauri::State<'_, AppState>,
-    title: String,
-) -> Cmd<Session> {
+pub async fn create_session(state: tauri::State<'_, AppState>, title: String) -> Cmd<Session> {
     let db = state.db();
     let title: String = title.trim().chars().take(80).collect();
     Store::open(&db)
         .and_then(|st| {
             st.create_session(
-                if title.is_empty() { "Nova conversa" } else { &title },
+                if title.is_empty() {
+                    "Nova conversa"
+                } else {
+                    &title
+                },
                 SessionSource::Native,
             )
         })
@@ -163,10 +164,7 @@ pub async fn set_memory_paused(state: tauri::State<'_, AppState>, paused: bool) 
 }
 
 #[tauri::command]
-pub async fn search_sessions(
-    state: tauri::State<'_, AppState>,
-    query: String,
-) -> Cmd<Vec<String>> {
+pub async fn search_sessions(state: tauri::State<'_, AppState>, query: String) -> Cmd<Vec<String>> {
     let db = state.db();
     wire::search_sessions(&db, &query, 500)
 }

@@ -77,17 +77,19 @@ pub async fn workspace_files(root: Option<String>) -> Cmd<Vec<String>> {
 const IMAGE_CAP: u64 = 20 * 1024 * 1024;
 
 fn image_mime(path: &Path) -> Option<&'static str> {
-    Some(match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "bmp" => "image/bmp",
-        "avif" => "image/avif",
-        // Scripts inside an SVG do not run when it is shown through <img>.
-        "svg" => "image/svg+xml",
-        _ => return None,
-    })
+    Some(
+        match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "gif" => "image/gif",
+            "webp" => "image/webp",
+            "bmp" => "image/bmp",
+            "avif" => "image/avif",
+            // Scripts inside an SVG do not run when it is shown through <img>.
+            "svg" => "image/svg+xml",
+            _ => return None,
+        },
+    )
 }
 
 /// `file:///C:/a.png`, `C:\a.png` or a path relative to the workspace, as the
@@ -198,7 +200,8 @@ pub async fn compact(state: State<'_, AppState>, session_id: String, model: Stri
             .next()
             .ok_or("nenhum provedor configurado")?;
         // `conta:modelo` from the picker goes where a turn would send it.
-        let settings = zerith_core::Settings::load(&zerith_core::Paths::with_root(&root), None).settings;
+        let settings =
+            zerith_core::Settings::load(&zerith_core::Paths::with_root(&root), None).settings;
         let (gw, _) = zerith_runtime::resolve_gateway(&settings, &model, &cfg);
         let (cfg, model) = match gw.candidates.into_iter().next() {
             Some(c) => (c.config, c.model),
@@ -215,7 +218,9 @@ mod tests {
     use super::*;
 
     fn scratch(tag: &str) -> PathBuf {
-        let d = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-scratch").join(tag);
+        let d = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-scratch")
+            .join(tag);
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
@@ -230,14 +235,32 @@ mod tests {
         let url = image_data_url(&png.to_string_lossy()).unwrap();
         assert_eq!(url, "data:image/png;base64,iVBORw==");
 
-        let file_url = format!("file:///{}", png.to_string_lossy().replace('\\', "/").trim_start_matches('/'));
-        assert_eq!(image_data_url(&file_url).unwrap(), url, "file:// urls name the same file");
+        let file_url = format!(
+            "file:///{}",
+            png.to_string_lossy()
+                .replace('\\', "/")
+                .trim_start_matches('/')
+        );
+        assert_eq!(
+            image_data_url(&file_url).unwrap(),
+            url,
+            "file:// urls name the same file"
+        );
 
         let secret = d.join("auth.json");
         std::fs::write(&secret, "{}").unwrap();
-        assert!(image_data_url(&secret.to_string_lossy()).is_err(), "not an image");
-        assert!(image_data_url(&d.join("nada.png").to_string_lossy()).is_err(), "missing");
+        assert!(
+            image_data_url(&secret.to_string_lossy()).is_err(),
+            "not an image"
+        );
+        assert!(
+            image_data_url(&d.join("nada.png").to_string_lossy()).is_err(),
+            "missing"
+        );
         std::fs::create_dir_all(d.join("pasta.png")).unwrap();
-        assert!(image_data_url(&d.join("pasta.png").to_string_lossy()).is_err(), "a directory");
+        assert!(
+            image_data_url(&d.join("pasta.png").to_string_lossy()).is_err(),
+            "a directory"
+        );
     }
 }

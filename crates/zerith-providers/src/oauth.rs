@@ -212,9 +212,7 @@ pub fn pasted_code(raw: &str) -> (&str, Option<&str>) {
 /// fixed port must fail loudly, not after the user already consented.
 pub fn bind(tool: OAuthTool) -> Result<(TcpListener, u16)> {
     let listener = match provider(tool).fixed_port {
-        Some(port) => {
-            TcpListener::bind(("127.0.0.1", port)).map_err(|_| OAuthError::Port(port))?
-        }
+        Some(port) => TcpListener::bind(("127.0.0.1", port)).map_err(|_| OAuthError::Port(port))?,
         None => TcpListener::bind("127.0.0.1:0").map_err(|e| OAuthError::Io(e.to_string()))?,
     };
     let port = listener
@@ -363,7 +361,11 @@ fn wait_for_code_within(
 /// Compares without an early exit, so the comparison time does not leak how
 /// many characters of a guessed state were right.
 fn constant_eq(a: &str, b: &str) -> bool {
-    a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    a.len() == b.len()
+        && a.bytes()
+            .zip(b.bytes())
+            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+            == 0
 }
 
 fn respond(stream: &mut TcpStream, status: u16, body: &str) {
@@ -470,7 +472,10 @@ pub fn refresh(tool: OAuthTool, cred: &OAuthCredential) -> Result<OAuthCredentia
             .ok_or(OAuthError::NoRefreshToken);
     }
     let p = provider(tool);
-    let refresh_token = cred.refresh_token.as_deref().ok_or(OAuthError::NoRefreshToken)?;
+    let refresh_token = cred
+        .refresh_token
+        .as_deref()
+        .ok_or(OAuthError::NoRefreshToken)?;
     let body = match p.refresh_encoding {
         Encoding::Json => post_json(
             p.token_url,
@@ -596,7 +601,9 @@ fn parse_antigravity_quota(body: &str) -> Quota {
         if let Some(name) = group["displayName"].as_str() {
             q.plan.get_or_insert_with(|| name.to_string());
         }
-        let Some(buckets) = group["buckets"].as_array() else { continue };
+        let Some(buckets) = group["buckets"].as_array() else {
+            continue;
+        };
         for b in buckets {
             let window = b["window"].as_str().unwrap_or("").to_ascii_lowercase();
             let remaining = b["remainingFraction"].as_f64().unwrap_or(1.0);
@@ -690,11 +697,9 @@ pub fn import_from_9router(tool: OAuthTool, db: &std::path::Path) -> Option<OAut
         OAuthTool::Codex => "codex",
         OAuthTool::Antigravity => "antigravity",
     };
-    let conn = rusqlite::Connection::open_with_flags(
-        db,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .ok()?;
+    let conn =
+        rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .ok()?;
     let raw: String = conn
         .query_row(
             "select data from providerConnections where provider = ?1 and isActive = 1
@@ -808,7 +813,9 @@ pub fn fetch_quota(tool: OAuthTool, access_token: &str) -> Result<Quota> {
             let post = |method: &str| {
                 read_body(
                     agent()
-                        .post(&format!("https://cloudcode-pa.googleapis.com/v1internal:{method}"))
+                        .post(&format!(
+                            "https://cloudcode-pa.googleapis.com/v1internal:{method}"
+                        ))
                         .set("Authorization", &format!("Bearer {access_token}"))
                         .set("Content-Type", "application/json")
                         .set("User-Agent", "antigravity/1.0.0")
@@ -952,7 +959,10 @@ pub fn parse_claude_credentials(raw: &str) -> Option<OAuthCredential> {
     let v: serde_json::Value = serde_json::from_str(raw).ok()?;
     // a file with only `mcpOAuth` means no subscription login was ever made
     let oauth = v.get("claudeAiOauth")?;
-    let access = oauth.get("accessToken").and_then(|t| t.as_str())?.to_string();
+    let access = oauth
+        .get("accessToken")
+        .and_then(|t| t.as_str())?
+        .to_string();
     let expires_at = oauth
         .get("expiresAt")
         .and_then(|t| t.as_i64())
@@ -989,7 +999,10 @@ mod tests {
     #[test]
     fn pkce_matches_the_rfc_vector() {
         let pkce = Pkce::from_verifier("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk");
-        assert_eq!(pkce.challenge, "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
+        assert_eq!(
+            pkce.challenge,
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
     }
 
     #[test]
@@ -1062,16 +1075,14 @@ mod tests {
             "http://127.0.0.1:{port}/callback?error=access_denied&state=st-2"
         ))
         .call();
-        assert!(matches!(
-            handle.join().unwrap(),
-            Err(OAuthError::Denied(_))
-        ));
+        assert!(matches!(handle.join().unwrap(), Err(OAuthError::Denied(_))));
     }
 
     #[test]
     fn an_abandoned_login_gives_the_port_back() {
         let (listener, _) = bind(OAuthTool::ClaudeCode).unwrap();
-        let e = wait_for_code_within(listener, "/callback", "st", Duration::from_millis(300)).unwrap_err();
+        let e = wait_for_code_within(listener, "/callback", "st", Duration::from_millis(300))
+            .unwrap_err();
         assert!(e.to_string().contains("não voltou"), "{e}");
     }
 
@@ -1142,11 +1153,21 @@ mod tests {
         assert_eq!(q.plan.as_deref(), Some("claude_pro"));
         assert_eq!(
             q.five_hour,
-            Some(QuotaWindow { utilization: 0.0, resets_at: None, resets_at_epoch: None })
+            Some(QuotaWindow {
+                utilization: 0.0,
+                resets_at: None,
+                resets_at_epoch: None
+            })
         );
         assert_eq!(q.seven_day.unwrap().utilization, 81.0);
         // a broken profile still leaves the numbers
-        assert_eq!(parse_claude_quota(usage, Some("lixo")).seven_day.unwrap().utilization, 81.0);
+        assert_eq!(
+            parse_claude_quota(usage, Some("lixo"))
+                .seven_day
+                .unwrap()
+                .utilization,
+            81.0
+        );
     }
 
     #[test]
@@ -1155,7 +1176,9 @@ mod tests {
         let url = authorize_url(OAuthTool::ClaudeCode, &pkce, "st", 45999);
         assert!(url.contains("code=true"), "{url}");
         assert!(
-            url.contains("redirect_uri=https%3A%2F%2Fconsole.anthropic.com%2Foauth%2Fcode%2Fcallback"),
+            url.contains(
+                "redirect_uri=https%3A%2F%2Fconsole.anthropic.com%2Foauth%2Fcode%2Fcallback"
+            ),
             "{url}"
         );
         assert!(!url.contains("127.0.0.1"), "{url}");
@@ -1228,9 +1251,9 @@ mod tests {
     #[test]
     fn importing_codex_credentials_reads_the_local_file() {
         let dir = scratch("codex");
-        std::fs::create_dir_all(&dir.join(".codex")).unwrap();
+        std::fs::create_dir_all(dir.join(".codex")).unwrap();
         std::fs::write(
-            &dir.join(".codex/auth.json"),
+            dir.join(".codex/auth.json"),
             r#"{"auth_mode":"chatgpt","tokens":{"access_token":"AT","refresh_token":"RT","account_id":"acc_1"},"last_refresh":"2026-11-08T00:00:00Z"}"#,
         )
         .unwrap();
@@ -1244,9 +1267,9 @@ mod tests {
     #[test]
     fn importing_claude_ignores_a_file_with_only_mcp_tokens() {
         let dir = scratch("claude-mcp");
-        std::fs::create_dir_all(&dir.join(".claude")).unwrap();
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
         std::fs::write(
-            &dir.join(".claude/.credentials.json"),
+            dir.join(".claude/.credentials.json"),
             r#"{"mcpOAuth":{"x":{"accessToken":"mcp"}}}"#,
         )
         .unwrap();
@@ -1256,9 +1279,9 @@ mod tests {
     #[test]
     fn importing_claude_reads_the_subscription_block_and_scales_ms_to_seconds() {
         let dir = scratch("claude-sub");
-        std::fs::create_dir_all(&dir.join(".claude")).unwrap();
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
         std::fs::write(
-            &dir.join(".claude/.credentials.json"),
+            dir.join(".claude/.credentials.json"),
             r#"{"claudeAiOauth":{"accessToken":"CA","refreshToken":"CR","expiresAt":1767225600000}}"#,
         )
         .unwrap();
@@ -1291,7 +1314,10 @@ mod tests {
     #[test]
     fn the_browser_gets_the_url_verbatim() {
         let url = authorize_url(OAuthTool::ClaudeCode, &Pkce::from_verifier("v"), "s", 4242);
-        assert!(url.contains('&') && !url.contains(['"', ' ', '\\']), "{url}");
+        assert!(
+            url.contains('&') && !url.contains(['"', ' ', '\\']),
+            "{url}"
+        );
         let c = browser_command(&url);
         let args: Vec<_> = c.get_args().collect();
         assert_eq!(args.last().unwrap().to_str(), Some(url.as_str()));

@@ -332,8 +332,7 @@ fn main() {
     let app = zerith_ui::app_with(spec);
     let me = app.handle();
     let mut paths = Paths::resolve();
-    let writable = paths.ensure().is_ok()
-        && zerith_sessions::Store::open(paths.db()).is_ok();
+    let writable = paths.ensure().is_ok() && zerith_sessions::Store::open(paths.db()).is_ok();
     if !writable {
         let fallback = Paths::with_root(std::env::temp_dir().join("zerith-ui-home"));
         if fallback.ensure().is_ok() {

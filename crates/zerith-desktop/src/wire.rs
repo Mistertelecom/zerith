@@ -455,11 +455,10 @@ pub fn oauth_import_pasted(
             .ok_or("não achei claudeAiOauth.accessToken nesse JSON")?,
         OAuthTool::Codex => zerith_providers::oauth::parse_codex_credentials(raw)
             .ok_or("não achei tokens.access_token nesse JSON")?,
-        OAuthTool::Antigravity => zerith_providers::oauth::parse_9router_credentials(
-            OAuthTool::Antigravity,
-            raw,
-        )
-        .ok_or("não achei accessToken nesse JSON (formato do 9router)")?,
+        OAuthTool::Antigravity => {
+            zerith_providers::oauth::parse_9router_credentials(OAuthTool::Antigravity, raw)
+                .ok_or("não achei accessToken nesse JSON (formato do 9router)")?
+        }
     };
     connect_account(root, tool, account, &cred)
 }
@@ -485,9 +484,7 @@ pub fn account_quota(account: &str) -> Result<zerith_providers::oauth::Quota, St
         .ok_or("sem credencial no cofre para esta conta")?;
     // Codex is never refreshed here: its refresh token rotates on use, so
     // renewing it from the app would log the user's `codex` CLI out.
-    if cred.tool != OAuthTool::Codex
-        && cred.expires_at <= zerith_providers::oauth::now_secs()
-    {
+    if cred.tool != OAuthTool::Codex && cred.expires_at <= zerith_providers::oauth::now_secs() {
         cred = zerith_providers::oauth::refresh(cred.tool, &cred).map_err(|e| e.to_string())?;
         zerith_core::secrets::save_oauth(&zerith_core::secrets::OsKeyring, account, &cred)
             .map_err(|e| e.to_string())?;

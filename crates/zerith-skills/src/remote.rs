@@ -233,7 +233,10 @@ fn cache_path(root: &Path, repo: &str) -> PathBuf {
 /// The `description:` of a SKILL.md header without validation, folded
 /// blocks joined, cut to 300 chars for a card.
 fn loose_description(text: &str) -> String {
-    let Some(header) = text.strip_prefix("---").and_then(|r| r.split("\n---").next()) else {
+    let Some(header) = text
+        .strip_prefix("---")
+        .and_then(|r| r.split("\n---").next())
+    else {
         return String::new();
     };
     let mut out = String::new();
@@ -453,11 +456,16 @@ mod tests {
     #[test]
     fn listing_shows_a_description_the_strict_parser_refuses() {
         let long = "x ".repeat(600);
-        let md = format!("---\nname: big\ndescription: |-\n  {long}\n  more\nlicense: MIT\n---\n# big\n");
+        let md = format!(
+            "---\nname: big\ndescription: |-\n  {long}\n  more\nlicense: MIT\n---\n# big\n"
+        );
         assert!(crate::parse(&md).is_err());
         let d = loose_description(&md);
         assert!(d.starts_with("x x") && d.ends_with('…'), "{d}");
-        assert_eq!(loose_description("---\nname: a\ndescription: \"Lê PDFs\"\n---\n"), "Lê PDFs");
+        assert_eq!(
+            loose_description("---\nname: a\ndescription: \"Lê PDFs\"\n---\n"),
+            "Lê PDFs"
+        );
     }
 
     use super::*;

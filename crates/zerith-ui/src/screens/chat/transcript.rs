@@ -351,15 +351,15 @@ fn tool_row(index: usize, t: &ToolRow, toggled: bool, ctx: &MediaCtx, u: &Ui) ->
                     u.layer2
                 })
                 .center()
-                .child(icon(tool_icon(&t.name), 12.0).color(
-                    if t.state == ToolState::Failed {
+                .child(
+                    icon(tool_icon(&t.name), 12.0).color(if t.state == ToolState::Failed {
                         u.danger
                     } else if t.state == ToolState::Running {
                         u.accent_text
                     } else {
                         u.muted_text
-                    },
-                )),
+                    }),
+                ),
             text(title.map_or_else(|| t.name.clone(), str::to_string))
                 .font(ui::SMALL)
                 .color(u.content),
@@ -453,7 +453,10 @@ fn subagent_row(index: usize, a: &Subagent, open: bool, u: &Ui) -> El {
         index,
         u,
         vec![
-            el().size(3.0, 14.0).radius(1.5).fill(bar_color).a11y_hidden(),
+            el().size(3.0, 14.0)
+                .radius(1.5)
+                .fill(bar_color)
+                .a11y_hidden(),
             sub_mark(a.state, u),
             text(a.name.clone()).font(ui::TITLE).color(u.content),
             widgets::pill("subagente", u),
@@ -483,18 +486,16 @@ fn subagent_row(index: usize, a: &Subagent, open: bool, u: &Ui) -> El {
         .px(4.0)
         .child(head);
     if open && has_body {
-        card = card
-            .child(rule(1.0, u.line).w_full().my(2.0))
-            .child(
-                text(a.summary.clone())
-                    .wrap()
-                    .font(ui::SMALL)
-                    .color(u.secondary)
-                    .selectable(true)
-                    .px(12.0)
-                    .pb(6.0)
-                    .pt(2.0),
-            );
+        card = card.child(rule(1.0, u.line).w_full().my(2.0)).child(
+            text(a.summary.clone())
+                .wrap()
+                .font(ui::SMALL)
+                .color(u.secondary)
+                .selectable(true)
+                .px(12.0)
+                .pb(6.0)
+                .pt(2.0),
+        );
     }
     col().w_full().pb(4.0).child(card)
 }

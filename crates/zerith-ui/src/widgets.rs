@@ -317,7 +317,14 @@ pub fn tabs(
                 .items_center()
                 .radius(ui::R_SM)
                 .fill(if on { u.muted } else { Color::TRANSPARENT })
-                .border(1.0, if on { u.line_strong } else { Color::TRANSPARENT })
+                .border(
+                    1.0,
+                    if on {
+                        u.line_strong
+                    } else {
+                        Color::TRANSPARENT
+                    },
+                )
                 .hover(u.hover)
                 .press(u.active)
                 .on_press(move |s: &mut Shell| pick(s, i))
@@ -333,7 +340,11 @@ pub fn tabs(
                 })),
         );
     }
-    col().w_full().gap(8.0).child(bar).child(rule(1.0, u.line).w_full())
+    col()
+        .w_full()
+        .gap(8.0)
+        .child(bar)
+        .child(rule(1.0, u.line).w_full())
 }
 
 /// A tab body that scrolls when it must, and says so: a scroll bar over the
@@ -358,7 +369,12 @@ pub fn split(left: El, right: El, gap: f32, u: &Ui) -> El {
     if u.compact {
         col().w_full().gap(gap.min(14.0)).child(left).child(right)
     } else {
-        row().w_full().gap(gap).items_start().child(left).child(right)
+        row()
+            .w_full()
+            .gap(gap)
+            .items_start()
+            .child(left)
+            .child(right)
     }
 }
 

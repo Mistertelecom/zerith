@@ -486,10 +486,15 @@ fn resolve_account_key(
 ) -> Option<String> {
     let key_ref = acc.api_key_ref.as_deref().or(Some(acc.id.as_str()));
     let read = |r: Option<&str>| {
-        zerith_core::secrets::resolve_api_key_with(store, |k| std::env::var(k).ok(), &acc.provider, r)
-            .ok()
-            .flatten()
-            .filter(|s| !s.trim().is_empty())
+        zerith_core::secrets::resolve_api_key_with(
+            store,
+            |k| std::env::var(k).ok(),
+            &acc.provider,
+            r,
+        )
+        .ok()
+        .flatten()
+        .filter(|s| !s.trim().is_empty())
     };
     if let Some(k) = read(key_ref) {
         return Some(k);
@@ -534,7 +539,9 @@ pub fn hydrate_oauth(
     acc: &AccountEntry,
     store: &dyn zerith_core::secrets::SecretStore,
 ) -> Option<zerith_providers::OAuthCredential> {
-    let mut cred = zerith_core::secrets::load_oauth(store, &acc.id).ok().flatten()?;
+    let mut cred = zerith_core::secrets::load_oauth(store, &acc.id)
+        .ok()
+        .flatten()?;
     if cred.needs_refresh(oauth_now()) {
         if let Ok(fresh) = zerith_providers::oauth::refresh(cred.tool, &cred) {
             // ponytail: a failed write only costs one extra refresh next turn.
@@ -1224,7 +1231,10 @@ mod gateway_tests {
         assert_eq!(model, "llama-3.3-70b-versatile");
         assert_eq!(gw.candidates.len(), 1);
         assert_eq!(gw.candidates[0].account_id, "groq");
-        assert_eq!(gw.candidates[0].config.base_url, "https://api.groq.com/openai/v1");
+        assert_eq!(
+            gw.candidates[0].config.base_url,
+            "https://api.groq.com/openai/v1"
+        );
         assert_eq!(gw.candidates[0].config.protocol, Protocol::OpenAi);
 
         // A bare model has no provider prefix the core knows: it rides the

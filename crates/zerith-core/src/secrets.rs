@@ -138,23 +138,22 @@ pub fn load_oauth(
         Err(SecretError::NotFound(_)) => return Ok(None),
         Err(e) => return Err(e),
     };
-    let json = if header.trim_start().starts_with('{') {
-        header // legacy: the whole credential in one entry
-    } else {
-        let n: usize = header
-            .trim()
-            .parse()
-            .map_err(|_| SecretError::Unavailable("cabeçalho oauth inválido".into()))?;
-        let mut buf = String::new();
-        for i in 0..n {
-            buf.push_str(
-                &store
-                    .get(&chunk_key(&entry, i))
-                    .map_err(|_| SecretError::Unavailable(format!("parte {i} da credencial sumiu")))?,
-            );
-        }
-        buf
-    };
+    let json =
+        if header.trim_start().starts_with('{') {
+            header // legacy: the whole credential in one entry
+        } else {
+            let n: usize = header
+                .trim()
+                .parse()
+                .map_err(|_| SecretError::Unavailable("cabeçalho oauth inválido".into()))?;
+            let mut buf = String::new();
+            for i in 0..n {
+                buf.push_str(&store.get(&chunk_key(&entry, i)).map_err(|_| {
+                    SecretError::Unavailable(format!("parte {i} da credencial sumiu"))
+                })?);
+            }
+            buf
+        };
     serde_json::from_str(&json)
         .map(Some)
         .map_err(|e| SecretError::Unavailable(format!("credencial oauth corrompida: {e}")))
@@ -347,7 +346,10 @@ mod tests {
                 r#"{"access_token":"A","expires_at":1,"tool":"codex"}"#,
             )
             .unwrap();
-        assert_eq!(load_oauth(&store, "old").unwrap().unwrap().access_token, "A");
+        assert_eq!(
+            load_oauth(&store, "old").unwrap().unwrap().access_token,
+            "A"
+        );
     }
 
     #[test]

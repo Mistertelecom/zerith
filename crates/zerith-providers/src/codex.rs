@@ -153,11 +153,7 @@ pub(crate) struct CodexStream {
 }
 
 impl CodexStream {
-    pub(crate) fn feed(
-        &mut self,
-        data: &str,
-        on: &mut impl FnMut(StreamEvent),
-    ) -> Result<bool> {
+    pub(crate) fn feed(&mut self, data: &str, on: &mut impl FnMut(StreamEvent)) -> Result<bool> {
         // A keep-alive or a comment between events is not an error.
         let Ok(v) = serde_json::from_str::<Value>(data) else {
             return Ok(false);

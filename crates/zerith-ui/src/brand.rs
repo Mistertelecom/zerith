@@ -106,7 +106,13 @@ pub fn logo(name: &str, size: f32, images: &Images, u: &Ui) -> El {
                 let needs_light_plate = key == "ollama";
                 let transparent_mark = matches!(
                     key,
-                    "ollama" | "deepseek" | "gemini" | "antigravity" | "openrouter" | "github" | "xai"
+                    "ollama"
+                        | "deepseek"
+                        | "gemini"
+                        | "antigravity"
+                        | "openrouter"
+                        | "github"
+                        | "xai"
                 );
                 let pad = if transparent_mark {
                     (size * 0.12).round().clamp(1.5, 3.5)

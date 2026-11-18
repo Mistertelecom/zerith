@@ -186,7 +186,12 @@ impl RoutingSettings {
         };
         non_empty(explicit)
             .or_else(|| non_empty(def_model))
-            .or_else(|| non_empty(self.combo(parent_model.trim()).and_then(|c| c.subagent_model.as_deref())))
+            .or_else(|| {
+                non_empty(
+                    self.combo(parent_model.trim())
+                        .and_then(|c| c.subagent_model.as_deref()),
+                )
+            })
             .or_else(|| non_empty(self.role_models.get(agent_name).map(String::as_str)))
             .or_else(|| non_empty(role_specific))
             .or_else(|| non_empty(self.subagent_model.as_deref()))
@@ -1144,10 +1149,19 @@ models = [\"gemini-flash\"]
             "openrouter:deepseek/deepseek-v4.1-flash-1017"
         );
         // an explicit model and an agent's own model still win
-        assert_eq!(r.resolve_subagent_model("general", Some("x"), None, parent), "x");
-        assert_eq!(r.resolve_subagent_model("general", None, Some("def"), parent), "def");
+        assert_eq!(
+            r.resolve_subagent_model("general", Some("x"), None, parent),
+            "x"
+        );
+        assert_eq!(
+            r.resolve_subagent_model("general", None, Some("def"), parent),
+            "def"
+        );
         // any other chat model keeps the global setting
-        assert_eq!(r.resolve_subagent_model("general", None, None, "gpt-5"), "global");
+        assert_eq!(
+            r.resolve_subagent_model("general", None, None, "gpt-5"),
+            "global"
+        );
     }
 
     #[test]

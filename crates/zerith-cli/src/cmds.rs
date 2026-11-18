@@ -2399,6 +2399,8 @@ mod login_tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("nenhuma credencial local"), "{e}");
-        assert!(zerith_core::secrets::load_oauth(&store, "codex").unwrap().is_none());
+        assert!(zerith_core::secrets::load_oauth(&store, "codex")
+            .unwrap()
+            .is_none());
     }
 }

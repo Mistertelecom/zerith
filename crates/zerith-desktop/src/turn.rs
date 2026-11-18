@@ -31,21 +31,69 @@ pub struct Setup {
 
 /// One thing that happened during the turn, already shaped for the window.
 #[derive(Debug, Clone, serde::Serialize)]
-#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum TurnEvent {
-    Delta { text: String },
-    Reasoning { text: String },
-    Step { n: usize },
-    ToolCall { id: String, name: String, args: String },
-    ToolResult { id: String, name: String, ok: bool, preview: String },
-    Approval { id: u64, tool: String, summary: String },
-    Usage { input: u64, output: u64 },
-    Compacted { before: usize, after: usize },
-    Tasks { items: Vec<zerith_sessions::Todo> },
-    Subagent { id: String, name: String, state: String, summary: String },
-    Question { id: u64, questions: Vec<QuestionView> },
-    Route { account_id: String, provider: String, model: String, attempts: usize },
-    Saved { tool: String, before: u64, after: u64 },
+    Delta {
+        text: String,
+    },
+    Reasoning {
+        text: String,
+    },
+    Step {
+        n: usize,
+    },
+    ToolCall {
+        id: String,
+        name: String,
+        args: String,
+    },
+    ToolResult {
+        id: String,
+        name: String,
+        ok: bool,
+        preview: String,
+    },
+    Approval {
+        id: u64,
+        tool: String,
+        summary: String,
+    },
+    Usage {
+        input: u64,
+        output: u64,
+    },
+    Compacted {
+        before: usize,
+        after: usize,
+    },
+    Tasks {
+        items: Vec<zerith_sessions::Todo>,
+    },
+    Subagent {
+        id: String,
+        name: String,
+        state: String,
+        summary: String,
+    },
+    Question {
+        id: u64,
+        questions: Vec<QuestionView>,
+    },
+    Route {
+        account_id: String,
+        provider: String,
+        model: String,
+        attempts: usize,
+    },
+    Saved {
+        tool: String,
+        before: u64,
+        after: u64,
+    },
     Done {
         stored: Option<i64>,
         text: String,
@@ -54,7 +102,9 @@ pub enum TurnEvent {
         saved_tokens: u64,
         model_used: Option<String>,
     },
-    Failed { message: String },
+    Failed {
+        message: String,
+    },
 }
 
 /// Translates the runtime's event into the window's shape. `None` means the
@@ -77,9 +127,7 @@ fn shape(ev: RunEvent) -> Option<TurnEvent> {
             ok,
             preview: output_preview,
         },
-        RunEvent::ApprovalNeeded { id, tool, summary } => {
-            TurnEvent::Approval { id, tool, summary }
-        }
+        RunEvent::ApprovalNeeded { id, tool, summary } => TurnEvent::Approval { id, tool, summary },
         RunEvent::Usage { input, output } => TurnEvent::Usage { input, output },
         RunEvent::Compacted { before, after } => TurnEvent::Compacted { before, after },
         RunEvent::Tasks { items } => TurnEvent::Tasks { items },
@@ -123,6 +171,7 @@ fn shape(ev: RunEvent) -> Option<TurnEvent> {
 }
 
 /// Runs the turn to completion. Blocking: call it on a worker thread.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     setup: &Setup,
     session_id: &str,
@@ -203,10 +252,9 @@ pub fn run(
             None => l,
         });
     let extra = contrib.as_ref().map(|c| c.agents.as_slice()).unwrap_or(&[]);
-    let agent = setup
-        .agent
-        .as_ref()
-        .and_then(|n| zerith_core::agents::find_with_extra(&paths, Some(&setup.workspace), extra, n));
+    let agent = setup.agent.as_ref().and_then(|n| {
+        zerith_core::agents::find_with_extra(&paths, Some(&setup.workspace), extra, n)
+    });
 
     let result = run_agent_turn(
         &store,

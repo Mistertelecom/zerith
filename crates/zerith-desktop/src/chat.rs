@@ -10,7 +10,9 @@ use std::sync::Mutex;
 use serde::Deserialize;
 use tauri::{AppHandle, Emitter, Manager};
 use zerith_providers::Cancel;
-use zerith_runtime::{approval_channel, question_channel, Approval, ApprovalSender, QuestionSender};
+use zerith_runtime::{
+    approval_channel, question_channel, Approval, ApprovalSender, QuestionSender,
+};
 
 use crate::state::AppState;
 use crate::turn::{self, Setup, TurnEvent};

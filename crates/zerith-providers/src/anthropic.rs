@@ -289,7 +289,10 @@ mod tests {
         let oauth = Client::new(cfg).unwrap();
         let req = ChatRequest::new(
             "m",
-            vec![crate::ChatMessage::system("sou o zerith"), crate::ChatMessage::user("oi")],
+            vec![
+                crate::ChatMessage::system("sou o zerith"),
+                crate::ChatMessage::user("oi"),
+            ],
         );
         let b = body_for(&oauth, &req, false);
         assert_eq!(b["system"][0]["text"], CLAUDE_CODE_IDENTITY);

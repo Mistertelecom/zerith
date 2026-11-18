@@ -487,8 +487,15 @@ mod tests {
     fn seeds_the_shipped_bundle() {
         let bundle = std::env::var_os("SEED_FROM")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../bundled-skills"));
-        let lib = Library::open(std::env::var_os("SEED_TO").map(PathBuf::from).unwrap_or_else(|| unique("real-seed"))).unwrap();
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../bundled-skills")
+            });
+        let lib = Library::open(
+            std::env::var_os("SEED_TO")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| unique("real-seed")),
+        )
+        .unwrap();
         let r = lib.seed_disabled(&bundle);
         eprintln!("{r:?}");
         r.unwrap();

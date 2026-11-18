@@ -178,8 +178,7 @@ pub async fn media_key(state: State<'_, AppState>, check: bool) -> Result<KeyVie
             limit_usd: None,
         };
         if check && view.source.is_some() {
-            let key = zerith_core::secrets::resolve_openrouter_key()
-                .map_err(|e| e.to_string())?;
+            let key = zerith_core::secrets::resolve_openrouter_key().map_err(|e| e.to_string())?;
             let info = OpenRouter::new(key, Some(base))
                 .check_key()
                 .map_err(|e| e.to_string())?;

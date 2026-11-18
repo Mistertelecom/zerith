@@ -141,7 +141,10 @@ pub async fn provider_save(
 
 /// A test connection. It leaves the caller's thread: the endpoint may hang.
 #[tauri::command]
-pub async fn provider_test(state: tauri::State<'_, AppState>, form: ProviderForm) -> Cmd<ProbeView> {
+pub async fn provider_test(
+    state: tauri::State<'_, AppState>,
+    form: ProviderForm,
+) -> Cmd<ProbeView> {
     let root = state.root().to_path_buf();
     let cfg = form.config(&root)?;
     tauri::async_runtime::spawn_blocking(move || {
@@ -196,7 +199,10 @@ pub struct AccountForm {
 }
 
 fn trimmed(v: &Option<String>) -> Option<String> {
-    v.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
+    v.as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 #[tauri::command]
@@ -206,7 +212,10 @@ pub async fn accounts(state: tauri::State<'_, AppState>) -> Cmd<Vec<AccountEntry
 }
 
 #[tauri::command]
-pub async fn account_save(state: tauri::State<'_, AppState>, form: AccountForm) -> Cmd<Vec<AccountEntry>> {
+pub async fn account_save(
+    state: tauri::State<'_, AppState>,
+    form: AccountForm,
+) -> Cmd<Vec<AccountEntry>> {
     let root = state.root().to_path_buf();
     let id = form.id.trim().to_string();
     if id.is_empty() {
@@ -279,9 +288,13 @@ pub async fn account_test(state: tauri::State<'_, AppState>, form: AccountForm) 
         _ => {}
     }
     cfg.api_key = trimmed(&form.key).or_else(|| {
-        let saved = wire::configured_accounts(&root).into_iter().find(|a| a.id == form.id.trim())?;
+        let saved = wire::configured_accounts(&root)
+            .into_iter()
+            .find(|a| a.id == form.id.trim())?;
         let key_ref = saved.api_key_ref.unwrap_or(saved.id);
-        zerith_core::secrets::get_secret(&key_ref).ok().filter(|k| !k.trim().is_empty())
+        zerith_core::secrets::get_secret(&key_ref)
+            .ok()
+            .filter(|k| !k.trim().is_empty())
     });
     tauri::async_runtime::spawn_blocking(move || {
         Client::new(cfg)
@@ -293,7 +306,10 @@ pub async fn account_test(state: tauri::State<'_, AppState>, form: AccountForm) 
 }
 
 #[tauri::command]
-pub async fn account_delete(state: tauri::State<'_, AppState>, id: String) -> Cmd<Vec<AccountEntry>> {
+pub async fn account_delete(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Cmd<Vec<AccountEntry>> {
     let root = state.root().to_path_buf();
     wire::delete_account(&root, &id)?;
     Ok(wire::configured_accounts(&root))
@@ -308,7 +324,8 @@ pub async fn oauth_import(
     account: String,
 ) -> Cmd<String> {
     let root = state.root().to_path_buf();
-    let tool = zerith_providers::OAuthTool::parse(&tool).ok_or("Ferramenta de OAuth desconhecida")?;
+    let tool =
+        zerith_providers::OAuthTool::parse(&tool).ok_or("Ferramenta de OAuth desconhecida")?;
     tauri::async_runtime::spawn_blocking(move || wire::oauth_import(&root, tool, &account))
         .await
         .map_err(|e| e.to_string())?
@@ -322,7 +339,8 @@ pub async fn oauth_import_9router(
     account: String,
 ) -> Cmd<String> {
     let root = state.root().to_path_buf();
-    let tool = zerith_providers::OAuthTool::parse(&tool).ok_or("Ferramenta de OAuth desconhecida")?;
+    let tool =
+        zerith_providers::OAuthTool::parse(&tool).ok_or("Ferramenta de OAuth desconhecida")?;
     tauri::async_runtime::spawn_blocking(move || wire::oauth_import_9router(&root, tool, &account))
         .await
         .map_err(|e| e.to_string())?
@@ -345,10 +363,13 @@ pub async fn oauth_import_pasted(
     raw: String,
 ) -> Cmd<String> {
     let root = state.root().to_path_buf();
-    let tool = zerith_providers::OAuthTool::parse(&tool).ok_or("Ferramenta de OAuth desconhecida")?;
-    tauri::async_runtime::spawn_blocking(move || wire::oauth_import_pasted(&root, tool, &account, &raw))
-        .await
-        .map_err(|e| e.to_string())?
+    let tool =
+        zerith_providers::OAuthTool::parse(&tool).ok_or("Ferramenta de OAuth desconhecida")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        wire::oauth_import_pasted(&root, tool, &account, &raw)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Delivers the code the user pasted after consenting in the browser.
@@ -366,22 +387,25 @@ pub async fn oauth_login(
 ) -> Cmd<String> {
     use tauri::Emitter;
     let root = state.root().to_path_buf();
-    let tool = zerith_providers::OAuthTool::parse(&tool).ok_or("Ferramenta de OAuth desconhecida")?;
+    let tool =
+        zerith_providers::OAuthTool::parse(&tool).ok_or("Ferramenta de OAuth desconhecida")?;
     tauri::async_runtime::spawn_blocking(move || {
         wire::oauth_login(&root, tool, &account, &|url| {
             let _ = app.emit("oauth:url", url);
         })
     })
-        .await
-        .map_err(|e| e.to_string())?
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
 pub async fn oauth_status(account: String) -> Cmd<Option<OauthView>> {
-    Ok(wire::oauth_status(&account).map(|(tool, minutes)| OauthView {
-        tool: tool.as_str().to_string(),
-        minutes,
-    }))
+    Ok(
+        wire::oauth_status(&account).map(|(tool, minutes)| OauthView {
+            tool: tool.as_str().to_string(),
+            minutes,
+        }),
+    )
 }
 
 #[derive(Serialize)]

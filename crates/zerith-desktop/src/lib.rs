@@ -27,12 +27,13 @@ pub fn data_root() -> std::path::PathBuf {
     }
 }
 
-
 /// Appends one line to `boot.log` beside the exe. The window may never appear,
 /// so the console is not enough: when a launch goes wrong, this file says why.
 fn boot_log(msg: &str) {
     use std::io::Write;
-    let Ok(exe) = std::env::current_exe() else { return };
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
     let Some(dir) = exe.parent() else { return };
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -51,10 +52,12 @@ fn boot_log(msg: &str) {
 /// turns them on, like the Rune window). Installed builds carry them as a
 /// bundle resource beside the exe; a dev build reads the checkout's folder.
 fn seed_bundled_skills(root: &std::path::Path) {
-    let bundle = zerith_core::Paths::with_root(root).bundled_skills().or_else(|| {
-        let dev = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bundled-skills");
-        dev.is_dir().then_some(dev)
-    });
+    let bundle = zerith_core::Paths::with_root(root)
+        .bundled_skills()
+        .or_else(|| {
+            let dev = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bundled-skills");
+            dev.is_dir().then_some(dev)
+        });
     let Some(bundle) = bundle else { return };
     match zerith_skills::Library::open(root.join("skills")).and_then(|l| l.seed_disabled(&bundle)) {
         Ok((_, failed)) => failed
@@ -96,7 +99,10 @@ pub fn run() {
         candidates.push(std::path::PathBuf::from(d));
     }
     candidates.push(root.join("webview"));
-    if let Some(d) = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("webview"))) {
+    if let Some(d) = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|d| d.join("webview")))
+    {
         candidates.push(d);
     }
     candidates.push(std::env::temp_dir().join("zerith-webview"));
@@ -134,7 +140,10 @@ pub fn run() {
                         break;
                     }
                     Err(e) => {
-                        eprintln!("zerith-desktop: janela não abriu com {}: {e}", dir.display());
+                        eprintln!(
+                            "zerith-desktop: janela não abriu com {}: {e}",
+                            dir.display()
+                        );
                         boot_log(&format!("webview falhou em {}: {e}", dir.display()));
                         last = e;
                     }

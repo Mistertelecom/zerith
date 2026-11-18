@@ -1,7 +1,8 @@
 name: Zerith
 
 # The Zerith workspace is the repository root and is a plain Cargo workspace: no
-# Node, no Tauri, no Rune build in the default lane (Rune pulls wgpu and winit).
+# Node and no Rune build in the default lane (Rune pulls wgpu and winit). Tauri
+# (zerith-desktop) does build here, against the system WebKitGTK on Linux.
 # Rune is compiled in its own job so a UI regression cannot hide behind a
 # minutes-long build in the main lane.
 
@@ -32,6 +33,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: .
+      # `zerith-desktop` is Tauri: on Linux it links WebKitGTK and GTK.
+      - name: Linux Tauri dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
       # `zerith-ui` is excluded: it compiles Rune and the workspace tests do not
       # need a GPU. The `ui` job below builds it.
       - run: cargo fmt --all --check

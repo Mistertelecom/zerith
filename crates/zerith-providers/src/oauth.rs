@@ -645,7 +645,7 @@ fn parse_antigravity_models(body: &str) -> Vec<QuotaBucket> {
     };
     let mut out: Vec<QuotaBucket> = models
         .iter()
-        .filter(|(_, m)| !m["isInternal"].as_bool().unwrap_or(false))
+        .filter(|(id, m)| !m["isInternal"].as_bool().unwrap_or(false) && !id.contains("disabled"))
         .filter_map(|(_, m)| {
             let name = m["displayName"].as_str()?;
             let qi = m.get("quotaInfo")?;
@@ -662,6 +662,92 @@ fn parse_antigravity_models(body: &str) -> Vec<QuotaBucket> {
         })
         .collect();
     out.sort_by(|a, b| a.label.cmp(&b.label));
+    // `-tiered-high` carries the same name (and limit) as `-high`
+    out.dedup_by(|a, b| a.label == b.label);
+    out
+}
+
+/// One `v1internal` call. The `daily` host is the one that lists Gemini 4
+/// (Hydrogen, Argon), and without an Antigravity user agent it answers 403
+/// "no valid license".
+fn antigravity_post(access_token: &str, method: &str) -> Result<String> {
+    read_body(
+        agent()
+            .post(&format!(
+                "{}/v1internal:{method}",
+                crate::antigravity::BASE_URL
+            ))
+            .set("Authorization", &format!("Bearer {access_token}"))
+            .set("Content-Type", "application/json")
+            .set("User-Agent", crate::antigravity::USER_AGENT)
+            .send_string("{}"),
+    )
+}
+
+/// A model the account can chat with: the id the API takes, the name it shows.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ModelInfo {
+    pub id: String,
+    pub name: String,
+}
+
+/// The models a subscription offers right now. Only Antigravity publishes a
+/// live list; the others answer empty and the window keeps its catalogue.
+pub fn fetch_models(tool: OAuthTool, access_token: &str) -> Result<Vec<ModelInfo>> {
+    match tool {
+        OAuthTool::Antigravity => Ok(parse_antigravity_model_list(&antigravity_post(
+            access_token,
+            "fetchAvailableModels",
+        )?)),
+        _ => Ok(Vec::new()),
+    }
+}
+
+/// The app's own "Recommended" order first (Gemini 4 Hydrogen/Argon, Claude,
+/// GPT-OSS), then every other named chat model. Internal, disabled and image
+/// models stay out, and one name is listed once (`-tiered-high` repeats
+/// `-high`).
+fn parse_antigravity_model_list(body: &str) -> Vec<ModelInfo> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Vec::new();
+    };
+    let Some(models) = v["models"].as_object() else {
+        return Vec::new();
+    };
+    let image: Vec<&str> = v["imageGenerationModelIds"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|x| x.as_str())
+        .collect();
+    let recommended = v["agentModelSorts"][0]["groups"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|g| g["modelIds"].as_array().into_iter().flatten())
+        .filter_map(|x| x.as_str());
+    let mut ids: Vec<&str> = recommended.collect();
+    let mut rest: Vec<&str> = models.keys().map(String::as_str).collect();
+    rest.sort();
+    ids.extend(rest);
+    let mut out: Vec<ModelInfo> = Vec::new();
+    for id in ids {
+        let Some(m) = models.get(id) else { continue };
+        let Some(name) = m["displayName"].as_str().map(str::trim) else {
+            continue;
+        };
+        if m["isInternal"].as_bool().unwrap_or(false)
+            || id.contains("disabled")
+            || image.contains(&id)
+            || out.iter().any(|o| o.id == id || o.name == name)
+        {
+            continue;
+        }
+        out.push(ModelInfo {
+            id: id.to_string(),
+            name: name.to_string(),
+        });
+    }
     out
 }
 
@@ -785,8 +871,8 @@ fn bucket(group: &str, label: impl Into<String>, window: &QuotaWindow) -> QuotaB
     }
 }
 
-/// Reads the plan quota for an OAuth credential. Claude and Codex report it;
-/// Antigravity keeps everything behind DPAPI and has no public usage endpoint.
+/// Reads the plan quota for an OAuth credential: Claude and Codex usage
+/// endpoints, Antigravity's quota summary plus one bar per model.
 pub fn fetch_quota(tool: OAuthTool, access_token: &str) -> Result<Quota> {
     let get = |url: &str| -> Result<String> {
         read_body(
@@ -809,21 +895,7 @@ pub fn fetch_quota(tool: OAuthTool, access_token: &str) -> Result<Quota> {
             "https://chatgpt.com/backend-api/wham/usage",
         )?)),
         OAuthTool::Antigravity => {
-            // without these three headers the API answers 403 "no valid license"
-            let post = |method: &str| {
-                read_body(
-                    agent()
-                        .post(&format!(
-                            "https://cloudcode-pa.googleapis.com/v1internal:{method}"
-                        ))
-                        .set("Authorization", &format!("Bearer {access_token}"))
-                        .set("Content-Type", "application/json")
-                        .set("User-Agent", "antigravity/1.0.0")
-                        .set("X-Client-Name", "antigravity")
-                        .set("X-Client-Version", "1.0.0")
-                        .send_string("{}"),
-                )
-            };
+            let post = |method: &str| antigravity_post(access_token, method);
             let mut q = parse_antigravity_quota(&post("retrieveUserQuotaSummary")?);
             // per-model limits (9router's long list); a failure keeps the summary
             if let Ok(models) = post("fetchAvailableModels") {
@@ -1112,6 +1184,28 @@ mod tests {
         assert_eq!(b[0].group, "Modelos");
         assert_eq!(b[0].window.utilization, 75.0);
         assert!(b[0].label.starts_with("Claude Sonnet 5.5 (High)"));
+    }
+
+    #[test]
+    fn antigravity_model_list_keeps_the_recommended_order_and_drops_noise() {
+        let body = r#"{"models":{
+            "gemini-4-hydrogen-high":{"displayName":"Gemini 4 Hydrogen (High)"},
+            "gemini-4-hydrogen-tiered-high":{"displayName":"Gemini 4 Hydrogen (High)"},
+            "gemini-4-carbon-disabled":{"displayName":"Gemini 4 Carbon"},
+            "gemini-3.1-flash-image":{"displayName":"Gemini 3.1 Flash Image"},
+            "chat_20706":{"isInternal":true},
+            "a-model":{"displayName":"A"},
+            "gpt-oss-120b-medium":{"displayName":"GPT-OSS 120B (Medium) "}},
+            "imageGenerationModelIds":["gemini-3.1-flash-image"],
+            "agentModelSorts":[{"groups":[{"modelIds":["gemini-4-hydrogen-high","gpt-oss-120b-medium","gemini-4-carbon-disabled"]}]}]}"#;
+        let ids: Vec<String> = parse_antigravity_model_list(body)
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(
+            ids,
+            ["gemini-4-hydrogen-high", "gpt-oss-120b-medium", "a-model"]
+        );
     }
 
     #[test]

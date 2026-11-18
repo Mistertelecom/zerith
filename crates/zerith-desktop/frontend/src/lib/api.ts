@@ -481,6 +481,8 @@ export const api = {
   oauthCode: (code: string) => invoke<boolean>("oauth_code", { code }),
   accountQuota: (account: string) =>
     invoke<Quota>("account_quota", { account }),
+  accountModels: (account: string) =>
+    invoke<{ id: string; name: string }[]>("account_models", { account }),
   oauthImport9router: (tool: string, account: string) =>
     invoke<string>("oauth_import_9router", { tool, account }),
   oauthImportPasted: (tool: string, account: string, raw: string) =>

@@ -237,9 +237,10 @@ pub fn save_provider(root: &Path, cfg: &ProviderConfig) -> Result<(), String> {
         protocol: match cfg.protocol {
             Protocol::OpenAi => Some(WireProtocol::OpenAi),
             Protocol::Anthropic => Some(WireProtocol::Anthropic),
-            // Responses (codex) is implied by the provider kind; the settings
-            // field only knows the two historical protocols.
-            Protocol::Responses => None,
+            // Responses (codex) and Gemini (antigravity) are implied by the
+            // provider kind; the settings field only knows the two historical
+            // protocols.
+            Protocol::Responses | Protocol::Gemini => None,
         },
         auth: match cfg.auth {
             AuthMode::ApiKey => AuthModeSettings::ApiKey,
@@ -479,6 +480,18 @@ pub fn oauth_import_9router(root: &Path, tool: OAuthTool, account: &str) -> Resu
 
 /// Plan quota for an OAuth account, refreshing the token when it went stale.
 pub fn account_quota(account: &str) -> Result<zerith_providers::oauth::Quota, String> {
+    let cred = fresh_oauth(account)?;
+    zerith_providers::oauth::fetch_quota(cred.tool, &cred.access_token).map_err(|e| e.to_string())
+}
+
+/// The live model list of an OAuth account (Antigravity publishes one).
+pub fn account_models(account: &str) -> Result<Vec<zerith_providers::oauth::ModelInfo>, String> {
+    let cred = fresh_oauth(account)?;
+    zerith_providers::oauth::fetch_models(cred.tool, &cred.access_token).map_err(|e| e.to_string())
+}
+
+/// The account's credential, renewed when it went stale.
+fn fresh_oauth(account: &str) -> Result<zerith_providers::OAuthCredential, String> {
     let mut cred = zerith_core::secrets::load_oauth(&zerith_core::secrets::OsKeyring, account)
         .map_err(|e| e.to_string())?
         .ok_or("sem credencial no cofre para esta conta")?;
@@ -489,7 +502,7 @@ pub fn account_quota(account: &str) -> Result<zerith_providers::oauth::Quota, St
         zerith_core::secrets::save_oauth(&zerith_core::secrets::OsKeyring, account, &cred)
             .map_err(|e| e.to_string())?;
     }
-    zerith_providers::oauth::fetch_quota(cred.tool, &cred.access_token).map_err(|e| e.to_string())
+    Ok(cred)
 }
 
 /// Where an account's credential stands, for the pill: which tool and how many

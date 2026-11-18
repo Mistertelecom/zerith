@@ -81,6 +81,7 @@ pub(super) fn model_placeholder(kind: ProviderKind) -> &'static str {
         ProviderKind::Ollama => "ex.: qwen2.5-coder",
         ProviderKind::LmStudio => "ex.: local-model",
         ProviderKind::Codex => "ex.: gpt-5-codex",
+        ProviderKind::Antigravity => "ex.: gemini-4-hydrogen-medium",
         ProviderKind::Custom => "ex.: modelo-padrão",
     }
 }

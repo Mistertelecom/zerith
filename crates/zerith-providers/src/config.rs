@@ -17,6 +17,9 @@ pub enum Protocol {
     /// `POST {base}/responses`: the Responses API a Codex subscription answers
     /// on. Flat `input`, typed SSE.
     Responses,
+    /// `POST {base}:streamGenerateContent`: Gemini's own wire, as an
+    /// Antigravity subscription speaks it (`v1internal`, wrapped request).
+    Gemini,
 }
 
 impl Protocol {
@@ -25,6 +28,7 @@ impl Protocol {
             Protocol::OpenAi => "openai",
             Protocol::Anthropic => "anthropic",
             Protocol::Responses => "responses",
+            Protocol::Gemini => "gemini",
         }
     }
 }
@@ -129,6 +133,8 @@ pub enum ProviderKind {
     LmStudio,
     /// A Codex subscription: OAuth only, own base URL and protocol.
     Codex,
+    /// An Antigravity subscription: OAuth only, Gemini's wire.
+    Antigravity,
     Custom,
 }
 
@@ -158,6 +164,7 @@ impl ProviderKind {
             "ollama" => Self::Ollama,
             "lmstudio" | "lm-studio" => Self::LmStudio,
             "codex" => Self::Codex,
+            "antigravity" => Self::Antigravity,
             _ => Self::Custom,
         }
     }
@@ -172,6 +179,7 @@ impl ProviderKind {
             ProviderKind::Ollama => "http://localhost:11434/v1",
             ProviderKind::LmStudio => "http://localhost:1234/v1",
             ProviderKind::Codex => "https://chatgpt.com/backend-api/codex",
+            ProviderKind::Antigravity => crate::antigravity::BASE_URL,
             ProviderKind::Custom => "",
         }
     }
@@ -180,6 +188,7 @@ impl ProviderKind {
         match self {
             ProviderKind::Anthropic => Protocol::Anthropic,
             ProviderKind::Codex => Protocol::Responses,
+            ProviderKind::Antigravity => Protocol::Gemini,
             _ => Protocol::OpenAi,
         }
     }
@@ -200,6 +209,7 @@ impl ProviderKind {
             ProviderKind::Ollama => "ollama",
             ProviderKind::LmStudio => "lmstudio",
             ProviderKind::Codex => "codex",
+            ProviderKind::Antigravity => "antigravity",
             ProviderKind::Custom => "custom",
         }
     }

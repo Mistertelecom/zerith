@@ -35,6 +35,7 @@ fn model_hint(kind: ProviderKind) -> &'static str {
         ProviderKind::Ollama => "ex.: qwen2.5-coder",
         ProviderKind::LmStudio => "ex.: local-model",
         ProviderKind::Codex => "ex.: gpt-5-codex",
+        ProviderKind::Antigravity => "ex.: gemini-4-hydrogen-medium",
         ProviderKind::Custom => "ex.: modelo-padrão",
     }
 }
@@ -54,16 +55,12 @@ pub async fn presets() -> Cmd<Vec<Preset>> {
                 ProviderKind::Ollama => "Ollama",
                 ProviderKind::LmStudio => "LM Studio",
                 ProviderKind::Codex => "Codex",
+                ProviderKind::Antigravity => "Antigravity",
                 ProviderKind::Custom => "Outro",
             }
             .to_string(),
             base_url: k.default_base_url().to_string(),
-            protocol: match k.default_protocol() {
-                Protocol::OpenAi => "openai",
-                Protocol::Anthropic => "anthropic",
-                Protocol::Responses => "responses",
-            }
-            .to_string(),
+            protocol: k.default_protocol().as_str().to_string(),
             model_hint: model_hint(*k).to_string(),
             needs_key: k.needs_key(),
         })
@@ -105,6 +102,7 @@ impl ProviderForm {
         cfg.protocol = match self.protocol.as_str() {
             "anthropic" => Protocol::Anthropic,
             "responses" => Protocol::Responses,
+            "gemini" => Protocol::Gemini,
             _ => Protocol::OpenAi,
         };
         cfg.base_url = url.to_string();
@@ -350,6 +348,14 @@ pub async fn oauth_import_9router(
 #[tauri::command]
 pub async fn account_quota(account: String) -> Cmd<zerith_providers::oauth::Quota> {
     tauri::async_runtime::spawn_blocking(move || wire::account_quota(&account))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Models an OAuth account offers right now (empty when the provider has no list).
+#[tauri::command]
+pub async fn account_models(account: String) -> Cmd<Vec<zerith_providers::oauth::ModelInfo>> {
+    tauri::async_runtime::spawn_blocking(move || wire::account_models(&account))
         .await
         .map_err(|e| e.to_string())?
 }

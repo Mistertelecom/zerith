@@ -9,6 +9,7 @@
 //! request header, never to a log or an error message.
 
 mod anthropic;
+mod antigravity;
 mod codex;
 mod config;
 pub mod explain;

@@ -212,7 +212,7 @@ export const CATALOG: CatalogEntry[] = [
     oauthTool: "antigravity",
     provider: "antigravity",
     protocol: "openai",
-    baseUrl: "https://daily-cloudcode-pa.googleapis.com/v1internal",
+    baseUrl: "https://daily-cloudcode-pa.googleapis.com",
     color: "#F59E0B",
     website: "https://antigravity.google",
     featured: true,

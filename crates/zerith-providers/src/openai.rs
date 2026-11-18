@@ -140,7 +140,9 @@ impl Client {
                             h.insert("chatgpt-account-id".into(), id.clone());
                         }
                     }
-                    OAuthTool::Antigravity => {}
+                    OAuthTool::Antigravity => {
+                        h.insert("user-agent".into(), crate::antigravity::USER_AGENT.into());
+                    }
                 }
             }
             _ => {
@@ -150,7 +152,7 @@ impl Client {
                             h.insert("x-api-key".into(), key.clone());
                         }
                         // Responses takes the same Bearer the OpenAI path takes.
-                        Protocol::OpenAi | Protocol::Responses => {
+                        Protocol::OpenAi | Protocol::Responses | Protocol::Gemini => {
                             h.insert("authorization".into(), format!("Bearer {key}"));
                         }
                     }
@@ -270,6 +272,9 @@ impl Client {
         if self.cfg.protocol == Protocol::Responses {
             return crate::codex::complete(self, req, cancel);
         }
+        if self.cfg.protocol == Protocol::Gemini {
+            return crate::antigravity::complete(self, req, cancel);
+        }
         let resp = self.post("chat/completions", &body(req, false), cancel)?;
         let text = resp
             .into_string()
@@ -294,6 +299,9 @@ impl Client {
         }
         if self.cfg.protocol == Protocol::Responses {
             return crate::codex::stream(self, req, cancel, &mut on_event);
+        }
+        if self.cfg.protocol == Protocol::Gemini {
+            return crate::antigravity::stream(self, req, cancel, &mut on_event);
         }
         let resp = self.post("chat/completions", &body(req, true), cancel)?;
         let mut state = OpenAiStream::default();

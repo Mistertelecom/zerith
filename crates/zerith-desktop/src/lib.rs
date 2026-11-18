@@ -163,6 +163,7 @@ pub fn run() {
             providers::oauth_import_pasted,
             providers::oauth_import_9router,
             providers::account_quota,
+            providers::account_models,
             chat::cancel_turn,
             chat::answer_approval,
             chat::answer_question,

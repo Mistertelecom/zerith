@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use zerith_providers::media::{KeyInfo, Kind, ModelPage};
-use zerith_providers::{Protocol, ProviderConfig};
+use zerith_providers::ProviderConfig;
 
 /// Appearance. `System` follows the OS and is the default.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,12 +166,7 @@ impl ProviderView {
         Self {
             name: cfg.name.clone(),
             kind: cfg.kind.as_str().to_string(),
-            protocol: match cfg.protocol {
-                Protocol::OpenAi => "openai",
-                Protocol::Anthropic => "anthropic",
-                Protocol::Responses => "responses",
-            }
-            .to_string(),
+            protocol: cfg.protocol.as_str().to_string(),
             base_url: cfg.base_url.clone(),
             default_model: cfg.default_model.clone(),
             known_models: cfg.known_models.clone(),

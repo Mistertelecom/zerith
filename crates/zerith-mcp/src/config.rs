@@ -37,6 +37,10 @@ pub struct ServerConfig {
     /// Per-request timeout; the client default (30 s) when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    /// `"oauth"`: log in with OAuth 2.1 (`zerith mcp login`, "Entrar"); the
+    /// tokens live in the OS vault, never here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<String>,
     #[serde(skip, default = "user")]
     pub origin: Origin,
 }
@@ -60,6 +64,16 @@ impl ServerConfig {
                 self.name
             ));
         }
+        match self.auth.as_deref() {
+            None => {}
+            Some("oauth") if self.url.is_some() => {}
+            Some(other) => {
+                return Err(format!(
+                    "servidor {}: auth = {other:?} não existe (use \"oauth\", só com `url`)",
+                    self.name
+                ))
+            }
+        }
         match (&self.command, &self.url) {
             (Some(c), None) if !c.trim().is_empty() => Ok(()),
             (None, Some(u)) if u.starts_with("http://") || u.starts_with("https://") => Ok(()),
@@ -76,6 +90,10 @@ impl ServerConfig {
 
     pub fn is_http(&self) -> bool {
         self.url.is_some()
+    }
+
+    pub fn is_oauth(&self) -> bool {
+        self.auth.as_deref() == Some("oauth")
     }
 }
 
@@ -293,6 +311,7 @@ pub fn parse_add(args: &[String]) -> Result<ServerConfig, String> {
         args: Vec::new(),
         url: None,
         timeout_ms: None,
+        auth: None,
         origin: Origin::User,
     };
     let mut i = 1;
@@ -301,6 +320,10 @@ pub fn parse_add(args: &[String]) -> Result<ServerConfig, String> {
             "--url" => {
                 server.url = Some(args.get(i + 1).ok_or("--url precisa de um valor")?.clone());
                 i += 2;
+            }
+            "--oauth" => {
+                server.auth = Some("oauth".into());
+                i += 1;
             }
             "--timeout-ms" => {
                 server.timeout_ms = Some(
@@ -347,6 +370,10 @@ mod tests {
         .unwrap();
         assert!(h.is_http());
         assert_eq!(h.timeout_ms, Some(5000));
+        assert!(!h.is_oauth());
+        let o = parse_add(&v(&["v", "--url", "https://mcp.vercel.com", "--oauth"])).unwrap();
+        assert!(o.is_oauth());
+        assert!(parse_add(&v(&["x", "--oauth", "--", "npx"])).is_err());
         assert!(parse_add(&v(&[])).is_err());
         assert!(parse_add(&v(&["a b", "--", "x"])).is_err());
         assert!(parse_add(&v(&["x"])).is_err());

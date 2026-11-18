@@ -85,8 +85,16 @@ impl Server {
                 timeout,
             ),
             (None, Some(url)) => {
-                let mut c =
-                    Client::connect_http_with(&self.cfg.name, url, &pairs(&self.extra.headers))?;
+                let auth = self
+                    .cfg
+                    .is_oauth()
+                    .then(|| crate::oauth::Auth::os(&self.cfg.name));
+                let mut c = Client::connect_http_auth(
+                    &self.cfg.name,
+                    url,
+                    &pairs(&self.extra.headers),
+                    auth,
+                )?;
                 c.set_timeout(timeout);
                 Ok(c)
             }

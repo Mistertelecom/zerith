@@ -7,6 +7,7 @@
 //! to the permission layer, and putting it here would hide it from the user.
 
 pub mod config;
+pub mod oauth;
 pub mod protocol;
 pub mod tools;
 
@@ -67,6 +68,8 @@ enum Transport {
         url: String,
         session: Option<String>,
         headers: Vec<(String, String)>,
+        /// `auth = "oauth"` servers: bearer tokens from the vault.
+        auth: Option<oauth::Auth>,
     },
 }
 
@@ -155,12 +158,23 @@ impl Client {
 
     /// Streamable HTTP with extra request headers (an `Authorization` token).
     pub fn connect_http_with(name: &str, url: &str, headers: &[(String, String)]) -> Result<Self> {
+        Self::connect_http_auth(name, url, headers, None)
+    }
+
+    /// Streamable HTTP with an OAuth bearer token on every request.
+    pub fn connect_http_auth(
+        name: &str,
+        url: &str,
+        headers: &[(String, String)],
+        auth: Option<oauth::Auth>,
+    ) -> Result<Self> {
         Self::handshake(Self {
             transport: Transport::Http {
                 agent: ureq::AgentBuilder::new().build(),
                 url: url.to_string(),
                 session: None,
                 headers: headers.to_vec(),
+                auth,
             },
             next_id: AtomicU64::new(1),
             timeout: DEFAULT_TIMEOUT,
@@ -242,6 +256,7 @@ impl Client {
     }
 
     /// One POST. Captures `Mcp-Session-Id` from the server and resends it.
+    /// With OAuth, a 401 refreshes the token and retries once.
     fn post(&mut self, msg: &Value) -> Result<ureq::Response> {
         let timeout = self.timeout;
         let Transport::Http {
@@ -249,28 +264,44 @@ impl Client {
             url,
             session,
             headers,
+            auth,
         } = &mut self.transport
         else {
             return Err(McpError::Protocol("not an http transport".into()));
         };
-        let mut req = agent
-            .post(url)
-            .timeout(timeout)
-            .set("Content-Type", "application/json")
-            .set("Accept", "application/json, text/event-stream");
-        for (k, v) in headers.iter() {
-            req = req.set(k, v);
-        }
-        if let Some(s) = session.as_deref() {
-            req = req.set("Mcp-Session-Id", s);
-        }
-        let resp = match req.send_string(&serde_json::to_string(msg)?) {
-            Ok(r) => r,
-            Err(ureq::Error::Status(code, r)) => {
-                let body = r.into_string().unwrap_or_default();
-                return Err(McpError::Http(format!("status {code}: {body}")));
+        let body = serde_json::to_string(msg)?;
+        let mut retried = false;
+        let resp = loop {
+            let mut req = agent
+                .post(url)
+                .timeout(timeout)
+                .set("Content-Type", "application/json")
+                .set("Accept", "application/json, text/event-stream");
+            for (k, v) in headers.iter() {
+                req = req.set(k, v);
             }
-            Err(e) => return Err(McpError::Http(e.to_string())),
+            if let Some(a) = auth.as_ref() {
+                let token = a.bearer(retried).map_err(McpError::Http)?;
+                req = req.set("Authorization", &format!("Bearer {token}"));
+            }
+            if let Some(s) = session.as_deref() {
+                req = req.set("Mcp-Session-Id", s);
+            }
+            match req.send_string(&body) {
+                Ok(r) => break r,
+                Err(ureq::Error::Status(401, _)) if auth.is_some() && !retried => retried = true,
+                Err(ureq::Error::Status(401, _)) if auth.is_some() => {
+                    if let Some(a) = auth.as_ref() {
+                        a.reject();
+                    }
+                    return Err(McpError::Http(oauth::EXPIRED.into()));
+                }
+                Err(ureq::Error::Status(code, r)) => {
+                    let body = r.into_string().unwrap_or_default();
+                    return Err(McpError::Http(format!("status {code}: {body}")));
+                }
+                Err(e) => return Err(McpError::Http(e.to_string())),
+            }
         };
         if let Some(s) = resp.header("Mcp-Session-Id") {
             *session = Some(s.to_string());

@@ -50,6 +50,7 @@ fn config(url: String) -> ServerConfig {
         args: vec![],
         url: Some(url),
         timeout_ms: Some(5000),
+        auth: None,
         origin: Origin::User,
     }
 }

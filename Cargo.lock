@@ -7765,6 +7765,7 @@ dependencies = [
 name = "zerith-mcp"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "serde",
  "serde_json",
  "tempfile",
@@ -7772,6 +7773,7 @@ dependencies = [
  "toml 1.1.8+spec-1.1.0",
  "ureq",
  "zerith-core",
+ "zerith-providers",
  "zerith-security",
  "zerith-tools",
 ]

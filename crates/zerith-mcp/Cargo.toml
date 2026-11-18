@@ -14,6 +14,10 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 ureq.workspace = true
+# MCP OAuth: PKCE, state and the loopback callback live with the providers'
+# OAuth; base64 (already in the tree) for client_secret_basic.
+zerith-providers = { path = "../zerith-providers" }
+base64 = "0.22"
 
 [dev-dependencies]
 tempfile.workspace = true

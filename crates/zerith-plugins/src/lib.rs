@@ -313,6 +313,7 @@ impl Library {
                         args: e.args.clone(),
                         url: e.url.clone(),
                         timeout_ms: None,
+                        auth: None,
                         origin: zerith_mcp::Origin::User,
                     },
                 ));
@@ -420,6 +421,7 @@ fn validate_bundle(m: &Manifest, root: &Path) -> Result<()> {
             args: e.args.clone(),
             url: e.url.clone(),
             timeout_ms: None,
+            auth: None,
             origin: zerith_mcp::Origin::User,
         };
         cfg.validate().map_err(|why| bad("mcp", why))?;

@@ -139,7 +139,10 @@ pub struct HermesMcp {
     pub url: Option<String>,
     pub env: BTreeMap<String, String>,
     pub headers: BTreeMap<String, String>,
-    /// `auth: oauth` or an `oauth:` block: zerith-mcp has no OAuth client.
+    /// `auth: oauth` or an `oauth:` block: imported as `auth = "oauth"`; the
+    /// person logs in afterwards ("Entrar" / `zerith mcp login`). Hermes'
+    /// tokens are never copied: its refresh tokens rotate, using one here
+    /// would log Hermes out.
     pub oauth: bool,
     pub enabled: bool,
     /// Hermes `timeout` is in seconds.
@@ -151,6 +154,7 @@ pub struct HermesMcp {
 pub enum McpStatus {
     Importable,
     NotFound,
+    /// Importable; needs a login afterwards.
     OAuth,
     Exists,
     Invalid,
@@ -176,6 +180,7 @@ impl HermesMcp {
             args: self.args.clone(),
             url: self.url.clone(),
             timeout_ms: self.timeout_secs.map(|s| s * 1000),
+            auth: self.oauth.then(|| "oauth".to_string()),
             origin: Origin::User,
         }
     }
@@ -197,10 +202,10 @@ pub fn hermes_mcp(home: &Path, paths: &Paths) -> Result<Vec<(HermesMcp, McpStatu
         .map(|m| {
             let status = if have.contains(&m.name.as_str()) {
                 McpStatus::Exists
-            } else if m.oauth {
-                McpStatus::OAuth
             } else if m.config().validate().is_err() {
                 McpStatus::Invalid
+            } else if m.oauth {
+                McpStatus::OAuth
             } else if m
                 .command
                 .as_deref()
@@ -228,13 +233,12 @@ pub fn import_hermes_mcp(
         .filter(|(m, _)| names.contains(&m.name))
     {
         let why = match status {
-            McpStatus::Importable => None,
+            McpStatus::Importable | McpStatus::OAuth => None,
             McpStatus::Exists => {
                 r.existed.push(m.name);
                 continue;
             }
             McpStatus::NotFound => Some("comando não encontrado neste computador"),
-            McpStatus::OAuth => Some("OAuth ainda não suportado"),
             McpStatus::Invalid => Some("precisa de `command` ou `url` (http/https)"),
         };
         if let Some(why) = why {
@@ -608,5 +612,35 @@ _left_core_scoped:
         assert_eq!(rea.timeout_secs, Some(1500));
         assert!(parse_mcp_servers("model: x\n").unwrap().is_empty());
         assert!(parse_mcp_servers("mcp_servers:\n  a:\n      b: 1\n    c: 2\n").is_err());
+    }
+
+    #[test]
+    fn hermes_oauth_servers_import_as_oauth_and_wait_for_a_login() {
+        let t = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-scratch")
+            .join(format!("hermes-oauth-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        std::fs::create_dir_all(t.join("home")).unwrap();
+        std::fs::write(t.join("home/config.yaml"), FIXTURE).unwrap();
+        let paths = Paths::with_root(t.join("root"));
+        let found = hermes_mcp(&t.join("home"), &paths).unwrap();
+        let st = |n: &str| found.iter().find(|(m, _)| m.name == n).unwrap().1;
+        assert_eq!(st("vercel"), McpStatus::OAuth);
+        assert_eq!(st("canva"), McpStatus::OAuth);
+        let r =
+            import_hermes_mcp(&t.join("home"), &paths, &["vercel".into(), "canva".into()]).unwrap();
+        assert_eq!(r.imported, ["vercel", "canva"], "{:?}", r.failed);
+        let l = load_servers(&paths, None);
+        let v = l.servers.iter().find(|s| s.name == "vercel").unwrap();
+        assert!(v.is_oauth());
+        assert_eq!(v.url.as_deref(), Some("https://mcp.vercel.com"));
+        let toml = std::fs::read_to_string(t.join("root/mcp.toml")).unwrap();
+        assert!(toml.contains("auth = \"oauth\""));
+        assert!(!toml.to_ascii_lowercase().contains("token"));
+        let again = hermes_mcp(&t.join("home"), &paths).unwrap();
+        assert!(again
+            .iter()
+            .any(|(m, s)| m.name == "vercel" && *s == McpStatus::Exists));
+        let _ = std::fs::remove_dir_all(&t);
     }
 }

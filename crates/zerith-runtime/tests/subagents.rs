@@ -362,13 +362,14 @@ fn two_agent_calls_run_in_parallel_and_the_parent_sees_only_the_summaries() {
             .starts_with("resposta de FILHO-"));
     }
 
-    // The UI hears about both: running then done.
+    // The UI hears about both: running (with live progress) then done.
     let ev = subagent_events(&events);
-    assert_eq!(
-        ev.iter().filter(|(_, s)| s == "running").count(),
-        2,
-        "{ev:?}"
-    );
+    let ran: std::collections::HashSet<&String> = ev
+        .iter()
+        .filter(|(_, s)| s == "running")
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(ran.len(), 2, "{ev:?}");
     assert_eq!(ev.iter().filter(|(_, s)| s == "done").count(), 2, "{ev:?}");
 }
 
@@ -763,6 +764,117 @@ fn a_background_agent_returns_an_id_and_agent_result_collects_it() {
     )
     .unwrap();
     assert_eq!(r.text, "fim: resultado do fundo");
+}
+
+#[test]
+fn a_background_child_the_model_forgets_is_awaited_and_its_result_handed_back() {
+    // The model starts a background child and answers right away, never
+    // calling agent_result. The turn must not end with the child running
+    // unseen: it waits, feeds the result back, and the model finishes with it.
+    let url = serve(|b| match prompt_of(b).as_str() {
+        "PAI" => {
+            let msgs = messages(b);
+            let joined = msgs
+                .iter()
+                .filter_map(|m| m["content"].as_str())
+                .find(|c| c.contains("subagentes em segundo plano terminaram"));
+            match (tool_msgs(b).len(), joined) {
+                (0, _) => calls(&[(
+                    "c1",
+                    "agent",
+                    json!({"description": "fundo", "prompt": "BG", "agent": "explore", "run_in_background": true}),
+                )]),
+                (_, None) => text("já volto"),
+                (_, Some(r)) => text(&format!("final com: {}", r.contains("resultado esquecido"))),
+            }
+        }
+        _ => slow("resultado esquecido", Duration::from_millis(400)),
+    });
+    let e = env(Mode::Default);
+    let reg = Registry::new();
+    let mut events = Vec::new();
+    let r = turn(
+        &e,
+        &url,
+        &reg,
+        AgentOptions {
+            subagents: subs(2),
+            ..AgentOptions::default()
+        },
+        TurnContext::default(),
+        "PAI",
+        &Cancel::default(),
+        |ev| events.push(ev),
+    )
+    .unwrap();
+    assert_eq!(r.text, "final com: true");
+    let states: Vec<String> = subagent_events(&events)
+        .into_iter()
+        .map(|(_, s)| s)
+        .collect();
+    assert!(states.contains(&"done".to_string()), "{states:?}");
+    // progress was shown while it ran, not only at the end
+    assert!(
+        events
+            .iter()
+            .any(|ev| matches!(ev, RunEvent::Subagent { state, summary, .. }
+        if state == "running" && summary.starts_with("passo "))),
+        "{states:?}"
+    );
+}
+
+#[test]
+fn a_turn_that_stops_takes_its_background_children_with_it_and_says_so() {
+    // The parent is stopped while its background child is still working:
+    // the child is cancelled and the person sees it, nothing keeps running.
+    let child_done = Arc::new(AtomicUsize::new(0));
+    let cd = child_done.clone();
+    let url = serve(move |b| match prompt_of(b).as_str() {
+        "PAI" => calls(&[(
+            "c1",
+            "agent",
+            json!({"description": "longo", "prompt": "LONGO", "agent": "explore", "run_in_background": true}),
+        )]),
+        _ => {
+            cd.fetch_add(1, Ordering::SeqCst);
+            slow("nunca", Duration::from_secs(5))
+        }
+    });
+    let e = env(Mode::Default);
+    let reg = Registry::new();
+    let cancel = Cancel::default();
+    let stopper = cancel.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(700));
+        stopper.cancel();
+    });
+    let mut events = Vec::new();
+    let started = Instant::now();
+    let r = turn(
+        &e,
+        &url,
+        &reg,
+        AgentOptions {
+            subagents: subs(2),
+            max_steps: 50,
+            ..AgentOptions::default()
+        },
+        TurnContext::default(),
+        "PAI",
+        &cancel,
+        |ev| events.push(ev),
+    );
+    assert!(r.is_err(), "a stopped turn is an error");
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "no wait for the child"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|ev| matches!(ev, RunEvent::Subagent { state, .. } if state == "cancelled")),
+        "the person is told the child was stopped"
+    );
 }
 
 #[test]

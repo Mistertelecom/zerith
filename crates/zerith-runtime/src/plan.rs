@@ -507,6 +507,7 @@ fn run_one(
         sink: None,
         settings: Some(settings),
         approvals: None,
+        announce: None,
     })
     .map_err(|e| e.to_string())?;
     Ok(TaskOutcome {

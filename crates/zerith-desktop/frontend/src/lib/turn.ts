@@ -11,9 +11,11 @@ export type Block =
       tools: ToolRow[];
       error?: string;
       streaming: boolean;
+      /** Row id of the stored answer (`done.stored` / history): keys its diff. */
+      stored?: number;
     }
   /** `learned`: what the background review saved after the turn (with undo). */
-  | { kind: "note"; text: string; learned?: LearnedItem[] };
+  | { kind: "note"; text: string; learned?: LearnedItem[]; sub?: string };
 
 export interface ToolRow {
   id: string;
@@ -105,18 +107,30 @@ export function applyEvent(state: TurnState, ev: TurnEvent): TurnState {
     case "compacted":
       state.blocks.push({ kind: "note", text: "Contexto compactado" });
       return state;
-    case "subagent":
-      state.blocks.push({
-        kind: "note",
-        text: `Subagente ${ev.name}: ${ev.state}${ev.summary ? " — " + ev.summary : ""}`,
-      });
+    case "subagent": {
+      // One line per subagent, updated in place: its live progress (step,
+      // tool) and then how it ended, never a stream of notes.
+      const word: Record<string, string> = {
+        running: "rodando",
+        done: "concluído",
+        failed: "falhou",
+        cancelled: "parado",
+      };
+      const text = `Subagente ${ev.name}: ${word[ev.state] ?? ev.state}${ev.summary ? " — " + ev.summary : ""}`;
+      const prev = state.blocks.find(
+        (b): b is Block & { kind: "note" } => b.kind === "note" && b.sub === ev.id,
+      );
+      if (prev) prev.text = text;
+      else state.blocks.push({ kind: "note", text, sub: ev.id });
       return state;
+    }
     case "done": {
       const a = assistant(state);
       a.streaming = false;
       // the turn's full saving: RTK plus the Ponytail/Caveman estimates
       state.saved = Math.max(state.saved, ev.savedTokens);
       if (!a.text && ev.text) a.text = ev.text;
+      if (ev.stored != null) a.stored = ev.stored;
       return state;
     }
     case "failed": {

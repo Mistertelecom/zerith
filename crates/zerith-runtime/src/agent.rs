@@ -284,6 +284,16 @@ pub fn run_agent_turn(
         on_event,
         &log,
     );
+    // No child may outlive its turn unseen: whatever is still running in the
+    // background (error, stop, step limit) is stopped and reported.
+    for (id, name) in subagent::abandon(session_id) {
+        on_event(RunEvent::Subagent {
+            id,
+            name,
+            state: "cancelled".into(),
+            summary: "parado: a conversa terminou antes dele".into(),
+        });
+    }
     match &result {
         Ok((_, reason)) => log.end(reason, None, None),
         Err(RunError::Provider(ProviderError::Cancelled)) => {
@@ -422,6 +432,8 @@ fn turn_body(
         .map(|r| {
             r.specs()
                 .into_iter()
+                // Deferred tools run through `mcp_call`: no schema per request.
+                .filter(|s| !s.source.starts_with(zerith_tools::DEFERRED_SOURCE))
                 .map(|s| ToolDef {
                     name: s.name.clone(),
                     description: s.description.clone(),
@@ -555,6 +567,35 @@ fn turn_body(
             // Told something while the answer streamed: the turn is not over.
             if step < max_steps && steer(store, session_id, agent, &mut hist, log)? > 0 {
                 continue;
+            }
+            // Background children the model never collected: the turn waits
+            // for them (showing their progress) and hands the results back,
+            // instead of ending with work still running unseen.
+            if step < max_steps {
+                let joined = subagent::join_background(session_id, cancel, || {
+                    subagent::flush(store, session_id, agent.tools, on_event);
+                    if let (0, Some(g)) = (agent.subagents.depth, agent.approvals) {
+                        for e in g.take_relayed() {
+                            on_event(e);
+                        }
+                    }
+                });
+                if !joined.is_empty() {
+                    let text = background_report(&joined);
+                    let id = store.append(
+                        session_id,
+                        &NewMessage {
+                            raw: Some(json!({"subagents_joined": true})),
+                            ..NewMessage::new(Role::User, text.clone())
+                        },
+                    )?;
+                    log.emit(
+                        "subagent/joined",
+                        json!({"n": joined.len(), "message_id": id}),
+                    );
+                    hist.push(ChatMessage::user(text), id);
+                    continue;
+                }
             }
             if step < max_steps {
                 if let Some(st) = ctx.settings {
@@ -886,6 +927,20 @@ fn steer(
         hist.push(ChatMessage::user(text.clone()), id);
     }
     Ok(msgs.len())
+}
+
+/// What the model reads when background children finish after its answer.
+fn background_report(joined: &[subagent::Joined]) -> String {
+    let mut s = String::from(
+        "[Os subagentes em segundo plano terminaram. Use os resultados abaixo e conclua a resposta.]",
+    );
+    for (id, name, r) in joined {
+        match r {
+            Ok(t) => s.push_str(&format!("\n\n## {id} ({name})\n{t}")),
+            Err(e) => s.push_str(&format!("\n\n## {id} ({name}) falhou\n{e}")),
+        }
+    }
+    s
 }
 
 fn record(

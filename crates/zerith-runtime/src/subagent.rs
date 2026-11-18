@@ -304,6 +304,9 @@ pub struct ChildSpec {
     pub settings: Option<zerith_core::Settings>,
     /// The parent's gate. `None`: a call that needs approval is refused.
     pub approvals: Option<ApprovalGate>,
+    /// `(id, name)` under which the child reports its live progress (step and
+    /// tool) to the person while it runs. `None`: silent until it ends.
+    pub announce: Option<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -369,7 +372,12 @@ pub fn run_child(spec: ChildSpec) -> Result<ChildOutput, ChildError> {
         .and_then(|r| zerith_skills::Library::open(r).ok());
 
     let cancel = Cancel::default();
-    let watchdog = watch(spec.cancel.clone(), cancel.clone(), spec.deadline);
+    // Every child ends: with no deadline from the caller (plan runner without
+    // a time budget) it gets the background limit.
+    let deadline = spec
+        .deadline
+        .unwrap_or_else(|| Instant::now() + BACKGROUND_LIMIT);
+    let watchdog = watch(spec.cancel.clone(), cancel.clone(), Some(deadline));
     let sink = spec.sink.clone();
     let opts = crate::AgentOptions {
         tools: Some(&spec.registry),
@@ -394,6 +402,7 @@ pub fn run_child(spec: ChildSpec) -> Result<ChildOutput, ChildError> {
         settings: spec.settings.as_ref(),
         ..TurnContext::default()
     };
+    let mut step = 0usize;
     let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::run_agent_turn(
             &store,
@@ -405,6 +414,48 @@ pub fn run_child(spec: ChildSpec) -> Result<ChildOutput, ChildError> {
             &spec.prompt,
             &cancel,
             |e| {
+                // Live progress: what step the child is on and what it is
+                // running, while it runs. The shared gate is pumped by the
+                // root turn during the `agent` call; the sink only between
+                // tool groups.
+                let progress = match (&e, &spec.announce) {
+                    (RunEvent::Step { n }, Some(_)) => {
+                        step = *n;
+                        Some(format!("passo {n} de {}", spec.max_steps))
+                    }
+                    (RunEvent::ToolCall { name, .. }, Some(_)) => {
+                        Some(format!("passo {step} de {} · {name}", spec.max_steps))
+                    }
+                    _ => None,
+                };
+                if let (Some(summary), Some((id, name))) = (progress, &spec.announce) {
+                    let ev = RunEvent::Subagent {
+                        id: id.clone(),
+                        name: name.clone(),
+                        state: "running".into(),
+                        summary,
+                    };
+                    match (&spec.approvals, &sink) {
+                        (Some(g), _) => g.relay(ev),
+                        (None, Some(s)) => {
+                            if let RunEvent::Subagent {
+                                id,
+                                name,
+                                state,
+                                summary,
+                            } = ev
+                            {
+                                s.push(HostEvent::Subagent {
+                                    id,
+                                    name,
+                                    state,
+                                    summary,
+                                });
+                            }
+                        }
+                        (None, None) => {}
+                    }
+                }
                 if let (
                     RunEvent::Subagent {
                         id,
@@ -488,7 +539,85 @@ enum Bg {
 
 struct BgSlot {
     parent: String,
+    name: String,
+    /// The child's own token: the parent turn ending (or stopping) pulls it.
+    cancel: Cancel,
     state: Mutex<Bg>,
+}
+
+impl BgSlot {
+    fn result(&self) -> Option<Result<String, String>> {
+        match &*self.state.lock().ok()? {
+            Bg::Running => None,
+            Bg::Done(t) => Some(Ok(t.clone())),
+            Bg::Failed(e) => Some(Err(e.clone())),
+        }
+    }
+}
+
+/// What a background child left for its turn: id, display name, outcome.
+pub(crate) type Joined = (String, String, Result<String, String>);
+
+/// Waits for the background children of `session` its model never collected.
+/// Called when the turn would end, so no child outlives its turn unseen: the
+/// turn hands their results to the model and carries on. `pump` shows their
+/// live progress and approval prompts meanwhile. A stop of the turn stops
+/// them too; their own deadline bounds the wait otherwise.
+pub(crate) fn join_background(
+    session: &str,
+    cancel: &Cancel,
+    mut pump: impl FnMut(),
+) -> Vec<Joined> {
+    let mine: Vec<(String, Arc<BgSlot>)> = background()
+        .lock()
+        .map(|m| {
+            m.iter()
+                .filter(|(_, s)| s.parent == session)
+                .map(|(k, s)| (k.clone(), s.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for (id, slot) in mine {
+        let r = loop {
+            if let Some(r) = slot.result() {
+                break r;
+            }
+            if cancel.is_cancelled() {
+                return out;
+            }
+            pump();
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        if let Ok(mut m) = background().lock() {
+            m.remove(&id);
+        }
+        out.push((id, slot.name.clone(), r));
+    }
+    pump();
+    out
+}
+
+/// Stops and forgets every background child `session` still has. The turn
+/// calls it on its way out (error, stop, step limit): returns who was
+/// stopped, so the person is told instead of left with a child that never
+/// reports.
+pub(crate) fn abandon(session: &str) -> Vec<(String, String)> {
+    let Ok(mut m) = background().lock() else {
+        return Vec::new();
+    };
+    let gone: Vec<String> = m
+        .iter()
+        .filter(|(_, s)| s.parent == session)
+        .map(|(k, _)| k.clone())
+        .collect();
+    gone.into_iter()
+        .filter_map(|id| m.remove(&id).map(|s| (id, s)))
+        .map(|(id, s)| {
+            s.cancel.cancel();
+            (id, s.name.clone())
+        })
+        .collect()
 }
 
 fn background() -> &'static Mutex<HashMap<String, Arc<BgSlot>>> {
@@ -688,6 +817,7 @@ impl Services for Runtime {
             .unwrap_or(DEFAULT_CHILD_STEPS);
         let name = resolved.name.clone();
         let description = req.description.clone();
+        let bg_cancel = Cancel::default();
         let spec = ChildSpec {
             db,
             cfg,
@@ -703,7 +833,13 @@ impl Services for Runtime {
             max_steps: steps,
             depth,
             gate: Some(self.gate.clone()),
-            cancel: cancel.clone(),
+            // A background child outlives the call: its own token, pulled by
+            // the turn that started it when that turn ends or stops.
+            cancel: if req.background {
+                bg_cancel.clone()
+            } else {
+                cancel.clone()
+            },
             deadline: Some(if req.background {
                 Instant::now() + BACKGROUND_LIMIT
             } else {
@@ -712,6 +848,7 @@ impl Services for Runtime {
             sink: Some(sink.clone()),
             settings: Some(settings),
             approvals: self.approvals.clone(),
+            announce: Some((id.clone(), format!("{name}: {description}"))),
         };
         let totals = self.saved.clone();
         // Only the first level takes a permit; deeper children run under it.
@@ -761,6 +898,8 @@ impl Services for Runtime {
         }
         let slot = Arc::new(BgSlot {
             parent: session.to_string(),
+            name: format!("{name}: {description}"),
+            cancel: bg_cancel,
             state: Mutex::new(Bg::Running),
         });
         background()
@@ -790,15 +929,14 @@ impl Services for Runtime {
             .cloned()
             .filter(|s| s.parent == session)
             .ok_or_else(|| format!("subagente desconhecido: {id}"))?;
-        let st = slot
-            .state
-            .lock()
-            .map_err(|_| "estado corrompido".to_string())?;
-        match &*st {
-            Bg::Running => Ok(format!("{id}: running")),
-            Bg::Done(t) => Ok(t.clone()),
-            Bg::Failed(e) => Err(e.clone()),
+        let Some(r) = slot.result() else {
+            return Ok(format!("{id}: running"));
+        };
+        // Collected: the turn's end has nothing left to hand over for it.
+        if let Ok(mut m) = background().lock() {
+            m.remove(id);
         }
+        r
     }
 
     fn tasks(&self, session: &str, op: &str, args: &Value) -> Result<String, String> {

@@ -153,6 +153,50 @@ impl Store {
             .optional()?)
     }
 
+    /// The folder a session works in. `None`: never set (CLI, pre-v8 rows).
+    pub fn workspace(&self, id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT workspace FROM sessions WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// Points a session at a folder. Leaves `updated_at` alone: picking a
+    /// folder is not a message, so the session keeps its place in the list.
+    pub fn set_workspace(&self, id: &str, dir: &str) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE sessions SET workspace = ?1 WHERE id = ?2",
+            params![dir, id],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound(format!("session {id}")));
+        }
+        Ok(())
+    }
+
+    /// Distinct session folders, most recently used first.
+    pub fn recent_workspaces(&self, limit: usize) -> Result<Vec<String>> {
+        let mut st = self.conn.prepare(
+            "SELECT workspace FROM sessions WHERE workspace IS NOT NULL AND workspace != '' GROUP BY workspace ORDER BY MAX(updated_at) DESC LIMIT ?1",
+        )?;
+        let rows = st.query_map(params![limit as i64], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Every session that has a folder, as `(id, folder)`.
+    pub fn workspaces(&self) -> Result<std::collections::HashMap<String, String>> {
+        let mut st = self
+            .conn
+            .prepare("SELECT id, workspace FROM sessions WHERE workspace IS NOT NULL")?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     pub fn list_sessions(&self, limit: usize) -> Result<Vec<Session>> {
         let mut st = self.conn.prepare(
             "SELECT id, title, source, source_id, source_profile, model, provider, created_at, updated_at, archived FROM sessions ORDER BY updated_at DESC LIMIT ?1",

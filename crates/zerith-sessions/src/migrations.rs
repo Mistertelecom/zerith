@@ -9,14 +9,20 @@ use rusqlite::Connection;
 /// Highest version this build knows. Migrations are applied by version number,
 /// not by "everything above the maximum", so a gap (v6 present, v5 not yet) is
 /// filled in later instead of being skipped forever.
-pub const CURRENT_VERSION: i32 = 7;
+pub const CURRENT_VERSION: i32 = 8;
 
 /// Sequential migrations. Index 0 is version 1.
 const MIGRATIONS: &[&str] = &[V1, V2, V3, V4];
 
 /// Migrations with an explicit version, applied after the sequential ones.
-/// Task list owns v5, checkpoints v6, usage/cooldowns v7.
-const VERSIONED: &[(i32, &str)] = &[(5, V5), (6, V6), (7, V7)];
+/// Task list owns v5, checkpoints v6, usage/cooldowns v7, session folder v8.
+const VERSIONED: &[(i32, &str)] = &[(5, V5), (6, V6), (7, V7), (8, V8)];
+
+const V8: &str = r#"
+-- The folder a conversation works in (tools root, AGENTS.md, @ mentions).
+-- NULL: made before v8 or by the CLI; the desktop falls back to the last used.
+ALTER TABLE sessions ADD COLUMN workspace TEXT;
+"#;
 
 const V5: &str = r#"
 -- The agent's own checklist (task_create / task_update / task_list), one list

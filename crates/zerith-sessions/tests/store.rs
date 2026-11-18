@@ -76,3 +76,39 @@ fn backup_produces_a_readable_copy() {
     let restored = Store::open(&copy).unwrap();
     assert_eq!(restored.message_count(&sess.id).unwrap(), 1);
 }
+
+/// v8: each session keeps its own folder; the newest folders come first and a
+/// file migrated from v7 (no column yet) gains it with every row NULL.
+#[test]
+fn a_session_remembers_its_folder() {
+    let dir = tempfile::Builder::new()
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
+    let db = dir.path().join("zerith.db");
+    {
+        // A v7 file: everything but the v8 migration applied.
+        let s = Store::open(&db).unwrap();
+        s.conn()
+            .execute_batch(
+                "ALTER TABLE sessions DROP COLUMN workspace; DELETE FROM schema_migrations WHERE version = 8;",
+            )
+            .unwrap();
+        s.create_session("antiga", SessionSource::Native).unwrap();
+    }
+    let s = Store::open(&db).unwrap();
+    assert_eq!(s.schema_version().unwrap(), 8);
+    let old = s.list_sessions(10).unwrap().remove(0);
+    assert_eq!(s.workspace(&old.id).unwrap(), None);
+
+    let a = s.create_session("a", SessionSource::Native).unwrap();
+    s.set_workspace(&a.id, "C:/proj/a").unwrap();
+    s.set_workspace(&old.id, "C:/proj/b").unwrap();
+    assert_eq!(s.workspace(&a.id).unwrap().as_deref(), Some("C:/proj/a"));
+    s.append(&a.id, &NewMessage::new(Role::User, "oi")).unwrap();
+    assert_eq!(
+        s.recent_workspaces(10).unwrap(),
+        vec!["C:/proj/a", "C:/proj/b"]
+    );
+    assert_eq!(s.workspaces().unwrap().len(), 2);
+    assert!(s.set_workspace("nope", "C:/x").is_err());
+}

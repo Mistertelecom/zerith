@@ -827,18 +827,16 @@ fn a_background_child_the_model_forgets_is_awaited_and_its_result_handed_back() 
 fn a_turn_that_stops_takes_its_background_children_with_it_and_says_so() {
     // The parent is stopped while its background child is still working:
     // the child is cancelled and the person sees it, nothing keeps running.
-    let child_done = Arc::new(AtomicUsize::new(0));
-    let cd = child_done.clone();
     let url = serve(move |b| match prompt_of(b).as_str() {
-        "PAI" => calls(&[(
+        // Deterministic on any machine: one call starts the child, then the
+        // parent answers and waits for it, and the stop lands in that wait.
+        "PAI" if tool_msgs(b).is_empty() => calls(&[(
             "c1",
             "agent",
             json!({"description": "longo", "prompt": "LONGO", "agent": "explore", "run_in_background": true}),
         )]),
-        _ => {
-            cd.fetch_add(1, Ordering::SeqCst);
-            slow("nunca", Duration::from_secs(5))
-        }
+        "PAI" => text("já volto"),
+        _ => slow("nunca", Duration::from_secs(5)),
     });
     let e = env(Mode::Default);
     let reg = Registry::new();

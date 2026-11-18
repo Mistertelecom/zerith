@@ -580,6 +580,10 @@ fn turn_body(
                         }
                     }
                 });
+                // Stopped while waiting: the turn was stopped, not answered.
+                if cancel.is_cancelled() {
+                    return Err(ProviderError::Cancelled.into());
+                }
                 if !joined.is_empty() {
                     let text = background_report(&joined);
                     let id = store.append(

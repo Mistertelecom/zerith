@@ -1220,6 +1220,7 @@ button.item-row {
 /* login in progress: link to copy if the browser did not open */
 .login-link {
   display: flex;
+  flex-wrap: wrap; /* the code field takes its own line below */
   align-items: center;
   gap: 12px;
   padding: 12px 14px;

@@ -111,12 +111,50 @@ pub(crate) fn body(req: &ChatRequest, project: Option<&str>) -> Value {
     b
 }
 
-/// The API is a protobuf behind JSON: it rejects `$schema` and a list in
-/// `type`. Everything else a tool schema here uses is accepted as is.
-fn clean_schema(mut v: Value) -> Value {
+/// The API is a protobuf behind JSON: it rejects `$schema`, `$ref`/`$defs`,
+/// `examples` and a list in `type` (400 on the whole turn, so one MCP server
+/// with a rich schema broke every request). `$ref`s are inlined from the
+/// root's `$defs`/`definitions` first.
+fn clean_schema(v: Value) -> Value {
+    let defs = v
+        .get("$defs")
+        .or_else(|| v.get("definitions"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    strip_schema(inline_refs(v, &defs, 0))
+}
+
+/// Replaces `{"$ref": "#/$defs/X"}` with the definition. A cycle or an
+/// unknown target becomes an empty schema (any value).
+// ponytail: depth 8 caps recursive types; deeper levels accept any value.
+fn inline_refs(v: Value, defs: &Value, depth: u8) -> Value {
+    match v {
+        Value::Object(mut o) => {
+            if let Some(Value::String(r)) = o.remove("$ref") {
+                let name = r.rsplit('/').next().unwrap_or_default();
+                return match defs.get(name) {
+                    Some(d) if depth < 8 => inline_refs(d.clone(), defs, depth + 1),
+                    _ => Value::Object(Default::default()),
+                };
+            }
+            for x in o.values_mut() {
+                *x = inline_refs(x.take(), defs, depth);
+            }
+            Value::Object(o)
+        }
+        Value::Array(a) => {
+            Value::Array(a.into_iter().map(|x| inline_refs(x, defs, depth)).collect())
+        }
+        other => other,
+    }
+}
+
+fn strip_schema(mut v: Value) -> Value {
     match &mut v {
         Value::Object(o) => {
-            o.remove("$schema");
+            for k in ["$schema", "$defs", "definitions", "$id", "examples"] {
+                o.remove(k);
+            }
             if let Some(Value::Array(ts)) = o.get("type") {
                 let first = ts.iter().find(|t| *t != "null").cloned();
                 match first {
@@ -125,12 +163,12 @@ fn clean_schema(mut v: Value) -> Value {
                 };
             }
             for x in o.values_mut() {
-                *x = clean_schema(x.take());
+                *x = strip_schema(x.take());
             }
         }
         Value::Array(a) => {
             for x in a.iter_mut() {
-                *x = clean_schema(x.take());
+                *x = strip_schema(x.take());
             }
         }
         _ => {}
@@ -284,6 +322,20 @@ mod tests {
         let p = &r["tools"][0]["functionDeclarations"][0]["parameters"];
         assert!(p.get("$schema").is_none());
         assert_eq!(p["properties"]["a"]["type"], "string");
+    }
+
+    #[test]
+    fn mcp_schemas_with_refs_are_inlined_for_gemini() {
+        let s = clean_schema(json!({
+            "type": "object",
+            "$defs": {"Addr": {"type": "string", "examples": ["0x1"]},
+                      "Node": {"type": "object", "properties": {"next": {"$ref": "#/$defs/Node"}}}},
+            "properties": {"at": {"$ref": "#/$defs/Addr"}, "tree": {"$ref": "#/$defs/Node"}}
+        }));
+        assert!(s.get("$defs").is_none());
+        assert_eq!(s["properties"]["at"], json!({"type": "string"}));
+        // a recursive type ends in an empty schema instead of looping
+        assert!(!s.to_string().contains("$ref"));
     }
 
     #[test]

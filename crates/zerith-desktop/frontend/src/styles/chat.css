@@ -1148,3 +1148,44 @@
   max-width: 220px;
   max-height: 140px;
 }
+
+/* "Aprendi: …" note under an answer, with its undo. */
+.msg-learned {
+  flex-wrap: wrap;
+  color: var(--label-secondary);
+}
+.msg-learned.undone {
+  color: var(--label-caption);
+  text-decoration: line-through;
+}
+.learned-undo {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 4px;
+  padding: 1px 8px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-full);
+  background: transparent;
+  color: var(--label-secondary);
+  font: inherit;
+  cursor: pointer;
+  transition: background 120ms var(--ease), color 120ms var(--ease);
+}
+.learned-undo:hover:not(:disabled) {
+  background: var(--hover);
+  color: var(--label-primary);
+}
+.learned-undo:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 1px;
+}
+.learned-undo:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.learned-error {
+  flex-basis: 100%;
+  color: var(--danger-text);
+  text-decoration: none;
+}

@@ -1463,3 +1463,8 @@ button.item-row {
   padding: 0 8px 12px 52px;
   gap: 4px;
 }
+
+/* MCP OAuth login in progress: under the row, aligned with its text */
+.pn-mcp-login {
+  margin: 0 8px 12px 52px;
+}

@@ -322,6 +322,10 @@ export interface McpServer {
   project: boolean;
   envKeys: string[];
   headerKeys: string[];
+  /** `auth = "oauth"`: needs "Entrar" before it works. */
+  oauth: boolean;
+  /** OAuth tokens are in the vault. */
+  connected: boolean;
 }
 
 export interface HermesMcp {
@@ -580,6 +584,10 @@ export const api = {
   mcpTest: (name: string) => invoke<{ name: string; description: string }[]>("mcp_test", { name }),
   mcpHermesPreview: () => invoke<HermesMcp[]>("mcp_hermes_preview"),
   mcpHermesImport: (names: string[]) => invoke<SetupImport>("mcp_hermes_import", { names }),
+  mcpOauthLogin: (name: string) => invoke<McpServer[]>("mcp_oauth_login", { name }),
+  mcpOauthStatus: (name: string) =>
+    invoke<{ connected: boolean; expiresAt: number | null }>("mcp_oauth_status", { name }),
+  mcpOauthLogout: (name: string) => invoke<McpServer[]>("mcp_oauth_logout", { name }),
   workspaceFiles: (root?: string) =>
     invoke<string[]>("workspace_files", { root: root ?? null }),
   /** A local image from the transcript (`![](C:/x.png)`) as a data URL. */
@@ -702,4 +710,34 @@ export function onOAuthUrl(
   handler: (url: string) => void,
 ): Promise<UnlistenFn> {
   return listen<string>("oauth:url", (e) => handler(e.payload));
+}
+
+/** One thing the background review learned after a turn (`turn:learned`). */
+export interface LearnedItem {
+  kind: "memória" | "skill";
+  op: "add" | "update" | "create" | "patch";
+  text: string;
+  id: number | null;
+  name: string | null;
+  /** What undo restores; null = undo deletes. */
+  previous: string | null;
+}
+export interface LearningView {
+  enabled: boolean;
+  model: string;
+}
+
+export const learnApi = {
+  get: () => invoke<LearningView>("learning"),
+  set: (patch: { enabled?: boolean; model?: string }) =>
+    invoke<LearningView>("set_learning", { patch }),
+  undo: (item: LearnedItem) => invoke<void>("learn_undo", { item }),
+};
+
+export function onTurnLearned(
+  handler: (sessionId: string, items: LearnedItem[]) => void,
+): Promise<UnlistenFn> {
+  return listen<[string, LearnedItem[]]>("turn:learned", (e) =>
+    handler(e.payload[0], e.payload[1]),
+  );
 }

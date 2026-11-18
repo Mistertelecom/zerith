@@ -749,6 +749,7 @@ fn chat(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>
     signals::install(cancel.clone());
 
     let mut streamed = false;
+    let mut digest = zerith_runtime::learn::TurnDigest::new(&prompt);
     let result = run_agent_turn(
         &store,
         &client,
@@ -770,36 +771,54 @@ fn chat(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>
         &model,
         &prompt,
         &cancel,
-        |e| match e {
-            RunEvent::Delta(text) => {
-                streamed = true;
-                print!("{text}");
-                let _ = std::io::Write::flush(&mut std::io::stdout());
-            }
-            RunEvent::Reasoning(r) => eprintln!("[reasoning] {r}"),
-            RunEvent::ToolCall { name, args, .. } => eprintln!("\n[tool] {name} {args}"),
-            RunEvent::ToolResult {
-                name,
-                ok,
-                output_preview,
-                ..
-            } => eprintln!(
-                "[tool:{}] {name}: {output_preview}",
-                if ok { "ok" } else { "erro" }
-            ),
-            RunEvent::Route {
-                account_id,
-                provider,
-                model,
-                attempts,
-            } if attempts > 1 => {
-                eprintln!(
+        |e| {
+            digest.observe(&e);
+            match e {
+                RunEvent::Delta(text) => {
+                    streamed = true;
+                    print!("{text}");
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                }
+                RunEvent::Reasoning(r) => eprintln!("[reasoning] {r}"),
+                RunEvent::ToolCall { name, args, .. } => eprintln!("\n[tool] {name} {args}"),
+                RunEvent::ToolResult {
+                    name,
+                    ok,
+                    output_preview,
+                    ..
+                } => eprintln!(
+                    "[tool:{}] {name}: {output_preview}",
+                    if ok { "ok" } else { "erro" }
+                ),
+                RunEvent::Route {
+                    account_id,
+                    provider,
+                    model,
+                    attempts,
+                } if attempts > 1 => {
+                    eprintln!(
                     "[gateway:failover] tentativa #{attempts} -> conta {account_id} ({provider}/{model})"
                 );
+                }
+                _ => {}
             }
-            _ => {}
         },
     );
+
+    if let Ok(r) = &result {
+        digest.answer = r.text.clone();
+        headless::learn_after(
+            &settings,
+            &store,
+            &client,
+            &session_id,
+            &model,
+            memory.map(|m| (m, &scope)),
+            skills.as_ref(),
+            &digest,
+            &cancel,
+        );
+    }
 
     let end = zerith_core::hooks::run_hooks(
         zerith_core::hooks::HookEvent::SessionEnd,

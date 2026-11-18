@@ -105,6 +105,17 @@ async function drive() {
   if (scene === "approval") {
     await turn({ type: "approval", id: 7, tool: "bash", summary: "cargo test -p zerith-providers --all-features" });
   }
+  // &learned=1: the background review's note under the answer.
+  if (q.get("learned")) {
+    await turn({ type: "done", stored: 9, text: "", promptTokens: 0, completionTokens: 0, savedTokens: 0, modelUsed: null });
+    await emit("turn:learned", [
+      "s1",
+      [
+        { kind: "memória", op: "add", text: "O usuário prefere respostas curtas", id: 4, name: null, previous: null },
+        { kind: "skill", op: "create", text: "Use when cmd.exe rejects POSIX flags", id: null, name: "windows-cmd-shell", previous: null },
+      ],
+    ]);
+  }
   if (scene === "question") {
     await turn({
       type: "question",

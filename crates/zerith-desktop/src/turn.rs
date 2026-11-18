@@ -266,6 +266,7 @@ pub fn run(
         &store, &settings, &client, session_id, model, setup, cancel, on,
     );
 
+    let mut digest = zerith_runtime::learn::TurnDigest::new(&prompt);
     let result = run_agent_turn(
         &store,
         &client,
@@ -296,6 +297,7 @@ pub fn run(
         &prompt,
         cancel,
         |ev| {
+            digest.observe(&ev);
             if let Some(ev) = shape(ev) {
                 on(ev);
             }
@@ -304,6 +306,7 @@ pub fn run(
 
     match result {
         Ok(r) => {
+            digest.answer = r.text.clone();
             on(TurnEvent::Done {
                 stored: Some(r.message_id),
                 text: r.text,
@@ -311,6 +314,17 @@ pub fn run(
                 completion_tokens: r.completion_tokens,
                 saved_tokens: r.saved_tokens,
                 model_used: r.model_used,
+            });
+            // After Done, on its own thread: the answer never waits for it.
+            crate::learn::spawn(crate::learn::Job {
+                root: setup.root.clone(),
+                db: setup.db.clone(),
+                fallback: client.config().clone(),
+                settings,
+                session_id: session_id.to_string(),
+                model: model.to_string(),
+                memory_paused: setup.memory_paused,
+                digest,
             });
             Ok(())
         }

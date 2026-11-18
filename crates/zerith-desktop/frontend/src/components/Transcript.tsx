@@ -1,5 +1,5 @@
 import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { api } from "../lib/api";
+import { api, learnApi, type LearnedItem } from "../lib/api";
 import {
   AlertTriangle,
   Bot,
@@ -15,7 +15,9 @@ import {
   Info,
   ListTodo,
   Search,
+  Sparkles,
   Terminal,
+  Undo2,
   Wrench,
   X,
   type LucideIcon,
@@ -23,6 +25,37 @@ import {
 import type { Block, ToolRow } from "../lib/turn";
 import { ZerithMark } from "./ui";
 import { parseBlocks, type Inline, type MdBlock } from "./markdown";
+
+/** "Aprendi: …" under an answer, with one undo for everything it saved. */
+function LearnedNote(props: { text: string; items: LearnedItem[] }) {
+  const [state, setState] = useState<"idle" | "busy" | "done" | string>("idle");
+  const undo = () => {
+    setState("busy");
+    Promise.all(props.items.map((i) => learnApi.undo(i)))
+      .then(() => setState("done"))
+      .catch((e) => setState(String(e)));
+  };
+  const failed = state !== "idle" && state !== "busy" && state !== "done";
+  return (
+    <div className={"msg-note msg-learned" + (state === "done" ? " undone" : "")}>
+      <Sparkles size={14} strokeWidth={2} aria-hidden />
+      <span>{state === "done" ? "Desfeito: " + props.text.replace(/^Aprendi: /, "") : props.text}</span>
+      {state === "done" ? null : (
+        <button
+          type="button"
+          className="learned-undo"
+          onClick={undo}
+          disabled={state === "busy"}
+          title={failed ? state : "Apagar o que foi aprendido neste turno"}
+        >
+          <Undo2 size={13} strokeWidth={2} aria-hidden />
+          Desfazer
+        </button>
+      )}
+      {failed ? <span className="learned-error">{state}</span> : null}
+    </div>
+  );
+}
 
 const isWeb = (src: string) => /^(https?:|data:)/i.test(src);
 const USER_IMG = /^!\[([^\]\n]*)\]\(<([^>\n]+)>\)\s*$/gm;
@@ -384,6 +417,9 @@ export function Transcript(props: { blocks: Block[]; tail?: React.ReactNode }) {
                 {text}
               </div>
             );
+          }
+          if (b.kind === "note" && b.learned?.length) {
+            return <LearnedNote key={i} text={b.text} items={b.learned} />;
           }
           if (b.kind === "note") {
             return (

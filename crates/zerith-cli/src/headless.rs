@@ -412,6 +412,7 @@ pub fn run(paths: &Paths, args: &[String]) -> Result<(), Boxed> {
     let format = h.format;
     let spent = Cell::new(0f64);
     let over_budget = Cell::new(false);
+    let mut digest = zerith_runtime::learn::TurnDigest::new(&prompt);
     let result = run_agent_turn(
         &store,
         &client,
@@ -428,6 +429,7 @@ pub fn run(paths: &Paths, args: &[String]) -> Result<(), Boxed> {
         &prompt,
         &cancel,
         |e| {
+            digest.observe(&e);
             if let (RunEvent::Usage { input, output }, Some((pi, po)), Some(max)) =
                 (&e, prices, h.max_budget_usd)
             {
@@ -470,6 +472,27 @@ pub fn run(paths: &Paths, args: &[String]) -> Result<(), Boxed> {
             }
             Err(e) => return Err(e.into()),
         };
+
+        // Learning pass, synchronous here (nothing else waits on a headless
+        // run); its event goes out before `result`, which stays the last line.
+        digest.answer = report.text.clone();
+        let learned = learn_after(
+            &settings,
+            &store,
+            &client,
+            &session_id,
+            &model,
+            memory.map(|m| (m, &scope)),
+            skills.as_ref(),
+            &digest,
+            &cancel,
+        );
+        if format == OutputFormat::StreamJson && !learned.is_empty() {
+            println!(
+                "{}",
+                serde_json::json!({"type": "learned", "items": learned})
+            );
+        }
 
         let stopped_at_limit = report.text.starts_with("[parado: limite de");
         let structured = schema
@@ -537,6 +560,68 @@ pub fn run(paths: &Paths, args: &[String]) -> Result<(), Boxed> {
 
 fn opts_steps(h: &Headless) -> usize {
     h.max_turns.unwrap_or(zerith_runtime::DEFAULT_MAX_STEPS)
+}
+
+/// Runs `zerith_runtime::learn` after a CLI turn when `[learning]` is on.
+/// Logs one stderr line either way (`aprender: …` / `aprendi: …`) so a
+/// headless run shows whether a review happened; returns the items as JSON.
+#[allow(clippy::too_many_arguments)]
+pub fn learn_after(
+    settings: &Settings,
+    store: &Store,
+    client: &Client,
+    session_id: &str,
+    model: &str,
+    memory: Option<(&dyn MemoryBackend, &zerith_memory::Scope)>,
+    skills: Option<&Library>,
+    digest: &zerith_runtime::learn::TurnDigest,
+    cancel: &Cancel,
+) -> Vec<serde_json::Value> {
+    use zerith_runtime::learn;
+    if !settings.learning.enabled {
+        return Vec::new();
+    }
+    if learn::gate(digest).is_empty() {
+        eprintln!("zerith: aprender: turno sem sinal, nenhuma revisão");
+        return Vec::new();
+    }
+    let Some((rc, rm)) = learn::route(settings, model, client.config()) else {
+        eprintln!("zerith: aprender: sem modelo para a revisão");
+        return Vec::new();
+    };
+    let pass = learn::Pass {
+        memory,
+        skills,
+        session_id,
+    };
+    let reviewer = learn::ClientReviewer {
+        client: &rc,
+        model: &rm,
+        record: Some((store, session_id)),
+    };
+    let out = learn::after_turn(digest, &pass, &reviewer, cancel);
+    eprintln!(
+        "zerith: aprender: revisão com {rm} (sinais: {}){}",
+        out.signals.join("; "),
+        out.error
+            .as_ref()
+            .map(|e| format!(", erro: {e}"))
+            .unwrap_or_default()
+    );
+    for r in &out.refused {
+        eprintln!("zerith: aprender: recusado: {r}");
+    }
+    for l in &out.learned {
+        let what = l
+            .name
+            .as_deref()
+            .map_or(l.text.clone(), |n| format!("{n} — {}", l.text));
+        eprintln!("zerith: aprendi ({} {}): {what}", l.kind, l.op);
+    }
+    if out.learned.is_empty() {
+        eprintln!("zerith: aprender: nada novo para guardar");
+    }
+    out.learned.iter().map(|l| l.to_json()).collect()
 }
 
 fn stream_event_json(e: RunEvent) -> Option<serde_json::Value> {

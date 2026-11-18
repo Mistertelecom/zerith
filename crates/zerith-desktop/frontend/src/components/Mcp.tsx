@@ -4,12 +4,14 @@ import {
   Check,
   CircleAlert,
   CircleCheck,
+  Copy,
   Download,
   FlaskConical,
   Globe,
   Import,
   KeyRound,
-  Lock,
+  LogIn,
+  LogOut,
   Plus,
   Save,
   Server,
@@ -19,7 +21,7 @@ import {
   Wrench,
   X,
 } from "lucide-react";
-import { api, type HermesMcp, type McpServer, type SetupImport } from "../lib/api";
+import { api, onOAuthUrl, type HermesMcp, type McpServer, type SetupImport } from "../lib/api";
 import { Card, EmptyState, Segmented, Switch } from "./ui";
 import { importLine } from "./Skills";
 
@@ -28,7 +30,7 @@ type Tested = { tools: { name: string; description: string }[] } | { error: stri
 const HERMES: Record<HermesMcp["status"], [string, string]> = {
   importavel: ["Importável", " ok"],
   "nao-encontrado": ["Comando não encontrado", " warn"],
-  oauth: ["OAuth ainda não suportado", " warn"],
+  oauth: ["Importável — depois clique em Entrar", " ok"],
   existe: ["Já existe", ""],
   invalido: ["Configuração inválida", " danger"],
 };
@@ -48,6 +50,9 @@ export function McpTab() {
   const [showHermes, setShowHermes] = useState(false);
   const [picked, setPicked] = useState<Set<string>>(new Set());
   const [result, setResult] = useState<SetupImport | null>(null);
+  const [loggingIn, setLoggingIn] = useState<string | null>(null);
+  const [loginUrl, setLoginUrl] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
 
   const load = useCallback(() => {
     api
@@ -81,6 +86,28 @@ export function McpTab() {
       .finally(() => setTesting(null));
   };
 
+  /** "Entrar": the backend opens the browser and waits (5 min) for the
+   * callback; meanwhile the row shows the link to copy. */
+  const login = async (name: string) => {
+    setLoggingIn(name);
+    setError(null);
+    const off = await onOAuthUrl(setLoginUrl).catch(() => null);
+    try {
+      setServers(await api.mcpOauthLogin(name));
+      setTested((t) => {
+        const n = { ...t };
+        delete n[name];
+        return n;
+      });
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      off?.();
+      setLoginUrl(null);
+      setLoggingIn(null);
+    }
+  };
+
   const openHermes = () => {
     setShowHermes((v) => !v);
     setResult(null);
@@ -88,7 +115,7 @@ export function McpTab() {
       .mcpHermesPreview()
       .then((l) => {
         setHermes(l);
-        setPicked(new Set(l.filter((s) => s.status === "importavel").map((s) => s.name)));
+        setPicked(new Set(l.filter((s) => s.status === "importavel" || s.status === "oauth").map((s) => s.name)));
       })
       .catch((e) => setError(String(e)));
   };
@@ -248,7 +275,7 @@ export function McpTab() {
           {hermes?.length ? (
             <div className="pn-list">
               {hermes.map((s) => {
-                const ok = s.status === "importavel";
+                const ok = s.status === "importavel" || s.status === "oauth";
                 const [label, tone] = HERMES[s.status];
                 return (
                   <label key={s.name} className={"pn-item pn-hermes-row" + (ok ? "" : " dim")}>
@@ -283,7 +310,7 @@ export function McpTab() {
                       ) : null}
                       {!s.enabled ? <span className="badge">Desligado</span> : null}
                       <span className={"badge" + tone}>
-                        {s.status === "oauth" ? <Lock size={12} strokeWidth={2} /> : ok ? <Check size={12} strokeWidth={2} /> : null}
+                        {s.status === "oauth" ? <LogIn size={12} strokeWidth={2} /> : ok ? <Check size={12} strokeWidth={2} /> : null}
                         {label}
                       </span>
                     </span>
@@ -341,6 +368,12 @@ export function McpTab() {
                           <AlertTriangle size={12} strokeWidth={2} /> Falhou
                         </span>
                       ) : null}
+                      {s.oauth ? (
+                        <span className={"badge" + (s.connected ? " ok" : " warn")}>
+                          {s.connected ? <CircleCheck size={12} strokeWidth={2} /> : <CircleAlert size={12} strokeWidth={2} />}
+                          {s.connected ? "Conectado" : "Precisa entrar"}
+                        </span>
+                      ) : null}
                       {s.approved ? null : (
                         <span className="badge warn">
                           <AlertTriangle size={12} strokeWidth={2} /> Do projeto, não aprovado
@@ -348,6 +381,26 @@ export function McpTab() {
                       )}
                     </span>
                     <span className="pn-actions">
+                      {s.oauth && !s.connected ? (
+                        <button
+                          className="btn btn-primary btn-sm"
+                          aria-label={`Entrar em ${s.name}`}
+                          disabled={loggingIn !== null}
+                          onClick={() => void login(s.name)}
+                        >
+                          <LogIn size={14} strokeWidth={2} /> Entrar
+                        </button>
+                      ) : null}
+                      {s.oauth && s.connected ? (
+                        <button
+                          className="btn btn-ghost btn-sm"
+                          aria-label={`Sair de ${s.name}`}
+                          disabled={busy || loggingIn !== null}
+                          onClick={() => void act(() => api.mcpOauthLogout(s.name))}
+                        >
+                          <LogOut size={14} strokeWidth={2} /> Sair
+                        </button>
+                      ) : null}
                       <button
                         className="icon-btn sm"
                         title="Testar (lista as ferramentas)"
@@ -374,7 +427,11 @@ export function McpTab() {
                           title="Remover"
                           aria-label={`Remover ${s.name}`}
                           disabled={busy}
-                          onClick={() => void act(() => api.mcpRemove(s.name))}
+                          onClick={() => {
+                            // also drops its login from the vault: ask first
+                            if (window.confirm(`Remover o servidor ${s.name}? O login salvo dele também é apagado.`))
+                              void act(() => api.mcpRemove(s.name));
+                          }}
                         >
                           <Trash2 size={14} strokeWidth={2} />
                         </button>
@@ -387,6 +444,29 @@ export function McpTab() {
                       />
                     </span>
                   </div>
+                  {loggingIn === s.name ? (
+                    <div className="login-link pn-mcp-login" role="status">
+                      <span className="spinner" aria-hidden />
+                      <div className="login-link-text">
+                        <strong>Aguardando o login no navegador…</strong>
+                        <span>Se o navegador não abriu, copie o link e cole em qualquer navegador. Expira em 5 min.</span>
+                      </div>
+                      {loginUrl ? (
+                        <button
+                          className="btn btn-sm"
+                          onClick={() =>
+                            void navigator.clipboard.writeText(loginUrl).then(() => {
+                              setCopied(true);
+                              setTimeout(() => setCopied(false), 1500);
+                            })
+                          }
+                        >
+                          {copied ? <Check size={14} strokeWidth={2} /> : <Copy size={14} strokeWidth={2} />}{" "}
+                          {copied ? "Copiado" : "Copiar link"}
+                        </button>
+                      ) : null}
+                    </div>
+                  ) : null}
                   {t && "error" in t ? (
                     <div className="pn-callout danger">
                       <CircleAlert size={14} strokeWidth={2} />

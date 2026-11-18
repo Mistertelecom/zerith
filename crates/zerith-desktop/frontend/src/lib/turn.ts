@@ -1,6 +1,6 @@
 // What the transcript becomes while a turn runs. Pure functions over the event
 // stream: the transcript is a list of blocks, and a turn mutates the last one.
-import type { Question, Todo, TurnEvent } from "./api";
+import type { LearnedItem, Question, Todo, TurnEvent } from "./api";
 
 export type Block =
   | { kind: "user"; text: string }
@@ -12,7 +12,8 @@ export type Block =
       error?: string;
       streaming: boolean;
     }
-  | { kind: "note"; text: string };
+  /** `learned`: what the background review saved after the turn (with undo). */
+  | { kind: "note"; text: string; learned?: LearnedItem[] };
 
 export interface ToolRow {
   id: string;

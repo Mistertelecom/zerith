@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { Archive, CircleAlert, Database, FolderOpen, Gauge, Leaf, Palette, ShieldCheck } from "lucide-react";
-import { api, type ProfileView, type StorageView } from "../lib/api";
+import { api, learnApi, type ProfileView, type StorageView } from "../lib/api";
 import { Card, Row, Segmented, Switch } from "./ui";
 
 const THEMES = [
@@ -56,6 +56,18 @@ export function GeneralTab(props: GeneralProps) {
   const [backup, setBackup] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [learning, setLearning] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    learnApi.get().then((l) => setLearning(l.enabled)).catch(() => undefined);
+  }, []);
+  const toggleLearning = (v: boolean) => {
+    setLearning(v);
+    learnApi
+      .set({ enabled: v })
+      .then((l) => setLearning(l.enabled))
+      .catch((e) => setError(String(e)));
+  };
 
   useEffect(() => {
     api.profileLimits().then(setLimits).catch(() => undefined);
@@ -113,6 +125,18 @@ export function GeneralTab(props: GeneralProps) {
           hint="Enquanto estiver ligado, as próximas conversas não leem nem gravam lembranças."
         >
           <Switch label="Pausar memória" checked={props.memoryPaused} onChange={props.onMemory} />
+        </Row>
+        <Row
+          label="Aprender sozinho (memória e skills)"
+          tech="revisão em segundo plano"
+          hint="Depois de um turno com correção, preferência ou trabalho com várias ferramentas, uma revisão rápida guarda o que vale lembrar. Turnos simples não custam nada. Cada item aparece no chat com Desfazer."
+        >
+          <Switch
+            label="Aprender sozinho"
+            checked={learning ?? true}
+            disabled={learning === null}
+            onChange={toggleLearning}
+          />
         </Row>
       </Card>
 

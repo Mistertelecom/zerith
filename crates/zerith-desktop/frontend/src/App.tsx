@@ -16,6 +16,7 @@ import {
   api,
   onTurnDone,
   onTurnEvent,
+  onTurnLearned,
   type Account,
   type Boot,
   type ChatMessage,
@@ -284,11 +285,25 @@ export default function App() {
     const done = onTurnDone((id) => {
       if (id === selected) setTurn((prev) => ({ ...prev, busy: false }));
     });
+    // The background review lands after the answer: a note under it.
+    const learned = onTurnLearned((id, items) => {
+      if (id !== selected || !items.length) return;
+      const text =
+        "Aprendi: " +
+        items
+          .map((i) => (i.kind === "skill" ? `skill ${i.name}` : i.text))
+          .join(" · ");
+      setTurn((prev) => ({
+        ...prev,
+        blocks: [...prev.blocks, { kind: "note", text, learned: items }],
+      }));
+    });
     return () => {
       stop = true;
       unlisten?.();
       if (listening.current?.id === selected) listening.current = null;
       void done.then((u) => u());
+      void learned.then((u) => u());
     };
   }, [selected, subscribe]);
 

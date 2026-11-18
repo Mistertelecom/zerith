@@ -288,6 +288,7 @@ pub fn mcp_cmd(paths: &Paths, args: &[String]) -> Res {
         "remove" => {
             let name = args.get(2).ok_or("mcp remove precisa de um nome")?;
             if remove_server(paths, name)? {
+                zerith_mcp::oauth::forget(paths.root(), &zerith_core::secrets::OsKeyring, name)?;
                 println!("removido {name}");
             } else {
                 return Err(format!(
@@ -340,6 +341,47 @@ pub fn mcp_cmd(paths: &Paths, args: &[String]) -> Res {
             }
         }
         "tools" | "call" => legacy_mcp(args)?,
+        "login" | "logout" | "status" if args.get(2).is_some() => {
+            let name = &args[2];
+            let loaded = load_servers(paths, project_dir().as_deref());
+            let s = loaded
+                .servers
+                .iter()
+                .chain(&loaded.disabled)
+                .chain(&loaded.unapproved)
+                .find(|s| &s.name == name && s.is_oauth())
+                .ok_or_else(|| format!("{name} não é um servidor MCP com auth = \"oauth\""))?;
+            let vault = zerith_core::secrets::OsKeyring;
+            match sub {
+                "login" => {
+                    let url = s.url.clone().unwrap_or_default();
+                    let no_browser = args.iter().any(|a| a == "--no-browser")
+                        || std::env::var_os("ZERITH_OAUTH_NO_BROWSER").is_some();
+                    zerith_mcp::oauth::login(paths.root(), &vault, name, &url, &|u| {
+                        println!("abra para entrar em {name}:\n{u}");
+                        if !no_browser {
+                            let _ = zerith_providers::oauth::open_browser(u);
+                        }
+                    })?;
+                    println!("{name}: conectado (tokens no cofre do sistema)");
+                }
+                "logout" => {
+                    zerith_mcp::oauth::logout(&vault, name)?;
+                    println!("{name}: desconectado");
+                }
+                _ => {
+                    let st = zerith_mcp::oauth::status(&vault, name);
+                    println!(
+                        "{name}: {}",
+                        if st.connected {
+                            "conectado"
+                        } else {
+                            "precisa entrar"
+                        }
+                    );
+                }
+            }
+        }
         "import-hermes" => {
             let home = zerith_importers::hermes_setup::hermes_home()
                 .ok_or("Hermes não encontrado (HERMES_HOME, ~/.hermes, %LOCALAPPDATA%\\hermes)")?;
@@ -360,6 +402,12 @@ pub fn mcp_cmd(paths: &Paths, args: &[String]) -> Res {
             );
             for f in &r.failed {
                 eprintln!("  {f}");
+            }
+            for (m, _) in found
+                .iter()
+                .filter(|(m, _)| m.oauth && r.imported.contains(&m.name))
+            {
+                println!("  {}: entre com `zerith mcp login {}`", m.name, m.name);
             }
         }
         other => return Err(format!("comando desconhecido: mcp {other}").into()),

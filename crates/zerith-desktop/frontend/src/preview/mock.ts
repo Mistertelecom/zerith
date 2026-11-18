@@ -1,6 +1,7 @@
 // Dev-only: fake Rust core so every screen can be rendered and photographed in
 // a plain browser (`/preview.html?scene=...`). Never imported by index.html.
 import { mockIPC } from "@tauri-apps/api/mocks";
+import { emit } from "@tauri-apps/api/event";
 
 const now = Math.floor(Date.now() / 1000);
 const PREVIEW_IMG =
@@ -742,7 +743,14 @@ export function installMock(theme: string) {
             { name: "codebase-memory-mcp", transport: "stdio", target: "npx --yes codebase-memory-mcp", enabled: true, approved: true, project: false, envKeys: [], headerKeys: [] },
             { name: "github", transport: "stdio", target: "npx -y @modelcontextprotocol/server-github", enabled: true, approved: true, project: false, envKeys: ["GITHUB_TOKEN"], headerKeys: [] },
             { name: "docs", transport: "http", target: "https://exemplo.test/mcp", enabled: false, approved: true, project: false, envKeys: [], headerKeys: ["Authorization"] },
+            { name: "vercel", transport: "http", target: "https://mcp.vercel.com", enabled: true, approved: true, project: false, envKeys: [], headerKeys: [], oauth: true, connected: true },
+            { name: "supabase", transport: "http", target: "https://mcp.supabase.com/mcp", enabled: true, approved: true, project: false, envKeys: [], headerKeys: [], oauth: true, connected: false },
           ];
+        case "mcp_oauth_login":
+          setTimeout(() => void emit("oauth:url", "https://api.supabase.com/v1/oauth/authorize?client_id=exemplo"), 50);
+          return new Promise(() => {}); // waits for the browser forever
+        case "mcp_oauth_logout":
+          return [];
         case "mcp_test":
           return [
             { name: "search_graph", description: "Find symbols" },

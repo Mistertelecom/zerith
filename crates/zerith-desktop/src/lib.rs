@@ -8,6 +8,7 @@ pub mod attachments;
 pub mod chat;
 pub mod commands;
 pub mod history;
+pub mod learn;
 pub mod mcp;
 pub mod media;
 pub mod memory;
@@ -115,6 +116,7 @@ pub fn run() {
     ));
     tauri::Builder::default()
         .setup(move |app| {
+            learn::bind(app.handle());
             // The window is built here, not by the config, so a WebView2
             // failure surfaces as a message instead of a panic.
             let cfg = app
@@ -220,6 +222,9 @@ pub fn run() {
             mcp::mcp_test,
             mcp::mcp_hermes_preview,
             mcp::mcp_hermes_import,
+            mcp::mcp_oauth_login,
+            mcp::mcp_oauth_status,
+            mcp::mcp_oauth_logout,
             agents::agents_list,
             agents::agent_create,
             agents::agent_toggle,
@@ -248,6 +253,9 @@ pub fn run() {
             workspace::read_image,
             workspace::open_image,
             attachments::save_attachment,
+            learn::learning,
+            learn::set_learning,
+            learn::learn_undo,
         ])
         .run(tauri::generate_context!())
         .expect("erro ao iniciar a janela do Zerith");

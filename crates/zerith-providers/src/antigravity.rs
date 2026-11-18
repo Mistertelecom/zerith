@@ -111,10 +111,11 @@ pub(crate) fn body(req: &ChatRequest, project: Option<&str>) -> Value {
     b
 }
 
-/// The API is a protobuf behind JSON: it rejects `$schema`, `$ref`/`$defs`,
-/// `examples` and a list in `type` (400 on the whole turn, so one MCP server
-/// with a rich schema broke every request). `$ref`s are inlined from the
-/// root's `$defs`/`definitions` first.
+/// The API is a protobuf behind JSON: any key outside its `Schema` message
+/// (`$ref`, `const`, `exclusiveMinimum`, `propertyNames`, a list in `type`…)
+/// is a 400 for the whole turn, so one MCP server with a rich schema (rea:
+/// 1,100+ such keys) broke every request. `$ref`s are inlined from the root's
+/// `$defs`/`definitions`, then only known keys are kept.
 fn clean_schema(v: Value) -> Value {
     let defs = v
         .get("$defs")
@@ -149,31 +150,71 @@ fn inline_refs(v: Value, defs: &Value, depth: u8) -> Value {
     }
 }
 
-fn strip_schema(mut v: Value) -> Value {
-    match &mut v {
-        Value::Object(o) => {
-            for k in ["$schema", "$defs", "definitions", "$id", "examples"] {
-                o.remove(k);
+/// Fields of the Gemini `Schema` message that pass through unchanged.
+const SCHEMA_KEYS: &[&str] = &[
+    "type",
+    "format",
+    "title",
+    "description",
+    "nullable",
+    "enum",
+    "required",
+    "minItems",
+    "maxItems",
+    "minProperties",
+    "maxProperties",
+    "minLength",
+    "maxLength",
+    "pattern",
+    "example",
+    "default",
+    "minimum",
+    "maximum",
+    "propertyOrdering",
+];
+
+/// Keeps only what the API accepts; a dropped constraint only loosens the
+/// schema, it never rejects a call the tool would take.
+fn strip_schema(v: Value) -> Value {
+    let Value::Object(o) = v else { return v };
+    let mut out = serde_json::Map::new();
+    for (k, x) in o {
+        match (k.as_str(), x) {
+            // property names are the tool's own words: only their schemas are cleaned
+            ("properties", Value::Object(ps)) => {
+                let ps = ps.into_iter().map(|(n, s)| (n, strip_schema(s)));
+                out.insert(k, Value::Object(ps.collect()));
             }
-            if let Some(Value::Array(ts)) = o.get("type") {
-                let first = ts.iter().find(|t| *t != "null").cloned();
-                match first {
-                    Some(t) => o.insert("type".into(), t),
-                    None => o.remove("type"),
-                };
+            ("items", Value::Array(mut a)) if !a.is_empty() => {
+                out.insert(k, strip_schema(a.swap_remove(0)));
             }
-            for x in o.values_mut() {
-                *x = strip_schema(x.take());
+            ("items", x) => {
+                out.insert(k, strip_schema(x));
             }
+            ("anyOf" | "oneOf", Value::Array(a)) => {
+                out.insert(k, Value::Array(a.into_iter().map(strip_schema).collect()));
+            }
+            ("type", Value::Array(ts)) => {
+                if let Some(t) = ts.into_iter().find(|t| t != "null") {
+                    out.insert(k, t);
+                }
+            }
+            ("const", x @ Value::String(_)) => {
+                out.entry("enum").or_insert(json!([x]));
+            }
+            ("exclusiveMinimum", x @ Value::Number(_)) => {
+                out.entry("minimum").or_insert(x);
+            }
+            ("exclusiveMaximum", x @ Value::Number(_)) => {
+                out.entry("maximum").or_insert(x);
+            }
+            (_, x) if SCHEMA_KEYS.contains(&k.as_str()) => {
+                out.insert(k, x);
+            }
+            _ => {}
         }
-        Value::Array(a) => {
-            for x in a.iter_mut() {
-                *x = strip_schema(x.take());
-            }
-        }
-        _ => {}
     }
-    v
+    Value::Object(out)
 }
 
 pub(crate) fn complete(client: &Client, req: &ChatRequest, cancel: &Cancel) -> Result<Completion> {
@@ -336,6 +377,42 @@ mod tests {
         assert_eq!(s["properties"]["at"], json!({"type": "string"}));
         // a recursive type ends in an empty schema instead of looping
         assert!(!s.to_string().contains("$ref"));
+    }
+
+    #[test]
+    fn json_schema_keys_gemini_rejects_are_dropped_or_mapped() {
+        // the keys the API named in its 400 for the rea MCP server
+        let s = clean_schema(json!({
+            "type": "object",
+            "propertyNames": {"pattern": "^[a-z]+$"},
+            "dependentRequired": {"a": ["b"]},
+            "additionalProperties": false,
+            "properties": {
+                "const": {"type": "string"},
+                "mode": {"oneOf": [{"const": "fast"}, {"const": 2}]},
+                "n": {"type": "integer", "exclusiveMinimum": 0},
+                "xs": {"type": "array", "items": [{"type": "string"}]}
+            }
+        }));
+        let text = s.to_string();
+        for bad in [
+            "propertyNames",
+            "dependentRequired",
+            "additionalProperties",
+            "exclusiveMinimum",
+            "\"const\":\"",
+            "\"const\":2",
+        ] {
+            assert!(!text.contains(bad), "{bad} left in {text}");
+        }
+        // a property literally named `const` is the tool's, not a keyword
+        assert_eq!(s["properties"]["const"], json!({"type": "string"}));
+        assert_eq!(
+            s["properties"]["mode"]["oneOf"][0],
+            json!({"enum": ["fast"]})
+        );
+        assert_eq!(s["properties"]["n"]["minimum"], 0);
+        assert_eq!(s["properties"]["xs"]["items"], json!({"type": "string"}));
     }
 
     #[test]

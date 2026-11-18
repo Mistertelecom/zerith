@@ -114,15 +114,15 @@ pub struct GatewayOutcome<T> {
 }
 
 /// Indica se o erro deve acionar failover automático para a próxima conta/alvo
-/// da cadeia (cota esgotada, credencial ausente/inválida, pagamento, timeout,
-/// rede ou 5xx).
+/// da cadeia (cota esgotada, credencial ausente/inválida, pagamento, modelo que
+/// a conta não tem mais (404), timeout, rede ou 5xx).
 pub fn is_failover_error(err: &ProviderError) -> bool {
     match err {
         ProviderError::RateLimited { .. } | ProviderError::NoKey | ProviderError::Transport(_) => {
             true
         }
         ProviderError::Http { status, .. } => {
-            matches!(*status, 401 | 402 | 403 | 408 | 429 | 500..=599)
+            matches!(*status, 401..=404 | 408 | 429 | 500..=599)
         }
         ProviderError::Cancelled
         | ProviderError::NoEndpoint
@@ -148,6 +148,8 @@ pub fn suggested_cooldown_ms(err: &ProviderError) -> u64 {
             status: 401..=403, ..
         } => 300_000,
         ProviderError::Http { status: 429, .. } => 60_000,
+        // the model is gone, not the account: its other models keep working
+        ProviderError::Http { status: 404, .. } => 0,
         ProviderError::Http {
             status: 500..=599, ..
         }
@@ -688,6 +690,35 @@ mod tests {
         assert_eq!(s1.requests()[0].1["model"], "gpt-4o");
         assert_eq!(s2.requests().len(), 1);
         assert_eq!(s2.requests()[0].1["model"], "gpt-4o-mini");
+    }
+
+    #[test]
+    fn a_model_the_account_no_longer_has_fails_over_without_cooling_the_account() {
+        // Antigravity answers 404 "Requested entity was not found" for a
+        // retired model: the next target serves the turn, the account stays up
+        let s1 = MockServer::start(vec![http_status(
+            404,
+            "",
+            "Requested entity was not found.",
+        )]);
+        let s2 = MockServer::start(vec![sse_text("ok")]);
+        let gw = Gateway::new(vec![
+            candidate("acc-1", "openai", "retired-model", &s1.url),
+            candidate("acc-2", "openai", "gpt-4o", &s2.url),
+        ]);
+        let req = ChatRequest::new("x", vec![ChatMessage::user("oi")]);
+        let mut failovers = Vec::new();
+        let outcome = gw
+            .stream_with(
+                &req,
+                &Cancel::default(),
+                |_| true,
+                |c, _, cooldown| failovers.push((c.account_id.clone(), cooldown)),
+                |_| {},
+            )
+            .unwrap();
+        assert_eq!(outcome.account_id, "acc-2");
+        assert_eq!(failovers, vec![("acc-1".to_string(), 0)]);
     }
 
     #[test]

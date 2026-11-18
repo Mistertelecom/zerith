@@ -1468,3 +1468,9 @@ button.item-row {
 .pn-mcp-login {
   margin: 0 8px 12px 52px;
 }
+
+/* a long `conta:modelo` must not squeeze the row's text into a column */
+.setting-control > select.select {
+  max-width: 280px;
+  text-overflow: ellipsis;
+}

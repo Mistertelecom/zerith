@@ -307,6 +307,14 @@ pub fn run(
     match result {
         Ok(r) => {
             digest.answer = r.text.clone();
+            // The sidebar draws the provider's logo from these columns.
+            let provider = r
+                .account_id
+                .as_deref()
+                .and_then(|id| settings.account(id))
+                .map(|a| a.provider.clone());
+            let _ =
+                store.set_session_model(session_id, r.model_used.as_deref(), provider.as_deref());
             on(TurnEvent::Done {
                 stored: Some(r.message_id),
                 text: r.text,

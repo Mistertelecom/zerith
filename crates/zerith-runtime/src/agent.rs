@@ -965,8 +965,11 @@ fn record_failover(
     cooldown_ms: u64,
     failed: &mut Vec<Value>,
 ) {
-    let until_ms = now_ms().saturating_add(i64::try_from(cooldown_ms).unwrap_or(i64::MAX));
-    let _ = store.set_account_cooldown(&cand.account_id, until_ms, Some(&err.to_string()));
+    // 0 = the error is about the model, not the account (404): no cooldown
+    if cooldown_ms > 0 {
+        let until_ms = now_ms().saturating_add(i64::try_from(cooldown_ms).unwrap_or(i64::MAX));
+        let _ = store.set_account_cooldown(&cand.account_id, until_ms, Some(&err.to_string()));
+    }
     let status = if matches!(
         err,
         ProviderError::RateLimited { .. } | ProviderError::Http { status: 429, .. }

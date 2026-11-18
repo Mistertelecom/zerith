@@ -38,10 +38,12 @@ import { Settings, type SettingsTab } from "./components/Settings";
 import { Composer, type CommandName } from "./components/Composer";
 import { Logo, ZerithMark } from "./components/ui";
 import { catalogEntry, NOT_CHAT } from "./lib/catalog";
+import { titleOf } from "./lib/title";
 import { TitleBar } from "./components/TitleBar";
 import { FolderPill } from "./components/FolderPill";
 
 const MODEL_KEY = "zerith.model";
+
 // Models the user took out of the chat menu (`account:model` values).
 const HIDDEN_KEY = "zerith.hiddenModels";
 
@@ -211,6 +213,19 @@ export default function App() {
     if (model) localStorage.setItem(MODEL_KEY, model);
   }, [model]);
 
+  // The saved model left its account's live list: move to the account's
+  // first model instead of failing every turn with a 404.
+  useEffect(() => {
+    const cut = model.indexOf(":");
+    const live = cut > 0 ? liveModels[model.slice(0, cut)] : undefined;
+    const id = model.slice(cut + 1);
+    if (!live?.length || live.some((m) => m.id === id)) return;
+    const next = live.find((m) => !NOT_CHAT.test(m.id));
+    if (!next) return;
+    setModel(model.slice(0, cut + 1) + next.id);
+    setStatus(`${id} não é mais oferecido pela conta; usando ${next.id}`);
+  }, [model, liveModels]);
+
   // OAuth accounts that publish their models (Antigravity's Gemini 4 Hydrogen
   // is not in any static catalogue); a failure keeps the catalogue list.
   useEffect(() => {
@@ -285,6 +300,16 @@ export default function App() {
     const done = onTurnDone((id) => {
       if (id === selected) setTurn((prev) => ({ ...prev, busy: false }));
     });
+    // The provider/model of a turn is stored when it ends: the sidebar logo
+    // reads it from the route the turn just took.
+    const routed = onTurnEvent(selected, (ev) => {
+      if (ev.type === "route")
+        setSessions((list) =>
+          list.map((s) =>
+            s.id === selected ? { ...s, provider: ev.provider, model: ev.model } : s,
+          ),
+        );
+    });
     // The background review lands after the answer: a note under it.
     const learned = onTurnLearned((id, items) => {
       if (id !== selected || !items.length) return;
@@ -303,6 +328,7 @@ export default function App() {
       unlisten?.();
       if (listening.current?.id === selected) listening.current = null;
       void done.then((u) => u());
+      void routed.then((u) => u());
       void learned.then((u) => u());
     };
   }, [selected, subscribe]);
@@ -319,7 +345,7 @@ export default function App() {
     let id = selected;
     try {
       if (!id) {
-        const created = await api.createSession(prompt.slice(0, 48), folder);
+        const created = await api.createSession(titleOf(prompt), folder);
         setSessions((prev) => [created, ...prev]);
         id = created.id;
         await subscribe(id);
@@ -490,13 +516,15 @@ export default function App() {
       if (!a.enabled) continue;
       const name =
         a.label || catalogEntry(a.oauth_tool || a.provider)?.name || a.id;
+      // An account that publishes its list is the authority: a model it no
+      // longer serves (Antigravity retired Gemini 4 Hydrogen) is not offered,
+      // not even as its saved default.
+      const live = liveModels[a.id];
       const ids = [
-        a.default_model,
-        ...(
-          liveModels[a.id] ??
-          catalogEntry(a.oauth_tool || a.provider)?.models ??
-          []
-        ).map((m) => m.id),
+        ...(live ? [] : [a.default_model]),
+        ...(live ?? catalogEntry(a.oauth_tool || a.provider)?.models ?? []).map(
+          (m) => m.id,
+        ),
       ];
       for (const m of [...new Set(ids)].filter(
         (m): m is string => !!m && !NOT_CHAT.test(m),
@@ -844,6 +872,7 @@ export default function App() {
               reduceMotion: boot.reduce_motion,
               profile: boot.profile,
               memoryPaused,
+              models,
               onTheme: setTheme,
               onReduceMotion: setReduceMotion,
               onProfile: setProfile,

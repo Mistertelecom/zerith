@@ -35,6 +35,8 @@ export interface GeneralProps {
   reduceMotion: boolean;
   profile: string;
   memoryPaused: boolean;
+  /** The composer's model list (`conta:modelo`), for the learning reviewer. */
+  models: { value: string; label: string }[];
   onTheme: (t: string) => void;
   onReduceMotion: (v: boolean) => void;
   onProfile: (p: string) => void;
@@ -57,15 +59,29 @@ export function GeneralTab(props: GeneralProps) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [learning, setLearning] = useState<boolean | null>(null);
+  const [learnModel, setLearnModel] = useState("");
 
   useEffect(() => {
-    learnApi.get().then((l) => setLearning(l.enabled)).catch(() => undefined);
+    learnApi
+      .get()
+      .then((l) => {
+        setLearning(l.enabled);
+        setLearnModel(l.model);
+      })
+      .catch(() => undefined);
   }, []);
   const toggleLearning = (v: boolean) => {
     setLearning(v);
     learnApi
       .set({ enabled: v })
       .then((l) => setLearning(l.enabled))
+      .catch((e) => setError(String(e)));
+  };
+  const pickLearnModel = (m: string) => {
+    setLearnModel(m);
+    learnApi
+      .set({ model: m })
+      .then((l) => setLearnModel(l.model))
       .catch((e) => setError(String(e)));
   };
 
@@ -137,6 +153,31 @@ export function GeneralTab(props: GeneralProps) {
             disabled={learning === null}
             onChange={toggleLearning}
           />
+        </Row>
+        <Row
+          label="Modelo da revisão"
+          hint="Um modelo barato basta: a revisão lê só um resumo do turno. “Mesmo da conversa” usa o modelo que respondeu."
+        >
+          <select
+            className="select"
+            aria-label="Modelo da revisão"
+            title={learnModel || "Mesmo da conversa"}
+            value={learnModel}
+            disabled={learning === null || learning === false}
+            onChange={(e) => pickLearnModel(e.target.value)}
+          >
+            <option value="">Mesmo da conversa</option>
+            {/* a saved model that is no longer offered still shows, so the
+                select never lies about what is stored */}
+            {learnModel && !props.models.some((m) => m.value === learnModel) ? (
+              <option value={learnModel}>{learnModel}</option>
+            ) : null}
+            {props.models.map((m) => (
+              <option key={m.value} value={m.value}>
+                {m.label}
+              </option>
+            ))}
+          </select>
         </Row>
       </Card>
 

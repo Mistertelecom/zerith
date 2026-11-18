@@ -13,8 +13,8 @@ use serde_json::{json, Value};
 use zerith_providers::{Cancel, Client, Protocol, ProviderConfig, ProviderKind};
 use zerith_runtime::plan::{parse_plan, run_plan, run_plan_opts, PlanOptions, TaskBudget};
 use zerith_runtime::{
-    question_channel, run_agent_turn, AgentOptions, RunError, RunEvent, SubagentOptions,
-    TurnContext,
+    approval_channel, question_channel, run_agent_turn, AgentOptions, Approval, RunError, RunEvent,
+    SubagentOptions, TurnContext,
 };
 use zerith_security::{preset, Mode, Policy};
 use zerith_sessions::{Role, SessionSource, Store, TodoStatus};
@@ -1319,4 +1319,162 @@ fn a_subagent_registry_has_no_authoring_tools() {
         assert!(child.get(name).is_none(), "{name} leaked into a subagent");
     }
     assert!(child.get("read_file").is_some());
+}
+
+/// A `general` child in the default (ask) mode writes a file and runs a shell
+/// command. Both prompts reach the parent's chat through the parent's gate;
+/// what the person answers is what happens.
+fn delegated_write_and_shell(answer: Approval) -> (Env, Vec<RunEvent>, String) {
+    let url = serve(move |b| match prompt_of(b).as_str() {
+        "PAI" => {
+            if tool_msgs(b).is_empty() {
+                calls(&[(
+                    "c1",
+                    "agent",
+                    json!({"description": "escreve", "prompt": "FILHO", "agent": "general"}),
+                )])
+            } else {
+                text(tool_msgs(b)[0]["content"].as_str().unwrap())
+            }
+        }
+        _ => {
+            if tool_msgs(b).is_empty() {
+                calls(&[
+                    ("w1", "write_file", json!({"path": "x.txt", "content": "c"})),
+                    ("s1", "shell", json!({"command": "echo oi> y.txt"})),
+                ])
+            } else {
+                let outs: Vec<String> = tool_msgs(b)
+                    .iter()
+                    .map(|m| m["content"].as_str().unwrap().to_string())
+                    .collect();
+                text(&outs.join(" | "))
+            }
+        }
+    });
+    let e = env(Mode::Default);
+    let reg = Registry::new();
+    let (tx, gate) = approval_channel();
+    let mut events = Vec::new();
+    let r = turn(
+        &e,
+        &url,
+        &reg,
+        AgentOptions {
+            approvals: Some(&gate),
+            subagents: subs(2),
+            ..AgentOptions::default()
+        },
+        TurnContext::default(),
+        "PAI",
+        &Cancel::default(),
+        |ev| {
+            if let RunEvent::ApprovalNeeded { id, .. } = &ev {
+                assert!(tx.answer(*id, answer));
+            }
+            events.push(ev);
+        },
+    )
+    .unwrap();
+    (e, events, r.text)
+}
+
+fn approvals_asked(events: &[RunEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            RunEvent::ApprovalNeeded { tool, summary, .. } => {
+                assert!(summary.starts_with("[subagente]"), "{summary}");
+                Some(tool.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_child_in_ask_mode_asks_the_person_through_the_parents_gate() {
+    let (e, events, text) = delegated_write_and_shell(Approval::AllowOnce);
+    assert_eq!(approvals_asked(&events), ["write_file", "shell"]);
+    assert!(e.dir.path().join("x.txt").exists(), "{text}");
+    assert!(e.dir.path().join("y.txt").exists(), "{text}");
+}
+
+#[test]
+fn a_child_in_ask_mode_is_refused_when_the_person_denies() {
+    let (e, events, text) = delegated_write_and_shell(Approval::Deny);
+    assert_eq!(approvals_asked(&events), ["write_file", "shell"]);
+    assert!(!e.dir.path().join("x.txt").exists());
+    assert!(!e.dir.path().join("y.txt").exists());
+    assert_eq!(text.matches("negado pelo usuário").count(), 2, "{text}");
+}
+
+#[test]
+fn a_delegating_turn_reports_what_its_children_saved() {
+    let url = serve(|b| match prompt_of(b).as_str() {
+        "PAI" if tool_msgs(b).is_empty() => calls(&[(
+            "c1",
+            "agent",
+            json!({"description": "x", "prompt": "FILHO", "agent": "explore"}),
+        )]),
+        "PAI" => text("ok"),
+        // Prose with real usage: Caveman counts a saving on the child's request.
+        _ => Reply::Whole(format!(
+            "{HEAD}{}{}data: [DONE]\n\n",
+            chunk(&json!({"choices":[{"delta":{"content":"o filho respondeu em prosa"}}]})),
+            chunk(
+                &json!({"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":100,"total_tokens":105}})
+            )
+        )),
+    });
+    let e = env(Mode::Default);
+    let reg = Registry::new();
+    let settings = zerith_core::Settings {
+        token_saver: zerith_core::TokenSaverSettings {
+            caveman: zerith_core::CavemanLevel::Full,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let r = turn(
+        &e,
+        &url,
+        &reg,
+        AgentOptions {
+            subagents: subs(2),
+            ..AgentOptions::default()
+        },
+        TurnContext {
+            settings: Some(&settings),
+            ..TurnContext::default()
+        },
+        "PAI",
+        &Cancel::default(),
+        |_| {},
+    )
+    .unwrap();
+    // One row per request, as before: the child's own row holds its saving.
+    let rows: Vec<(String, i64)> = {
+        let mut st = e
+            .store
+            .conn()
+            .prepare("SELECT session_id, saved_caveman_tokens FROM usage_records")
+            .unwrap();
+        st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    let parent_own: i64 = rows.iter().filter(|r| r.0 == e.sid).map(|r| r.1).sum();
+    let child: i64 = rows.iter().filter(|r| r.0 != e.sid).map(|r| r.1).sum();
+    assert!(child > 0, "{rows:?}");
+    assert_eq!(
+        r.saved_caveman_tokens as i64,
+        parent_own + child,
+        "{rows:?}"
+    );
+    assert_eq!(
+        r.saved_tokens,
+        r.saved_rtk_tokens + r.saved_ponytail_tokens + r.saved_caveman_tokens
+    );
 }

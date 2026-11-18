@@ -15,9 +15,11 @@
 //!   through a watchdog; a panic or error becomes an error string, never a
 //!   crash.
 //!
-//! Children get no approval gate (the parent's is borrowed for one turn) and
-//! none of the host's middleware: a call the policy would *ask* about is
-//! refused. The policy itself (mode, rules, workspace) is the parent's.
+//! Children share the parent's [`ApprovalGate`]: a call the policy would *ask*
+//! about is queued on it and the root turn shows the prompt in the person's
+//! chat; no gate (plan runner, bare CLI) still refuses. They get none of the
+//! host's middleware. The policy itself (mode, rules, workspace) is the
+//! parent's, made stricter by a definition, never looser.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -29,11 +31,11 @@ use serde_json::Value;
 use zerith_core::agents::{self, AgentDef};
 use zerith_memory::{MemoryBackend, Scope, SqliteMemory};
 use zerith_providers::{Cancel, Client, ProviderConfig, ProviderError};
-use zerith_security::{Mode, Policy};
+use zerith_security::{Mode, ModeHandle, Policy};
 use zerith_sessions::{Role, Store};
 use zerith_tools::{AgentRequest, EventSink, HostEvent, Registry, Services, SkillLoad};
 
-use crate::{RunError, RunEvent, TurnContext};
+use crate::{ApprovalGate, RunError, RunEvent, TurnContext};
 
 /// Deepest chain of subagents: root -> child -> grandchild.
 pub const MAX_DEPTH: usize = 2;
@@ -300,6 +302,8 @@ pub struct ChildSpec {
     /// Receives events of the child's own subagents.
     pub sink: Option<EventSink>,
     pub settings: Option<zerith_core::Settings>,
+    /// The parent's gate. `None`: a call that needs approval is refused.
+    pub approvals: Option<ApprovalGate>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -323,7 +327,29 @@ impl std::fmt::Display for ChildError {
 pub struct ChildOutput {
     pub text: String,
     pub session_id: String,
+    /// What the child turn (its own children included) saved.
+    pub saved: Saved,
 }
+
+/// Token Saver totals of one turn, by source.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Saved {
+    pub rtk: u64,
+    pub ponytail: u64,
+    pub caveman: u64,
+}
+
+impl Saved {
+    fn add(&mut self, o: Saved) {
+        self.rtk += o.rtk;
+        self.ponytail += o.ponytail;
+        self.caveman += o.caveman;
+    }
+}
+
+/// Savings of the children a turn started, summed as they finish. The turn
+/// adds them to its report; the database keeps one row per request.
+pub(crate) type SavedTotals = Arc<Mutex<Saved>>;
 
 /// Runs one child to completion on the calling thread.
 pub fn run_child(spec: ChildSpec) -> Result<ChildOutput, ChildError> {
@@ -348,6 +374,7 @@ pub fn run_child(spec: ChildSpec) -> Result<ChildOutput, ChildError> {
     let opts = crate::AgentOptions {
         tools: Some(&spec.registry),
         policy: Some(&spec.policy),
+        approvals: spec.approvals.as_ref(),
         max_steps: spec.max_steps.max(1),
         subagents: SubagentOptions {
             depth: spec.depth,
@@ -425,6 +452,11 @@ pub fn run_child(spec: ChildSpec) -> Result<ChildOutput, ChildError> {
             Ok(ChildOutput {
                 text: report.text,
                 session_id: session.id,
+                saved: Saved {
+                    rtk: report.saved_rtk_tokens,
+                    ponytail: report.saved_ponytail_tokens,
+                    caveman: report.saved_caveman_tokens,
+                },
             })
         }
     }
@@ -476,10 +508,13 @@ struct Runtime {
     gate: Arc<Gate>,
     limit: Option<usize>,
     settings: Option<zerith_core::Settings>,
+    approvals: Option<ApprovalGate>,
+    saved: SavedTotals,
 }
 
 /// Binds the turn's session to its registry so the session tools work. Called
-/// by the loop once per turn.
+/// by the loop once per turn. Returns where the turn's children add up what
+/// they saved.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn bind(
     tools: &Registry,
@@ -490,7 +525,8 @@ pub(crate) fn bind(
     model: &str,
     session_id: &str,
     opts: &SubagentOptions,
-) {
+    approvals: Option<&ApprovalGate>,
+) -> SavedTotals {
     let db = store
         .conn()
         .path()
@@ -507,8 +543,12 @@ pub(crate) fn bind(
         gate: opts.gate.clone().unwrap_or_else(Gate::global),
         limit: opts.max_concurrent,
         settings: ctx.settings.cloned(),
+        approvals: approvals.cloned(),
+        saved: SavedTotals::default(),
     };
+    let saved = rt.saved.clone();
     tools.host().bind(session_id, Arc::new(rt));
+    saved
 }
 
 pub(crate) fn pick_candidate<'a>(
@@ -622,8 +662,9 @@ impl Services for Runtime {
             .and_then(Mode::parse)
             .is_some_and(|m| m == Mode::Plan)
         {
-            // A definition may only make a child stricter, never looser.
-            policy.mode = Mode::Plan;
+            // A definition may only make a child stricter, never looser. Its
+            // own handle: the parent's live one would win over `mode`.
+            policy = policy.with_handle(ModeHandle::new(Mode::Plan));
         }
         let id = format!("sub-{}", NEXT_ID.fetch_add(1, Ordering::Relaxed));
         let settings = self.settings.clone().unwrap_or_else(|| {
@@ -670,7 +711,9 @@ impl Services for Runtime {
             }),
             sink: Some(sink.clone()),
             settings: Some(settings),
+            approvals: self.approvals.clone(),
         };
+        let totals = self.saved.clone();
         // Only the first level takes a permit; deeper children run under it.
         let permit_gate = (self.depth == 0).then(|| (self.gate.clone(), self.limit));
         let limit = self.limit.unwrap_or_else(profile_limit);
@@ -696,6 +739,9 @@ impl Services for Runtime {
             announce("running", &spec.prompt);
             match run_child(spec) {
                 Ok(o) => {
+                    if let Ok(mut t) = totals.lock() {
+                        t.add(o.saved);
+                    }
                     announce("done", &o.text);
                     Ok(o.text)
                 }

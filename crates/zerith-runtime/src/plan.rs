@@ -506,6 +506,7 @@ fn run_one(
         deadline,
         sink: None,
         settings: Some(settings),
+        approvals: None,
     })
     .map_err(|e| e.to_string())?;
     Ok(TaskOutcome {

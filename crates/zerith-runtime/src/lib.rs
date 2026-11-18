@@ -374,21 +374,30 @@ pub(crate) fn system_prompt(
 /// A failed recall is not a failed turn: memory is an aid, and losing it must
 /// degrade the answer, not block it.
 pub(crate) fn recall_block(memory: &dyn MemoryBackend, scope: &Scope, query: &str) -> String {
-    let Ok(hits) = memory.recall(scope, query, MEMORY_HITS) else {
-        return String::new();
-    };
+    // Instructions and preferences apply to every turn, whatever was asked;
+    // other facts come in when the prompt matches them.
+    // ponytail: newest 50 rules, then the ranking; a rule beyond that only
+    // comes back through recall.
+    let rules = memory
+        .list(scope, 50)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|f| {
+            matches!(
+                f.kind,
+                zerith_memory::FactKind::Instruction | zerith_memory::FactKind::Preference
+            )
+        });
+    let hits = memory.recall(scope, query, MEMORY_HITS).unwrap_or_default();
+    let mut seen = std::collections::HashSet::new();
     let mut block = String::from("# O que você já sabe sobre o usuário\n");
     let mut used = block.len();
     let mut any = false;
-    for hit in hits {
-        if hit.fact.superseded_by.is_some() {
+    for fact in rules.chain(hits.into_iter().map(|h| h.fact)) {
+        if fact.superseded_by.is_some() || !seen.insert(fact.id) {
             continue;
         }
-        let line = format!(
-            "- [{}] {}\n",
-            hit.fact.confidence.as_str(),
-            hit.fact.text.trim()
-        );
+        let line = format!("- [{}] {}\n", fact.confidence.as_str(), fact.text.trim());
         if used + line.len() > MEMORY_BUDGET_CHARS {
             break;
         }
@@ -936,6 +945,27 @@ mod tests {
     }
 
     #[test]
+    fn preferences_reach_every_turn_even_when_the_prompt_does_not_match() {
+        let mem = zerith_memory::SqliteMemory::open_in_memory().unwrap();
+        let s = Scope::user("t");
+        let c = zerith_memory::Confidence::Confirmed;
+        mem.remember(
+            &s,
+            FactKind::Preference,
+            "prefere respostas curtas",
+            c,
+            None,
+        )
+        .unwrap();
+        mem.remember(&s, FactKind::Fact, "o gato se chama Rex", c, None)
+            .unwrap();
+        let block = recall_block(&mem, &s, "qual meu editor favorito?");
+        assert!(block.contains("prefere respostas curtas"), "{block}");
+        assert!(!block.contains("Rex"), "{block}");
+        assert!(recall_block(&mem, &s, "gato").contains("Rex"));
+    }
+
+    #[test]
     fn an_empty_memory_adds_no_section_at_all() {
         let mem = Fixed(vec![]);
         assert_eq!(recall_block(&mem, &Scope::user("t"), "x"), "");
@@ -968,6 +998,11 @@ pub(crate) fn tool_guidance(tools: &zerith_tools::Registry) -> String {
     if has("ask_user") {
         out.push_str(
             "\n\n# Perguntas\nSe falta uma decisão que só o usuário pode tomar, use `ask_user` em vez de adivinhar.",
+        );
+    }
+    if has("memory_save") {
+        out.push_str(
+            "\n\n# Memória\nQuando o usuário revelar uma preferência, instrução ou fato durável sobre ele ou o projeto, salve com `memory_save` na hora, sem pedir. Não salve progresso de tarefa nem segredos.",
         );
     }
     if has("edit_file") {

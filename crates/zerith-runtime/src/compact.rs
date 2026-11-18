@@ -39,6 +39,12 @@ Não invente nada que não esteja no texto. No máximo 400 palavras.";
 
 /// How many rows `compact_now` reads.
 const COMPACT_WINDOW: usize = 500;
+/// Context window assumed when neither the provider nor the account says.
+// ponytail: one number for every model (Claude 200k, Gemini 1M, GPT 400k);
+// a per-model table belongs in the provider catalogue if early summaries hurt.
+pub const DEFAULT_CONTEXT: usize = 128_000;
+/// History share of the window that triggers a summary before the turn.
+pub const AUTO_COMPACT_PCT: usize = 75;
 /// Characters of the span sent to the summarizer, at most.
 const TRANSCRIPT_CHARS: usize = 60_000;
 
@@ -363,16 +369,64 @@ pub fn compact_now(
     cancel: &Cancel,
     summarizer: Option<&dyn Summarizer>,
 ) -> Result<Option<CompactReport>> {
+    let default = ClientSummarizer { client, model };
+    compact_with(
+        store,
+        session_id,
+        summarizer.unwrap_or(&default),
+        cancel,
+        "manual",
+    )
+}
+
+fn compact_with(
+    store: &Store,
+    session_id: &str,
+    summarizer: &dyn Summarizer,
+    cancel: &Cancel,
+    trigger: &str,
+) -> Result<Option<CompactReport>> {
     store
         .session(session_id)?
         .ok_or_else(|| RunError::NoSession(session_id.to_string()))?;
     let rows = store.recent_messages(session_id, COMPACT_WINDOW)?;
     let mut hist = History::new(Vec::new(), replay_items(&rows));
     let log = TurnLog::outside_turn(store, session_id);
-    let default = ClientSummarizer { client, model };
-    let s = summarizer.unwrap_or(&default);
-    summarize_into(store, session_id, &mut hist, 0, s, cancel, &log, "manual")
-        .map_err(|e| RunError::Provider(ProviderError::Transport(e)))
+    summarize_into(
+        store, session_id, &mut hist, 0, summarizer, cancel, &log, trigger,
+    )
+    .map_err(|e| RunError::Provider(ProviderError::Transport(e)))
+}
+
+/// Whether a history of `tokens` should be summarized before the next turn:
+/// past [`AUTO_COMPACT_PCT`] of the window (`context_limit`, else
+/// [`DEFAULT_CONTEXT`]).
+pub fn needs_compaction(tokens: usize, context_limit: Option<u32>) -> bool {
+    let window = context_limit
+        .filter(|&l| l > 0)
+        .map_or(DEFAULT_CONTEXT, |l| l as usize);
+    tokens * 100 > window * AUTO_COMPACT_PCT
+}
+
+/// Before a turn: when the `history` rows the turn will replay pass the
+/// threshold, the same summary as `/compact` replaces the older ones.
+/// `Ok(None)`: below the threshold, or nothing to summarize.
+pub fn auto_compact(
+    store: &Store,
+    session_id: &str,
+    history: usize,
+    context_limit: Option<u32>,
+    summarizer: &dyn Summarizer,
+    cancel: &Cancel,
+) -> Result<Option<CompactReport>> {
+    // ponytail: counts the replayed rows only; the system prompt and tool
+    // specs (a few k tokens) ride on the 25% margin.
+    let rows = store.recent_messages(session_id, history.max(1))?;
+    let tokens: usize = replay_items(&rows).iter().map(|i| cost(&i.msg)).sum();
+    if !needs_compaction(tokens, context_limit) {
+        return Ok(None);
+    }
+    compact_with(store, session_id, summarizer, cancel, "auto")
 }
 
 /// Stored rows as the model's view, with tool calls and results paired and
@@ -493,4 +547,76 @@ pub(crate) fn pair(items: Vec<Item>) -> Vec<Item> {
     }
     close(&mut out, &mut open);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zerith_sessions::SessionSource;
+
+    struct Canned;
+    impl Summarizer for Canned {
+        fn summarize(&self, t: &str, _: &Cancel) -> std::result::Result<String, String> {
+            assert!(
+                t.contains("pedido 0"),
+                "the oldest turn goes to the summary"
+            );
+            Ok("o usuário pediu 30 coisas".into())
+        }
+    }
+
+    #[test]
+    fn the_threshold_is_three_quarters_of_the_window() {
+        assert!(!needs_compaction(75_000, Some(100_000)));
+        assert!(needs_compaction(75_001, Some(100_000)));
+        // no window known: 128k
+        assert!(!needs_compaction(96_000, None));
+        assert!(needs_compaction(96_001, None));
+        assert!(needs_compaction(96_001, Some(0)), "0 means unknown");
+    }
+
+    /// A long history crosses the line: one summary row replaces every turn
+    /// but the last, and the next replay shows it in their place.
+    #[test]
+    fn a_long_history_is_summarized_before_the_turn() {
+        let store = Store::open_in_memory().unwrap();
+        let sid = store
+            .create_session("longa", SessionSource::Native)
+            .unwrap()
+            .id;
+        let filler = "x".repeat(4_000); // ~1000 tokens per message
+        for i in 0..30 {
+            store
+                .append(
+                    &sid,
+                    &NewMessage::new(Role::User, format!("pedido {i} {filler}")),
+                )
+                .unwrap();
+            store
+                .append(
+                    &sid,
+                    &NewMessage::new(Role::Assistant, format!("feito {i} {filler}")),
+                )
+                .unwrap();
+        }
+        let c = Cancel::default();
+        // 60 messages ~ 60k tokens: under 75% of 128k, nothing happens
+        assert!(auto_compact(&store, &sid, 100, None, &Canned, &c)
+            .unwrap()
+            .is_none());
+        // a 64k window: over the line
+        let r = auto_compact(&store, &sid, 100, Some(64_000), &Canned, &c)
+            .unwrap()
+            .expect("the trigger fires");
+        assert_eq!(r.summarized, 58, "everything before the last user message");
+        assert!(r.tokens_after < r.tokens_before / 10);
+        let replay = replay(&store.recent_messages(&sid, 500).unwrap());
+        assert_eq!(replay.len(), 3, "summary + last prompt + last answer");
+        assert!(replay[0].content.starts_with(SUMMARY_HEADER));
+        assert!(replay[1].content.starts_with("pedido 29"));
+        // and the history now fits: no second summary on the next turn
+        assert!(auto_compact(&store, &sid, 100, Some(64_000), &Canned, &c)
+            .unwrap()
+            .is_none());
+    }
 }

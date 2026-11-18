@@ -11,9 +11,9 @@
 //! one tool call), [`crate::compact`] (keeping the history inside the context
 //! window) and [`crate::spill`] (outputs too big for the model).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -58,10 +58,17 @@ impl ApprovalSender {
 }
 
 /// The turn's half. Keep one per conversation: `AllowSession` grants live
-/// here, so a new gate starts asking again.
+/// here, so a new gate starts asking again. Clones share everything: a
+/// subagent holds a clone of its parent's gate, so its prompts reach the same
+/// person through the parent's events (see [`ApprovalGate::relay`]).
+#[derive(Clone)]
 pub struct ApprovalGate {
-    rx: Mutex<mpsc::Receiver<(u64, Approval)>>,
-    granted: Mutex<HashSet<String>>,
+    rx: Arc<Mutex<mpsc::Receiver<(u64, Approval)>>>,
+    granted: Arc<Mutex<HashSet<String>>>,
+    /// Answers that arrived for another waiter (parallel children).
+    early: Arc<Mutex<HashMap<u64, Approval>>>,
+    /// `ApprovalNeeded` events of subagents, for the parent loop to emit.
+    relayed: Arc<Mutex<Vec<RunEvent>>>,
 }
 
 pub fn approval_channel() -> (ApprovalSender, ApprovalGate) {
@@ -69,30 +76,59 @@ pub fn approval_channel() -> (ApprovalSender, ApprovalGate) {
     (
         ApprovalSender(tx),
         ApprovalGate {
-            rx: Mutex::new(rx),
-            granted: Mutex::new(HashSet::new()),
+            rx: Arc::new(Mutex::new(rx)),
+            granted: Arc::default(),
+            early: Arc::default(),
+            relayed: Arc::default(),
         },
     )
 }
 
 impl ApprovalGate {
     /// Blocks until the answer for `id` arrives. Fails closed: a cancel, or a
-    /// sender that went away, is a Deny.
+    /// sender that went away, is a Deny. Several waiters may share the gate:
+    /// an answer meant for another one is parked for it, not dropped.
+    // ponytail: parked answers to prompts nobody waits for anymore are never
+    // pruned; a few bytes per stale answer.
     pub(crate) fn wait(&self, id: u64, cancel: &Cancel) -> Approval {
-        let Ok(rx) = self.rx.lock() else {
-            return Approval::Deny;
-        };
         loop {
             if cancel.is_cancelled() {
                 return Approval::Deny;
             }
+            if let Some(a) = self.early.lock().ok().and_then(|mut e| e.remove(&id)) {
+                return a;
+            }
+            let Ok(rx) = self.rx.lock() else {
+                return Approval::Deny;
+            };
             match rx.recv_timeout(Duration::from_millis(50)) {
                 Ok((got, a)) if got == id => return a,
-                // A late answer to an earlier prompt: ignore it.
-                Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Ok((got, a)) => {
+                    drop(rx);
+                    if let Ok(mut e) = self.early.lock() {
+                        e.insert(got, a);
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => return Approval::Deny,
             }
         }
+    }
+
+    /// A subagent's prompt: queued here, emitted by the parent loop while it
+    /// waits for the `agent` call (the child cannot reach the parent's
+    /// `on_event`).
+    pub(crate) fn relay(&self, e: RunEvent) {
+        if let Ok(mut q) = self.relayed.lock() {
+            q.push(e);
+        }
+    }
+
+    pub(crate) fn take_relayed(&self) -> Vec<RunEvent> {
+        self.relayed
+            .lock()
+            .map(|mut q| std::mem::take(&mut *q))
+            .unwrap_or_default()
     }
 
     // ponytail: grants are per tool name ("allow shell for the session"), not
@@ -281,7 +317,12 @@ fn turn_body(
     if let Some(dir) = &agent.spill_dir {
         spill::prune(dir, SPILL_MAX_AGE);
     }
-    let cwd = std::env::current_dir().unwrap_or_default();
+    // hooks run where the turn's tools act: the session's folder, not the
+    // process's (the desktop starts from anywhere)
+    let cwd = agent
+        .policy
+        .map(|p| p.workspace.clone())
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let mut prompt_context = Vec::new();
     if let Some(st) = ctx.settings {
         if store.message_count(session_id).unwrap_or(1) == 0 {
@@ -344,8 +385,8 @@ fn turn_body(
         system_text.push_str(&crate::tool_guidance(r));
     }
     let system = vec![ChatMessage::system(system_text)];
-    if let (Some(r), Some(p)) = (agent.tools, agent.policy) {
-        subagent::bind(
+    let kids_saved = if let (Some(r), Some(p)) = (agent.tools, agent.policy) {
+        Some(subagent::bind(
             r,
             p,
             store,
@@ -354,8 +395,11 @@ fn turn_body(
             model,
             session_id,
             &agent.subagents,
-        );
-    }
+            agent.approvals,
+        ))
+    } else {
+        None
+    };
     // The newest rows, which include the prompt just appended.
     let rows = store.recent_messages(session_id, agent.history.max(1))?;
     let mut hist = History::new(system, replay_items(&rows));
@@ -408,6 +452,7 @@ fn turn_body(
         scope: ctx.scope,
         middleware: &agent.middleware,
         approvals: agent.approvals,
+        relay: agent.subagents.depth == 0,
         spill_dir: agent.spill_dir.as_deref(),
         session_id,
         cancel,
@@ -582,9 +627,16 @@ fn turn_body(
             let ran = if cancel.is_cancelled() {
                 vec![None; prepared.len()]
             } else {
-                pipe.run_group(&prepared, agent.max_parallel_tools.max(1))
+                pipe.run_group(&prepared, agent.max_parallel_tools.max(1), on_event)
             };
             subagent::flush(store, session_id, agent.tools, on_event);
+            // ponytail: a background child's prompt is shown at the next tool
+            // group; pump between stream chunks if that wait ever matters.
+            if let (0, Some(g)) = (agent.subagents.depth, agent.approvals) {
+                for e in g.take_relayed() {
+                    on_event(e);
+                }
+            }
             // Commit in the model's order, whatever order they finished in.
             for ((call, p), ran) in group.iter().zip(prepared).zip(ran) {
                 let ran = ran.or_else(|| {
@@ -669,6 +721,13 @@ fn turn_body(
         }
     }
 
+    // What the subagents saved counts for the turn that delegated; their own
+    // usage rows already hold it, so only the report adds it up.
+    if let Some(k) = kids_saved.and_then(|k| k.lock().ok().map(|k| *k)) {
+        total_saved_rtk_tokens += k.rtk;
+        total_saved_ponytail_tokens += k.ponytail;
+        total_saved_caveman_tokens += k.caveman;
+    }
     on_event(RunEvent::Done {
         stored: Some(last.0),
     });

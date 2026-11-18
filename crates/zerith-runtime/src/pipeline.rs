@@ -103,6 +103,9 @@ pub(crate) struct Pipeline<'a> {
     pub scope: Option<&'a Scope>,
     pub middleware: &'a [Box<dyn Middleware + Send + Sync>],
     pub approvals: Option<&'a ApprovalGate>,
+    /// The root turn emits the approval prompts its subagents queue on the
+    /// shared gate while an `agent` call runs. Children only queue.
+    pub relay: bool,
     pub spill_dir: Option<&'a Path>,
     pub session_id: &'a str,
     pub cancel: &'a Cancel,
@@ -225,11 +228,20 @@ impl Pipeline<'_> {
             return Ok(());
         }
         let id = NEXT_APPROVAL.fetch_add(1, Ordering::Relaxed);
-        on_event(RunEvent::ApprovalNeeded {
-            id,
-            tool: tool.to_string(),
-            summary: why,
-        });
+        if self.relay {
+            on_event(RunEvent::ApprovalNeeded {
+                id,
+                tool: tool.to_string(),
+                summary: why,
+            });
+        } else {
+            // A subagent: the root turn emits it into the person's chat.
+            gate.relay(RunEvent::ApprovalNeeded {
+                id,
+                tool: tool.to_string(),
+                summary: format!("[subagente] {why}"),
+            });
+        }
         match gate.wait(id, self.cancel) {
             Approval::AllowOnce => Ok(()),
             Approval::AllowSession => {
@@ -244,7 +256,12 @@ impl Pipeline<'_> {
     /// `max_parallel` threads, but only when *all* of them are still safe
     /// after middleware; any doubt means serial, in order. Results come back
     /// indexed like `jobs`, so the caller commits them in the model's order.
-    pub fn run_group(&self, jobs: &[Prepared], max_parallel: usize) -> Vec<Option<(bool, String)>> {
+    pub fn run_group(
+        &self,
+        jobs: &[Prepared],
+        max_parallel: usize,
+        on_event: &mut dyn FnMut(RunEvent),
+    ) -> Vec<Option<(bool, String)>> {
         let mut out: Vec<Option<(bool, String)>> = vec![None; jobs.len()];
         let Some((tools, policy)) = self.core else {
             return out;
@@ -257,7 +274,13 @@ impl Pipeline<'_> {
             .all(|&i| tools.concurrency_safe(&jobs[i].inv.name, &jobs[i].inv.args));
         if max_parallel <= 1 || todo.len() < 2 || !all_safe {
             for i in todo {
-                out[i] = Some(self.run_one(tools, policy, &jobs[i].inv));
+                let inv = &jobs[i].inv;
+                out[i] = Some(if self.relays() && inv.name == "agent" {
+                    let cancel = self.cancel;
+                    self.pumped(on_event, || run_plain(tools, policy, inv, cancel))
+                } else {
+                    self.run_one(tools, policy, inv)
+                });
             }
             return out;
         }
@@ -268,6 +291,7 @@ impl Pipeline<'_> {
             .partition(|&i| tools.uses_memory(&jobs[i].inv.name));
         let slots: Mutex<&mut Vec<Option<(bool, String)>>> = Mutex::new(&mut out);
         let next = AtomicUsize::new(0);
+        let finished = AtomicUsize::new(0);
         let cancel = self.cancel;
         let workers = max_parallel.min(pool.len());
         std::thread::scope(|s| {
@@ -279,6 +303,7 @@ impl Pipeline<'_> {
                     if let Ok(mut g) = slots.lock() {
                         g[i] = Some(r);
                     }
+                    finished.fetch_add(1, Ordering::SeqCst);
                 });
             }
             for &i in &mine {
@@ -287,8 +312,44 @@ impl Pipeline<'_> {
                     g[i] = Some(r);
                 }
             }
+            while self.relays() && finished.load(Ordering::SeqCst) < pool.len() {
+                self.pump(on_event);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
         });
+        self.pump(on_event);
         out
+    }
+
+    fn relays(&self) -> bool {
+        self.relay && self.approvals.is_some()
+    }
+
+    /// Emits what subagents queued on the shared gate (their approval
+    /// prompts): the person answers them in the parent's chat.
+    fn pump(&self, on_event: &mut dyn FnMut(RunEvent)) {
+        if let (true, Some(g)) = (self.relay, self.approvals) {
+            for e in g.take_relayed() {
+                on_event(e);
+            }
+        }
+    }
+
+    /// Runs `job` on a scoped thread while this one pumps subagent prompts.
+    fn pumped<R: Send>(
+        &self,
+        on_event: &mut dyn FnMut(RunEvent),
+        job: impl FnOnce() -> R + Send,
+    ) -> R {
+        std::thread::scope(|s| {
+            let h = s.spawn(job);
+            while !h.is_finished() {
+                self.pump(on_event);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            self.pump(on_event);
+            h.join().unwrap_or_else(|p| std::panic::resume_unwind(p))
+        })
     }
 
     fn run_one(&self, tools: &Registry, policy: &Policy, inv: &ToolInvocation) -> (bool, String) {

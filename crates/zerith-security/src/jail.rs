@@ -204,6 +204,9 @@ impl Sandbox {
 
 /// A started child plus whatever keeps it contained. Dropping it closes the
 /// job: on Windows, any process of the tree still alive is killed.
+// The unit guard off Windows only mirrors the Windows layout; it is not a
+// non-exhaustive marker, which is what clippy takes it for on Linux.
+#[allow(clippy::manual_non_exhaustive)]
 pub struct Jailed {
     pub child: Child,
     #[cfg(windows)]

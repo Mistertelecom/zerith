@@ -8,6 +8,8 @@
 //! The boundary is the OS sandbox (`zerith_security::jail`) and the user's approval;
 //! rules are there to save prompts and to catch honest mistakes.
 
+use std::path::PathBuf;
+
 /// A command line broken into the simple commands it would run.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Analysis {
@@ -18,20 +20,46 @@ pub struct Analysis {
     pub inner: Vec<String>,
 }
 
+/// The grammar a command line is read with. Reading cmd text as sh is how
+/// `echo ' & mkdir x & echo '` looked like one harmless `echo`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dialect {
+    /// POSIX sh: `'` and `"` quote, `\` escapes, `$(...)` and backticks run.
+    Sh,
+    /// Windows `cmd.exe`: only `"` quotes (nothing escapes inside them), `^`
+    /// escapes the next character outside quotes, `'` and `\` are literal,
+    /// and `%VAR%` / `!VAR!` expand anywhere.
+    Cmd,
+}
+
+impl Dialect {
+    /// The shell the `shell` tool runs: `cmd /S /C` on Windows, `sh -c` elsewhere.
+    pub const NATIVE: Dialect = if cfg!(windows) {
+        Dialect::Cmd
+    } else {
+        Dialect::Sh
+    };
+}
+
 const MAX_DEPTH: usize = 3;
 
+/// [`analyze_in`] with the platform shell's grammar.
 pub fn analyze(cmd: &str) -> Analysis {
+    analyze_in(cmd, Dialect::NATIVE)
+}
+
+pub fn analyze_in(cmd: &str, d: Dialect) -> Analysis {
     let mut a = Analysis::default();
-    collect(cmd, 0, &mut a);
+    collect(cmd, d, 0, &mut a);
     a
 }
 
-fn collect(cmd: &str, depth: usize, a: &mut Analysis) {
-    for part in split_compound(cmd) {
-        let inner = strip_wrappers(&part);
+fn collect(cmd: &str, d: Dialect, depth: usize, a: &mut Analysis) {
+    for part in split_compound(cmd, d) {
+        let inner = strip_wrappers(&part, d);
         if depth < MAX_DEPTH {
-            if let Some(script) = nested_script(&inner) {
-                collect(&script, depth + 1, a);
+            if let Some((script, nd)) = nested_script(&inner, d) {
+                collect(&script, nd, depth + 1, a);
             }
         }
         a.raw.push(part);
@@ -40,10 +68,13 @@ fn collect(cmd: &str, depth: usize, a: &mut Analysis) {
 }
 
 /// Splits on `&&`, `||`, `;`, `|`, `&`, newlines and subshell parentheses
-/// outside quotes. `$(...)` and backtick bodies become commands of their own
-/// (in double quotes too: the shell runs them there), and the text left behind
-/// keeps a `$()` marker so the outer command never looks like it ran nothing.
-pub fn split_compound(cmd: &str) -> Vec<String> {
+/// outside quotes. In sh, `$(...)` and backtick bodies become commands of
+/// their own (in double quotes too: the shell runs them there), and the text
+/// left behind keeps a `$()` marker so the outer command never looks like it
+/// ran nothing. In cmd, `^x` becomes a literal `x` (the caret goes, as cmd
+/// drops it), so `^d^e^l` reads as `del` and `^&` does not split.
+pub fn split_compound(cmd: &str, d: Dialect) -> Vec<String> {
+    let sh = d == Dialect::Sh;
     let chars: Vec<char> = cmd.chars().collect();
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -58,10 +89,10 @@ pub fn split_compound(cmd: &str) -> Vec<String> {
     }
     while i < chars.len() {
         let c = chars[i];
-        if quote != Some('\'') {
+        if sh && quote != Some('\'') {
             if c == '$' && chars.get(i + 1) == Some(&'(') {
                 let (inner, next) = matching_paren(&chars, i + 2);
-                out.extend(split_compound(&inner));
+                out.extend(split_compound(&inner, d));
                 cur.push_str("$()");
                 i = next;
                 continue;
@@ -73,7 +104,7 @@ pub fn split_compound(cmd: &str) -> Vec<String> {
                     .map(|p| i + 1 + p)
                     .unwrap_or(chars.len());
                 let inner: String = chars[i + 1..end].iter().collect();
-                out.extend(split_compound(&inner));
+                out.extend(split_compound(&inner, d));
                 cur.push_str("$()");
                 i = (end + 1).min(chars.len());
                 continue;
@@ -84,7 +115,7 @@ pub fn split_compound(cmd: &str) -> Vec<String> {
                 cur.push(c);
                 if c == q {
                     quote = None;
-                } else if q == '"' && c == '\\' {
+                } else if sh && q == '"' && c == '\\' {
                     if let Some(n) = chars.get(i + 1) {
                         cur.push(*n);
                         i += 1;
@@ -92,11 +123,22 @@ pub fn split_compound(cmd: &str) -> Vec<String> {
                 }
             }
             None => match c {
-                '\'' | '"' => {
+                '"' => {
                     quote = Some(c);
                     cur.push(c);
                 }
-                '\\' => {
+                '\'' if sh => {
+                    quote = Some(c);
+                    cur.push(c);
+                }
+                // cmd: the caret goes and the next char is taken literally.
+                '^' if !sh => {
+                    if let Some(n) = chars.get(i + 1) {
+                        cur.push(*n);
+                        i += 1;
+                    }
+                }
+                '\\' if sh => {
                     cur.push(c);
                     if let Some(n) = chars.get(i + 1) {
                         cur.push(*n);
@@ -136,7 +178,7 @@ fn matching_paren(chars: &[char], from: usize) -> (String, usize) {
 }
 
 /// Whitespace split that keeps quoted runs together (quotes stay in the token).
-fn tokens(part: &str) -> Vec<String> {
+fn tokens(part: &str, d: Dialect) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut quote: Option<char> = None;
@@ -148,7 +190,7 @@ fn tokens(part: &str) -> Vec<String> {
                     quote = None;
                 }
             }
-            None if c == '\'' || c == '"' => {
+            None if c == '"' || (c == '\'' && d == Dialect::Sh) => {
                 quote = Some(c);
                 cur.push(c);
             }
@@ -215,8 +257,13 @@ fn skip_flags<'a>(mut t: &'a [String], takes_value: &[&str]) -> &'a [String] {
 /// Removes the wrappers that only change *how* a command runs, so a rule for
 /// `cargo test *` also sees `timeout 60 env RUST_LOG=x cargo test -p a`.
 /// `sudo` and friends are deliberately kept: they change *who* runs it.
-pub fn strip_wrappers(part: &str) -> String {
-    let all = tokens(part);
+/// In cmd the command name is normalised the way cmd reads it: `@del`,
+/// `del,x` and `del/q x` all run `del`.
+pub fn strip_wrappers(part: &str, d: Dialect) -> String {
+    let mut all = tokens(part, d);
+    if d == Dialect::Cmd {
+        cmd_name(&mut all);
+    }
     let mut t: &[String] = &all;
     while let Some(first) = t.first() {
         let rest = &t[1..];
@@ -253,10 +300,10 @@ pub fn strip_wrappers(part: &str) -> String {
 
 /// The script an interpreter would run (`bash -c "..."`, `cmd /c ...`,
 /// `powershell -Command ...`), so rules also see what is inside.
-fn nested_script(part: &str) -> Option<String> {
-    let t = tokens(part);
+fn nested_script(part: &str, d: Dialect) -> Option<(String, Dialect)> {
+    let t = tokens(part, d);
     let name = base_name(t.first()?);
-    match name.as_str() {
+    let body = match name.as_str() {
         "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish" => {
             let i = t
                 .iter()
@@ -277,13 +324,47 @@ fn nested_script(part: &str) -> Option<String> {
             Some(unquote(&t[i + 1..].join(" ")))
         }
         _ => None,
+    }?;
+    // `cmd /c` runs cmd text; the others run sh text.
+    Some((
+        body,
+        if name == "cmd" {
+            Dialect::Cmd
+        } else {
+            Dialect::Sh
+        },
+    ))
+}
+
+/// cmd reads the command name up to `,` `;` `=` or `/` (`del/q x` runs `del`)
+/// and a leading `@` only mutes the echo. The rest of the token stays as a
+/// token of its own so nothing about the line is lost.
+fn cmd_name(t: &mut Vec<String>) {
+    let Some(first) = t.first().cloned() else {
+        return;
+    };
+    let s = first.trim_start_matches('@');
+    // A path (`C:\x\type.exe`) keeps its slashes.
+    let pathish = s.contains('\\') || s.contains(':');
+    let cut = s
+        .find([',', ';', '='])
+        .or_else(|| if pathish { None } else { s.find('/') })
+        .unwrap_or(s.len());
+    let name = s[..cut].trim();
+    if name.is_empty() {
+        return;
+    }
+    let flags = s[cut..].trim_start_matches([',', ';', '=']);
+    t[0] = name.to_string();
+    if !flags.is_empty() {
+        t.insert(1, flags.to_string());
     }
 }
 
 const READ_ONLY: &[&str] = &[
     "ls", "dir", "cat", "head", "tail", "pwd", "echo", "wc", "which", "where", "whoami", "stat",
     "type", "uname", "hostname", "diff", "cmp", "du", "df", "basename", "dirname", "realpath",
-    "grep", "egrep", "fgrep", "rg", "true", "false",
+    "grep", "egrep", "fgrep", "rg", "findstr", "true", "false",
 ];
 
 const GIT_READ_ONLY: &[&str] = &[
@@ -301,10 +382,19 @@ const GIT_READ_ONLY: &[&str] = &[
 /// One simple command that cannot write or run other programs, as far as
 /// its text shows. A redirection (`>`) always disqualifies it.
 pub fn is_read_only(part: &str) -> bool {
+    is_read_only_in(part, Dialect::NATIVE)
+}
+
+pub fn is_read_only_in(part: &str, d: Dialect) -> bool {
     if part.contains('>') {
         return false;
     }
-    let t = tokens(part);
+    // cmd expands %VAR% and !VAR! anywhere, and the text says nothing about
+    // what they hold, so a line that expands is never "read-only".
+    if d == Dialect::Cmd && part.contains(['%', '!']) {
+        return false;
+    }
+    let t = tokens(part, d);
     let Some(first) = t.first() else {
         return false;
     };
@@ -339,49 +429,76 @@ pub fn is_read_only(part: &str) -> bool {
 
 /// Every simple command in `cmd` is read-only (and there is at least one).
 pub fn all_read_only(cmd: &str) -> bool {
-    let a = analyze(cmd);
-    !a.inner.is_empty() && a.inner.iter().all(|p| is_read_only(p))
+    all_read_only_in(cmd, Dialect::NATIVE)
+}
+
+/// Same, read with `d`'s grammar: the shell the command will really run in.
+pub fn all_read_only_in(cmd: &str, d: Dialect) -> bool {
+    let a = analyze_in(cmd, d);
+    !a.inner.is_empty() && a.inner.iter().all(|p| is_read_only_in(p, d))
+}
+
+/// The arguments of one simple command that name a file: not a flag, and
+/// either carrying a separator or an extension (`a.txt`, `C:\x`, `./x`).
+/// `type C:\Windows\win.ini` reads a file just like `read_file` does.
+pub fn file_args(part: &str, d: Dialect) -> Vec<PathBuf> {
+    let t = tokens(part, d);
+    t.iter()
+        .skip(1)
+        .filter(|a| !a.starts_with('-') && !(d == Dialect::Cmd && a.starts_with('/')))
+        .filter(|a| a.contains(['\\', '/']) || a.rsplit('.').next().is_some_and(|e| e != *a))
+        .map(|a| PathBuf::from(unquote(a)))
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // The older checks below describe sh: single quotes quote, `$( )` runs.
+    fn split_compound_sh(cmd: &str) -> Vec<String> {
+        split_compound(cmd, Dialect::Sh)
+    }
+
+    fn strip_wrappers_sh(part: &str) -> String {
+        strip_wrappers(part, Dialect::Sh)
+    }
+
     #[test]
     fn compound_commands_split_outside_quotes_only() {
         assert_eq!(
-            split_compound("a && b || c; d | e\nf & g"),
+            split_compound_sh("a && b || c; d | e\nf & g"),
             ["a", "b", "c", "d", "e", "f", "g"]
         );
-        assert_eq!(split_compound(r#"echo "a && b" 'c; d'"#).len(), 1);
+        assert_eq!(split_compound_sh(r#"echo "a && b" 'c; d'"#).len(), 1);
         assert_eq!(
-            split_compound("cargo test 2>&1 | tail"),
+            split_compound_sh("cargo test 2>&1 | tail"),
             ["cargo test 2>&1", "tail"]
         );
     }
 
     #[test]
     fn substitutions_and_subshells_are_commands_too() {
-        let p = split_compound("echo $(rm -rf x) `id`");
+        let p = split_compound_sh("echo $(rm -rf x) `id`");
         assert!(p.contains(&"rm -rf x".to_string()), "{p:?}");
         assert!(p.contains(&"id".to_string()), "{p:?}");
         assert!(p.iter().any(|x| x.starts_with("echo")));
-        assert_eq!(split_compound("(cd a; make)"), ["cd a", "make"]);
+        assert_eq!(split_compound_sh("(cd a; make)"), ["cd a", "make"]);
         // Single quotes keep `$(` literal.
-        assert_eq!(split_compound("echo '$(rm x)'").len(), 1);
+        assert_eq!(split_compound_sh("echo '$(rm x)'").len(), 1);
     }
 
     #[test]
     fn wrappers_are_peeled() {
-        assert_eq!(strip_wrappers("timeout 60 cargo test"), "cargo test");
-        assert_eq!(strip_wrappers("timeout -s KILL 5 make"), "make");
-        assert_eq!(strip_wrappers("nice -n 5 make"), "make");
-        assert_eq!(strip_wrappers("env -i A=1 B=2 make -j4"), "make -j4");
-        assert_eq!(strip_wrappers("FOO=1 BAR=2 make"), "make");
-        assert_eq!(strip_wrappers("xargs -n 1 rm"), "rm");
-        assert_eq!(strip_wrappers("timeout 5 env X=1 nice make"), "make");
-        assert_eq!(strip_wrappers("sudo make"), "sudo make");
-        assert_eq!(strip_wrappers("timeout 5"), "timeout 5");
+        assert_eq!(strip_wrappers_sh("timeout 60 cargo test"), "cargo test");
+        assert_eq!(strip_wrappers_sh("timeout -s KILL 5 make"), "make");
+        assert_eq!(strip_wrappers_sh("nice -n 5 make"), "make");
+        assert_eq!(strip_wrappers_sh("env -i A=1 B=2 make -j4"), "make -j4");
+        assert_eq!(strip_wrappers_sh("FOO=1 BAR=2 make"), "make");
+        assert_eq!(strip_wrappers_sh("xargs -n 1 rm"), "rm");
+        assert_eq!(strip_wrappers_sh("timeout 5 env X=1 nice make"), "make");
+        assert_eq!(strip_wrappers_sh("sudo make"), "sudo make");
+        assert_eq!(strip_wrappers_sh("timeout 5"), "timeout 5");
     }
 
     #[test]
@@ -392,6 +509,37 @@ mod tests {
         assert!(a.inner.contains(&"del a.txt".to_string()), "{a:?}");
         let a = analyze("powershell -Command Remove-Item a");
         assert!(a.inner.contains(&"Remove-Item a".to_string()), "{a:?}");
+    }
+
+    /// The payloads that ran without approval: read as sh, `echo ' & del x & echo '`
+    /// looked like one harmless echo. Read as cmd, the same text is three
+    /// commands and `del` is not read-only.
+    #[test]
+    fn cmd_quotes_and_carets_do_not_hide_a_second_command() {
+        let cmd = Dialect::Cmd;
+        for bad in [
+            r"echo ' & mkdir pwned & echo '",
+            r"echo \& mkdir pwned",
+            r"^d^e^l /q *.txt",
+            r"del/q *.txt",
+            r"echo %USERPROFILE%\..\x > y",
+            r"echo !X! > y",
+            r"type a.txt & del b.txt",
+        ] {
+            assert!(!all_read_only_in(bad, cmd), "{bad}");
+        }
+        for ok in [
+            r"dir /b",
+            r"type C:\Windows\win.ini",
+            "findstr x a.txt",
+            "git status",
+        ] {
+            assert!(all_read_only_in(ok, cmd), "{ok}");
+        }
+        // sh keeps its own reading: single quotes hide the `&` there.
+        assert!(all_read_only_in(r"echo ' & mkdir x & '", Dialect::Sh));
+        // `cmd /c <text>` is read with cmd's grammar.
+        assert!(!all_read_only("cmd /c \"echo hi & del x\""));
     }
 
     #[test]

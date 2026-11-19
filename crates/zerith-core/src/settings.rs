@@ -700,6 +700,16 @@ impl Settings {
         }
         for (label, path) in files {
             match read_layer(&path) {
+                // A repo ships with whatever its author put there: its own
+                // layer may tighten (ask/deny) but never widen (allow, mode,
+                // hooks), which is how `write_file .zerith/settings.toml` used
+                // to grant the model `allow = ["shell"]` by itself.
+                Ok(Some(mut t)) if label != "user" => {
+                    if let Some(why) = tighten_only(&mut t) {
+                        out.errors.push(format!("{label}: {why}"));
+                    }
+                    merge(&mut merged, t, label, "", &mut out.sources)
+                }
                 Ok(Some(t)) => merge(&mut merged, t, label, "", &mut out.sources),
                 Ok(None) => {}
                 Err(e) => out.errors.push(e),
@@ -811,6 +821,31 @@ fn env_table(env: &impl Fn(&str) -> Option<String>) -> Table {
     t
 }
 
+/// Removes what a layer that ships inside a repo must not decide for the
+/// person: `hooks` and the widening half of `permissions` (`allow`, `mode`,
+/// `default_mode`). `ask` and `deny` stay: a project may tighten what it
+/// allows. Returns what was dropped, so the loading report can say so.
+fn tighten_only(t: &mut Table) -> Option<String> {
+    let mut removed: Vec<&str> = Vec::new();
+    if t.remove("hooks").is_some() {
+        removed.push("hooks");
+    }
+    if let Some(Value::Table(p)) = t.get_mut("permissions") {
+        for k in ["allow", "mode", "default_mode"] {
+            if p.remove(k).is_some() {
+                removed.push("permissions");
+            }
+        }
+    }
+    removed.dedup();
+    (!removed.is_empty()).then(|| {
+        format!(
+            "ignorado: {} só o usuário amplia permissões",
+            removed.join(", ")
+        )
+    })
+}
+
 fn merge(
     base: &mut Table,
     over: Table,
@@ -876,26 +911,29 @@ mod tests {
         );
         let env = |k: &str| (k == "ZERITH_SANDBOX").then(|| "read-only".to_string());
         let l = Settings::load_with_env(&paths, Some(&project), env);
-        assert!(l.errors.is_empty(), "{:?}", l.errors);
+        // The project and local layers say so: their widening halves were
+        // ignored, and the report names it.
+        assert_eq!(l.errors.len(), 2, "{:?}", l.errors);
         let s = &l.settings;
         assert_eq!(s.model.as_deref(), Some("c"));
         assert_eq!(s.profile, Profile::Economy);
         assert_eq!(s.ui.theme, Theme::Dark);
-        assert_eq!(s.permissions.allow, vec!["read_file", "list_dir"]);
+        // allow and hooks only from the user layer; deny from the project stays.
+        assert_eq!(s.permissions.allow, vec!["read_file"]);
         assert_eq!(s.permissions.mode, "read-only");
-        assert_eq!(s.hooks.pre_tool_use[0].timeout_ms, 60_000);
+        assert!(s.hooks.pre_tool_use.is_empty(), "project hook ignored");
         assert_eq!(
             s.permissions.decide("write_file", "a/.env"),
             Some(Decision::Deny)
         );
-        assert_eq!(s.permissions.decide("list_dir", "x"), Some(Decision::Allow));
+        assert_eq!(s.permissions.decide("list_dir", "x"), None);
         assert_eq!(s.permissions.decide("shell", "x"), None);
 
         let entries = l.entries();
         let src = |k: &str| entries.iter().find(|e| e.0 == k).map(|e| e.2.clone());
         assert_eq!(src("model").as_deref(), Some("local"));
         assert_eq!(src("permissions.allow[0]").as_deref(), Some("user"));
-        assert_eq!(src("permissions.allow[1]").as_deref(), Some("project"));
+        assert_eq!(src("permissions.allow[1]"), None);
         assert_eq!(src("permissions.mode").as_deref(), Some("env"));
         assert_eq!(src("memory.budget_chars").as_deref(), Some("default"));
     }

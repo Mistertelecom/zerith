@@ -294,6 +294,9 @@ mod win {
     };
 
     const CREATE_SUSPENDED: u32 = 0x0000_0004;
+    /// The app itself is a window (`windows_subsystem = "windows"`): without
+    /// this, every shell command popped a console window on top of it.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
     #[link(name = "ntdll")]
     extern "system" {
@@ -375,7 +378,7 @@ mod win {
 
     pub fn spawn(mut cmd: Command, jail: &Jail) -> std::io::Result<Jailed> {
         let guard = job(jail)?;
-        cmd.creation_flags(CREATE_SUSPENDED);
+        cmd.creation_flags(CREATE_SUSPENDED | CREATE_NO_WINDOW);
         let mut child = cmd.spawn()?;
         let h = child.as_raw_handle() as HANDLE;
         // SAFETY: both handles are valid; the child is suspended, so it has

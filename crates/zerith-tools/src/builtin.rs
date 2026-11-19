@@ -216,13 +216,97 @@ fn shell_action(args: &Value, _: &CallCtx<'_>) -> Result<Option<Action>> {
     Ok(Some(Action::Shell(str_arg(args, "command")?.to_string())))
 }
 
+/// Console text as Windows really writes it: UTF-8 when it is, the OEM code
+/// page otherwise (`dir`, `ping`, `taskkill` write CP850 on a pt-BR machine —
+/// read as UTF-8, every accent became a U+FFFD).
+pub fn decode(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_string(),
+        Err(_) => {
+            #[cfg(windows)]
+            {
+                oem(bytes)
+            }
+            #[cfg(not(windows))]
+            {
+                String::from_utf8_lossy(bytes).into_owned()
+            }
+        }
+    }
+}
+
+/// `MultiByteToWideChar(GetOEMCP())` straight from kernel32: one call, no
+/// crate, and the page is the machine's own.
+#[cfg(windows)]
+fn oem(bytes: &[u8]) -> String {
+    use std::os::windows::ffi::OsStringExt;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetOEMCP() -> u32;
+        fn MultiByteToWideChar(
+            cp: u32,
+            flags: u32,
+            s: *const u8,
+            len: i32,
+            out: *mut u16,
+            cap: i32,
+        ) -> i32;
+    }
+    let lossy = || String::from_utf8_lossy(bytes).into_owned();
+    if bytes.is_empty() || bytes.len() > i32::MAX as usize {
+        return lossy();
+    }
+    // SAFETY: both calls only read `bytes` and write into `wide`, whose length
+    // the first call reported.
+    unsafe {
+        let cp = GetOEMCP();
+        let n = MultiByteToWideChar(
+            cp,
+            0,
+            bytes.as_ptr(),
+            bytes.len() as i32,
+            std::ptr::null_mut(),
+            0,
+        );
+        if n <= 0 {
+            return lossy();
+        }
+        let mut wide = vec![0u16; n as usize];
+        if MultiByteToWideChar(
+            cp,
+            0,
+            bytes.as_ptr(),
+            bytes.len() as i32,
+            wide.as_mut_ptr(),
+            n,
+        ) <= 0
+        {
+            return lossy();
+        }
+        std::ffi::OsString::from_wide(&wide)
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
 fn read_file(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
     let path = ctx.resolve(str_arg(args, "path")?);
-    let text = std::fs::read_to_string(&path)?;
+    let raw = std::fs::read(&path)?;
+    // Legacy pt-BR files are CP1252/Latin-1: a lossy read still reads, an
+    // Input/output error does not.
+    let lossy = std::str::from_utf8(&raw).is_err();
+    let text = decode(&raw);
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
     exec.host.note_read(&path);
     let offset = args["offset"].as_u64().unwrap_or(1).max(1) as usize;
     let limit = args["limit"].as_u64().unwrap_or(2000) as usize;
     let total = text.lines().count();
+    if lossy {
+        eprintln!(
+            "zerith: {} não está em UTF-8, lido com a página de código do sistema",
+            path.display()
+        );
+    }
     let mut out: String = text
         .lines()
         .enumerate()
@@ -274,7 +358,23 @@ fn edit_file(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String>
             "old_string e new_string são iguais".into(),
         ));
     }
-    let text = std::fs::read_to_string(&path)?;
+    let raw = std::fs::read(&path)?;
+    let text = String::from_utf8(raw).map_err(|_| {
+        ToolError::Failed(format!(
+            "{} não está em UTF-8 (arquivo antigo em CP1252/Latin-1): converta antes de editar",
+            path.display()
+        ))
+    })?;
+    // A Windows file uses CRLF while the model, which sees lines through
+    // `.lines()`, sends LF. The text as it came is tried first (the file keeps
+    // its own style); the CRLF retry is what made a multi-line edit of this
+    // very repo fail.
+    let crlf = |t: &str| t.replace("\r\n", "\n").replace('\n', "\r\n");
+    let (old, new) = match (text.matches(old).count(), text.contains("\r\n")) {
+        (0, true) => (crlf(old), crlf(new)),
+        _ => (old.to_string(), new.to_string()),
+    };
+    let (old, new) = (old.as_str(), new.as_str());
     let n = text.matches(old).count();
     if n > 0 {
         exec.host.before_write(&path)?;
@@ -462,7 +562,18 @@ fn grep(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
 pub fn shell_command(cmd: &str) -> Command {
     let mut c = if cfg!(windows) {
         let mut c = Command::new("cmd");
-        c.arg("/C").arg(cmd);
+        // Through `.arg`, Rust escapes the quotes as `\"`, which cmd does not
+        // understand: `git commit -m "msg"` and every path with a space broke.
+        // `raw_arg` hands cmd the line the person would have typed.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            c.raw_arg(format!("/S /C \"{cmd}\""));
+        }
+        #[cfg(not(windows))]
+        {
+            c.arg("/C").arg(cmd);
+        }
         c
     } else {
         let mut c = Command::new("sh");
@@ -513,16 +624,34 @@ fn shell(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
     // Pipes are drained on threads: a child that fills a pipe buffer would
     // otherwise block forever while we wait for it to exit.
     let drain = |r: Option<Box<dyn Read + Send>>| {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (fill, finished) = (buf.clone(), done.clone());
         std::thread::spawn(move || {
-            let mut buf = Vec::new();
+            let mut chunk = [0u8; 8192];
             if let Some(mut r) = r {
-                let _ = r.read_to_end(&mut buf);
+                while let Ok(n) = r.read(&mut chunk) {
+                    if n == 0 {
+                        break;
+                    }
+                    let mut v = fill.lock().unwrap_or_else(|e| e.into_inner());
+                    // ponytail: 8 MB per stream is a log's worth; a runaway
+                    // producer is cut here instead of in RAM.
+                    if v.len() < 8 * 1024 * 1024 {
+                        v.extend_from_slice(&chunk[..n]);
+                    }
+                }
             }
-            String::from_utf8_lossy(&buf).into_owned()
-        })
+            finished.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        (buf, done)
     };
-    let out = drain(child.stdout.take().map(|s| Box::new(s) as _));
-    let err = drain(child.stderr.take().map(|s| Box::new(s) as _));
+    let (out, out_done) = drain(child.stdout.take().map(|s| Box::new(s) as _));
+    let (err, err_done) = drain(child.stderr.take().map(|s| Box::new(s) as _));
+    let text_of = |b: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>| {
+        let v = b.lock().unwrap_or_else(|e| e.into_inner());
+        decode(&v)
+    };
     let status = loop {
         if let Some(s) = child.try_wait()? {
             break s;
@@ -536,12 +665,36 @@ fn shell(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
         };
         if let Some(e) = stop {
             jailed.kill_tree();
-            return Err(e);
+            // The pipe may still hold what the command printed before it was
+            // stopped; a timeout that says nothing is not diagnosable.
+            std::thread::sleep(Duration::from_millis(150));
+            return Err(match e {
+                ToolError::Timeout(d) => ToolError::Failed(format!(
+                    "tempo esgotado após {}s: o comando e o que ele iniciou foram encerrados\n--- stdout (parcial)\n{}\n--- stderr (parcial)\n{}",
+                    d.as_secs(),
+                    text_of(&out),
+                    text_of(&err)
+                )),
+                other => other,
+            });
         }
         std::thread::sleep(Duration::from_millis(20));
     };
-    let stdout = out.join().unwrap_or_default();
-    let stderr = err.join().unwrap_or_default();
+    // A detached grandchild (`start /b`, a dev server) keeps the pipes open
+    // after the shell exits and `join()` used to wait for it forever. Give the
+    // readers a short grace, then stop the tree: a background process belongs
+    // to the jobs tool, not to this call.
+    let grace = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < grace {
+        use std::sync::atomic::Ordering::SeqCst;
+        if out_done.load(SeqCst) && err_done.load(SeqCst) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    jailed.kill_tree();
+    let stdout = text_of(&out);
+    let stderr = text_of(&err);
     let code = status
         .code()
         .map(|c| c.to_string())

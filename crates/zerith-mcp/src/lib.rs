@@ -111,7 +111,14 @@ impl Client {
         timeout: Duration,
     ) -> Result<Self> {
         let program = which(command).unwrap_or_else(|| command.into());
-        let mut child = Command::new(program)
+        let mut spawn = Command::new(program);
+        // A stdio server is a console program: no window of its own.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            spawn.creation_flags(0x0800_0000);
+        }
+        let mut child = spawn
             .args(args)
             .envs(env.iter().map(|(k, v)| (k, v)))
             .stdin(Stdio::piped())

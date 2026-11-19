@@ -549,6 +549,27 @@ impl Policy {
         }
     }
 
+    /// A line made only of read-only commands: allowed, unless it *reads* a
+    /// file the read side would not allow — outside the workspace, or hit by a
+    /// `read_file` deny rule (`type .env` used to walk past both).
+    fn read_only_verdict(&self, cmd: &str) -> Verdict {
+        let bypass = self.mode() == Mode::Bypass;
+        for part in shellparse::analyze(cmd).inner {
+            for path in shellparse::file_args(&part, shellparse::Dialect::NATIVE) {
+                let ps = self.path_subject(&path);
+                if let Some(r) = self.rules.iter().find(|r| {
+                    r.kind == RuleKind::Deny && r.tool_matches("read_file") && r.path_matches(&ps)
+                }) {
+                    return Verdict::Deny(format!("bloqueado pela regra {}", r.describe()));
+                }
+                if !bypass && !self.inside_workspace(&path) {
+                    return Verdict::Ask(format!("leitura fora do workspace: {}", path.display()));
+                }
+            }
+        }
+        Verdict::Allow
+    }
+
     fn check_base(&self, action: &Action) -> Verdict {
         let mode = self.mode();
         let bypass = mode == Mode::Bypass;
@@ -568,6 +589,15 @@ impl Policy {
                     return Verdict::Deny("modo plan: nenhuma escrita é permitida".into());
                 }
                 let inside = self.inside_workspace(path);
+                // These files decide what the agent may do next (or what runs
+                // on the next commit): rewriting one is always the person's
+                // call, never an automatic edit.
+                if !bypass && self.is_own_control(path) {
+                    return Verdict::Ask(format!(
+                        "escrever {} (muda as permissões/configuração do projeto)",
+                        path.display()
+                    ));
+                }
                 if bypass || (inside && mode == Mode::AcceptEdits) {
                     Verdict::Allow
                 } else if inside {
@@ -581,9 +611,11 @@ impl Policy {
                 }
             }
             Action::Shell(cmd) => {
-                // Read-only commands never prompt, in any mode.
+                // Read-only commands never prompt, in any mode — but reading a
+                // file is still a read: `type C:\Windows\win.ini` gets the
+                // same path guard and the same deny rules as `read_file`.
                 if shellparse::all_read_only(cmd) {
-                    return Verdict::Allow;
+                    return self.read_only_verdict(cmd);
                 }
                 match mode {
                     Mode::Plan => Verdict::Deny("modo plan: shell não é permitido".into()),
@@ -662,18 +694,23 @@ impl Policy {
         }
         // allow: a compound command is allowed only when *every* piece is, so
         // `shell(git *)` never blesses `git status && rm -rf x`.
+        // With no allow rule at all there is no opinion: the preset's verdict
+        // stands (`type C:\x` must still be able to ask).
+        let allow: Vec<&Rule> = rules(RuleKind::Allow).collect();
+        if allow.is_empty() {
+            return None;
+        }
+        let allows = |t: &str| allow.iter().any(|r| r.text_matches(t));
         let allowed = match (subject, &shell) {
-            (Subject::Path(p), _) => rules(RuleKind::Allow).any(|r| r.path_matches(p)),
+            (Subject::Path(p), _) => allow.iter().any(|r| r.path_matches(p)),
             (Subject::Shell(_), Some(a)) => {
-                rules(RuleKind::Allow).any(|r| r.pattern.is_none())
+                allow.iter().any(|r| r.pattern.is_none())
                     || (!a.raw.is_empty()
                         && a.raw.iter().zip(&a.inner).all(|(raw, inner)| {
-                            shellparse::is_read_only(inner)
-                                || rules(RuleKind::Allow)
-                                    .any(|r| r.text_matches(raw) || r.text_matches(inner))
+                            shellparse::is_read_only(inner) || allows(raw) || allows(inner)
                         }))
             }
-            (Subject::Text(t), _) => rules(RuleKind::Allow).any(|r| r.text_matches(t)),
+            (Subject::Text(t), _) => allows(t),
             (Subject::Shell(_), None) => false,
         };
         allowed.then_some(Verdict::Allow)
@@ -767,6 +804,20 @@ impl Policy {
             return false;
         };
         self.resolve(path).starts_with(&base)
+    }
+
+    /// Files that decide the agent's own limits: the project's `.zerith/`
+    /// settings, the git hooks that run on the next commit, and `.mcp.json`.
+    fn is_own_control(&self, path: &Path) -> bool {
+        let abs = self.resolve(path);
+        let Ok(base) = self.workspace.canonicalize() else {
+            return false;
+        };
+        let Ok(rel) = abs.strip_prefix(&base) else {
+            return false;
+        };
+        let rel = slashes(rel).to_ascii_lowercase();
+        rel.starts_with(".zerith/") || rel == ".mcp.json" || rel.starts_with(".git/hooks/")
     }
 }
 
@@ -904,6 +955,58 @@ mod tests {
         let p = Policy::new(ws, Mode::Bypass, dir.path());
         assert_eq!(p.check(&shell), Verdict::Allow);
         assert_eq!(p.check(&read_out), Verdict::Allow);
+    }
+
+    /// `type C:\Windows\win.ini` reads a file: the same guard as `read_file`,
+    /// and read deny rules apply. `type x.txt` inside the workspace stays free.
+    #[test]
+    fn a_read_only_shell_line_cannot_read_around_the_guard() {
+        let dir = scratch_dir();
+        let mut p = Policy::new(
+            preset("workspace-write").unwrap(),
+            Mode::Default,
+            dir.path(),
+        );
+        std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+        let sh = |p: &Policy, c: &str| p.check_tool("shell", &Action::Shell(c.into()));
+        assert_eq!(sh(&p, "dir /b"), Verdict::Allow);
+        assert_eq!(sh(&p, "type a.txt"), Verdict::Allow);
+        assert!(
+            matches!(
+                sh(&p, &format!("type {}", outside("win.ini").display())),
+                Verdict::Ask(_)
+            ),
+            "a read outside the workspace asks, like read_file"
+        );
+        p.rules = vec![Rule::parse(RuleKind::Deny, "read_file(*.env)").unwrap()];
+        assert!(matches!(sh(&p, "type .env"), Verdict::Deny(_)));
+    }
+
+    /// Writing the files that decide the agent's own limits is never automatic,
+    /// not even in accept-edits where everything inside the workspace is.
+    #[test]
+    fn the_agent_cannot_rewrite_its_own_permissions_unasked() {
+        let dir = scratch_dir();
+        let p = Policy::new(
+            preset("workspace-write").unwrap(),
+            Mode::AcceptEdits,
+            dir.path(),
+        );
+        std::fs::create_dir_all(dir.path().join(".zerith")).unwrap();
+        for own in [
+            ".zerith/settings.toml",
+            ".mcp.json",
+            ".git/hooks/pre-commit",
+        ] {
+            let v = p.check(&Action::Write(dir.path().join(own)));
+            assert!(matches!(v, Verdict::Ask(_)), "{own}: {v:?}");
+        }
+        let plain = p.check(&Action::Write(dir.path().join("src/main.rs")));
+        assert_eq!(
+            plain,
+            Verdict::Allow,
+            "an ordinary file still needs no prompt"
+        );
     }
 
     #[test]

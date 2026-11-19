@@ -73,6 +73,12 @@ impl Jobs {
             .stderr(Stdio::piped());
         #[cfg(unix)]
         std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+        // Same reason as the jail: the windowed app must not flash a console.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000);
+        }
         let mut child = cmd.spawn()?;
         let out = Arc::new(Mutex::new(Output::default()));
         let readers = vec![

@@ -178,7 +178,8 @@ fn shell_is_killed_at_its_timeout_not_after_it_returns() {
             &ctx(&p),
         )
         .unwrap_err();
-    assert!(matches!(err, ToolError::Timeout(_)), "{err}");
+    // The timeout now says what happened and shows what was printed before it.
+    assert!(err.to_string().contains("tempo esgotado"), "{err}");
     assert!(started.elapsed() < Duration::from_secs(10));
 }
 
@@ -292,7 +293,7 @@ fn shell_timeout_kills_the_whole_process_tree() {
             &ctx(&p),
         )
         .unwrap_err();
-    assert!(matches!(err, ToolError::Timeout(_)), "{err}");
+    assert!(err.to_string().contains("tempo esgotado"), "{err}");
     let size = || std::fs::metadata(dir.path().join("grand.txt")).map(|m| m.len());
     std::thread::sleep(Duration::from_millis(500));
     let first = size().unwrap();
@@ -331,4 +332,95 @@ fn memory_save_writes_once_and_respects_the_pause() {
     let paused = r.call("memory_save", &json!({"text": "outro fato"}), &c);
     assert!(matches!(paused, Err(ToolError::Denied(_))), "{paused:?}");
     assert_eq!(mem.list(&scope, 10).unwrap().len(), 1);
+}
+
+/// `cmd` never understood the `\"` that Rust wrote through `.arg`: every path
+/// with a space and every `-m "..."` broke.
+#[test]
+fn quotes_reach_cmd_verbatim() {
+    let dir = scratch();
+    let p = policy(dir.path(), Mode::Bypass);
+    std::fs::write(dir.path().join("a b.txt"), "conteudo").unwrap();
+    let ok = Registry::new()
+        .call("shell", &json!({"command": "type \"a b.txt\""}), &ctx(&p))
+        .expect("a quoted path with a space");
+    assert!(ok.contains("conteudo"), "{ok}");
+    let echo = Registry::new()
+        .call("shell", &json!({"command": "echo \"a b\""}), &ctx(&p))
+        .expect("echo with quotes");
+    assert!(echo.contains("a b"), "{echo}");
+}
+
+/// A file written with CRLF is edited with strings the model saw through
+/// `.lines()`, i.e. with LF.
+#[test]
+fn a_crlf_file_takes_a_multi_line_edit() {
+    let dir = scratch();
+    let p = policy(dir.path(), Mode::Bypass);
+    let path = dir.path().join("crlf.rs");
+    std::fs::write(&path, "um\r\ndois\r\ntres\r\n").unwrap();
+    Registry::new()
+        .call(
+            "edit_file",
+            &json!({"path": "crlf.rs", "old_string": "um\ndois", "new_string": "um\nDOIS\nmeio"}),
+            &ctx(&p),
+        )
+        .expect("multi-line edit of a CRLF file");
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(after, "um\r\nDOIS\r\nmeio\r\ntres\r\n", "{after:?}");
+}
+
+/// A legacy Latin-1 file still reads; editing it says why it cannot.
+#[test]
+fn a_non_utf8_file_reads_and_refuses_to_be_edited() {
+    let dir = scratch();
+    let p = policy(dir.path(), Mode::Bypass);
+    std::fs::write(dir.path().join("velho.txt"), b"N\xfamero 1\n").unwrap();
+    let text = Registry::new()
+        .call("read_file", &json!({"path": "velho.txt"}), &ctx(&p))
+        .expect("a CP1252 file is readable");
+    assert!(text.contains("mero"), "{text}");
+    let err = Registry::new()
+        .call(
+            "edit_file",
+            &json!({"path": "velho.txt", "old_string": "mero", "new_string": "x"}),
+            &ctx(&p),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("UTF-8"), "{err}");
+}
+
+/// `ping`/`dir` write the OEM code page: read as UTF-8, `Número` came out
+/// as `N\uFFFDmero`.
+#[test]
+fn console_output_is_read_in_the_machine_code_page() {
+    let text = if cfg!(windows) {
+        // CP850: 'N' 'u' 'm' 'e' 'r' 'o'  with 'u' = 0x97 in CP850.
+        super::builtin::decode(b"N\x97mero")
+    } else {
+        "Número".to_string()
+    };
+    assert!(text.contains("mero"), "{text}");
+    assert_eq!(super::builtin::decode(b"plain ascii"), "plain ascii");
+}
+
+/// A command that leaves a program behind (`start /b`, a dev server) used to
+/// keep the output pipes open forever: `out.join()` waited for a process that
+/// is not the command. It must return, and say where that program belongs.
+#[cfg(windows)]
+#[test]
+fn a_grandchild_holding_the_pipe_does_not_hang_the_shell() {
+    let dir = scratch();
+    let p = policy(dir.path(), Mode::Bypass);
+    let started = Instant::now();
+    let out = Registry::new()
+        .call(
+            "shell",
+            &json!({"command": "start /b ping -n 12 127.0.0.1 > NUL", "timeout_secs": 20}),
+            &ctx(&p),
+        )
+        .expect("the shell itself finished at once");
+    let took = started.elapsed();
+    assert!(took < Duration::from_secs(8), "took {took:?}");
+    assert!(out.contains("exit 0"), "{out}");
 }

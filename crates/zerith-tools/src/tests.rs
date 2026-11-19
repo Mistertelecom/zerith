@@ -336,6 +336,7 @@ fn memory_save_writes_once_and_respects_the_pause() {
 
 /// `cmd` never understood the `\"` that Rust wrote through `.arg`: every path
 /// with a space and every `-m "..."` broke.
+#[cfg(windows)]
 #[test]
 fn quotes_reach_cmd_verbatim() {
     let dir = scratch();

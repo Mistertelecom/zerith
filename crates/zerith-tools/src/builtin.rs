@@ -429,6 +429,10 @@ fn walk<'a>(
     exec: &'a Exec<'_>,
 ) -> impl Iterator<Item = Result<(String, walkdir::DirEntry)>> + 'a {
     walkdir::WalkDir::new(base)
+        // Directory order is whatever the file system hands back (it differed
+        // between Windows and the CI runner): sorted, the model gets the same
+        // answer twice.
+        .sort_by_file_name()
         .into_iter()
         .filter_entry(|e| !skipped(e))
         .filter_map(move |e| {

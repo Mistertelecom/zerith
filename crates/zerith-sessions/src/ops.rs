@@ -25,6 +25,8 @@ pub struct MessageHit {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SessionFilter {
     pub source: Option<SessionSource>,
+    /// Leaves this source out (the sidebar hides `Subagent` children).
+    pub exclude_source: Option<SessionSource>,
     pub archived: Option<bool>,
     /// Matches the title (substring) or any message content (FTS).
     pub query: Option<String>,
@@ -79,6 +81,10 @@ impl Store {
         if let Some(src) = f.source {
             args.push(Box::new(src.as_str()));
             sql.push_str(&format!(" AND s.source = ?{}", args.len()));
+        }
+        if let Some(src) = f.exclude_source {
+            args.push(Box::new(src.as_str()));
+            sql.push_str(&format!(" AND s.source != ?{}", args.len()));
         }
         if let Some(a) = f.archived {
             args.push(Box::new(a as i64));

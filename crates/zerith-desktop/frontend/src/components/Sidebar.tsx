@@ -2,6 +2,7 @@ import { useEffect, useMemo } from "react";
 import {
   Brain,
   Gauge,
+  Loader,
   MessageSquare,
   Search,
   Settings,
@@ -46,6 +47,8 @@ export function Sidebar(props: {
   onQuotas: () => void;
   memoryPaused: boolean;
   onToggleMemory: () => void;
+  /** Live turn of a conversation: `busy` or `waiting` (approval/question). */
+  status?: (id: string) => "busy" | "waiting" | null;
 }) {
   const { onNew } = props;
 
@@ -76,9 +79,11 @@ export function Sidebar(props: {
     }));
     for (const s of props.sessions) {
       if (q && !s.title.toLowerCase().includes(q)) continue;
-      // Timestamps arrive in seconds from the store.
-      const g = group(s.updated_at * 1000, midnight.getTime());
-      out[g].rows.push({ s, time: when(s.updated_at * 1000, g) });
+      // Milliseconds, like History.tsx: `* 1000` here put every conversation
+      // in the year 58852, i.e. always "Hoje".
+      const ts = s.updated_at < 1e12 ? s.updated_at * 1000 : s.updated_at;
+      const g = group(ts, midnight.getTime());
+      out[g].rows.push({ s, time: when(ts, g) });
     }
     return out.filter((g) => g.rows.length > 0);
   }, [props.sessions, props.query]);
@@ -135,6 +140,19 @@ export function Sidebar(props: {
                 >
                   <Logo id={s.provider ?? s.model} size={16} />
                   <span className="side-row-title">{s.title}</span>
+                  {(() => {
+                    const state = props.status?.(s.id);
+                    if (!state) return null;
+                    return (
+                      <span
+                        className={"side-row-state " + state}
+                        title={state === "waiting" ? "Esperando você" : "Respondendo"}
+                        aria-label={state === "waiting" ? "Esperando você" : "Respondendo"}
+                      >
+                        {state === "waiting" ? "!" : <Loader size={11} strokeWidth={2.5} />}
+                      </span>
+                    );
+                  })()}
                   <span className="side-row-time">{time}</span>
                 </button>
               ))}

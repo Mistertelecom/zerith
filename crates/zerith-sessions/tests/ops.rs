@@ -159,6 +159,19 @@ fn archive_and_filters() {
         })
         .unwrap();
     assert!(hermes.is_empty());
+    let sub = s
+        .create_session("subagente: x", SessionSource::Subagent)
+        .unwrap();
+    let sidebar = s
+        .list_sessions_filtered(&SessionFilter {
+            archived: Some(false),
+            exclude_source: Some(SessionSource::Subagent),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(sidebar.len(), 1, "no archived, no subagent");
+    assert_eq!(sidebar[0].id, other.id);
+    assert!(s.session(&sub.id).unwrap().is_some());
     let q = s
         .list_sessions_filtered(&SessionFilter {
             archived: Some(true),

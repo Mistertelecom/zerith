@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use zerith_sessions::{Session, SessionSource, Store};
+use zerith_sessions::{Session, SessionFilter, SessionSource, Store};
 
 use crate::state::AppState;
 use crate::types::{ChatMessage, Profile, ProviderView, Theme};
@@ -33,9 +33,18 @@ fn with_workspaces(st: &Store, list: Vec<Session>) -> Vec<SessionView> {
         .collect()
 }
 
+/// The sidebar list: archived conversations and subagent children stay out
+/// (Histórico lists those through `sessions_history`).
 fn list(db: &Path, limit: usize) -> Cmd<Vec<SessionView>> {
     let st = Store::open(db).map_err(|e| e.to_string())?;
-    let v = st.list_sessions(limit).map_err(|e| e.to_string())?;
+    let v = st
+        .list_sessions_filtered(&SessionFilter {
+            archived: Some(false),
+            exclude_source: Some(SessionSource::Subagent),
+            limit,
+            ..SessionFilter::default()
+        })
+        .map_err(|e| e.to_string())?;
     Ok(with_workspaces(&st, v))
 }
 
@@ -169,6 +178,8 @@ pub async fn reveal_workspace(path: String) -> Cmd<()> {
     wire::reveal(&native)
 }
 
+/// The newest `limit` messages of a conversation, oldest first: a long chat
+/// opens on its latest answer.
 #[tauri::command]
 pub async fn session_messages(
     state: tauri::State<'_, AppState>,
@@ -177,7 +188,7 @@ pub async fn session_messages(
 ) -> Cmd<Vec<ChatMessage>> {
     let db = state.db();
     Store::open(&db)
-        .and_then(|st| st.messages(&id, limit.unwrap_or(400), 0))
+        .and_then(|st| st.recent_messages(&id, limit.unwrap_or(400)))
         .map(|v| {
             v.into_iter()
                 .map(|m| ChatMessage {

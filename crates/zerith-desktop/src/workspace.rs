@@ -322,3 +322,50 @@ mod tests {
         );
     }
 }
+
+/// Opens a link in the system browser. The webview drops `target=_blank` and
+/// `window.open` (wry reports the request as handled unless a handler exists),
+/// so a cited source used to do nothing at all. Only the schemes a person can
+/// click are accepted: this command must never be a way to run anything else.
+#[tauri::command]
+pub fn open_url(url: String) -> Result<(), String> {
+    check_url(&url)?;
+    zerith_providers::oauth::open_browser(url.trim())
+        .map_err(|e| format!("não consegui abrir o link: {e}"))
+}
+
+/// The accepted schemes, apart from the spawning so it can be tested.
+fn check_url(url: &str) -> Result<(), String> {
+    let u = url.trim();
+    let lower = u.to_ascii_lowercase();
+    let ok = lower.starts_with("https://")
+        || lower.starts_with("http://")
+        || lower.starts_with("mailto:");
+    if !ok || (u.contains(char::is_whitespace) && !lower.starts_with("mailto:")) {
+        return Err(format!("link recusado: {u}"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod open_url_tests {
+    use super::*;
+
+    /// Only http(s) and mailto reach the browser; a `file:` or `javascript:`
+    /// link from a page the model read must not.
+    #[test]
+    fn only_clickable_schemes_pass() {
+        for ok in ["https://a.b/c", "http://a.b", "mailto:x@y.z"] {
+            assert!(check_url(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "file:///C:/Windows/win.ini",
+            "javascript:alert(1)",
+            "ms-settings:privacy",
+            "https://a.b/a b",
+            "",
+        ] {
+            assert!(check_url(bad).is_err(), "{bad}");
+        }
+    }
+}

@@ -112,3 +112,81 @@ fn a_session_remembers_its_folder() {
     assert_eq!(s.workspaces().unwrap().len(), 2);
     assert!(s.set_workspace("nope", "C:/x").is_err());
 }
+
+/// The replay window counts user messages: tool rows ride free, synthetic
+/// user rows do not count, and the newest summary is kept even when older
+/// than the window.
+#[test]
+fn history_rows_count_user_messages_and_keep_the_summary() {
+    let s = Store::open_in_memory().unwrap();
+    let sid = s.create_session("longa", SessionSource::Native).unwrap().id;
+    let put = |role, text: &str, raw: Option<serde_json::Value>| {
+        s.append(
+            &sid,
+            &NewMessage {
+                raw,
+                ..NewMessage::new(role, text)
+            },
+        )
+        .unwrap()
+    };
+    let first = put(Role::User, "primeira pergunta", None);
+    put(Role::Assistant, "resposta 0", None);
+    let summary = put(
+        Role::User,
+        "[resumo]",
+        Some(
+            serde_json::json!({"summary": {"start_id": first, "end_id": first + 1, "supersedes": []}}),
+        ),
+    );
+    for i in 1..=3 {
+        put(Role::User, &format!("pergunta {i}"), None);
+        for _ in 0..30 {
+            put(Role::Assistant, "chamada", None);
+            put(Role::Tool, "resultado", None);
+        }
+        put(
+            Role::User,
+            "ctx",
+            Some(serde_json::json!({"tool_context": true})),
+        );
+        put(Role::Assistant, &format!("resposta {i}"), None);
+    }
+    let texts = |w| -> Vec<String> {
+        s.history_rows(&sid, w)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.content)
+            .collect()
+    };
+
+    // Window 2: the summary, then from "pergunta 2" on, all 60 tool rows in.
+    let two = texts(2);
+    assert_eq!(two[0], "[resumo]");
+    assert_eq!(two[1], "pergunta 2");
+    assert_eq!(two.len(), 1 + 2 * (1 + 60 + 2));
+    assert_eq!(two.last().unwrap(), "resposta 3");
+    // Window 3 starts at "pergunta 1": "ctx" rows did not eat a slot.
+    assert_eq!(texts(3)[1], "pergunta 1");
+    // A window larger than the session: everything, the summary once.
+    let all = texts(40);
+    assert_eq!(all.len(), s.message_count(&sid).unwrap() as usize);
+    assert_eq!(all.iter().filter(|t| *t == "[resumo]").count(), 1);
+    assert_eq!(all[0], "primeira pergunta");
+    // What the window shows of a long chat: the newest rows, oldest first.
+    let shown: Vec<String> = s
+        .recent_messages(&sid, 2)
+        .unwrap()
+        .into_iter()
+        .map(|m| m.content)
+        .collect();
+    assert_eq!(shown, ["ctx", "resposta 3"]);
+    // A superseded summary is not replayed.
+    s.conn()
+        .execute(
+            "UPDATE messages SET superseded = 1 WHERE id = ?1",
+            [summary],
+        )
+        .unwrap();
+    assert_eq!(texts(1)[0], "pergunta 3");
+}

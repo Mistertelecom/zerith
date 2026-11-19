@@ -41,6 +41,8 @@ export interface ChatMessage {
   content: string;
   reasoning: string | null;
   tool_name: string | null;
+  /** The stored `tool_calls` JSON, when the core sends it. */
+  tool_calls?: unknown;
 }
 
 export interface Boot {
@@ -597,6 +599,8 @@ export const api = {
   /** A local image from the transcript (`![](C:/x.png)`) as a data URL. */
   readImage: (path: string) => invoke<string>("read_image", { path }),
   openImage: (path: string) => invoke<void>("open_image", { path }),
+  /** An http(s)/mailto link, in the system browser (the webview opens none). */
+  openUrl: (url: string) => invoke<void>("open_url", { url }),
   /** An attached image (data URL) saved under `<root>/attachments`; returns its path. */
   saveAttachment: (data: string) => invoke<string>("save_attachment", { data }),
   checkpoints: (sessionId: string) =>
@@ -663,7 +667,8 @@ export const api = {
         prompt: args.prompt,
         mode: args.mode,
         agent: args.agent ?? null,
-        history: args.history ?? 20,
+        // 0 = the profile's history window (the core decides).
+        history: args.history ?? 0,
       },
     }),
   cancelTurn: (sessionId: string) => invoke<void>("cancel_turn", { sessionId }),
@@ -676,15 +681,12 @@ export const api = {
     invoke<boolean>("answer_question", { sessionId, id, answers }),
 };
 
-/** Subscribes to the turn events of one conversation. */
+/** Turn events of every conversation, so a turn running in a chat that is not
+ * open keeps its state (and its approval card) for when it is opened again. */
 export async function onTurnEvent(
-  sessionId: string,
-  handler: (ev: TurnEvent) => void,
+  handler: (sessionId: string, ev: TurnEvent) => void,
 ): Promise<UnlistenFn> {
-  return listen<[string, TurnEvent]>("turn:event", (e) => {
-    const [id, ev] = e.payload;
-    if (id === sessionId) handler(ev);
-  });
+  return listen<[string, TurnEvent]>("turn:event", (e) => handler(e.payload[0], e.payload[1]));
 }
 
 export function onTurnDone(

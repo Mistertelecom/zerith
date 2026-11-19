@@ -256,6 +256,7 @@ pub fn run() {
             workspace::compact,
             workspace::read_image,
             workspace::open_image,
+            workspace::open_url,
             attachments::save_attachment,
             changes::turn_changes,
             changes::turn_undo,

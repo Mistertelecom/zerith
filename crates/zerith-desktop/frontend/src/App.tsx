@@ -19,14 +19,15 @@ import {
   onTurnLearned,
   type Account,
   type Boot,
-  type ChatMessage,
   type Routing,
   type Session,
-  type TurnEvent,
 } from "./lib/api";
 import {
   applyEvent,
+  borrowIds,
   emptyTurn,
+  finishTurn,
+  toBlocks,
   tokenTotal,
   type Block,
   type TurnState,
@@ -85,30 +86,32 @@ const SUGGESTIONS: readonly [LucideIcon, string, string, string][] = [
 
 const num = (n: number) => n.toLocaleString("pt-BR");
 
-// A stored message becomes a transcript block. Shared by the conversation load
-// and by anything that rewrites the transcript (rewind).
-function toBlocks(list: ChatMessage[]): Block[] {
-  return list.map((m) =>
-    m.role === "user"
-      ? ({ kind: "user", text: m.content, id: m.id } as Block)
-      : ({
-          kind: "assistant",
-          text: m.content,
-          reasoning: m.reasoning ?? "",
-          tools: [],
-          streaming: false,
-          stored: m.role === "assistant" ? m.id : undefined,
-        } as Block),
-  );
-}
-
 export default function App() {
   const [boot, setBoot] = useState<Boot | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [sessions, setSessions] = useState<Session[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [messages, setMessages] = useState<Block[]>([]);
-  const [turn, setTurn] = useState<TurnState>(emptyTurn);
+  // One live turn per conversation, keyed by session id: a chat that is not
+  // open keeps its stream, its Stop button and its approval card. `turn` below
+  // is the open one.
+  const [turns, setTurns] = useState<Record<string, TurnState>>({});
+  const selectedRef = useRef<string | null>(null);
+  selectedRef.current = selected;
+  const updateTurn = useCallback(
+    (id: string, fn: (prev: TurnState) => TurnState) =>
+      setTurns((all) => ({ ...all, [id]: fn(all[id] ?? emptyTurn) })),
+    [],
+  );
+  const turn: TurnState = (selected && turns[selected]) || emptyTurn;
+  const setTurn = useCallback(
+    (next: TurnState | ((prev: TurnState) => TurnState)) => {
+      const id = selectedRef.current;
+      if (!id) return;
+      updateTurn(id, (prev) => (typeof next === "function" ? next(prev) : next));
+    },
+    [updateTurn],
+  );
   const [draft, setDraft] = useState("");
   const [query, setQuery] = useState("");
   // The last pick survives a restart; settings.toml's routing.main_model is the fallback.
@@ -259,104 +262,68 @@ export default function App() {
       .sessionMessages(selected)
       .then((list) => setMessages(toBlocks(list)))
       .catch(() => setMessages([]));
-    setTurn(emptyTurn);
   }, [selected]);
 
-  // Turn events. The subscription is per conversation, so a stale stream can
-  // never write into the next one. `send` subscribes a brand-new conversation
-  // itself before starting its first turn (the effect would subscribe after
-  // the next render, and the first events, approval card included, would be
-  // lost); the effect then reuses that subscription.
-  const listening = useRef<{ id: string; ready: Promise<() => void> } | null>(
-    null,
-  );
-  const subscribe = useCallback((id: string) => {
-    if (listening.current?.id === id) return listening.current.ready;
-    const ready = onTurnEvent(id, (ev: TurnEvent) => {
-      // applyEvent mutates and returns the same object; React skips a render
-      // when the reference does not change, so it gets a copy.
-      setTurn((prev) =>
-        ev.type === "autoCompacted"
-          ? {
-              ...prev,
-              blocks: [
-                ...prev.blocks,
-                {
-                  kind: "note",
-                  text: `Conversa resumida automaticamente (${num(ev.before)} → ${num(ev.after)} tokens)`,
-                },
-              ],
-            }
-          : applyEvent(structuredClone(prev), ev),
-      );
-    });
-    listening.current = { id, ready };
-    return ready;
-  }, []);
+  // Turn events, for every conversation at once. The state of a chat that is
+  // not open is kept here, so switching away and back shows the same stream,
+  // the Stop button and any approval that arrived while away.
   useEffect(() => {
-    if (!selected) return;
-    let stop = false;
-    let unlisten: (() => void) | undefined;
-    void subscribe(selected).then((u) => (stop ? u() : (unlisten = u)));
-    const done = onTurnDone((id) => {
-      if (id !== selected) return;
-      setTurn((prev) => ({ ...prev, busy: false }));
-      // The prompt just sent has no row id until the store has it; "Editar"
-      // needs it, so borrow it from the stored copy (same text, newest first).
-      void api
-        .sessionMessages(selected)
-        .then((list) =>
-          setMessages((prev) =>
-            prev.map((b) =>
-              b.kind === "user" && b.id == null
-                ? {
-                    ...b,
-                    id: [...list]
-                      .reverse()
-                      .find((m) => m.role === "user" && m.content === b.text)?.id,
-                  }
-                : b,
-            ),
+    const ev = onTurnEvent((id, event) => {
+      if (event.type === "route") {
+        setSessions((list) =>
+          list.map((s) =>
+            s.id === id ? { ...s, provider: event.provider, model: event.model } : s,
           ),
+        );
+        return;
+      }
+      updateTurn(id, (prev) => applyEvent(prev, event));
+    });
+    const done = onTurnDone((id) => {
+      updateTurn(id, finishTurn);
+      // The open conversation gets its stored rows back (with their ids, which
+      // "Editar" needs); a closed one rereads them when it is opened.
+      if (id !== selectedRef.current) return;
+      void api
+        .sessionMessages(id)
+        .then((list) =>
+          setMessages((prev) => {
+            const last = turns[id]?.blocks.at(-1);
+            const stored = last?.kind === "assistant" ? last.stored : undefined;
+            return borrowIds(prev, list, stored);
+          }),
         )
         .catch(() => undefined);
     });
-    // The provider/model of a turn is stored when it ends: the sidebar logo
-    // reads it from the route the turn just took.
-    const routed = onTurnEvent(selected, (ev) => {
-      if (ev.type === "route")
-        setSessions((list) =>
-          list.map((s) =>
-            s.id === selected ? { ...s, provider: ev.provider, model: ev.model } : s,
-          ),
-        );
-    });
-    // The background review lands after the answer: a note under it.
     const learned = onTurnLearned((id, items) => {
-      if (id !== selected || !items.length) return;
+      if (!items.length) return;
       const text =
         "Aprendi: " +
         items
           .map((i) => (i.kind === "skill" ? `skill ${i.name}` : i.text))
           .join(" · ");
-      setTurn((prev) => ({
+      updateTurn(id, (prev) => ({
         ...prev,
         blocks: [...prev.blocks, { kind: "note", text, learned: items }],
       }));
     });
     return () => {
-      stop = true;
-      unlisten?.();
-      if (listening.current?.id === selected) listening.current = null;
+      void ev.then((u) => u());
       void done.then((u) => u());
-      void routed.then((u) => u());
       void learned.then((u) => u());
     };
-  }, [selected, subscribe]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [updateTurn]);
 
   const send = useCallback(async () => {
     const prompt = draft.trim();
     if (!prompt) return;
+    // Enter while the answer streams: the backend would refuse the second
+    // turn and the transcript would split. Keep the draft and say why.
+    if (selected && (turns[selected]?.busy ?? false)) {
+      setStatus("Espere a resposta terminar (ou pare) para enviar outra");
+      return;
+    }
     if (!model) {
       setError("Escolha um modelo antes de enviar");
       return;
@@ -369,7 +336,6 @@ export default function App() {
         const created = await api.createSession(titleOf(prompt), folder);
         setSessions((prev) => [created, ...prev]);
         id = created.id;
-        await subscribe(id);
         fresh.current = id;
         setSelected(id);
         setMessages([]);
@@ -384,13 +350,14 @@ export default function App() {
         ...done,
         { kind: "user", text: prompt },
       ]);
-      setTurn({ ...emptyTurn, busy: true });
-      await api.sendTurn({ sessionId: id, model, prompt, mode, history: 20 });
+      updateTurn(id, () => ({ ...emptyTurn, busy: true }));
+      // `history: 0` = the execution profile's window, decided by the core.
+      await api.sendTurn({ sessionId: id, model, prompt, mode, history: 0 });
     } catch (e) {
       setError(String(e));
-      setTurn((prev) => ({ ...prev, busy: false }));
+      if (id) updateTurn(id, (prev) => ({ ...prev, busy: false }));
     }
-  }, [draft, model, mode, selected, turn.blocks, folder, subscribe]);
+  }, [draft, model, mode, selected, turns, folder, updateTurn]);
 
   // "Editar" / "Ramificar daqui": a copy of the conversation up to `upto`
   // (same folder), opened in place of this one, which stays untouched. An
@@ -692,8 +659,12 @@ export default function App() {
           onNew={() => {
             setSelected(null);
             setMessages([]);
-            setTurn(emptyTurn);
             draftRef.current?.focus();
+          }}
+          status={(id) => {
+            const t = turns[id];
+            if (!t?.busy) return null;
+            return t.approval || t.question ? "waiting" : "busy";
           }}
           onSettings={() => setSettings("Geral")}
           onQuotas={() => setSettings("Cotas")}
@@ -750,6 +721,7 @@ export default function App() {
                 </div>
               ) : (
                 <Transcript
+                  key={selected ?? "new"}
                   blocks={surface}
                   tail={tail}
                   sessionId={selected}

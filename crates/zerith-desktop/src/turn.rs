@@ -26,7 +26,6 @@ pub struct Setup {
     pub mode: Mode,
     pub memory_paused: bool,
     pub agent: Option<String>,
-    pub history: usize,
 }
 
 /// One thing that happened during the turn, already shaped for the window.
@@ -191,6 +190,8 @@ pub fn run(
     let store = Store::open(&setup.db).map_err(|e| e.to_string())?;
     let paths = zerith_core::Paths::with_root(&setup.root);
     let cfg = zerith_core::Settings::load(&paths, Some(&setup.workspace)).settings;
+    // User messages replayed per turn: the execution profile's, as in the CLI.
+    let history = cfg.profile.limits().history_window;
     // `configured_providers` already puts the routed primary first, so the head
     // of the list is the provider this turn should use.
     let provider = crate::wire::configured_providers(&setup.root)
@@ -263,7 +264,7 @@ pub fn run(
     });
 
     auto_compact(
-        &store, &settings, &client, session_id, model, setup, cancel, on,
+        &store, &settings, &client, session_id, model, history, cancel, on,
     );
 
     let mut digest = zerith_runtime::learn::TurnDigest::new(&prompt);
@@ -289,7 +290,7 @@ pub fn run(
                 .map(|g| Box::new(g) as Box<dyn zerith_runtime::Middleware + Send + Sync>)
                 .collect(),
             spill_dir: Some(setup.root.join("spill")),
-            history: setup.history,
+            history,
             ..AgentOptions::default()
         },
         session_id,
@@ -357,7 +358,7 @@ fn auto_compact(
     client: &Client,
     session_id: &str,
     model: &str,
-    setup: &Setup,
+    history: usize,
     cancel: &Cancel,
     on: &mut dyn FnMut(TurnEvent),
 ) {
@@ -382,7 +383,7 @@ fn auto_compact(
     match zerith_runtime::compact::auto_compact(
         store,
         session_id,
-        setup.history,
+        history,
         limit,
         &summarizer,
         cancel,

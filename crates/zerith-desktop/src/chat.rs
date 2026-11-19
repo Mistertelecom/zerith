@@ -5,6 +5,7 @@
 //! `turn:event` payloads, so a slow model never freezes a frame.
 
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::sync::Mutex;
 
 use serde::Deserialize;
@@ -54,7 +55,9 @@ pub struct SendArgs {
     pub prompt: String,
     pub mode: String,
     pub agent: Option<String>,
-    pub history: usize,
+    // No `history`: the replay window is the execution profile's
+    // (`history_window`), read by the turn. An old window still sending one
+    // is fine, serde ignores the field.
 }
 
 /// Starts a turn. Returns at once: the answer arrives as `turn:event`.
@@ -80,7 +83,6 @@ pub fn send_turn(
         mode: turn::parse_mode(&args.mode),
         memory_paused: crate::wire::memory_paused(&state.db()),
         agent: args.agent.clone(),
-        history: args.history.max(1),
     };
 
     let cancel = Cancel::default();
@@ -117,27 +119,72 @@ pub fn send_turn(
     };
 
     std::thread::spawn(move || {
-        let result = turn::run(
-            &setup,
-            &session,
-            &args.model,
-            &prompt,
-            &cancel,
-            &approval_gate,
-            &question_gate,
-            &mut emit,
-        );
-        // Always tell the window the turn is over, even after a failure: the
-        // composer stays disabled otherwise.
-        app.state::<Turns>().take(&session);
-        let _ = app.emit("turn:done", &session);
-        match result {
-            Ok(()) => crate::notify::ping(&app, "Zerith respondeu", "A resposta está pronta."),
-            Err(e) => crate::notify::ping(&app, "A conversa parou com erro", &e),
+        // Whatever happens below, even a panic, the turn ends: the slot frees
+        // (else every later message is refused) and the spinner stops.
+        let end_app = app.clone();
+        let end_session = session.clone();
+        let end = OnDrop(Some(move || {
+            end_app.state::<Turns>().take(&end_session);
+            let _ = end_app.emit("turn:done", &end_session);
+        }));
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            turn::run(
+                &setup,
+                &session,
+                &args.model,
+                &prompt,
+                &cancel,
+                &approval_gate,
+                &question_gate,
+                &mut emit,
+            )
+        }));
+        // A setup error or a panic reaches the chat before `turn:done`.
+        let failed = outcome(result, &mut emit);
+        drop(end);
+        match failed {
+            None => crate::notify::ping(&app, "Zerith respondeu", "A resposta está pronta."),
+            Some(e) => crate::notify::ping(&app, "A conversa parou com erro", &e),
         }
     });
 
     Ok(())
+}
+
+/// Runs its closure when dropped, unwinding included.
+struct OnDrop<F: FnOnce()>(Option<F>);
+
+impl<F: FnOnce()> Drop for OnDrop<F> {
+    fn drop(&mut self) {
+        if let Some(f) = self.0.take() {
+            f();
+        }
+    }
+}
+
+/// Tells the chat how a turn ended when `turn::run` itself could not: an
+/// error before the turn started (no provider, store) or a panic becomes a
+/// `Failed` event, so a turn never ends silently. Returns that message.
+fn outcome(
+    result: std::thread::Result<Result<(), String>>,
+    emit: &mut dyn FnMut(TurnEvent),
+) -> Option<String> {
+    let message = match result {
+        Ok(Ok(())) => return None,
+        Ok(Err(e)) => e,
+        Err(p) => {
+            let why = p
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| p.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "falha sem mensagem".into());
+            format!("erro interno: {why}")
+        }
+    };
+    emit(TurnEvent::Failed {
+        message: message.clone(),
+    });
+    Some(message)
 }
 
 /// Stops the turn at the next network read.
@@ -177,4 +224,51 @@ pub fn answer_question(
     turns
         .with(&session_id, |r| r.questions.answer(id, answers))
         .ok_or_else(|| "Turno encerrado".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn failed(evs: &[TurnEvent]) -> Vec<String> {
+        evs.iter()
+            .filter_map(|e| match e {
+                TurnEvent::Failed { message } => Some(message.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A setup error and a panic both reach the chat as `Failed`, and the end
+    /// guard runs even while unwinding; a clean turn adds nothing.
+    #[test]
+    fn a_turn_never_ends_silently() {
+        let mut evs = Vec::new();
+        let ok = outcome(Ok(Ok(())), &mut |e| evs.push(e));
+        assert_eq!(ok, None);
+        assert!(evs.is_empty());
+
+        let err = outcome(Ok(Err("Nenhum provedor configurado".into())), &mut |e| {
+            evs.push(e)
+        });
+        assert_eq!(err.as_deref(), Some("Nenhum provedor configurado"));
+        assert_eq!(failed(&evs), ["Nenhum provedor configurado"]);
+
+        let ended = std::cell::Cell::new(false);
+        let caught = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _end = OnDrop(Some(|| ended.set(true)));
+            panic!("ferramenta quebrou");
+        }));
+        assert!(ended.get(), "the guard ran while unwinding");
+        let mut evs = Vec::new();
+        outcome(caught.map(|()| Ok(())), &mut |e| evs.push(e));
+        assert_eq!(failed(&evs), ["erro interno: ferramenta quebrou"]);
+
+        let caught = std::panic::catch_unwind(|| -> Result<(), String> {
+            panic!("{} de {}", 3, 4);
+        });
+        let mut evs = Vec::new();
+        outcome(caught, &mut |e| evs.push(e));
+        assert_eq!(failed(&evs), ["erro interno: 3 de 4"]);
+    }
 }

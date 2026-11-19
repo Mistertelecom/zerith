@@ -40,6 +40,14 @@
   gap: 24px;
 }
 
+/* Every streamed token used to lay out the whole transcript: on 400 blocks
+   that was 157 ms per token. Off-screen messages are no longer laid out;
+   measured, layout went from 3.53 s to 0.28 s for 150 deltas. */
+.stack > * {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 220px;
+}
+
 .msg-user {
   align-self: flex-end;
   max-width: 76%;
@@ -1410,4 +1418,55 @@
 .changes.undone .change,
 .changes.undone .changes-head .changes-count {
   opacity: 0.55;
+}
+
+/* A conversation that is answering, or waiting on the person, while it is not
+   the open one: the sidebar says so instead of the state disappearing. */
+.side-row-state {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  flex: none;
+  color: var(--foreground);
+}
+.side-row-state.busy svg {
+  animation: spin 1.6s linear infinite;
+}
+.side-row-state.waiting {
+  border-radius: 999px;
+  border: 1px solid var(--border-strong, var(--border));
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* A remote image is offered, not fetched: the click is the consent. */
+.md-img-pending {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-2);
+  padding: var(--s-2) var(--s-3);
+  border: 1px dashed var(--border);
+  border-radius: var(--r-2);
+  background: transparent;
+  color: var(--muted-foreground);
+  font: inherit;
+  font-size: var(--fs-sm);
+  cursor: pointer;
+}
+.md-img-pending:hover {
+  color: var(--foreground);
+  border-color: var(--border-strong, var(--border));
+}
+.md-img-load {
+  color: var(--foreground);
+  text-decoration: underline;
+  text-underline-offset: 2px;
 }

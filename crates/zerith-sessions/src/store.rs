@@ -251,6 +251,40 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// What a turn replays, oldest first: every row from the `window`-th most
+    /// recent user message on (tool calls and results ride free), plus the
+    /// newest compaction summary when it is older than that, so a summary
+    /// never falls out of the window. Synthetic user rows (summaries, hook
+    /// and tool context, subagent reports) are not messages and do not count.
+    pub fn history_rows(&self, session_id: &str, window: usize) -> Result<Vec<Message>> {
+        // CASE, not OR: SQLite may evaluate both sides of an OR, and json_each
+        // on a malformed `raw` would fail the whole query.
+        let start: i64 = self
+            .conn
+            .query_row(
+                "SELECT id FROM messages WHERE session_id = ?1 AND superseded = 0 AND role = 'user'
+                 AND CASE WHEN raw IS NULL OR NOT json_valid(raw) THEN 1 ELSE NOT EXISTS (
+                     SELECT 1 FROM json_each(raw) WHERE key IN
+                     ('summary', 'hook_context', 'hook_stop', 'tool_context', 'subagents_joined')) END
+                 ORDER BY id DESC LIMIT 1 OFFSET ?2",
+                params![session_id, window.saturating_sub(1) as i64],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        let mut st = self.conn.prepare(
+            "SELECT id, session_id, role, content, tool_name, tool_calls, reasoning, token_count, created_at, raw FROM messages
+             WHERE session_id = ?1 AND superseded = 0 AND (id >= ?2 OR id = (
+                 SELECT id FROM messages WHERE session_id = ?1 AND superseded = 0
+                 AND CASE WHEN raw IS NULL OR NOT json_valid(raw) THEN 0
+                     ELSE json_type(raw, '$.summary.start_id') IS NOT NULL END
+                 ORDER BY id DESC LIMIT 1))
+             ORDER BY id",
+        )?;
+        let rows = st.query_map(params![session_id, start], row_to_message)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn message_count(&self, session_id: &str) -> Result<i64> {
         Ok(self.conn.query_row(
             "SELECT COUNT(*) FROM messages WHERE session_id = ?1 AND superseded = 0",

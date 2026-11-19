@@ -24,6 +24,10 @@ pub fn headline(e: &ProviderError) -> String {
             ),
             None => "Limite de requisições atingido. Espere um pouco e tente de novo.".into(),
         },
+        ProviderError::Transport(m) if m == crate::stream::CUT => {
+            "A resposta do provedor foi cortada antes do fim (a conexão caiu no meio). Tente de novo."
+                .into()
+        }
         ProviderError::Transport(m) => {
             format!(
                 "Sem resposta do provedor ({}). Veja a URL e a conexão.",
@@ -49,6 +53,7 @@ fn http(status: u16, body: &str) -> String {
         408 | 504 => "O provedor demorou demais para responder",
         413 => "O pedido ficou grande demais para o provedor",
         429 => "Limite de requisições atingido. Espere um pouco",
+        529 => "O provedor está sobrecarregado. Tente de novo em instantes",
         500..=599 => "O provedor teve um erro interno. Tente de novo em instantes",
         _ => "O provedor devolveu um erro",
     };

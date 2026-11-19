@@ -5,7 +5,7 @@
 //! to share, and where they differ quietly is exactly here.
 
 use crate::{Cancel, ProviderError, Result, StreamEvent, ToolCall, Usage};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::io::BufRead;
 
 /// Parses one `data:` payload. Returns `None` for a heartbeat or a chunk that
@@ -74,11 +74,53 @@ pub(crate) struct OpenAiStream {
     calls: Vec<ToolCall>,
     usage: Option<Usage>,
     chunks: usize,
+    finish_reason: Option<String>,
+    done: bool,
+}
+
+/// The message a stream that ended before its completion event fails with.
+pub(crate) const CUT: &str = "a resposta foi cortada antes do fim";
+
+/// An error the server sent inside a 200 stream, typed like the HTTP error it
+/// stands for, so failover, retry and the headline treat it the same way.
+/// `kind` is Anthropic's `error.type`; `code` an OpenAI-style numeric code.
+pub(crate) fn stream_error(e: &Value) -> ProviderError {
+    let body = json!({ "error": e }).to_string();
+    let code = e["code"]
+        .as_u64()
+        .or_else(|| e["code"].as_str().and_then(|s| s.parse().ok()))
+        .or_else(|| e["status"].as_u64())
+        .filter(|c| (400..600).contains(c));
+    let kind = e["type"]
+        .as_str()
+        .or_else(|| e["code"].as_str())
+        .or_else(|| e["status"].as_str());
+    match (kind, code) {
+        (_, Some(429))
+        | (Some("rate_limit_error" | "rate_limit_exceeded" | "RESOURCE_EXHAUSTED"), _) => {
+            ProviderError::RateLimited {
+                retry_after_ms: None,
+                body,
+            }
+        }
+        (_, Some(status)) => ProviderError::Http {
+            status: status as u16,
+            body,
+        },
+        (Some("overloaded_error" | "server_is_overloaded" | "UNAVAILABLE"), _) => {
+            ProviderError::Http { status: 529, body }
+        }
+        (Some("api_error" | "server_error" | "INTERNAL"), _) => {
+            ProviderError::Http { status: 500, body }
+        }
+        _ => ProviderError::Malformed(crate::openai::error_message(e)),
+    }
 }
 
 impl OpenAiStream {
     pub(crate) fn feed(&mut self, data: &str, on: &mut impl FnMut(StreamEvent)) -> Result<bool> {
         if data == "[DONE]" {
+            self.done = true;
             return Ok(true);
         }
         // A garbage line between good ones is skipped; a stream that never
@@ -87,9 +129,15 @@ impl OpenAiStream {
             return Ok(false);
         };
         if let Some(e) = v.get("error") {
-            return Err(ProviderError::Malformed(crate::openai::error_message(e)));
+            return Err(stream_error(e));
         }
         self.chunks += 1;
+        if let Some(r) = v
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str)
+        {
+            self.finish_reason = Some(r.to_string());
+        }
         if let Some(ev) = text_event(&v) {
             on(ev);
         }
@@ -133,6 +181,10 @@ impl OpenAiStream {
                 "o stream terminou sem nenhum chunk válido".into(),
             ));
         }
+        // Some servers omit `[DONE]`; a finish_reason says the same.
+        if !self.done && self.finish_reason.is_none() {
+            return Err(ProviderError::Transport(CUT.into()));
+        }
         let calls: Vec<ToolCall> = self
             .calls
             .into_iter()
@@ -148,7 +200,10 @@ impl OpenAiStream {
         if !calls.is_empty() {
             on(StreamEvent::ToolCalls(calls));
         }
-        on(StreamEvent::Done { usage: self.usage });
+        on(StreamEvent::Done {
+            usage: self.usage,
+            stop_reason: self.finish_reason,
+        });
         Ok(())
     }
 }
@@ -188,6 +243,7 @@ mod tests {
             r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"b","function":{"name":"glob","arguments":"{}"}}]}}]}"#,
             r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"th\":\"x\"}"}}]}}]}"#,
             r#"{"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}"#,
+            "[DONE]",
         ] {
             s.feed(d, &mut on).unwrap();
         }
@@ -197,6 +253,56 @@ mod tests {
         };
         assert_eq!(calls[0].arguments, r#"{"path":"x"}"#);
         assert_eq!(calls[1].name, "glob");
-        assert!(matches!(&events[1], StreamEvent::Done { usage: Some(u) } if u.total_tokens == 5));
+        assert!(
+            matches!(&events[1], StreamEvent::Done { usage: Some(u), .. } if u.total_tokens == 5)
+        );
+    }
+
+    fn replay(lines: &[&str]) -> (Result<()>, Vec<StreamEvent>) {
+        let mut s = OpenAiStream::default();
+        let mut ev = Vec::new();
+        for d in lines {
+            if let Err(e) = s.feed(d, &mut |e| ev.push(e)) {
+                return (Err(e), ev);
+            }
+        }
+        let r = s.finish(&mut |e| ev.push(e));
+        (r, ev)
+    }
+
+    #[test]
+    fn a_stream_cut_mid_tool_call_is_an_error_not_an_answer() {
+        let (r, ev) = replay(&[
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"write_file","arguments":"{\"path\":\"a"}}]}}]}"#,
+        ]);
+        assert!(
+            matches!(r, Err(ProviderError::Transport(ref m)) if m == CUT),
+            "{r:?}"
+        );
+        assert!(ev.is_empty(), "no half call reaches the loop: {ev:?}");
+    }
+
+    #[test]
+    fn a_finish_reason_without_done_completes_and_is_carried() {
+        let (r, ev) = replay(&[
+            r#"{"choices":[{"delta":{"content":"oi"}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"length"}]}"#,
+        ]);
+        r.unwrap();
+        assert!(matches!(
+            ev.last(),
+            Some(StreamEvent::Done { stop_reason: Some(s), .. }) if s == "length"
+        ));
+        assert!(crate::is_cut_off("length") && !crate::is_cut_off("stop"));
+    }
+
+    #[test]
+    fn errors_inside_the_stream_keep_their_http_meaning() {
+        let (r, _) = replay(&[r#"{"error":{"code":503,"message":"upstream down"}}"#]);
+        assert!(matches!(r, Err(ProviderError::Http { status: 503, .. })));
+        let (r, _) = replay(&[r#"{"error":{"code":429,"message":"slow down"}}"#]);
+        assert!(matches!(r, Err(ProviderError::RateLimited { .. })));
+        let (r, _) = replay(&[r#"{"error":{"message":"what"}}"#]);
+        assert!(matches!(r, Err(ProviderError::Malformed(_))));
     }
 }

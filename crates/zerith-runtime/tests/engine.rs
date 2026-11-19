@@ -1472,6 +1472,125 @@ fn gateway_failover_switches_accounts_records_usage_and_skips_cooled_down_accoun
     assert_eq!(fake2_turn2.seen.lock().unwrap().len(), 1);
 }
 
+/// With one account there is nowhere to fail over to: a failed request must
+/// not cool the account down, or every later turn is refused unsent with a
+/// "rate limit" that never happened.
+#[test]
+fn a_single_account_is_never_cooled_down_and_shows_the_real_error() {
+    let fake = serve(vec![http(503, "text/plain", "upstream busy")]);
+    let settings = zerith_core::Settings {
+        accounts: vec![zerith_core::AccountEntry {
+            id: "solo".into(),
+            provider: "openai".into(),
+            base_url: Some(fake.url.clone()),
+            priority: 1,
+            enabled: true,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let mut cfg = ProviderConfig::new(ProviderKind::OpenAi).with_key("test-key");
+    cfg.base_url = fake.url.clone();
+    cfg.timeout_ms = 5_000;
+    let fb = Client::new(cfg).unwrap().with_retry(RetryPolicy::none());
+    let store = Store::open_in_memory().unwrap();
+    let sid = session(&store);
+    let turn = |prompt: &str| {
+        run_agent_turn(
+            &store,
+            &fb,
+            TurnContext {
+                settings: Some(&settings),
+                ..quiet()
+            },
+            AgentOptions::default(),
+            &sid,
+            "gpt-4o",
+            prompt,
+            &Cancel::default(),
+            |_| {},
+        )
+    };
+    let err = turn("oi").unwrap_err();
+    assert!(
+        matches!(
+            err,
+            RunError::Provider(zerith_providers::ProviderError::Http { status: 503, .. })
+        ),
+        "{err}"
+    );
+    assert!(store.is_account_available("solo", 5, None, None).unwrap());
+    let acc = store.account_window_stats("solo", 5).unwrap();
+    assert_eq!(acc.cooldown_until, 0);
+    assert_eq!(acc.requests, 1, "the failed attempt is still on the record");
+
+    // The next turn is sent, not refused.
+    let fake2 = serve(vec![text("voltou")]);
+    let mut settings2 = settings.clone();
+    settings2.accounts[0].base_url = Some(fake2.url.clone());
+    let r = run_agent_turn(
+        &store,
+        &fb,
+        TurnContext {
+            settings: Some(&settings2),
+            ..quiet()
+        },
+        AgentOptions::default(),
+        &sid,
+        "gpt-4o",
+        "de novo",
+        &Cancel::default(),
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(r.text, "voltou");
+    assert_eq!(fake2.seen.lock().unwrap().len(), 1);
+}
+
+/// No `context_limit` anywhere: the turn assumes the default window, so a
+/// history past 80% of it is compacted in the turn instead of sent whole.
+#[test]
+fn in_turn_compaction_runs_without_a_configured_context_limit() {
+    let fake = serve(vec![text("ok")]);
+    let store = Store::open_in_memory().unwrap();
+    let sid = session(&store);
+    // 14 messages of ~32k chars: ~112k tokens, over 80% of the 128k default
+    for i in 0..14 {
+        let role = if i % 2 == 0 {
+            Role::User
+        } else {
+            Role::Assistant
+        };
+        store
+            .append(
+                &sid,
+                &NewMessage::new(role, format!("pergunta {i} {}", "g".repeat(32_000))),
+            )
+            .unwrap();
+    }
+    let summarizer = FakeSummary {
+        fail: false,
+        seen: Mutex::new(Vec::new()),
+    };
+    let (r, events) = run(
+        &store,
+        &fake,
+        &sid,
+        AgentOptions {
+            summarizer: Some(&summarizer),
+            history: 100,
+            ..Default::default()
+        },
+        &Cancel::default(),
+        None,
+    );
+    r.unwrap();
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, RunEvent::Compacted { .. })));
+    assert_eq!(summarizer.seen.lock().unwrap().len(), 1);
+}
+
 struct FakeBuildTool {
     spec: ToolSpec,
     output: String,

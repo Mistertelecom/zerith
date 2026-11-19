@@ -373,6 +373,7 @@ fn emit_completion_events(completion: Completion, on_event: &mut impl FnMut(Stre
     }
     on_event(StreamEvent::Done {
         usage: completion.usage,
+        stop_reason: completion.finish_reason,
     });
 }
 
@@ -532,6 +533,36 @@ mod tests {
             quota_requests: None,
             window_hours: 24,
         }
+    }
+
+    #[test]
+    fn an_error_inside_a_200_stream_fails_over_before_the_first_token() {
+        // overloaded, said inside the stream instead of as an HTTP status
+        let s1 = MockServer::start(vec![MockResponse::Raw(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\
+             data: {\"error\":{\"code\":529,\"message\":\"Overloaded\"}}\n\n"
+                .into(),
+        )]);
+        let s2 = MockServer::start(vec![sse_text("ok da conta 2")]);
+        let gw = Gateway::new(vec![
+            candidate("acc-1", "openai", "m", &s1.url),
+            candidate("acc-2", "openai", "m", &s2.url),
+        ]);
+        let req = ChatRequest::new("m", vec![ChatMessage::user("oi")]);
+        let mut failovers = Vec::new();
+        let outcome = gw
+            .stream_with(
+                &req,
+                &Cancel::default(),
+                |_| true,
+                |c, e, cd| failovers.push((c.account_id.clone(), e.to_string(), cd)),
+                |_| {},
+            )
+            .unwrap();
+        assert_eq!(outcome.account_id, "acc-2");
+        assert_eq!(failovers.len(), 1, "{failovers:?}");
+        assert!(failovers[0].1.contains("529"));
+        assert_eq!(s2.requests().len(), 1);
     }
 
     #[test]
@@ -843,7 +874,8 @@ mod tests {
                         prompt_tokens: 3,
                         completion_tokens: 4,
                         total_tokens: 7,
-                    })
+                    }),
+                    stop_reason: Some("tool_calls".into()),
                 }
             ]
         );

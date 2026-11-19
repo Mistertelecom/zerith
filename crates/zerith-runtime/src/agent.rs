@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use zerith_core::hooks::{run_hooks, HookEvent, HookOutcome, HookPayload};
 use zerith_providers::{
-    is_failover_error, suggested_cooldown_ms, Cancel, ChatMessage, ChatRequest, Client, Gateway,
-    GatewayOutcome, ProviderError, RouteCandidate, StreamEvent, ToolCall, ToolDef, Usage,
+    is_failover_error, Cancel, ChatMessage, ChatRequest, Client, Gateway, GatewayOutcome,
+    ProviderError, RouteCandidate, StreamEvent, ToolCall, ToolDef, Usage,
 };
 use zerith_security::Policy;
 use zerith_sessions::{checkpoints, migrations::now_ms, NewMessage, NewUsageRecord, Role, Store};
@@ -411,7 +411,7 @@ fn turn_body(
         None
     };
     // The newest rows, which include the prompt just appended.
-    let rows = store.recent_messages(session_id, agent.history.max(1))?;
+    let rows = store.history_rows(session_id, agent.history.max(1))?;
     let mut hist = History::new(system, replay_items(&rows));
     for text in prompt_context {
         if text.trim().is_empty() {
@@ -442,7 +442,9 @@ fn turn_body(
                 .collect()
         })
         .unwrap_or_default();
-    let budget = ctx
+    // Unknown window: assume the default one, so in-turn compaction is on for
+    // every provider, not only for those whose context_limit the user typed.
+    let window = ctx
         .settings
         .and_then(|st| {
             crate::resolve_gateway(st, model, client.config())
@@ -453,7 +455,18 @@ fn turn_body(
                 .and_then(|c| c.config.context_limit)
         })
         .or(client.config().context_limit)
-        .map(|l| l as usize * 8 / 10);
+        .filter(|&l| l > 0)
+        .map_or(crate::compact::DEFAULT_CONTEXT, |l| l as usize);
+    // The tool schemas ride on every request: their share of the window is
+    // not history's to use.
+    // ponytail: floor at a quarter of the window so a huge non-deferred
+    // toolset does not drop all history; a per-model window fixes it properly.
+    let schema_tokens = serde_json::to_string(&defs).map_or(0, |s| s.len() / 4);
+    let budget = Some(
+        (window * 8 / 10)
+            .saturating_sub(schema_tokens)
+            .max(window / 4),
+    );
     let default_summarizer = ClientSummarizer { client, model };
     let summarizer: &dyn Summarizer = agent.summarizer.unwrap_or(&default_summarizer);
     let mut summary_failed = false;
@@ -512,6 +525,8 @@ fn turn_body(
             req = req.tools(defs.clone()).tool_choice("auto");
         }
         let mut failed = Vec::new();
+        // What this step painted, kept if the step dies (error or stop).
+        let mut painted = String::new();
         let out = request(
             store,
             client,
@@ -522,7 +537,12 @@ fn turn_body(
             model,
             &req,
             cancel,
-            on_event,
+            &mut |e: RunEvent| {
+                if let RunEvent::Delta(t) = &e {
+                    painted.push_str(t);
+                }
+                on_event(e)
+            },
             log,
             &mut failed,
             &mut pending_rtk_tokens,
@@ -532,7 +552,28 @@ fn turn_body(
         for f in failed {
             log.emit("assistant/attempt", json!({"step": step, "attempt": f}));
         }
-        let (out, gw_outcome, step_savings) = out?;
+        let (mut out, gw_outcome, step_savings) = match out {
+            Ok(o) => o,
+            Err(e) => {
+                keep_partial(store, session_id, &painted, &e, log)?;
+                return Err(e);
+            }
+        };
+        // The output cap cut the answer: a call's JSON is incomplete and must
+        // not run (half a file); a text answer is kept and says so.
+        let cut = out
+            .stop_reason
+            .as_deref()
+            .is_some_and(zerith_providers::is_cut_off);
+        let cut_calls = cut && !out.calls.is_empty();
+        if cut_calls {
+            for c in &mut out.calls {
+                c.arguments = "{}".into();
+            }
+        } else if cut {
+            out.text.push_str(CUT_TEXT);
+            on_event(RunEvent::Delta(CUT_TEXT.into()));
+        }
         total_saved_ponytail_tokens += step_savings.ponytail;
         total_saved_caveman_tokens += step_savings.caveman;
         last_account_id = Some(gw_outcome.account_id);
@@ -632,6 +673,27 @@ fn turn_body(
 
         let mut context: Vec<String> = Vec::new();
         let mut i = 0;
+        if cut_calls {
+            for c in &out.calls {
+                on_event(RunEvent::ToolCall {
+                    id: c.id.clone(),
+                    name: c.name.clone(),
+                    args: c.arguments.clone(),
+                });
+                record(store, session_id, c, CUT_CALL, &mut hist)?;
+                log.emit(
+                    "tool/result",
+                    json!({"id": c.id, "name": c.name, "ok": false, "cut": true}),
+                );
+                on_event(RunEvent::ToolResult {
+                    id: c.id.clone(),
+                    name: c.name.clone(),
+                    ok: false,
+                    output_preview: CUT_CALL.chars().take(PREVIEW_CHARS).collect(),
+                });
+            }
+            i = out.calls.len();
+        }
         while i < out.calls.len() {
             if cancel.is_cancelled() {
                 // Close every open call so the stored history stays paired.
@@ -966,6 +1028,39 @@ fn record(
     Ok(())
 }
 
+/// A step that died after painting text keeps it: the person saw it, and a
+/// conversation must not end on an unanswered prompt. Text only, no calls,
+/// so replay stays paired.
+fn keep_partial(
+    store: &Store,
+    session_id: &str,
+    painted: &str,
+    err: &RunError,
+    log: &TurnLog<'_>,
+) -> Result<()> {
+    if painted.trim().is_empty() {
+        return Ok(());
+    }
+    let why = match err {
+        RunError::Provider(ProviderError::Cancelled) => "parada pelo usuário".to_string(),
+        RunError::Provider(e) => zerith_providers::explain::headline(e),
+        e => e.to_string(),
+    };
+    let text = format!("{painted}\n\n_[resposta interrompida: {why}]_");
+    let id = store.append(
+        session_id,
+        &NewMessage {
+            raw: Some(json!({"partial": true})),
+            ..NewMessage::new(Role::Assistant, text)
+        },
+    )?;
+    log.emit(
+        "assistant/partial",
+        json!({"message_id": id, "chars": painted.chars().count()}),
+    );
+    Ok(())
+}
+
 fn close_cancelled(
     store: &Store,
     session_id: &str,
@@ -989,7 +1084,16 @@ struct StepOut {
     reasoning: Option<String>,
     calls: Vec<ToolCall>,
     usage: Option<Usage>,
+    stop_reason: Option<String>,
 }
+
+/// What the model reads instead of running a call cut by the output cap: its
+/// JSON is incomplete, and running it would write half a file.
+const CUT_CALL: &str = "erro: resposta cortada pelo limite de saída antes de terminar esta \
+chamada; nada foi executado. Divida o conteúdo: escreva o arquivo em partes menores \
+(um arquivo curto e depois edições) e chame de novo.";
+/// Appended to a text answer the output cap cut short.
+const CUT_TEXT: &str = "\n\n_[resposta cortada pelo limite de saída do modelo]_";
 
 fn default_gateway(client: &Client, model: &str) -> Gateway {
     let cfg = client.config();
@@ -1079,9 +1183,12 @@ fn apply_stream_event(
         }
         StreamEvent::ToolCalls(c) => out.calls = c,
         // A trailing chunk without usage must not erase earlier counts.
-        StreamEvent::Done { usage } => {
+        StreamEvent::Done { usage, stop_reason } => {
             if usage.is_some() {
                 out.usage = usage;
+            }
+            if stop_reason.is_some() {
+                out.stop_reason = stop_reason;
             }
         }
     }
@@ -1089,6 +1196,8 @@ fn apply_stream_event(
 
 /// Runs a single candidate preserving detailed `assistant/attempt` diagnostics
 /// when streaming falls back to blocking `complete` on HTTP 400.
+/// The only account is never cooled down (cooldown 0 below): with nothing to
+/// fail over to, a cooldown just refuses the next turns unsent.
 #[allow(clippy::too_many_arguments)]
 fn request_single(
     store: &Store,
@@ -1104,18 +1213,22 @@ fn request_single(
     if cancel.is_cancelled() {
         return Err(ProviderError::Cancelled.into());
     }
-    let available = store
-        .is_account_available(
-            &cand.account_id,
-            cand.window_hours,
-            cand.quota_tokens,
-            cand.quota_requests,
-        )
-        .unwrap_or(true);
-    if !available {
+    // The only account: a cooldown would refuse the request without sending
+    // it, and blame a rate limit that may never have happened. Only the quota
+    // the user set still holds; the real error of each attempt is shown.
+    let over_quota = store
+        .account_window_stats(&cand.account_id, cand.window_hours)
+        .is_ok_and(|s| {
+            cand.quota_tokens.is_some_and(|q| s.total_tokens >= q)
+                || cand.quota_requests.is_some_and(|q| s.requests >= q)
+        });
+    if over_quota {
         return Err(ProviderError::RateLimited {
             retry_after_ms: None,
-            body: "todas as contas configuradas atingiram o limite ou estão em cooldown".into(),
+            body: format!(
+                "a conta {} atingiu a cota configurada para a janela de {} h",
+                cand.account_id, cand.window_hours
+            ),
         }
         .into());
     }
@@ -1127,15 +1240,7 @@ fn request_single(
         Ok(c) => c,
         Err(err) => {
             if is_failover_error(&err) {
-                record_failover(
-                    store,
-                    session_id,
-                    role_kind,
-                    cand,
-                    &err,
-                    suggested_cooldown_ms(&err),
-                    failed,
-                );
+                record_failover(store, session_id, role_kind, cand, &err, 0, failed);
             }
             return Err(err.into());
         }
@@ -1176,15 +1281,7 @@ fn request_single(
     }
     if painted || !matches!(e, ProviderError::Http { status: 400, .. }) {
         if !painted && is_failover_error(&e) {
-            record_failover(
-                store,
-                session_id,
-                role_kind,
-                cand,
-                &e,
-                suggested_cooldown_ms(&e),
-                failed,
-            );
+            record_failover(store, session_id, role_kind, cand, &e, 0, failed);
         }
         return Err(e.into());
     }
@@ -1196,15 +1293,7 @@ fn request_single(
                 failed.push(json!({"mode": "complete", "error": e2.to_string()}));
             }
             if is_failover_error(&e2) {
-                record_failover(
-                    store,
-                    session_id,
-                    role_kind,
-                    cand,
-                    &e2,
-                    suggested_cooldown_ms(&e2),
-                    failed,
-                );
+                record_failover(store, session_id, role_kind, cand, &e2, 0, failed);
             }
             return Err(e2.into());
         }
@@ -1221,6 +1310,7 @@ fn request_single(
             reasoning: c.reasoning,
             calls: c.tool_calls,
             usage: c.usage,
+            stop_reason: c.finish_reason,
         },
         GatewayOutcome {
             value: (),

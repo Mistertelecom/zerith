@@ -380,7 +380,7 @@ fn without_an_approval_gate_ask_fails_closed() {
 }
 
 #[test]
-fn cancel_stops_the_stream_and_stores_no_answer() {
+fn cancel_stops_the_stream_and_keeps_what_was_painted() {
     let fake = serve(vec![sse(&[
         json!({"choices":[{"delta":{"content":"um"}}]}),
         json!({"choices":[{"delta":{"content":"dois"}}]}),
@@ -409,7 +409,116 @@ fn cancel_stops_the_stream_and_stores_no_answer() {
         err,
         RunError::Provider(zerith_providers::ProviderError::Cancelled)
     ));
-    assert_eq!(rows(&store, &sid), [(Role::User, "oi".to_string())]);
+    // The painted text stays, marked as cut; the prompt is not left unanswered.
+    let r = rows(&store, &sid);
+    assert_eq!(r.len(), 2, "{r:?}");
+    assert_eq!(r[1].0, Role::Assistant);
+    assert!(r[1].1.starts_with("um"), "{r:?}");
+    assert!(r[1]
+        .1
+        .contains("_[resposta interrompida: parada pelo usuário]_"));
+    let last = store.messages(&sid, 10, 0).unwrap().pop().unwrap();
+    assert_eq!(last.raw.unwrap()["partial"], true);
+    // and the next turn replays it as a plain answer, no dangling calls
+    let replay = zerith_runtime::compact::replay(&store.recent_messages(&sid, 10).unwrap());
+    assert_eq!(replay.len(), 2);
+    assert!(replay[1].tool_calls.is_empty());
+}
+
+#[test]
+fn a_stream_error_after_text_keeps_the_text_with_the_reason() {
+    // the connection dies mid-answer: no [DONE], no finish_reason
+    let cut = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\
+               data: {\"choices\":[{\"delta\":{\"content\":\"metade da \"}}]}\n\n"
+        .to_string();
+    let fake = serve(vec![cut]);
+    let store = Store::open_in_memory().unwrap();
+    let sid = session(&store);
+    let err = run_turn_cancellable(
+        &store,
+        &client(&fake.url, Protocol::OpenAi),
+        None,
+        None,
+        &sid,
+        "m",
+        "oi",
+        &Cancel::default(),
+        |_| {},
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            RunError::Provider(zerith_providers::ProviderError::Transport(_))
+        ),
+        "{err}"
+    );
+    let r = rows(&store, &sid);
+    assert_eq!(r.len(), 2, "{r:?}");
+    assert!(r[1].1.starts_with("metade da "));
+    assert!(r[1].1.contains("cortada antes do fim"), "{r:?}");
+}
+
+/// Claude stops at max_tokens inside a `write_file`: the call must not run
+/// (its JSON is cut), the model is told why in a tool result, and the turn
+/// goes on instead of looping on invalid JSON.
+#[test]
+fn a_tool_call_cut_by_the_output_cap_is_not_run() {
+    let dir = workspace();
+    let fake = serve(vec![
+        anthropic_sse(&[
+            json!({"type":"message_start","message":{"usage":{"input_tokens":7}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tu1","name":"write_file","input":{}}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"big.txt\",\"content\":\"aaaa"}}),
+            json!({"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":32000}}),
+            json!({"type":"message_stop"}),
+        ]),
+        anthropic_sse(&[
+            json!({"type":"message_start","message":{"usage":{"input_tokens":20}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"vou dividir"}}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}),
+            json!({"type":"message_stop"}),
+        ]),
+    ]);
+    let store = Store::open_in_memory().unwrap();
+    let sid = session(&store);
+    let policy = Policy::new(
+        preset("workspace-write").unwrap(),
+        Mode::Default,
+        dir.path(),
+    );
+    let mut events = Vec::new();
+    let report = turn(
+        &store,
+        &client(&fake.url, Protocol::Anthropic),
+        &policy,
+        &sid,
+        |e| events.push(e),
+    )
+    .unwrap();
+    assert_eq!(report.text, "vou dividir");
+    assert!(
+        !dir.path().join("big.txt").exists(),
+        "half a file was written"
+    );
+    assert!(events.iter().any(|e| matches!(
+        e,
+        RunEvent::ToolResult { ok: false, output_preview, .. }
+            if output_preview.contains("cortada pelo limite de saída")
+    )));
+    let seen = fake.seen.lock().unwrap();
+    assert_eq!(
+        seen[0].1["max_tokens"], 8192,
+        "non-Claude model name: safe default"
+    );
+    let msgs = seen[1].1["messages"].as_array().unwrap();
+    let last = msgs.last().unwrap();
+    assert_eq!(last["content"][0]["tool_use_id"], "tu1");
+    assert!(last["content"][0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("escreva o arquivo em partes"));
 }
 
 #[test]
@@ -490,7 +599,8 @@ fn a_long_session_replays_its_newest_messages_including_the_prompt() {
     let fake = serve(vec![text("ok")]);
     let store = Store::open_in_memory().unwrap();
     let sid = session(&store);
-    for i in 0..60 {
+    // 100 user messages: past the largest profile window (80).
+    for i in 0..200 {
         let role = if i % 2 == 0 {
             Role::User
         } else {
@@ -516,7 +626,7 @@ fn a_long_session_replays_its_newest_messages_including_the_prompt() {
     let msgs = seen[0].1["messages"].as_array().unwrap();
     assert_eq!(msgs.last().unwrap()["content"], "PERGUNTA ATUAL");
     assert!(msgs.iter().all(|m| m["content"] != "msg 0"));
-    assert!(msgs.iter().any(|m| m["content"] == "msg 59"));
+    assert!(msgs.iter().any(|m| m["content"] == "msg 199"));
 }
 
 #[test]

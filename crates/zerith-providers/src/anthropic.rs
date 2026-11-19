@@ -5,15 +5,35 @@
 //! content blocks and their results are `tool_result` blocks inside a *user*
 //! message, and the stream is typed events instead of choice deltas.
 
-use crate::openai::error_message;
 use crate::{
     Cancel, ChatRequest, Client, Completion, ProviderError, Result, Role, StreamEvent, ToolCall,
     Usage,
 };
 use serde_json::{json, Value};
 
-/// Anthropic requires `max_tokens`; this is what a request without one gets.
-const DEFAULT_MAX_TOKENS: u32 = 4096;
+/// Anthropic requires `max_tokens`; a request without one gets the model's
+/// output cap. Too low and a long `write_file` is cut mid-argument.
+// ponytail: name heuristic; a catalogue entry per model if one rejects these.
+fn max_output(model: &str) -> u32 {
+    let m = model.to_ascii_lowercase();
+    if !m.contains("claude") {
+        return 8192;
+    }
+    if ["claude-3-5", "claude-3.5", "claude-3-7", "claude-3.7"]
+        .iter()
+        .any(|v| m.contains(v))
+    {
+        8192
+    } else if ["claude-3", "claude-2", "claude-instant"]
+        .iter()
+        .any(|v| m.contains(v))
+    {
+        4096
+    } else {
+        // Claude 4.x and later: opus 4/4.1 stop at 32k, the rest go higher.
+        32000
+    }
+}
 
 pub(crate) fn body(req: &ChatRequest, stream: bool) -> Value {
     let mut system = Vec::new();
@@ -73,7 +93,7 @@ pub(crate) fn body(req: &ChatRequest, stream: bool) -> Value {
     }
     let mut b = json!({
         "model": req.model,
-        "max_tokens": req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+        "max_tokens": req.max_tokens.unwrap_or_else(|| max_output(&req.model)),
         "stream": stream,
     });
     if !system.is_empty() {
@@ -151,7 +171,7 @@ pub(crate) fn complete(client: &Client, req: &ChatRequest, cancel: &Cancel) -> R
 fn parse_completion(text: &str) -> Result<Completion> {
     let v: Value = serde_json::from_str(text)?;
     if let Some(e) = v.get("error") {
-        return Err(ProviderError::Malformed(error_message(e)));
+        return Err(crate::stream::stream_error(e));
     }
     let blocks = v["content"]
         .as_array()
@@ -219,6 +239,7 @@ pub(crate) struct AnthropicStream {
     calls: Vec<(u64, ToolCall)>,
     input_tokens: u64,
     usage: Option<Usage>,
+    stop_reason: Option<String>,
     stopped: bool,
     events: usize,
 }
@@ -262,12 +283,17 @@ impl AnthropicStream {
                     _ => {}
                 }
             }
-            Some("message_delta") => self.usage = usage(&v["usage"], self.input_tokens),
+            Some("message_delta") => {
+                self.usage = usage(&v["usage"], self.input_tokens);
+                if let Some(r) = v["delta"]["stop_reason"].as_str() {
+                    self.stop_reason = Some(r.to_string());
+                }
+            }
             Some("message_stop") => {
                 self.stopped = true;
                 return Ok(true);
             }
-            Some("error") => return Err(ProviderError::Malformed(error_message(&v["error"]))),
+            Some("error") => return Err(crate::stream::stream_error(&v["error"])),
             _ => {}
         }
         Ok(false)
@@ -278,6 +304,9 @@ impl AnthropicStream {
             return Err(ProviderError::Malformed(
                 "o stream terminou sem nenhum evento válido".into(),
             ));
+        }
+        if !self.stopped {
+            return Err(ProviderError::Transport(crate::stream::CUT.into()));
         }
         let calls: Vec<ToolCall> = self
             .calls
@@ -293,7 +322,10 @@ impl AnthropicStream {
         if !calls.is_empty() {
             on(StreamEvent::ToolCalls(calls));
         }
-        on(StreamEvent::Done { usage: self.usage });
+        on(StreamEvent::Done {
+            usage: self.usage,
+            stop_reason: self.stop_reason,
+        });
         Ok(())
     }
 }
@@ -398,7 +430,7 @@ mod tests {
         );
         let b = body(&req, false);
         assert_eq!(b["system"], "s");
-        assert_eq!(b["max_tokens"], DEFAULT_MAX_TOKENS);
+        assert_eq!(b["max_tokens"], 32000);
         let msgs = b["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 3);
         assert_eq!(msgs[1]["content"][1]["input"]["path"], "x");
@@ -417,5 +449,86 @@ mod tests {
         assert_eq!(c.reasoning.as_deref(), Some("hm"));
         assert_eq!(c.tool_calls[0].arguments, r#"{"pattern":"*"}"#);
         assert_eq!(c.usage.unwrap().total_tokens, 10);
+    }
+
+    #[test]
+    fn the_output_cap_follows_the_model() {
+        assert_eq!(max_output("claude-haiku-4.5"), 32000);
+        assert_eq!(max_output("anthropic/claude-sonnet-4-5"), 32000);
+        assert_eq!(max_output("claude-opus-5-5"), 32000);
+        assert_eq!(max_output("claude-3-5-sonnet-latest"), 8192);
+        assert_eq!(max_output("claude-3-haiku-20240307"), 4096);
+        assert_eq!(max_output("MiniMax-M2"), 8192);
+        let req = ChatRequest::new("claude-3-7-sonnet", vec![]).max_tokens(10);
+        assert_eq!(body(&req, false)["max_tokens"], 10, "an explicit cap wins");
+    }
+
+    fn replay(events: &[&str]) -> (Result<()>, Vec<StreamEvent>) {
+        let mut st = AnthropicStream::default();
+        let mut ev = Vec::new();
+        for d in events {
+            if let Err(e) = st.feed(d, &mut |e| ev.push(e)) {
+                return (Err(e), ev);
+            }
+        }
+        let r = st.finish(&mut |e| ev.push(e));
+        (r, ev)
+    }
+
+    const START: &str = r#"{"type":"message_start","message":{"usage":{"input_tokens":5}}}"#;
+    const TOOL: &str = r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t","name":"write_file"}}"#;
+    const HALF: &str = r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"a"}}"#;
+
+    #[test]
+    fn max_tokens_mid_tool_use_is_reported_with_the_stop_reason() {
+        let (r, ev) = replay(&[
+            START,
+            TOOL,
+            HALF,
+            r#"{"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":9}}"#,
+            r#"{"type":"message_stop"}"#,
+        ]);
+        r.unwrap();
+        assert!(matches!(
+            ev.last(),
+            Some(StreamEvent::Done { stop_reason: Some(s), .. }) if crate::is_cut_off(s)
+        ));
+    }
+
+    #[test]
+    fn a_stream_without_message_stop_is_cut_not_complete() {
+        let (r, ev) = replay(&[START, TOOL, HALF]);
+        assert!(
+            matches!(r, Err(ProviderError::Transport(ref m)) if m == crate::stream::CUT),
+            "{r:?}"
+        );
+        assert!(!ev.iter().any(|e| matches!(e, StreamEvent::ToolCalls(_))));
+    }
+
+    #[test]
+    fn stream_errors_are_typed_for_failover() {
+        let err = |t: &str| {
+            replay(&[
+                START,
+                &format!(r#"{{"type":"error","error":{{"type":"{t}","message":"x"}}}}"#),
+            ])
+            .0
+        };
+        assert!(matches!(
+            err("overloaded_error"),
+            Err(ProviderError::Http { status: 529, .. })
+        ));
+        assert!(matches!(
+            err("api_error"),
+            Err(ProviderError::Http { status: 500, .. })
+        ));
+        assert!(matches!(
+            err("rate_limit_error"),
+            Err(ProviderError::RateLimited { .. })
+        ));
+        let e = err("overloaded_error").unwrap_err();
+        assert!(crate::is_failover_error(&e));
+        let h = crate::explain::headline(&e);
+        assert!(h.contains("sobrecarregado") && !h.contains("/v1"), "{h}");
     }
 }

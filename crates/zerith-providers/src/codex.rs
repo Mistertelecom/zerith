@@ -105,7 +105,7 @@ pub(crate) fn stream(
 fn parse_completion(text: &str) -> Result<Completion> {
     let v: Value = serde_json::from_str(text)?;
     if let Some(e) = v.get("error") {
-        return Err(ProviderError::Malformed(crate::openai::error_message(e)));
+        return Err(crate::stream::stream_error(e));
     }
     let mut out = Completion {
         text: String::new(),
@@ -152,6 +152,7 @@ fn usage(v: &Value) -> Option<Usage> {
 pub(crate) struct CodexStream {
     calls: Vec<ToolCall>,
     usage: Option<Usage>,
+    stop_reason: Option<String>,
     done: bool,
     seen: usize,
 }
@@ -184,19 +185,26 @@ impl CodexStream {
                     });
                 }
             }
-            "response.completed" => {
+            "response.completed" | "response.incomplete" => {
                 self.usage = usage(&v["response"]["usage"]).or(self.usage.take());
+                self.stop_reason = v["response"]["incomplete_details"]["reason"]
+                    .as_str()
+                    .map(str::to_string);
                 self.done = true;
                 return Ok(true);
             }
             "response.failed" | "error" => {
-                return Err(ProviderError::Malformed(
-                    v["response"]["error"]["message"]
-                        .as_str()
-                        .or_else(|| v["message"].as_str())
-                        .unwrap_or("stream codex falhou")
-                        .to_string(),
-                ));
+                let e = if v["response"]["error"].is_object() {
+                    &v["response"]["error"]
+                } else if v["error"].is_object() {
+                    &v["error"]
+                } else {
+                    &v
+                };
+                if e.get("message").is_none() {
+                    return Err(ProviderError::Malformed("stream codex falhou".into()));
+                }
+                return Err(crate::stream::stream_error(e));
             }
             _ => {}
         }
@@ -210,14 +218,15 @@ impl CodexStream {
             ));
         }
         if !self.done {
-            return Err(ProviderError::Malformed(
-                "o stream do codex terminou sem response.completed".into(),
-            ));
+            return Err(ProviderError::Transport(crate::stream::CUT.into()));
         }
         if !self.calls.is_empty() {
             on(StreamEvent::ToolCalls(self.calls));
         }
-        on(StreamEvent::Done { usage: self.usage });
+        on(StreamEvent::Done {
+            usage: self.usage,
+            stop_reason: self.stop_reason,
+        });
         Ok(())
     }
 }
@@ -261,7 +270,7 @@ mod tests {
         assert_eq!(calls[0].id, "call_1");
         assert!(matches!(
             events.last(),
-            Some(StreamEvent::Done { usage: Some(u) }) if u.total_tokens == 13
+            Some(StreamEvent::Done { usage: Some(u), .. }) if u.total_tokens == 13
         ));
     }
 

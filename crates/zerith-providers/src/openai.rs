@@ -406,7 +406,7 @@ pub(crate) fn body(req: &ChatRequest, stream: bool) -> Value {
 fn parse_completion(text: &str) -> Result<Completion> {
     let v: Value = serde_json::from_str(text)?;
     if let Some(e) = v.get("error") {
-        return Err(ProviderError::Malformed(error_message(e)));
+        return Err(crate::stream::stream_error(e));
     }
     let choice = v
         .pointer("/choices/0")

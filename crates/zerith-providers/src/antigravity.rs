@@ -229,7 +229,10 @@ pub(crate) fn complete(client: &Client, req: &ChatRequest, cancel: &Cancel) -> R
         StreamEvent::Delta(d) => out.text.push_str(&d),
         StreamEvent::Reasoning(r) => out.reasoning.get_or_insert_with(String::new).push_str(&r),
         StreamEvent::ToolCalls(c) => out.tool_calls = c,
-        StreamEvent::Done { usage } => out.usage = usage,
+        StreamEvent::Done { usage, stop_reason } => {
+            out.usage = usage;
+            out.finish_reason = stop_reason;
+        }
     })?;
     Ok(out)
 }
@@ -255,6 +258,7 @@ pub(crate) fn stream(
 pub(crate) struct GeminiStream {
     calls: Vec<ToolCall>,
     usage: Option<Usage>,
+    finish_reason: Option<String>,
     seen: usize,
 }
 
@@ -266,12 +270,13 @@ impl GeminiStream {
         self.seen += 1;
         let r = v.get("response").unwrap_or(&v);
         if let Some(e) = r.get("error") {
-            return Err(ProviderError::Malformed(
-                e["message"]
-                    .as_str()
-                    .unwrap_or("erro do antigravity")
-                    .into(),
-            ));
+            if e.get("message").is_none() {
+                return Err(ProviderError::Malformed("erro do antigravity".into()));
+            }
+            return Err(crate::stream::stream_error(e));
+        }
+        if let Some(f) = r["candidates"][0]["finishReason"].as_str() {
+            self.finish_reason = Some(f.to_string());
         }
         for part in r["candidates"][0]["content"]["parts"]
             .as_array()
@@ -314,10 +319,16 @@ impl GeminiStream {
                 "o stream do antigravity terminou sem nenhum evento".into(),
             ));
         }
+        if self.finish_reason.is_none() {
+            return Err(ProviderError::Transport(crate::stream::CUT.into()));
+        }
         if !self.calls.is_empty() {
             on(StreamEvent::ToolCalls(self.calls));
         }
-        on(StreamEvent::Done { usage: self.usage });
+        on(StreamEvent::Done {
+            usage: self.usage,
+            stop_reason: self.finish_reason,
+        });
         Ok(())
     }
 }
@@ -421,7 +432,7 @@ mod tests {
         let mut ev = Vec::new();
         for d in [
             r#"{"response":{"candidates":[{"content":{"parts":[{"thought":true,"text":"hm"}]}}]}}"#,
-            r#"{"response":{"candidates":[{"content":{"parts":[{"text":"Olá"},{"functionCall":{"name":"glob","args":{"p":"*"},"id":"x"},"thoughtSignature":"s"}]}}],"usageMetadata":{"promptTokenCount":3,"totalTokenCount":10}}}"#,
+            r#"{"response":{"candidates":[{"content":{"parts":[{"text":"Olá"},{"functionCall":{"name":"glob","args":{"p":"*"},"id":"x"},"thoughtSignature":"s"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":3,"totalTokenCount":10}}}"#,
         ] {
             st.feed(d, &mut |e| ev.push(e)).unwrap();
         }
@@ -435,6 +446,32 @@ mod tests {
             (c[0].id.as_str(), c[0].arguments.as_str()),
             ("x", r#"{"p":"*"}"#)
         );
-        assert!(matches!(&ev[3], StreamEvent::Done { usage: Some(u) } if u.completion_tokens == 7));
+        assert!(
+            matches!(&ev[3], StreamEvent::Done { usage: Some(u), stop_reason: Some(s) } if u.completion_tokens == 7 && s == "STOP")
+        );
+    }
+
+    #[test]
+    fn a_stream_without_finish_reason_is_cut_and_errors_are_typed() {
+        let mut st = GeminiStream::default();
+        let mut ev = Vec::new();
+        st.feed(
+            r#"{"response":{"candidates":[{"content":{"parts":[{"text":"meio"}]}}]}}"#,
+            &mut |e| ev.push(e),
+        )
+        .unwrap();
+        assert!(matches!(
+            st.finish(&mut |e| ev.push(e)),
+            Err(ProviderError::Transport(ref m)) if m == crate::stream::CUT
+        ));
+        let mut st = GeminiStream::default();
+        let e = st
+            .feed(
+                r#"{"error":{"code":503,"message":"overloaded","status":"UNAVAILABLE"}}"#,
+                &mut |_| {},
+            )
+            .unwrap_err();
+        assert!(matches!(e, ProviderError::Http { status: 503, .. }));
+        assert!(crate::is_cut_off("MAX_TOKENS"));
     }
 }

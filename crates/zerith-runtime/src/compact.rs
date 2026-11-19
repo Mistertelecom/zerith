@@ -109,13 +109,23 @@ impl Item {
     }
 }
 
+/// Tokens a provider bills for one attached image, about (Claude ~1.6k for a
+/// screenshot); the `![..](path)` text itself is a few chars.
+const IMAGE_TOKENS: usize = 1600;
+
 fn cost(m: &ChatMessage) -> usize {
     let calls: usize = m
         .tool_calls
         .iter()
         .map(|c| c.name.len() + c.arguments.len())
         .sum();
-    (m.content.len() + calls) / 4 + 4
+    // ponytail: counts every `![` in a user message, file or not; local_images
+    // reads the file, too slow to run per estimate.
+    let images = match m.role {
+        PRole::User => m.content.matches("![").count(),
+        _ => 0,
+    };
+    (m.content.len() + calls) / 4 + 4 + images * IMAGE_TOKENS
 }
 
 /// A rough 4 chars per token, plus a little per message for the framing.
@@ -421,7 +431,7 @@ pub fn auto_compact(
 ) -> Result<Option<CompactReport>> {
     // ponytail: counts the replayed rows only; the system prompt and tool
     // specs (a few k tokens) ride on the 25% margin.
-    let rows = store.recent_messages(session_id, history.max(1))?;
+    let rows = store.history_rows(session_id, history.max(1))?;
     let tokens: usize = replay_items(&rows).iter().map(|i| cost(&i.msg)).sum();
     if !needs_compaction(tokens, context_limit) {
         return Ok(None);
@@ -563,6 +573,16 @@ mod tests {
             );
             Ok("o usuário pediu 30 coisas".into())
         }
+    }
+
+    #[test]
+    fn an_image_in_history_costs_like_an_image_not_like_its_path() {
+        let plain = ChatMessage::user("veja");
+        let shot = ChatMessage::user("veja\n![tela](C:/a/b.png)");
+        assert!(cost(&shot) - cost(&plain) >= IMAGE_TOKENS);
+        // a path the assistant merely mentions is text
+        let said = ChatMessage::assistant("![tela](C:/a/b.png)", vec![]);
+        assert!(cost(&said) < 20);
     }
 
     #[test]

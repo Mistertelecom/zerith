@@ -216,6 +216,23 @@ pub enum StreamEvent {
     /// fragments are assembled in the client so no caller sees half an
     /// argument.
     ToolCalls(Vec<ToolCall>),
-    /// The stream finished; carries usage if the provider reported it.
-    Done { usage: Option<Usage> },
+    /// The stream finished; carries usage if the provider reported it, and
+    /// the provider's stop/finish reason as sent (`end_turn`, `length`, ...).
+    Done {
+        usage: Option<Usage>,
+        stop_reason: Option<String>,
+    },
+}
+
+/// Whether a stop/finish reason means the output hit the token cap: the
+/// answer, and any tool call in it, is incomplete.
+pub fn is_cut_off(stop_reason: &str) -> bool {
+    matches!(
+        stop_reason,
+        "max_tokens"
+            | "MAX_TOKENS"
+            | "length"
+            | "max_output_tokens"
+            | "model_context_window_exceeded"
+    )
 }

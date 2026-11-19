@@ -252,7 +252,9 @@ impl Default for ProviderConfig {
             default_model: None,
             known_models: Vec::new(),
             context_limit: None,
-            timeout_ms: 60_000,
+            // Per-read, not total: a reasoning model may think silently for
+            // minutes before its first token.
+            timeout_ms: 300_000,
             account_id: None,
         }
     }

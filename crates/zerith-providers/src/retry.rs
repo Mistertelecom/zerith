@@ -58,14 +58,17 @@ fn jitter(bound: u64) -> u64 {
 }
 
 /// Whether a failed send may be repeated, and how long the server asked us to
-/// wait.
+/// wait. Only what provably did not reach the model is repeated: a refused
+/// connection or a failed DNS lookup, or a status the server answered with.
+/// An I/O error (reset, read timeout) may come after the body was sent; a
+/// second POST then bills the same request twice, so it goes to the caller.
 fn retryable(e: &ureq::Error) -> Option<Option<u64>> {
     match e {
-        ureq::Error::Status(status, r) if *status == 429 || *status >= 500 => {
+        ureq::Error::Status(status, r) if matches!(*status, 408 | 429 | 500..=599) => {
             Some(r.header("retry-after").and_then(parse_retry_after))
         }
         ureq::Error::Transport(t) => match t.kind() {
-            ureq::ErrorKind::ConnectionFailed | ureq::ErrorKind::Io => Some(None),
+            ureq::ErrorKind::ConnectionFailed | ureq::ErrorKind::Dns => Some(None),
             _ => None,
         },
         _ => None,
@@ -163,5 +166,56 @@ mod tests {
         assert_eq!(parse_retry_after("2"), Some(2000));
         assert_eq!(parse_retry_after("0.5"), Some(500));
         assert_eq!(parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT"), None);
+    }
+
+    /// A server that reads each request and then hangs up (`close`) or goes
+    /// silent past the read timeout: the POST reached it, so it is sent once.
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn a_post_that_reached_the_server_is_never_sent_twice() {
+        use std::io::{BufRead, BufReader, Read};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        for silent in [false, true] {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/x", l.local_addr().unwrap());
+            let hits = Arc::new(AtomicUsize::new(0));
+            let h = hits.clone();
+            std::thread::spawn(move || {
+                for s in l.incoming().flatten() {
+                    h.fetch_add(1, Ordering::SeqCst);
+                    let mut r = BufReader::new(s);
+                    let mut len = 0;
+                    loop {
+                        let mut line = String::new();
+                        if r.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                            break;
+                        }
+                        if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                            len = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                    let _ = r.read_exact(&mut vec![0; len]);
+                    if silent {
+                        std::thread::sleep(Duration::from_millis(800));
+                    }
+                }
+            });
+            let agent = ureq::AgentBuilder::new()
+                .timeout_read(Duration::from_millis(200))
+                .build();
+            let fast = RetryPolicy {
+                max_retries: 3,
+                base_ms: 1,
+                max_ms: 2,
+                max_retry_after_ms: 10,
+            };
+            let r = send(&fast, &Cancel::default(), || {
+                agent.post(&url).send_string("{\"a\":1}")
+            });
+            assert!(matches!(r, Err(ProviderError::Transport(_))), "{silent}");
+            std::thread::sleep(Duration::from_millis(50));
+            assert_eq!(hits.load(Ordering::SeqCst), 1, "silent={silent}");
+        }
     }
 }

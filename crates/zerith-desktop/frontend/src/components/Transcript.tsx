@@ -10,10 +10,12 @@ import {
   ExternalLink,
   FilePen,
   FileText,
+  GitBranch,
   Globe,
   ImageOff,
   Info,
   ListTodo,
+  Pencil,
   Search,
   Sparkles,
   Terminal,
@@ -308,7 +310,11 @@ function ToolLine({ row }: { row: ToolRow }) {
   );
 }
 
-function AssistantBlock(props: { block: Block & { kind: "assistant" }; sessionId?: string | null }) {
+function AssistantBlock(props: {
+  block: Block & { kind: "assistant" };
+  sessionId?: string | null;
+  onBranch?: (id: number) => void;
+}) {
   const [showReasoning, setShowReasoning] = useState(false);
   const b = props.block;
   const thinking = b.streaming && !b.text && b.tools.length === 0;
@@ -359,6 +365,17 @@ function AssistantBlock(props: { block: Block & { kind: "assistant" }; sessionId
         {b.text && !b.streaming ? (
           <div className="msg-actions">
             <CopyButton text={b.text} label="Copiar" />
+            {props.onBranch && b.stored ? (
+              <button
+                className="copy-btn"
+                onClick={() => props.onBranch!(b.stored!)}
+                aria-label="Ramificar daqui"
+                title="Ramificar daqui: nova conversa com tudo até esta resposta"
+              >
+                <GitBranch size={14} strokeWidth={2} />
+                <span>Ramificar daqui</span>
+              </button>
+            ) : null}
           </div>
         ) : null}
       </div>
@@ -366,9 +383,19 @@ function AssistantBlock(props: { block: Block & { kind: "assistant" }; sessionId
   );
 }
 
-export function Transcript(props: { blocks: Block[]; tail?: React.ReactNode; sessionId?: string | null }) {
+export function Transcript(props: {
+  blocks: Block[];
+  tail?: React.ReactNode;
+  sessionId?: string | null;
+  /** A turn is running: no edit/branch until it lands. */
+  busy?: boolean;
+  onEdit?: (id: number, text: string) => void;
+  onBranch?: (id: number) => void;
+}) {
   const box = useRef<HTMLDivElement>(null);
   const pinned = useRef(true);
+  const onEdit = props.busy ? undefined : props.onEdit;
+  const onBranch = props.busy ? undefined : props.onBranch;
 
   useEffect(() => {
     const el = box.current;
@@ -413,15 +440,30 @@ export function Transcript(props: { blocks: Block[]; tail?: React.ReactNode; ses
             const imgs = [...b.text.matchAll(USER_IMG)];
             const text = imgs.length ? b.text.replace(USER_IMG, "").trim() : b.text;
             return (
-              <div key={i} className="msg-user">
-                {imgs.length ? (
-                  <div className="msg-user-imgs">
-                    {imgs.map((m, j) => (
-                      <MdImage key={j} src={m[2]} alt={m[1]} />
-                    ))}
+              <div key={i} className="msg-user-row">
+                <div className="msg-user">
+                  {imgs.length ? (
+                    <div className="msg-user-imgs">
+                      {imgs.map((m, j) => (
+                        <MdImage key={j} src={m[2]} alt={m[1]} />
+                      ))}
+                    </div>
+                  ) : null}
+                  {text}
+                </div>
+                {onEdit && b.id != null ? (
+                  <div className="msg-actions">
+                    <button
+                      className="copy-btn"
+                      onClick={() => onEdit(b.id!, b.text)}
+                      aria-label="Editar"
+                      title="Editar: nova conversa a partir daqui com esta mensagem no campo"
+                    >
+                      <Pencil size={14} strokeWidth={2} />
+                      <span>Editar</span>
+                    </button>
                   </div>
                 ) : null}
-                {text}
               </div>
             );
           }
@@ -436,7 +478,7 @@ export function Transcript(props: { blocks: Block[]; tail?: React.ReactNode; ses
               </div>
             );
           }
-          return <AssistantBlock key={i} block={b} sessionId={props.sessionId} />;
+          return <AssistantBlock key={i} block={b} sessionId={props.sessionId} onBranch={onBranch} />;
         })}
         {props.tail}
       </div>

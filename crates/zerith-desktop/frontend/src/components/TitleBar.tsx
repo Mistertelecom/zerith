@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Copy, Minus, Square, X } from "lucide-react";
 import { ZerithMark } from "./ui";
+import { UpdatePill } from "./Update";
 
 /** The window's own title bar: the native one is off (decorations: false) so
  * the bar can sit on the app's black. Empty space drags the window (Tauri's
@@ -42,6 +43,8 @@ export function TitleBar({ title, brand = false }: { title?: string; brand?: boo
         </span>
       ) : null}
       <span className="titlebar-fill" data-tauri-drag-region />
+      {/* boot screens (brand) have no app yet to update */}
+      {brand ? null : <UpdatePill />}
       <div className="titlebar-ctrls">
         <button onClick={act((w) => w.minimize())} aria-label="Minimizar" title="Minimizar">
           <Minus size={16} strokeWidth={1.5} />

@@ -11,15 +11,16 @@ pub mod commands;
 pub mod history;
 pub mod learn;
 pub mod mcp;
-pub mod notify;
 pub mod media;
 pub mod memory;
+pub mod notify;
 pub mod prefs;
 pub mod providers;
 pub mod skills;
 pub mod state;
 pub mod turn;
 pub mod types;
+pub mod update;
 pub mod wire;
 pub mod workspace;
 
@@ -177,6 +178,7 @@ pub fn run() {
             commands::list_sessions,
             commands::create_session,
             commands::session_messages,
+            commands::session_fork,
             commands::set_archived,
             commands::export_session,
             commands::save_prefs,
@@ -260,6 +262,8 @@ pub fn run() {
             learn::learning,
             learn::set_learning,
             learn::learn_undo,
+            update::update_check,
+            update::update_install,
         ])
         .run(tauri::generate_context!())
         .expect("erro ao iniciar a janela do Zerith");

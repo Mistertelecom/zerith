@@ -90,7 +90,7 @@ const num = (n: number) => n.toLocaleString("pt-BR");
 function toBlocks(list: ChatMessage[]): Block[] {
   return list.map((m) =>
     m.role === "user"
-      ? ({ kind: "user", text: m.content } as Block)
+      ? ({ kind: "user", text: m.content, id: m.id } as Block)
       : ({
           kind: "assistant",
           text: m.content,
@@ -299,7 +299,27 @@ export default function App() {
     let unlisten: (() => void) | undefined;
     void subscribe(selected).then((u) => (stop ? u() : (unlisten = u)));
     const done = onTurnDone((id) => {
-      if (id === selected) setTurn((prev) => ({ ...prev, busy: false }));
+      if (id !== selected) return;
+      setTurn((prev) => ({ ...prev, busy: false }));
+      // The prompt just sent has no row id until the store has it; "Editar"
+      // needs it, so borrow it from the stored copy (same text, newest first).
+      void api
+        .sessionMessages(selected)
+        .then((list) =>
+          setMessages((prev) =>
+            prev.map((b) =>
+              b.kind === "user" && b.id == null
+                ? {
+                    ...b,
+                    id: [...list]
+                      .reverse()
+                      .find((m) => m.role === "user" && m.content === b.text)?.id,
+                  }
+                : b,
+            ),
+          ),
+        )
+        .catch(() => undefined);
     });
     // The provider/model of a turn is stored when it ends: the sidebar logo
     // reads it from the route the turn just took.
@@ -371,6 +391,29 @@ export default function App() {
       setTurn((prev) => ({ ...prev, busy: false }));
     }
   }, [draft, model, mode, selected, turn.blocks, folder, subscribe]);
+
+  // "Editar" / "Ramificar daqui": a copy of the conversation up to `upto`
+  // (same folder), opened in place of this one, which stays untouched. An
+  // edit copies up to just before the prompt and puts it back in the
+  // composer, to be changed and sent as a normal turn.
+  const fork = useCallback(
+    (upto: number, suffix: string, text?: string) => {
+      if (!selected) return;
+      api
+        .forkSession(selected, upto, `${current?.title ?? "Conversa"} (${suffix})`)
+        .then((s) => {
+          setSessions((prev) => [s, ...prev]);
+          setSelected(s.id);
+          if (text == null) return;
+          setDraft(text);
+          requestAnimationFrame(() =>
+            document.querySelector<HTMLTextAreaElement>(".composer textarea")?.focus(),
+          );
+        })
+        .catch((e) => setStatus(`Não consegui copiar a conversa: ${e}`));
+    },
+    [selected, current],
+  );
 
   // A provider saved in Ajustes changes the models the composer can offer, so
   // the boot payload is re-read when the panel closes.
@@ -706,7 +749,14 @@ export default function App() {
                   </p>
                 </div>
               ) : (
-                <Transcript blocks={surface} tail={tail} sessionId={selected} />
+                <Transcript
+                  blocks={surface}
+                  tail={tail}
+                  sessionId={selected}
+                  busy={turn.busy}
+                  onEdit={(id, text) => fork(id - 1, "editada", text)}
+                  onBranch={(id) => fork(id, "ramo")}
+                />
               )}
               <Composer
                 draft={draft}

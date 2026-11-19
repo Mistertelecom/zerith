@@ -506,6 +506,9 @@ export const api = {
   revealWorkspace: (path: string) => invoke<void>("reveal_workspace", { path }),
   sessionMessages: (id: string, limit = 400) =>
     invoke<ChatMessage[]>("session_messages", { id, limit }),
+  /** A copy up to `uptoMessageId` (all when null), same folder. */
+  forkSession: (sessionId: string, uptoMessageId: number | null, title: string) =>
+    invoke<Session>("session_fork", { sessionId, uptoMessageId, title }),
   setArchived: (id: string, archived: boolean) =>
     invoke<void>("set_archived", { id, archived }),
   exportSession: (id: string) => invoke<string>("export_session", { id }),
@@ -770,4 +773,23 @@ export const changesApi = {
     invoke<FileChange[]>("turn_changes", { sessionId, messageId }),
   undo: (sessionId: string, messageId: number, force = false) =>
     invoke<UndoView>("turn_undo", { sessionId, messageId, force }),
+};
+
+/** What `update_check` found on GitHub's latest release. */
+export interface UpdateInfo {
+  current: string;
+  latest: string | null;
+  /** True only when there is a newer installer to run. */
+  newer: boolean;
+  url: string | null;
+  notes: string;
+  /** One pt-BR line for the window. */
+  message: string;
+  size: number | null;
+}
+
+export const updateApi = {
+  check: () => invoke<UpdateInfo>("update_check"),
+  /** Downloads, checks SHA-256, starts the installer and quits the app. */
+  install: (url: string) => invoke<void>("update_install", { url }),
 };

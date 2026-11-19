@@ -102,6 +102,19 @@ fn fork_copies_messages_up_to_a_point() {
 }
 
 #[test]
+fn fork_keeps_the_folder_and_leaves_the_original_alone() {
+    let (s, id, ids) = seeded();
+    s.set_workspace(&id, "C:/proj").unwrap();
+    let f = s.fork_session(&id, Some(ids[0]), "editada").unwrap();
+    assert_eq!(s.workspace(&f.id).unwrap().as_deref(), Some("C:/proj"));
+    let msgs = s.messages(&f.id, 10, 0).unwrap();
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(msgs[0].content, s.messages(&id, 10, 0).unwrap()[0].content);
+    assert_eq!(s.message_count(&id).unwrap(), 3);
+    assert_eq!(s.workspace(&id).unwrap().as_deref(), Some("C:/proj"));
+}
+
+#[test]
 fn export_jsonl_and_markdown() {
     let (s, id, _) = seeded();
     let mut buf = Vec::new();

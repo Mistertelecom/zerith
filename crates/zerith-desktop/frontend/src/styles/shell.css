@@ -42,6 +42,68 @@
   flex: 1;
   align-self: stretch;
 }
+/* "Nova versão" pill: quiet hairline, the action is the only filled thing. */
+.update-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 460px;
+  height: 28px;
+  margin-right: 8px;
+  padding: 0 5px 0 10px;
+  border-radius: var(--r-full);
+  border: 1px solid var(--line-strong);
+  background: var(--layer-1);
+  color: var(--label-primary);
+  font-size: var(--fs-small);
+  animation: rise var(--t-base) var(--ease);
+}
+.update-pill.bad {
+  border-color: var(--danger-soft);
+  color: var(--danger-text);
+}
+.update-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.update-pill button {
+  flex: none;
+  height: 20px;
+  padding: 0 10px;
+  border-radius: var(--r-full);
+  font-size: var(--fs-caption);
+  font-weight: 600;
+  transition:
+    background var(--t-fast) var(--ease),
+    color var(--t-fast) var(--ease);
+}
+.update-go {
+  margin-left: 4px;
+  background: var(--accent);
+  color: var(--on-accent);
+}
+.update-go:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+.update-go:disabled {
+  opacity: 0.45;
+}
+.update-later {
+  color: var(--label-tertiary);
+}
+.update-later:hover {
+  background: var(--hover);
+  color: var(--label-primary);
+}
+.update-pill button:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+.update-result.bad {
+  color: var(--danger-text);
+}
 .titlebar-ctrls {
   display: flex;
   align-self: stretch;

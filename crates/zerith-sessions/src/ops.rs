@@ -144,8 +144,9 @@ impl Store {
         };
         let tx = self.write_tx()?;
         tx.execute(
-            "INSERT INTO sessions(id, title, source, model, provider, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
-            params![fork.id, fork.title, fork.source.as_str(), fork.model, fork.provider, ts],
+            "INSERT INTO sessions(id, title, source, model, provider, created_at, updated_at, workspace)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, (SELECT workspace FROM sessions WHERE id = ?7))",
+            params![fork.id, fork.title, fork.source.as_str(), fork.model, fork.provider, ts, id],
         )?;
         tx.execute(
             "INSERT INTO messages(session_id, role, content, tool_name, tool_calls, reasoning, token_count, created_at, raw)

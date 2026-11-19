@@ -7727,12 +7727,14 @@ name = "zerith-desktop"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "ring",
  "rusqlite",
  "serde",
  "serde_json",
  "tauri",
  "tauri-build",
  "tokio",
+ "ureq",
  "zerith-core",
  "zerith-importers",
  "zerith-mcp",

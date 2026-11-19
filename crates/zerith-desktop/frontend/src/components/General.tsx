@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
-import { Archive, CircleAlert, Database, FolderOpen, Gauge, Leaf, Palette, ShieldCheck } from "lucide-react";
+import { Archive, CircleAlert, CircleArrowUp, Database, FolderOpen, Gauge, Leaf, Palette, ShieldCheck } from "lucide-react";
 import { api, learnApi, type ProfileView, type StorageView } from "../lib/api";
 import { Card, Row, Segmented, Switch } from "./ui";
+import { UpdateRow } from "./Update";
 
 const THEMES = [
   ["dark", "Escuro"],
@@ -133,6 +134,10 @@ export function GeneralTab(props: GeneralProps) {
         >
           <Switch label="Movimento reduzido" checked={props.reduceMotion} onChange={props.onReduceMotion} />
         </Row>
+      </Card>
+
+      <Card title="Sobre o Zerith" icon={CircleArrowUp} description="Novas versões chegam direto do GitHub.">
+        <UpdateRow />
       </Card>
 
       <Card title="Privacidade" icon={ShieldCheck} description="O que o agente pode lembrar entre conversas.">

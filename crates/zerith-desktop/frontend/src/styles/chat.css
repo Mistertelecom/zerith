@@ -79,8 +79,18 @@
   transition: opacity var(--t-base) var(--ease);
 }
 .msg-assistant:hover .msg-actions,
+.msg-user-row:hover .msg-actions,
 .msg-actions:focus-within {
   opacity: 1;
+}
+/* A sent prompt with its hover actions ("Editar") under the bubble. */
+.msg-user-row {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+}
+.msg-user-row .msg-actions {
+  margin: 2px -8px -18px 0;
 }
 
 .msg-note {

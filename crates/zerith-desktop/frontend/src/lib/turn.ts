@@ -3,7 +3,8 @@
 import type { LearnedItem, Question, Todo, TurnEvent } from "./api";
 
 export type Block =
-  | { kind: "user"; text: string }
+  /** `id`: the stored row (history), for "Editar". */
+  | { kind: "user"; text: string; id?: number }
   | {
       kind: "assistant";
       text: string;

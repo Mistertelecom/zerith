@@ -192,6 +192,23 @@ pub async fn session_messages(
         .map_err(|e| e.to_string())
 }
 
+/// A copy of a conversation up to `upto_message_id` (all when `None`), in the
+/// same folder; the original is untouched (edit a prompt, branch an answer).
+#[tauri::command]
+pub async fn session_fork(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+    upto_message_id: Option<i64>,
+    title: String,
+) -> Cmd<SessionView> {
+    let st = Store::open(state.db()).map_err(|e| e.to_string())?;
+    let session = st
+        .fork_session(&session_id, upto_message_id, title.trim())
+        .map_err(|e| e.to_string())?;
+    let workspace = st.workspace(&session.id).map_err(|e| e.to_string())?;
+    Ok(SessionView { session, workspace })
+}
+
 #[tauri::command]
 pub async fn set_archived(
     state: tauri::State<'_, AppState>,

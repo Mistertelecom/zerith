@@ -6,10 +6,13 @@ name: Zerith release
 #   Windows  zerith-<tag>-windows-x86_64.zip     + .sha256
 #   Linux    zerith-<tag>-linux-x86_64.tar.gz    + .sha256
 #   macOS    zerith-<tag>-macos-<arch>.tar.gz    + .sha256
+#   Windows  Zerith_<ver>_x64-setup.exe          + .sha256   (desktop installer)
 #
-# These are archives of binaries. There is no installer, no code signing and no
-# notarization, and the release notes say so. `docs/release.md` is the source
-# of truth. This file has never been executed by the author's tooling: the
+# The archives are binaries; the one installer is the Tauri NSIS setup of the
+# desktop window, which the app's own updater (crates/zerith-desktop/src/
+# update.rs) downloads from the *published* release and checks against its
+# `.sha256`. No code signing and no notarization, and the release notes say
+# so. `docs/release.md` is the source of truth. This file has never been executed by the author's tooling: the
 # first tag run is the first real test.
 
 on:
@@ -48,6 +51,19 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libxcursor-dev libvulkan-dev
+      # The updater compares the tag with the version compiled into the app; a
+      # tag that disagrees with Cargo.toml or tauri.conf.json would offer the
+      # same update forever, so refuse it here.
+      - name: Tag matches the app version
+        if: startsWith(github.ref, 'refs/tags/zerith-v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#zerith-v}"
+          cargo_ver="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)"
+          conf_ver="$(sed -n 's/^  "version": "\(.*\)",/\1/p' crates/zerith-desktop/tauri.conf.json)"
+          echo "tag=${tag} cargo=${cargo_ver} tauri=${conf_ver}"
+          [ "$tag" = "$cargo_ver" ] && [ "$tag" = "$conf_ver" ]
       # The UI crate compiles Rune (wgpu, winit): minutes, and no GPU needed for
       # its tests. It is built below, not tested here, same as the CI lane.
       - name: Test (workspace, without the window)
@@ -88,12 +104,41 @@ jobs:
           fi
           cat "${archive}.sha256"
           echo "archive=${archive}" >> "$GITHUB_OUTPUT"
+      # Desktop installer (Windows only): Tauri's NSIS bundle of zerith-desktop.
+      - uses: actions/setup-node@v4
+        if: runner.os == 'Windows'
+        with:
+          node-version: 22
+      - name: Desktop frontend dependencies
+        if: runner.os == 'Windows'
+        shell: bash
+        working-directory: crates/zerith-desktop/frontend
+        run: |
+          if [ -f package-lock.json ]; then npm ci; else npm install --no-audit --no-fund; fi
+      - name: Build the desktop installer (NSIS)
+        if: runner.os == 'Windows'
+        shell: bash
+        working-directory: crates/zerith-desktop
+        # beforeBuildCommand (tauri.conf.json) runs the frontend build first.
+        run: npx --yes @tauri-apps/cli@2 build --bundles nsis
+      - name: Package the desktop installer
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          src=(target/release/bundle/nsis/*-setup.exe)
+          [ "${#src[@]}" -eq 1 ] && [ -f "${src[0]}" ]
+          setup="$(basename "${src[0]}")"
+          cp "${src[0]}" "dist/${setup}"
+          # Bare file name inside, so `sha256sum -c` works next to the download.
+          (cd dist && sha256sum "$setup" > "${setup}.sha256" && cat "${setup}.sha256")
       - uses: actions/upload-artifact@v4
         with:
           name: zerith-${{ runner.os }}
           path: |
             dist/*.zip
             dist/*.tar.gz
+            dist/*-setup.exe
             dist/*.sha256
           if-no-files-found: error
 
@@ -116,7 +161,10 @@ jobs:
           {
             echo "## Zerith ${GITHUB_REF_NAME}"
             echo
-            echo "Arquivos portáteis (binários), sem instalador. **Sem assinatura de código e sem notarização**:"
+            echo "Arquivos portáteis (binários) e, no Windows, o instalador do app de janela (\`Zerith_<versão>_x64-setup.exe\`)."
+            echo "O Zerith instalado avisa sozinho quando esta versão for **publicada** (rascunho não aparece para ele)."
+            echo
+            echo "**Sem assinatura de código e sem notarização**:"
             echo "o Windows SmartScreen e o Gatekeeper do macOS vão avisar. Confira o download com o arquivo \`.sha256\` ao lado;"
             echo "isso prova integridade, não autoria."
             echo

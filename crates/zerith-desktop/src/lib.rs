@@ -11,6 +11,7 @@ pub mod commands;
 pub mod history;
 pub mod learn;
 pub mod mcp;
+pub mod notify;
 pub mod media;
 pub mod memory;
 pub mod prefs;

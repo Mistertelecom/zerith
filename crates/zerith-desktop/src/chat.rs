@@ -101,11 +101,23 @@ pub fn send_turn(
     let emit_app = app.clone();
     let emit_session = session.clone();
     let mut emit = move |ev: TurnEvent| {
+        // Waiting on the person: call them back if the window is behind.
+        match &ev {
+            TurnEvent::Approval { tool, .. } => {
+                crate::notify::ping(&emit_app, "Zerith precisa da sua aprovação", tool)
+            }
+            TurnEvent::Question { .. } => crate::notify::ping(
+                &emit_app,
+                "Zerith tem uma pergunta",
+                "Responda na conversa para ele continuar.",
+            ),
+            _ => {}
+        }
         let _ = emit_app.emit("turn:event", (&emit_session, ev));
     };
 
     std::thread::spawn(move || {
-        let _ = turn::run(
+        let result = turn::run(
             &setup,
             &session,
             &args.model,
@@ -119,6 +131,10 @@ pub fn send_turn(
         // composer stays disabled otherwise.
         app.state::<Turns>().take(&session);
         let _ = app.emit("turn:done", &session);
+        match result {
+            Ok(()) => crate::notify::ping(&app, "Zerith respondeu", "A resposta está pronta."),
+            Err(e) => crate::notify::ping(&app, "A conversa parou com erro", &e),
+        }
     });
 
     Ok(())

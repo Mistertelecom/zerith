@@ -73,13 +73,23 @@ pub(crate) fn body(req: &ChatRequest, stream: bool) -> Value {
     }
     let mut b = json!({
         "model": req.model,
-        "messages": messages,
         "max_tokens": req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
         "stream": stream,
     });
     if !system.is_empty() {
         b["system"] = json!(system.join("\n\n"));
     }
+    // Last block of the conversation: the next request starts with all of it,
+    // so it is read from cache instead of billed again (4 breakpoints max:
+    // tools, system, this one).
+    if let Some(block) = messages
+        .last_mut()
+        .and_then(|m| m["content"].as_array_mut())
+        .and_then(|c| c.last_mut())
+    {
+        block["cache_control"] = json!({"type": "ephemeral"});
+    }
+    b["messages"] = json!(messages);
     if let Some(t) = req.temperature {
         b["temperature"] = json!(t);
     }
@@ -89,6 +99,11 @@ pub(crate) fn body(req: &ChatRequest, stream: bool) -> Value {
             .iter()
             .map(|t| json!({"name": t.name, "description": t.description, "input_schema": t.parameters}))
             .collect();
+        // Prompt cache (like Claude Code): the tool list rarely changes, so
+        // the server reuses it and bills a fraction of the input on reuse.
+        if let Some(last) = b["tools"].as_array_mut().and_then(|t| t.last_mut()) {
+            last["cache_control"] = json!({"type": "ephemeral"});
+        }
         if let Some(choice) = &req.tool_choice {
             b["tool_choice"] = match choice.as_str() {
                 "auto" => json!({"type": "auto"}),
@@ -171,7 +186,11 @@ fn usage(u: &Value, input_seen: u64) -> Option<Usage> {
     if !u.is_object() {
         return None;
     }
-    let input = u["input_tokens"].as_u64().unwrap_or(input_seen);
+    // With the prompt cache, `input_tokens` counts only the uncached part:
+    // the prompt really sent is that plus what was read from / written to cache.
+    let cached = u["cache_read_input_tokens"].as_u64().unwrap_or(0)
+        + u["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+    let input = u["input_tokens"].as_u64().unwrap_or(input_seen) + cached;
     let output = u["output_tokens"].as_u64().unwrap_or(0);
     Some(Usage {
         prompt_tokens: input,
@@ -213,7 +232,8 @@ impl AnthropicStream {
         let index = v["index"].as_u64().unwrap_or(0);
         match v["type"].as_str() {
             Some("message_start") => {
-                self.input_tokens = v["message"]["usage"]["input_tokens"].as_u64().unwrap_or(0);
+                // Cached prompt is reported apart: count it as input too.
+                self.input_tokens = usage(&v["message"]["usage"], 0).map_or(0, |u| u.prompt_tokens);
             }
             Some("content_block_start") => {
                 let b = &v["content_block"];
@@ -310,6 +330,45 @@ mod tests {
         assert_eq!(body_for(&key, &req, false)["system"], "sou o zerith");
     }
     use crate::ChatMessage;
+
+    #[test]
+    fn the_tools_and_the_conversation_so_far_are_marked_for_the_prompt_cache() {
+        let mut req = ChatRequest::new(
+            "claude",
+            vec![
+                ChatMessage::user("a"),
+                ChatMessage::assistant("b", vec![]),
+                ChatMessage::user("c"),
+            ],
+        );
+        req.tools = vec![
+            crate::ToolDef {
+                name: "x".into(),
+                description: String::new(),
+                parameters: json!({"type": "object"}),
+            },
+            crate::ToolDef {
+                name: "y".into(),
+                description: String::new(),
+                parameters: json!({"type": "object"}),
+            },
+        ];
+        let b = body(&req, false);
+        let eph = json!({"type": "ephemeral"});
+        assert_eq!(b["tools"][1]["cache_control"], eph);
+        assert!(b["tools"][0].get("cache_control").is_none());
+        assert_eq!(b["messages"][2]["content"][0]["cache_control"], eph);
+        assert!(b["messages"][0]["content"][0]
+            .get("cache_control")
+            .is_none());
+        // what was read from cache still counts as prompt
+        let u = usage(
+            &json!({"input_tokens": 10, "cache_read_input_tokens": 900, "cache_creation_input_tokens": 90, "output_tokens": 5}),
+            0,
+        )
+        .unwrap();
+        assert_eq!((u.prompt_tokens, u.total_tokens), (1000, 1005));
+    }
 
     #[test]
     fn system_is_top_level_and_tool_results_merge_into_one_user_turn() {

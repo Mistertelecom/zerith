@@ -969,7 +969,8 @@ mod tests {
         );
         std::fs::write(dir.path().join("a.txt"), "x").unwrap();
         let sh = |p: &Policy, c: &str| p.check_tool("shell", &Action::Shell(c.into()));
-        assert_eq!(sh(&p, "dir /b"), Verdict::Allow);
+        // `/b` is a flag to cmd and a path to sh: this line is the same on both.
+        assert_eq!(sh(&p, "echo oi"), Verdict::Allow);
         assert_eq!(sh(&p, "type a.txt"), Verdict::Allow);
         assert!(
             matches!(

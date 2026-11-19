@@ -13,6 +13,8 @@ export type Block =
       streaming: boolean;
       /** Row id of the stored answer (`done.stored` / history): keys its diff. */
       stored?: number;
+      /** Tool calls already behind the text, so text after a new one starts a paragraph. */
+      toolsAtText?: number;
     }
   /** `learned`: what the background review saved after the turn (with undo). */
   | { kind: "note"; text: string; learned?: LearnedItem[]; sub?: string };
@@ -64,6 +66,9 @@ export function applyEvent(state: TurnState, ev: TurnEvent): TurnState {
   switch (ev.type) {
     case "delta": {
       const a = assistant(state);
+      // Text after a tool call starts a new paragraph, not the old sentence.
+      if (a.tools.length > (a.toolsAtText ?? 0) && a.text && !/\s$/.test(a.text)) a.text += "\n\n";
+      a.toolsAtText = a.tools.length;
       a.text += ev.text;
       return state;
     }

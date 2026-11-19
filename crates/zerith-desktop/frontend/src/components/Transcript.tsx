@@ -112,6 +112,9 @@ function MdImage({ src, alt }: { src: string; alt: string }) {
     );
   }
   if (!url) return <span className="md-img loading" aria-label="Carregando imagem" />;
+  if (url.startsWith("data:video/") || /\.(mp4|m4v|webm|mov)$/i.test(src)) {
+    return <video className="md-video" src={url} controls preload="metadata" aria-label={alt || "Vídeo"} />;
+  }
   return (
     <>
       <button className="md-img" onClick={() => setZoom(true)} title={alt || "Ampliar"}>

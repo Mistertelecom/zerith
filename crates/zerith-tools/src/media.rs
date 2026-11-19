@@ -443,15 +443,19 @@ fn report(
             f.bytes.div_ceil(1024)
         ));
     }
-    if kind == Kind::Image {
-        for f in files {
-            out.push_str(&markdown_image(prompt, &f.path));
-            out.push('\n');
-        }
-        out.push_str(
-            "Cole a(s) linha(s) Markdown acima na resposta para o usuário ver a imagem.\n",
-        );
+    // Same `![](path)` line for video: the chat shows a player for .mp4.
+    for f in files {
+        out.push_str(&markdown_image(prompt, &f.path));
+        out.push('\n');
     }
+    out.push_str(&format!(
+        "Cole a(s) linha(s) Markdown acima na resposta para o usuário ver {}.\n",
+        if kind == Kind::Image {
+            "a imagem"
+        } else {
+            "o vídeo"
+        }
+    ));
     out
 }
 

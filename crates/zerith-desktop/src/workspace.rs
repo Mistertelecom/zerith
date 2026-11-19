@@ -76,6 +76,9 @@ pub async fn workspace_files(state: State<'_, AppState>, root: Option<String>) -
 /// command must not turn into a way to pull arbitrary files into the window:
 /// only image extensions, only regular files, only this big.
 const IMAGE_CAP: u64 = 20 * 1024 * 1024;
+// ponytail: videos travel as a data URL like images; past this cap the chat
+// offers the system player. Asset protocol if bigger videos must play inline.
+const VIDEO_CAP: u64 = 60 * 1024 * 1024;
 
 fn image_mime(path: &Path) -> Option<&'static str> {
     Some(
@@ -88,6 +91,9 @@ fn image_mime(path: &Path) -> Option<&'static str> {
             "avif" => "image/avif",
             // Scripts inside an SVG do not run when it is shown through <img>.
             "svg" => "image/svg+xml",
+            "mp4" | "m4v" => "video/mp4",
+            "webm" => "video/webm",
+            "mov" => "video/quicktime",
             _ => return None,
         },
     )
@@ -153,12 +159,16 @@ if ($d.ShowDialog($f) -eq 'OK') { $d.SelectedPath }";
 /// A local image checked against the rules above.
 fn checked_image(raw: &str) -> Cmd<(PathBuf, &'static str)> {
     let path = image_path(raw);
-    let mime = image_mime(&path).ok_or("só abro imagens (png, jpg, gif, webp, bmp, avif, svg)")?;
+    let mime = image_mime(&path)
+        .ok_or("só abro imagens (png, jpg, gif, webp, bmp, avif, svg) e vídeos (mp4, webm, mov)")?;
     let meta = std::fs::metadata(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     if !meta.is_file() {
         return Err(format!("{} não é um arquivo", path.display()));
     }
-    if meta.len() > IMAGE_CAP {
+    if mime.starts_with("video/") && meta.len() > VIDEO_CAP {
+        return Err("vídeo maior que 60 MB: abra no player".into());
+    }
+    if !mime.starts_with("video/") && meta.len() > IMAGE_CAP {
         return Err("imagem maior que 20 MB".into());
     }
     Ok((path, mime))
@@ -285,6 +295,14 @@ mod tests {
             image_data_url(&file_url).unwrap(),
             url,
             "file:// urls name the same file"
+        );
+
+        let mp4 = d.join("v.mp4");
+        std::fs::write(&mp4, [0, 0, 0]).unwrap();
+        assert_eq!(
+            image_data_url(&mp4.to_string_lossy()).unwrap(),
+            "data:video/mp4;base64,AAAA",
+            "a generated video plays in the chat"
         );
 
         let secret = d.join("auth.json");

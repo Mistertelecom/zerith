@@ -418,16 +418,22 @@ fn console_output_is_read_in_the_machine_code_page() {
 /// A command that leaves a program behind (`start /b`, a dev server) used to
 /// keep the output pipes open forever: `out.join()` waited for a process that
 /// is not the command. It must return, and say where that program belongs.
+/// Written for the shell that runs it: `&` in Git Bash, `start /b` in cmd.
 #[cfg(windows)]
 #[test]
 fn a_grandchild_holding_the_pipe_does_not_hang_the_shell() {
     let dir = scratch();
     let p = policy(dir.path(), Mode::Bypass);
+    let cmd = if zerith_core::shellparse::windows_bash().is_some() {
+        "ping -n 12 127.0.0.1 > /dev/null &"
+    } else {
+        "start /b ping -n 12 127.0.0.1 > NUL"
+    };
     let started = Instant::now();
     let out = Registry::new()
         .call(
             "shell",
-            &json!({"command": "start /b ping -n 12 127.0.0.1 > NUL", "timeout_secs": 20}),
+            &json!({"command": cmd, "timeout_secs": 20}),
             &ctx(&p),
         )
         .expect("the shell itself finished at once");

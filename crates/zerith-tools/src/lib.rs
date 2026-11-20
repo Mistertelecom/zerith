@@ -37,7 +37,7 @@ pub use ask_user::{parse_questions, Question, QuestionOption};
 pub use authoring::{tools as authoring_tools, Authoring};
 pub use builtin::shell_command;
 pub use host::{AgentRequest, EventSink, Host, HostEvent, Services, SkillLoad};
-pub use jobs::{background_jobs, stop_background_job, BackgroundJob};
+pub use jobs::{background_jobs, kill_all_jobs, stop_background_job, BackgroundJob};
 pub use media::{tools as media_tools, tools_with_key as media_tools_with_key};
 pub use skill_tool::check as check_skill_args;
 pub use tasks::{check as check_task_args, STATUSES as TASK_STATUSES};

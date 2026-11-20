@@ -282,6 +282,13 @@ pub fn run() {
             update::update_check,
             update::update_install,
         ])
-        .run(tauri::generate_context!())
-        .expect("erro ao iniciar a janela do Zerith");
+        .build(tauri::generate_context!())
+        .expect("erro ao preparar a janela do Zerith")
+        .run(|_, event| {
+            // A background job outlives its turn, not the app: closing the
+            // window stops whatever is still running.
+            if matches!(event, tauri::RunEvent::Exit) {
+                zerith_tools::kill_all_jobs();
+            }
+        });
 }

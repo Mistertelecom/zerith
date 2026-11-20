@@ -56,6 +56,11 @@ type Table = Mutex<Vec<(String, Job)>>;
 /// jobs of any turn. Weak: a table still dies with its host.
 static TABLES: Mutex<Vec<Weak<Table>>> = Mutex::new(Vec::new());
 
+/// Jobs outlive the turn that started them: the table is kept alive here, so a
+/// GUI script (`python janela.py`) does not lose its window when the answer
+/// lands. `kill_all` stops them when the app closes.
+static KEEP: Mutex<Vec<Arc<Table>>> = Mutex::new(Vec::new());
+
 pub struct Jobs {
     jobs: Arc<Table>,
 }
@@ -116,6 +121,22 @@ pub fn background_jobs() -> Vec<BackgroundJob> {
 
 /// Stops job `id` wherever it runs (ids are unique per process): the window's
 /// Stop button. The model sees it as ended at its next `shell_output`.
+/// Stops every job of the process: the window is closing.
+pub fn kill_all_jobs() {
+    for table in tables() {
+        let ids: Vec<String> = table
+            .lock()
+            .map(|jobs| jobs.iter().map(|(i, _)| i.clone()).collect())
+            .unwrap_or_default();
+        for id in ids {
+            let _ = kill_in(&table, &id);
+        }
+    }
+    if let Ok(mut keep) = KEEP.lock() {
+        keep.clear();
+    }
+}
+
 pub fn stop_background_job(id: &str) -> Result<String> {
     let table = tables()
         .into_iter()
@@ -180,6 +201,11 @@ impl Jobs {
             ));
             id
         };
+        if let Ok(mut keep) = KEEP.lock() {
+            if !keep.iter().any(|t| Arc::ptr_eq(t, &self.jobs)) {
+                keep.push(self.jobs.clone());
+            }
+        }
         for r in to_join {
             let _ = r.join();
         }
@@ -257,6 +283,15 @@ fn find<'a>(jobs: &'a mut [(String, Job)], id: &str) -> Result<&'a mut Job> {
 
 impl Drop for Jobs {
     fn drop(&mut self) {
+        // A background job is adopted by `KEEP`: it belongs to the app, not to
+        // the turn that started it, and stops with `shell_kill` (or when the
+        // app closes). Everything else dies with its host, as before.
+        if KEEP
+            .lock()
+            .is_ok_and(|keep| keep.iter().any(|t| Arc::ptr_eq(t, &self.jobs)))
+        {
+            return;
+        }
         if let Ok(mut jobs) = self.jobs.lock() {
             for (_, j) in jobs.iter_mut() {
                 if j.exit.is_none() {
@@ -385,6 +420,11 @@ mod tests {
 
         assert!(listed(&b).is_some());
         drop(jobs);
-        assert!(listed(&b).is_none(), "jobs die with their host");
+        assert!(
+            listed(&b).is_some(),
+            "a background job outlives the turn that started it"
+        );
+        kill_all_jobs();
+        assert!(listed(&b).is_none(), "closing the app stops the jobs");
     }
 }

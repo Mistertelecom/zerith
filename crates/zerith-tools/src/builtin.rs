@@ -155,7 +155,7 @@ pub(crate) fn all() -> Vec<Box<dyn crate::Tool>> {
         ),
         tool(
             "shell",
-            "Executa um comando no shell dentro do workspace: bash (Git Bash no Windows, quando instalado; senão cmd), sh nos demais.",
+            "Executa um comando no shell dentro do workspace: bash (Git Bash no Windows, quando instalado; senão cmd), sh nos demais. Programa que não termina sozinho (janela gráfica, servidor, `python -m http.server`) precisa de run_in_background: em primeiro plano ele é encerrado no timeout e a janela fecha junto.",
             json!({"type": "object", "properties": {
                 "command": {"type": "string"},
                 "timeout_secs": {"type": "integer", "description": "padrão 120, máximo 600"},

@@ -1,6 +1,6 @@
 // Background shell jobs (`shell run_in_background`) still running, with a Stop
-// button each. They live only while their turn runs (the turn owns the tool
-// host), so the strip polls while a turn is busy and once on mount.
+// button each. A job outlives its turn (a GUI script keeps its window after the
+// answer), so the strip polls while one exists, not only while a turn runs.
 import { useCallback, useEffect, useState } from "react";
 import { CircleStop, SquareTerminal } from "lucide-react";
 import { jobsApi, type BackgroundJob, type Session } from "../lib/api";
@@ -32,10 +32,9 @@ export function BackgroundJobs({
 
   useEffect(() => {
     load();
-    if (!active) return;
-    const t = setInterval(load, 2000);
+    const t = setInterval(load, active || jobs.length ? 2000 : 8000);
     return () => clearInterval(t);
-  }, [active, load]);
+  }, [active, jobs.length > 0, load]);
 
   if (!jobs.length) return null;
   return (

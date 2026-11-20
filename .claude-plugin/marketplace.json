@@ -1,0 +1,77 @@
+{
+  "name": "zerith",
+  "owner": {
+    "name": "Joao Pedro Mota",
+    "url": "https://github.com/Mistertelecom"
+  },
+  "metadata": {
+    "description": "Loja de plugins do Zerith: pacotes no formato do Claude Code (skills, comandos, agentes e MCP) que a IA usa sozinha quando o assunto aparece.",
+    "version": "1"
+  },
+  "plugins": [
+    {
+      "name": "claude-bughunter",
+      "description": "Bug bounty e red team externo: 83 skills (hunt-* por classe de vulnerabilidade, recon/OSINT, M365/Entra, Okta, VPN, APK/iOS, relatório) e 15 comandos (/hunt, /recon, /chain...). Use só em alvos com autorização.",
+      "version": "2.1.0",
+      "category": "security",
+      "license": "MIT (código) + CC BY 4.0 (conteúdo)",
+      "homepage": "https://github.com/elementalsouls/Claude-BugHunter",
+      "source": {
+        "source": "github",
+        "repo": "elementalsouls/Claude-BugHunter"
+      }
+    },
+    {
+      "name": "cli-anything",
+      "description": "Gera um CLI completo e com estado para qualquer programa de interface gráfica (GIMP, Blender, LibreOffice...), seguindo a metodologia HARNESS.md. Comandos /cli-anything, list, refine, test e validate.",
+      "category": "development",
+      "license": "Apache-2.0",
+      "homepage": "https://github.com/HKUDS/CLI-Anything",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/HKUDS/CLI-Anything.git",
+        "path": "cli-anything-plugin"
+      }
+    },
+    {
+      "name": "stitch-skills",
+      "description": "Google Stitch: design para código (React, React Native, shadcn/ui, dashboard Vite, vídeo Remotion), código para design, DESIGN.md e sistema de design. 15 skills dos pacotes stitch-build, stitch-design e stitch-utilities.",
+      "version": "1.0.0",
+      "category": "design",
+      "license": "Apache-2.0",
+      "homepage": "https://github.com/google-labs-code/stitch-skills",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/google-labs-code/stitch-skills.git",
+        "path": "plugins"
+      },
+      "skills": [
+        "./stitch-build/skills",
+        "./stitch-design/skills",
+        "./stitch-utilities/skills"
+      ]
+    },
+    {
+      "name": "astryx",
+      "description": "Astryx (Meta), sistema de design e biblioteca de UI pelo comando astryx: componentes, layout, estilo e tema. A IA usa quando o projeto mexe em interface ou depende de @astryxdesign.",
+      "version": "0.1.0",
+      "category": "design",
+      "license": "MIT",
+      "homepage": "https://github.com/meta/astryx",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/meta/astryx.git",
+        "path": "plugins/astryx"
+      }
+    },
+    {
+      "name": "billion-context",
+      "description": "Conversas longas sem perder o fio: o Zerith passa o chat pelo proxy local billion-context (ranxianglei, MIT). Esta skill explica como ligar, instalar e conferir; o proxy em si já é integrado em Ajustes › Geral.",
+      "version": "0.1.216",
+      "category": "productivity",
+      "license": "MIT",
+      "homepage": "https://github.com/ranxianglei/billion-context",
+      "source": "./plugins/billion-context"
+    }
+  ]
+}

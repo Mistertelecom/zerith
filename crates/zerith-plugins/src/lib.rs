@@ -13,6 +13,13 @@
 //! `agents`, `hooks` and `mcp` entries in the manifest. Nothing in a bundle is
 //! active until the plugin is enabled **and** reviewed; [`Library::contributions`]
 //! returns only what such plugins declare, and the host decides what to load.
+//!
+//! Plugins in the Claude Code layout (`.claude-plugin/plugin.json`) install
+//! as they are ([`claude`]), and come from marketplaces ([`market`]): the
+//! built-in `zerith` one or any `owner/repo` added by the person.
+
+mod claude;
+pub mod market;
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -220,11 +227,58 @@ impl Library {
 
     /// Copies a plugin directory in and records it as *disabled and
     /// untrusted*. Installing is not trusting, and this is the only place that
-    /// distinction is enforced.
+    /// distinction is enforced. `from` holds a Zerith `plugin.json` or a Claude
+    /// Code `.claude-plugin/plugin.json`.
     pub fn install(&self, from: &Path) -> Result<Plugin> {
-        let manifest = read_manifest(&from.join(MANIFEST))?;
+        let claude = from.join(".claude-plugin").join(MANIFEST);
+        if !claude.is_file() && from.join(MANIFEST).is_file() {
+            let m = read_manifest(&from.join(MANIFEST))?;
+            // A root `plugin.json` that declares nothing is a Claude Code
+            // manifest kept at the root: find its parts by convention.
+            let empty = m.command.trim().is_empty()
+                && m.skills.is_empty()
+                && m.agents.is_empty()
+                && m.hooks.is_empty()
+                && m.mcp.is_empty();
+            if !empty {
+                return self.install_as(from, m, None);
+            }
+            return self.install_claude(from, read_json(&from.join(MANIFEST))?);
+        }
+        self.install_claude(from, read_json(&claude)?)
+    }
+
+    /// A Claude Code plugin: `v` is its manifest (a marketplace entry's fields
+    /// already merged in). The parts are found after the copy, so command
+    /// skills are written into the installed folder, never the source.
+    pub(crate) fn install_claude(&self, from: &Path, v: serde_json::Value) -> Result<Plugin> {
+        let name = v["name"].as_str().unwrap_or_default().to_string();
+        let shell = Manifest {
+            name,
+            version: String::new(),
+            description: String::new(),
+            license: None,
+            command: String::new(),
+            args: Vec::new(),
+            capabilities: Vec::new(),
+            skills: Vec::new(),
+            agents: Vec::new(),
+            hooks: Vec::new(),
+            mcp: Vec::new(),
+        };
+        self.install_as(from, shell, Some(v))
+    }
+
+    fn install_as(
+        &self,
+        from: &Path,
+        mut manifest: Manifest,
+        claude: Option<serde_json::Value>,
+    ) -> Result<Plugin> {
         validate_name(&manifest.name)?;
-        validate_bundle(&manifest, from)?;
+        if claude.is_none() {
+            validate_bundle(&manifest, from)?;
+        }
         let mut plugins = self.plugins()?;
         if plugins.iter().any(|p| p.manifest.name == manifest.name) {
             return Err(PluginError::Exists(manifest.name));
@@ -234,6 +288,20 @@ impl Library {
             std::fs::remove_dir_all(&dest)?;
         }
         copy_dir(from, &dest)?;
+        if let Some(v) = claude {
+            let abs = std::path::absolute(&dest)?;
+            let built = claude::manifest(&v, &abs).and_then(|m| {
+                validate_bundle(&m, &dest)?;
+                Ok(m)
+            });
+            match built {
+                Ok(m) => manifest = m,
+                Err(e) => {
+                    let _ = std::fs::remove_dir_all(&dest);
+                    return Err(e);
+                }
+            }
+        }
         let plugin = Plugin {
             manifest,
             status: Status::Disabled,
@@ -288,13 +356,16 @@ impl Library {
             .ok_or_else(|| PluginError::Missing(name.into()))
     }
 
-    /// Skills, agents, hooks and MCP servers declared by plugins that are
-    /// enabled **and** reviewed. Nothing is read from disk beyond the index and
-    /// nothing is started: loading what this returns is the host's decision.
+    /// What enabled plugins add. Skills and agents are text the model reads
+    /// (a skill's `allowed-tools` grants nothing, and every command still
+    /// goes through approval), so they load once the plugin is enabled; hooks
+    /// and MCP servers run code and also need the plugin reviewed. Nothing is
+    /// read from disk beyond the index and nothing is started: loading what
+    /// this returns is the host's decision.
     pub fn contributions(&self) -> Result<Contributions> {
         let mut out = Contributions::default();
         for p in self.plugins()? {
-            if p.status != Status::Enabled || !p.trusted {
+            if p.status != Status::Enabled {
                 continue;
             }
             let m = &p.manifest;
@@ -302,6 +373,9 @@ impl Library {
                 .extend(m.skills.iter().map(|s| (m.name.clone(), p.dir.join(s))));
             out.agents
                 .extend(m.agents.iter().map(|a| (m.name.clone(), p.dir.join(a))));
+            if !p.trusted {
+                continue;
+            }
             out.hooks
                 .extend(m.hooks.iter().map(|h| (m.name.clone(), h.clone())));
             for e in &m.mcp {
@@ -429,6 +503,19 @@ fn validate_bundle(m: &Manifest, root: &Path) -> Result<()> {
     Ok(())
 }
 
+fn read_json(path: &Path) -> Result<serde_json::Value> {
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        PluginError::Invalid(format!(
+            "sem {MANIFEST} nem .claude-plugin/{MANIFEST} em {} ({e})",
+            path.parent()
+                .and_then(Path::parent)
+                .unwrap_or(path)
+                .display()
+        ))
+    })?;
+    Ok(serde_json::from_str(text.trim_start_matches('\u{feff}'))?)
+}
+
 fn validate_name(name: &str) -> Result<()> {
     let ok = !name.is_empty()
         && name.len() <= 64
@@ -448,14 +535,14 @@ fn validate_name(name: &str) -> Result<()> {
 }
 
 /// Recursive copy without following symlinks: a plugin cannot pull the rest of
-/// the filesystem into the library through a link.
+/// the filesystem into the library through a link. A clone's `.git` stays out.
 fn copy_dir(from: &Path, to: &Path) -> Result<()> {
     std::fs::create_dir_all(to)?;
     for entry in std::fs::read_dir(from)? {
         let entry = entry?;
         let ty = entry.file_type()?;
         let dest = to.join(entry.file_name());
-        if ty.is_symlink() {
+        if ty.is_symlink() || entry.file_name() == ".git" {
             continue;
         }
         if ty.is_dir() {

@@ -11,7 +11,7 @@ use zerith_core::{
     Settings, TokenSaverSettings,
 };
 use zerith_mcp::config::{
-    add_server, approve_server, load_servers, parse_add, remove_server, user_file,
+    add_server, approve_project_server, load_servers, parse_add, remove_server, user_file,
 };
 use zerith_mcp::{Client as McpClient, McpRegistry};
 use zerith_memory::{Scope, SqliteMemory};
@@ -84,6 +84,9 @@ pub fn rewind_cmd(paths: &Paths, args: &[String]) -> Res {
                 if *existed { "restaurar" } else { "apagar   " }
             );
         }
+        for n in &p.notes {
+            println!("aviso: {n}");
+        }
         println!("escolha --code, --conversation ou --both para aplicar.");
         println!("{}", LIMITS);
         return Ok(());
@@ -93,6 +96,9 @@ pub fn rewind_cmd(paths: &Paths, args: &[String]) -> Res {
         "turno {turn}: {} arquivo(s) restaurado(s), {} removido(s), {} mensagem(ns) arquivada(s)",
         report.files_restored, report.files_removed, report.messages_archived
     );
+    for n in &report.notes {
+        println!("{n}");
+    }
     for e in &report.errors {
         eprintln!("zerith: {e}");
     }
@@ -114,8 +120,8 @@ pub fn rewind_cmd(paths: &Paths, args: &[String]) -> Res {
     }
 }
 
-const LIMITS: &str = "limite: só edições feitas pelas ferramentas de arquivo são rastreadas; \
-mudanças feitas por comandos de shell não são desfeitas.";
+const LIMITS: &str = "limite: arquivos ignorados (.gitignore, node_modules/, target/...) \
+só voltam se uma ferramenta de arquivo os editou.";
 
 pub fn export_cmd(paths: &Paths, args: &[String]) -> Res {
     let a = parse_export(args)?;
@@ -317,7 +323,8 @@ pub fn mcp_cmd(paths: &Paths, args: &[String]) -> Res {
             if !args.iter().any(|a| a == "--yes") {
                 return Err("revise o comando acima e repita com --yes para aprovar".into());
             }
-            approve_server(paths, name)?;
+            let proj = project_dir().ok_or("diretório do projeto indisponível")?;
+            approve_project_server(paths, &proj, s)?;
             println!("{name} aprovado");
         }
         "tools" | "call"
@@ -492,17 +499,59 @@ pub fn plugin_cmd(paths: &Paths, args: &[String]) -> Res {
             }
         }
         Some("show") => print_review(&lib.get(&name("show")?)?),
+        Some("marketplace" | "market") => market_cmd(&lib, args)?,
+        Some("browse" | "store" | "loja") => {
+            let installed = lib.plugins()?;
+            for o in zerith_plugins::market::offers(&lib)? {
+                let have = installed.iter().any(|p| p.manifest.name == o.name);
+                println!(
+                    "{:<20} {:<10} {:<10} {}",
+                    format!("{}@{}", o.name, o.market),
+                    if have { "instalado" } else { "" },
+                    o.category,
+                    o.description
+                );
+            }
+        }
         Some("install") => {
-            let dir = args.get(2).ok_or("plugin install precisa de uma pasta")?;
-            let p = lib.install(Path::new(dir))?;
+            let spec = args
+                .get(2)
+                .ok_or("plugin install precisa de nome@marketplace ou de uma pasta")?;
+            let p = if Path::new(spec).is_dir() {
+                let p = lib.install(Path::new(spec))?;
+                println!(
+                    "{} {} instalado (desativado, não revisado)",
+                    p.manifest.name, p.manifest.version
+                );
+                p
+            } else {
+                println!("baixando {spec}...");
+                let p = zerith_plugins::market::install(&lib, spec)?;
+                println!(
+                    "{} {} instalado e ativo",
+                    p.manifest.name, p.manifest.version
+                );
+                p
+            };
+            let m = &p.manifest;
             println!(
-                "{} {} instalado (desativado, não revisado)",
-                p.manifest.name, p.manifest.version
+                "skills {}  agentes {}  mcp {}  hooks {}",
+                m.skills.len(),
+                m.agents.len(),
+                m.mcp.len(),
+                m.hooks.len()
             );
-            println!(
-                "veja o que ele pede com `zerith plugin show {}`",
-                p.manifest.name
-            );
+            if p.status == PluginStatus::Enabled {
+                println!("a IA já usa as skills e os agentes dele quando o assunto aparece");
+            }
+            if zerith_plugins::market::runs_code(&p) {
+                println!(
+                    "ele também roda código (MCP/hooks): fica desligado até `zerith plugin trust {} --yes`",
+                    m.name
+                );
+            } else if p.status != PluginStatus::Enabled {
+                println!("veja o que ele pede com `zerith plugin show {}`", m.name);
+            }
         }
         Some("remove") => {
             let n = name("remove")?;
@@ -543,6 +592,42 @@ pub fn plugin_cmd(paths: &Paths, args: &[String]) -> Res {
             }
         }
         Some(other) => return Err(format!("comando desconhecido: plugin {other}").into()),
+    }
+    Ok(())
+}
+
+/// `plugin marketplace list|add|update|remove`.
+fn market_cmd(lib: &Plugins, args: &[String]) -> Res {
+    use zerith_plugins::market;
+    match args.get(2).map(String::as_str) {
+        None | Some("list") => {
+            for m in market::list(lib)? {
+                println!("{:<20} {}", m.name, m.source);
+            }
+        }
+        Some("add" | "update") => {
+            let arg = args
+                .get(3)
+                .ok_or("marketplace add precisa de dono/repo, URL git ou pasta")?;
+            // `update <nome>` refetches from where it was added.
+            let src = market::list(lib)?
+                .into_iter()
+                .find(|m| &m.name == arg)
+                .map_or(arg.clone(), |m| m.source);
+            let m = market::add(lib, &src)?;
+            let n = market::offers(lib)?
+                .iter()
+                .filter(|o| o.market == m.name)
+                .count();
+            println!("marketplace {} pronto ({n} plugins)", m.name);
+            println!("instale com `zerith plugin install <plugin>@{}`", m.name);
+        }
+        Some("remove") => {
+            let n = args.get(3).ok_or("marketplace remove precisa do nome")?;
+            market::remove(lib, n)?;
+            println!("marketplace {n} removido");
+        }
+        Some(o) => return Err(format!("comando desconhecido: plugin marketplace {o}").into()),
     }
     Ok(())
 }

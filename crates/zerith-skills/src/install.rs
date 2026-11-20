@@ -76,6 +76,7 @@ pub enum InstallError {
 pub type Result<T> = std::result::Result<T, InstallError>;
 
 /// The skills root, its manifest, and the copies kept for rollback.
+#[derive(Clone)]
 pub struct Library {
     root: PathBuf,
     extra: Vec<PathBuf>,
@@ -99,6 +100,11 @@ impl Library {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The plugin skill folders loaded next to the user's library.
+    pub fn extra(&self) -> &[PathBuf] {
+        &self.extra
     }
 
     pub fn manifest(&self) -> Result<Manifest> {

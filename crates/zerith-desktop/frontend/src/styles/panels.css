@@ -22,6 +22,12 @@
 .pn-inline.wrap {
   flex-wrap: wrap;
 }
+.pn-gap-top {
+  margin-top: var(--s-3);
+}
+.pn-warn {
+  color: var(--warn-text);
+}
 .pn-end {
   justify-content: flex-end;
 }

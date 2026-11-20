@@ -40,6 +40,76 @@ pub struct PluginView {
     capabilities: Vec<String>,
     trusted: bool,
     enabled: bool,
+    skills: usize,
+    agents: usize,
+    /// MCP servers, hooks or a process: off until reviewed.
+    runs_code: bool,
+}
+
+/// The Plugins tab: what is installed, what the marketplaces offer, and the
+/// marketplaces themselves.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginsView {
+    installed: Vec<PluginView>,
+    offers: Vec<zerith_plugins::market::Offer>,
+    markets: Vec<zerith_plugins::market::Market>,
+}
+
+fn plugins_view(root: &Path) -> Result<PluginsView, String> {
+    use zerith_plugins::market;
+    let lib = zerith_plugins::Library::open(root).map_err(|e| e.to_string())?;
+    let installed = lib
+        .plugins()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|p| PluginView {
+            runs_code: market::runs_code(&p),
+            name: p.manifest.name,
+            version: p.manifest.version,
+            description: p.manifest.description,
+            capabilities: p.manifest.capabilities,
+            trusted: p.trusted,
+            enabled: p.status == zerith_plugins::Status::Enabled,
+            skills: p.manifest.skills.len(),
+            agents: p.manifest.agents.len(),
+        })
+        .collect();
+    Ok(PluginsView {
+        installed,
+        offers: market::offers(&lib).map_err(|e| e.to_string())?,
+        markets: market::list(&lib).map_err(|e| e.to_string())?,
+    })
+}
+
+/// One plugin action from the tab, then the tab again. `install` takes
+/// `name@market`; `market-add` an `owner/repo`, URL or folder.
+#[tauri::command]
+pub async fn plugin_action(
+    state: State<'_, AppState>,
+    action: String,
+    target: String,
+) -> Result<PluginsView, String> {
+    let root = state.root().join("plugins");
+    tauri::async_runtime::spawn_blocking(move || {
+        use zerith_plugins::{market, Status};
+        let lib = zerith_plugins::Library::open(&root).map_err(|e| e.to_string())?;
+        let done = match action.as_str() {
+            "install" => market::install(&lib, &target).map(|_| ()),
+            "enable" => lib.set_status(&target, Status::Enabled),
+            "disable" => lib.set_status(&target, Status::Disabled),
+            "trust" => lib.trust(&target),
+            "untrust" => lib.untrust(&target),
+            "remove" => lib.remove(&target),
+            "market-add" => market::add(&lib, &target).map(|_| ()),
+            "market-remove" => market::remove(&lib, &target),
+            other => return Err(format!("ação desconhecida: {other}")),
+        };
+        done.map_err(|e| e.to_string())?;
+        plugins_view(&root)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 fn library(state: &AppState) -> PathBuf {
@@ -110,27 +180,11 @@ pub async fn skills_catalog(state: State<'_, AppState>, force: bool) -> Result<C
 }
 
 #[tauri::command]
-pub async fn skills_plugins(state: State<'_, AppState>) -> Result<Vec<PluginView>, String> {
+pub async fn skills_plugins(state: State<'_, AppState>) -> Result<PluginsView, String> {
     let root = state.root().join("plugins");
-    tauri::async_runtime::spawn_blocking(move || {
-        zerith_plugins::Library::open(&root)
-            .and_then(|l| l.plugins())
-            .map(|list| {
-                list.into_iter()
-                    .map(|p| PluginView {
-                        name: p.manifest.name.clone(),
-                        version: p.manifest.version.clone(),
-                        description: p.manifest.description.clone(),
-                        capabilities: p.manifest.capabilities.clone(),
-                        trusted: p.trusted,
-                        enabled: p.status == zerith_plugins::Status::Enabled,
-                    })
-                    .collect()
-            })
-            .map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(move || plugins_view(&root))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]

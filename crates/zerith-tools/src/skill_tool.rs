@@ -65,11 +65,9 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
                     .as_u64()
                     .map_or(SEARCH_DEFAULT, |n| (n as usize).clamp(1, SEARCH_MAX));
                 let (_, svc) = e.host.bound()?;
-                let root = svc
+                let lib = svc
                     .skills_root()
                     .ok_or_else(|| ToolError::Failed("nenhuma biblioteca de skills neste turno".into()))?;
-                let lib = zerith_skills::Library::open(root)
-                    .map_err(|err| ToolError::Failed(err.to_string()))?;
                 let hits = zerith_skills::search::search(&lib, query, limit);
                 Ok(render(query, &hits, zerith_skills::search::count(&lib)))
             },

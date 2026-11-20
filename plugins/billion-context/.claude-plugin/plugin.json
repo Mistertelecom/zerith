@@ -1,0 +1,10 @@
+{
+  "name": "billion-context",
+  "version": "0.1.216",
+  "description": "Como o Zerith usa o proxy billion-context para conversas longas.",
+  "author": {
+    "name": "ranxianglei (billion-context); integração: Zerith"
+  },
+  "homepage": "https://github.com/ranxianglei/billion-context",
+  "license": "MIT"
+}

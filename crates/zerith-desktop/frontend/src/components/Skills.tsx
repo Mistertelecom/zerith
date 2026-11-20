@@ -25,6 +25,7 @@ import {
   ShieldCheck,
   Sparkles,
   Star,
+  Store,
   Terminal,
   Trash2,
   Wrench,
@@ -37,7 +38,8 @@ import {
   type Finding,
   type HermesSkill,
   type SetupImport,
-  type PluginView,
+  type PluginAction,
+  type PluginsView,
   type RemoteRepo,
   type RemoteSkill,
   type SkillView,
@@ -103,7 +105,9 @@ export function SkillsTab() {
   const [tab, setTab] = useState<Tab>("Instaladas");
   const [skills, setSkills] = useState<SkillView[] | null>(null);
   const [catalog, setCatalog] = useState<Catalogue | null>(null);
-  const [plugins, setPlugins] = useState<PluginView[] | null>(null);
+  const [plugins, setPlugins] = useState<PluginsView | null>(null);
+  const [pluginBusy, setPluginBusy] = useState<string | null>(null);
+  const [marketSrc, setMarketSrc] = useState("");
   const [selected, setSelected] = useState<string | null>(null);
   const [from, setFrom] = useState("");
   const [showFolder, setShowFolder] = useState(false);
@@ -166,6 +170,20 @@ export function SkillsTab() {
       .finally(() => setLoadingRepo(null));
   };
 
+  const plugin = async (action: PluginAction, target: string, done?: string) => {
+    setPluginBusy(action + ":" + target);
+    setNotice(null);
+    try {
+      setPlugins(await api.pluginAction(action, target));
+      setError(null);
+      if (done) setNotice(done);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setPluginBusy(null);
+    }
+  };
+
   const install = async (r: RemoteRepo, s: RemoteSkill) => {
     setInstalling(sourceOf(r.repo, s.path));
     setNotice(null);
@@ -188,7 +206,7 @@ export function SkillsTab() {
   const counts: Record<Tab, number | undefined> = {
     Instaladas: skills?.length,
     Catálogo: catalog?.entries.length,
-    Plugins: plugins?.length,
+    Plugins: plugins?.installed.length,
   };
 
   const viewFor = (r: RemoteRepo, s: RemoteSkill) =>
@@ -582,48 +600,162 @@ export function SkillsTab() {
       ) : null}
 
       {tab === "Plugins" ? (
-        <Card
-          title="Plugins"
-          icon={Plug}
-          description={plugins ? `${plugins.length} ${plugins.length === 1 ? "plugin instalado" : "plugins instalados"}` : undefined}
-        >
-          {plugins === null ? <Loading text="Lendo os plugins…" /> : null}
-          {plugins?.length === 0 ? (
-            <EmptyState icon={Plug} title="Nenhum plugin" text="Plugins instalados aparecem aqui." />
-          ) : null}
-          {plugins?.length ? (
-            <div className="pn-list">
-              {plugins.map((p) => (
-                <div key={p.name} className={"pn-item" + (p.enabled ? "" : " dim")}>
-                  <span className="pn-ico">
-                    <Plug size={16} strokeWidth={1.75} />
-                  </span>
-                  <span className="pn-body">
-                    <span className="pn-title">
-                      {p.name} <span className="pn-num pn-hint">v{p.version}</span>
-                    </span>
-                    <span className="pn-sub">{p.description}</span>
-                  </span>
-                  <span className="pn-meta">
-                    {p.capabilities.map((c) => {
-                      const Icon = CAPABILITY[c] ?? Wrench;
-                      return (
-                        <span key={c} className="badge mono" title="Capacidade">
-                          <Icon size={12} strokeWidth={2} /> {c}
+        <>
+          <Card
+            title="Loja de plugins"
+            icon={Store}
+            description="Pacotes no formato do Claude Code. Depois de instalado, a IA usa as skills e os comandos dele sozinha quando o assunto aparece."
+          >
+            {plugins === null ? <Loading text="Lendo as lojas…" /> : null}
+            {plugins?.offers.length ? (
+              <div className="pn-list">
+                {plugins.offers.map((o) => {
+                  const spec = `${o.name}@${o.market}`;
+                  const have = plugins.installed.some((p) => p.name === o.name);
+                  const working = pluginBusy === "install:" + spec;
+                  return (
+                    <div key={spec} className="pn-item">
+                      <span className="pn-ico">
+                        <Package size={16} strokeWidth={1.75} />
+                      </span>
+                      <span className="pn-body">
+                        <span className="pn-title">
+                          {o.name} <span className="pn-num pn-hint">{spec}</span>
                         </span>
-                      );
-                    })}
-                    <span className={"badge" + (p.trusted ? "" : " warn")}>
-                      {p.trusted ? <ShieldCheck size={12} strokeWidth={2} /> : <AlertTriangle size={12} strokeWidth={2} />}
-                      {p.trusted ? "Revisado" : "Não revisado"}
-                    </span>
-                    <span className={"badge" + (p.enabled ? " ok" : "")}>{p.enabled ? "Ativo" : "Desligado"}</span>
-                  </span>
-                </div>
-              ))}
+                        <span className="pn-sub">{o.description}</span>
+                      </span>
+                      <span className="pn-meta">
+                        {o.category ? <span className="badge">{o.category}</span> : null}
+                        {have ? (
+                          <span className="badge ok">
+                            <Check size={12} strokeWidth={2} /> Instalado
+                          </span>
+                        ) : (
+                          <button
+                            className="btn btn-sm btn-primary"
+                            disabled={pluginBusy !== null}
+                            onClick={() =>
+                              void plugin("install", spec, `${o.name} instalado e ativo: a IA já pode usá-lo na próxima mensagem.`)
+                            }
+                          >
+                            {working ? <span className="spinner" /> : <Download size={14} strokeWidth={2} />}
+                            {working ? "Baixando…" : "Instalar"}
+                          </button>
+                        )}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            ) : null}
+            <div className="pn-inline pn-gap-top">
+              <label className="pn-affix pn-spacer">
+                <span className="pn-affix-icon">
+                  <GitBranch size={16} strokeWidth={1.75} />
+                </span>
+                <input
+                  className="input mono"
+                  value={marketSrc}
+                  placeholder="dono/repo de outra loja (ex.: elementalsouls/Claude-BugHunter)"
+                  aria-label="Adicionar loja"
+                  onChange={(e) => setMarketSrc(e.target.value)}
+                />
+              </label>
+              <button
+                className="btn"
+                disabled={pluginBusy !== null || !marketSrc.trim()}
+                onClick={() =>
+                  void plugin("market-add", marketSrc.trim(), "Loja adicionada: os plugins dela aparecem na lista acima.").then(() =>
+                    setMarketSrc(""),
+                  )
+                }
+              >
+                <Store size={14} strokeWidth={2} /> Adicionar loja
+              </button>
             </div>
-          ) : null}
-        </Card>
+          </Card>
+
+          <Card
+            title="Instalados"
+            icon={Plug}
+            description={
+              plugins
+                ? `${plugins.installed.length} ${plugins.installed.length === 1 ? "plugin instalado" : "plugins instalados"}`
+                : undefined
+            }
+          >
+            {plugins?.installed.length === 0 ? (
+              <EmptyState icon={Plug} title="Nenhum plugin" text="Instale um da loja acima." />
+            ) : null}
+            {plugins?.installed.length ? (
+              <div className="pn-list">
+                {plugins.installed.map((p) => (
+                  <div key={p.name} className={"pn-item" + (p.enabled ? "" : " dim")}>
+                    <span className="pn-ico">
+                      <Plug size={16} strokeWidth={1.75} />
+                    </span>
+                    <span className="pn-body">
+                      <span className="pn-title">
+                        {p.name} {p.version && p.version !== "-" ? <span className="pn-num pn-hint">v{p.version}</span> : null}
+                      </span>
+                      <span className="pn-sub" title={p.description}>
+                        {p.skills} {p.skills === 1 ? "skill" : "skills"}
+                        {p.agents ? ` · ${p.agents} ${p.agents === 1 ? "agente" : "agentes"}` : ""}
+                        {p.runsCode ? (p.trusted ? " · programas liberados" : " · programas bloqueados") : ""}
+                        {" · "}
+                        {p.description}
+                      </span>
+                    </span>
+                    <span className="pn-meta">
+                      {p.capabilities.map((c) => {
+                        const Icon = CAPABILITY[c] ?? Wrench;
+                        return (
+                          <span key={c} className="badge mono" title="Capacidade">
+                            <Icon size={12} strokeWidth={2} /> {c}
+                          </span>
+                        );
+                      })}
+                      {p.runsCode ? (
+                        <button
+                          className="btn-icon"
+                          disabled={pluginBusy !== null}
+                          aria-label={p.trusted ? `Bloquear programas de ${p.name}` : `Liberar programas de ${p.name}`}
+                          title={
+                            p.trusted
+                              ? "Servidores MCP/hooks dele estão ligados. Clique para bloquear."
+                              : "Ele também roda programas (MCP/hooks). Revise a pasta dele antes de liberar."
+                          }
+                          onClick={() => void plugin(p.trusted ? "untrust" : "trust", p.name)}
+                        >
+                          {p.trusted ? (
+                            <ShieldCheck size={14} strokeWidth={2} />
+                          ) : (
+                            <AlertTriangle size={14} strokeWidth={2} className="pn-warn" />
+                          )}
+                        </button>
+                      ) : null}
+                      <Switch
+                        checked={p.enabled}
+                        label={p.enabled ? `Desligar ${p.name}` : `Ligar ${p.name}`}
+                        disabled={pluginBusy !== null}
+                        onChange={(on) => void plugin(on ? "enable" : "disable", p.name)}
+                      />
+                      <button
+                        className="btn-icon"
+                        aria-label={`Remover ${p.name}`}
+                        title="Remover"
+                        disabled={pluginBusy !== null}
+                        onClick={() => void plugin("remove", p.name, `${p.name} removido.`)}
+                      >
+                        <Trash2 size={14} strokeWidth={2} />
+                      </button>
+                    </span>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+          </Card>
+        </>
       ) : null}
     </div>
   );

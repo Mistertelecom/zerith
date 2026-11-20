@@ -5,9 +5,13 @@
 //! pre-edit bytes into `<data root>/checkpoints/<session>/<turn>/`, or records
 //! "did not exist" for a file the turn creates. [`restore`] puts that state back.
 //!
-//! Honest limits (same as Claude Code's `/rewind`):
-//! - only files a tool reported through `record_file` are tracked. Anything a
-//!   shell command changes (`rm`, `sed -i`, a build) is invisible here;
+//! The first mutating step of a turn (a file tool or a shell command that is
+//! not read-only) also snapshots the whole workspace ([`Checkpoint::snapshot`],
+//! see `shadow.rs`), so a code restore undoes what the shell changed too.
+//!
+//! Honest limits:
+//! - ignored files (`.gitignore`, `node_modules/`, `target/`...) are outside
+//!   the snapshot: only the per-file copies cover them;
 //! - a restore overwrites whatever is on disk now, including edits the user
 //!   made by hand after the turn;
 //! - it is not version control. Keep using git.
@@ -18,13 +22,15 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, Once};
 
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::migrations::now_ms;
 use crate::store::Store;
+
+mod shadow;
 
 /// Turns kept per session; older ones lose their saved files.
 pub const KEEP_TURNS: i64 = 100;
@@ -105,15 +111,20 @@ pub struct RestoreReport {
     pub messages_archived: usize,
     /// Per-file failures; the restore keeps going.
     pub errors: Vec<String>,
+    /// Things the person should know (pt-BR): a turn without a workspace
+    /// snapshot, where the replaced state was kept.
+    pub notes: Vec<String>,
 }
 
 /// An open checkpoint for one turn. `Send + Sync`: tools may share it behind an
 /// `Arc` and call `record_file` from parallel calls.
 pub struct Checkpoint {
     dir: PathBuf,
+    data_root: PathBuf,
     pub session: String,
     pub turn: i64,
     state: Mutex<(Manifest, HashSet<String>)>,
+    snapped: Once,
 }
 
 fn session_dir(data_root: &Path, session: &str) -> PathBuf {
@@ -177,10 +188,23 @@ impl Checkpoint {
         prune(store, data_root, session, turn - KEEP_TURNS)?;
         Ok(Self {
             dir,
+            data_root: data_root.to_path_buf(),
             session: session.to_string(),
             turn,
             state: Mutex::new((Manifest::default(), HashSet::new())),
+            snapped: Once::new(),
         })
+    }
+
+    /// Snapshots `workspace` before the turn's first mutation; later calls
+    /// are no-ops. Call it before a shell command that is not read-only and
+    /// before a file tool writes. Never fails and never blocks the command:
+    /// a refusal (home folder, drive root), a missing git or the 20 s budget
+    /// is recorded, and a restore of this turn falls back to the per-file
+    /// copies and says so.
+    pub fn snapshot(&self, workspace: &Path) {
+        self.snapped
+            .call_once(|| shadow::snapshot(&self.data_root, workspace, &self.dir));
     }
 
     /// Saves the current state of `path`, once per file per turn. **Call it
@@ -308,8 +332,11 @@ pub fn list(store: &Store, data_root: &Path, session: &str) -> Result<Vec<Checkp
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Preview {
     /// `(path, existed_before)`: `false` means a restore deletes the file.
+    /// Includes what shell commands changed when the turn has a snapshot.
     pub files: Vec<(String, bool)>,
     pub messages_after: i64,
+    /// Same as [`RestoreReport::notes`].
+    pub notes: Vec<String>,
 }
 
 /// Shows what [`restore`] would do, without doing it.
@@ -343,15 +370,46 @@ pub fn preview(store: &Store, data_root: &Path, session: &str, turn: i64) -> Res
         let rows = st.query_map(params![session, turn], |r| r.get(0))?;
         rows.collect::<rusqlite::Result<_>>()?
     };
-    let mut seen = HashSet::new();
-    for t in turns {
-        for e in read_manifest(&turn_dir(data_root, session, t))?.entries {
-            if seen.insert(e.path.clone()) {
-                out.files.push((e.path, e.existed));
+    // First listed wins, mirroring `restore`: earlier turns over later ones,
+    // a turn's snapshot over its own copies. Only the earliest snapshot is
+    // diffed: it is the tracked state a restore ends on.
+    let (mut seen, mut diffed) = (HashSet::new(), false);
+    for t in &turns {
+        let dir = turn_dir(data_root, session, *t);
+        let mut found = Vec::new();
+        match shadow::load(&dir) {
+            Some(Ok(snap)) if !diffed => {
+                diffed = true;
+                match shadow::restore(data_root, &snap, false) {
+                    Ok(o) => found = o.changes,
+                    Err(e) => out
+                        .notes
+                        .push(format!("snapshot do workspace (turno {t}) ilegível: {e}")),
+                }
+            }
+            Some(Err(why)) => out.notes.push(no_snapshot(*t, &why)),
+            _ => {}
+        }
+        found.extend(
+            read_manifest(&dir)?
+                .entries
+                .into_iter()
+                .map(|e| (e.path, e.existed)),
+        );
+        for (path, existed) in found {
+            if seen.insert(path.clone()) {
+                out.files.push((path, existed));
             }
         }
     }
     Ok(out)
+}
+
+fn no_snapshot(turn: i64, why: &str) -> String {
+    format!(
+        "turno {turn} sem snapshot do workspace ({}): só as edições das ferramentas de arquivo voltam; o que o shell mudou fica",
+        why.trim()
+    )
 }
 
 /// Puts the session back to the state **before** `turn` started.
@@ -392,15 +450,42 @@ pub fn restore(
             let rows = st.query_map(params![session, turn], |r| r.get(0))?;
             rows.collect::<rusqlite::Result<_>>()?
         };
-        let mut done: HashSet<String> = HashSet::new();
-        for t in &turns {
+        // Newest turn first, each one's copies before its snapshot: the
+        // earliest state wins, and a snapshot (taken at the turn's first
+        // mutation) wins over copies of the same turn, which can be later
+        // (a file the shell deleted and `write_file` then recreated).
+        // Copies still cover what a snapshot does not: ignored files and
+        // paths outside the workspace.
+        // Final outcome per path (restored or removed): the last write wins.
+        let mut outcome: std::collections::HashMap<String, bool> = Default::default();
+        let mut undo = None;
+        for t in turns.iter().rev() {
             let dir = turn_dir(data_root, session, *t);
             for e in read_manifest(&dir)?.entries {
-                if done.insert(e.path.clone()) {
-                    put_back(&dir, &e, &mut report);
+                match put_back(&dir, &e) {
+                    Ok(Some(back)) => drop(outcome.insert(e.path, back)),
+                    Ok(None) => {}
+                    Err(err) => report.errors.push(err),
                 }
             }
+            match shadow::load(&dir) {
+                Some(Ok(snap)) => match shadow::restore(data_root, &snap, true) {
+                    Ok(o) => {
+                        outcome.extend(o.changes);
+                        // The first one holds the state from before the rewind.
+                        undo = undo.or(o.undo);
+                    }
+                    Err(e) => report
+                        .errors
+                        .push(format!("snapshot do workspace (turno {t}): {e}")),
+                },
+                Some(Err(why)) => report.notes.push(no_snapshot(*t, &why)),
+                None => {}
+            }
         }
+        report.files_restored = outcome.values().filter(|b| **b).count();
+        report.files_removed = outcome.len() - report.files_restored;
+        report.notes.extend(undo);
         // Consumed: re-applying these blobs later would clobber newer work.
         for t in &turns {
             let dir = turn_dir(data_root, session, *t);
@@ -449,27 +534,24 @@ pub fn restore(
 }
 
 /// Puts one recorded file back to its pre-turn state (or removes it when the
-/// turn created it). Failures land in the report.
-fn put_back(dir: &Path, e: &Entry, report: &mut RestoreReport) {
+/// turn created it): `Some(true)` restored, `Some(false)` removed, `None`
+/// nothing to do.
+fn put_back(dir: &Path, e: &Entry) -> std::result::Result<Option<bool>, String> {
     let target = PathBuf::from(&e.path);
     let outcome = match (&e.blob, e.existed) {
         (Some(blob), true) => {
             if let Some(parent) = target.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            std::fs::copy(dir.join(blob), &target).map(|_| true)
+            std::fs::copy(dir.join(blob), &target).map(|_| Some(true))
         }
         _ => match std::fs::remove_file(&target) {
-            Ok(()) => Ok(false),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+            Ok(()) => Ok(Some(false)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(err) => Err(err),
         },
     };
-    match outcome {
-        Ok(true) => report.files_restored += 1,
-        Ok(false) => report.files_removed += 1,
-        Err(err) => report.errors.push(format!("{}: {err}", e.path)),
-    }
+    outcome.map_err(|err| format!("{}: {err}", e.path))
 }
 
 /// The checkpoint turn whose final answer is `message_id`, if any.
@@ -588,7 +670,12 @@ pub fn restore_turn(
     let dir = turn_dir(data_root, session, turn);
     let mut report = RestoreReport::default();
     for e in read_manifest(&dir)?.entries {
-        put_back(&dir, &e, &mut report);
+        match put_back(&dir, &e) {
+            Ok(Some(true)) => report.files_restored += 1,
+            Ok(Some(false)) => report.files_removed += 1,
+            Ok(None) => {}
+            Err(err) => report.errors.push(err),
+        }
     }
     // Consumed, as in `restore`: re-applying these copies would clobber work.
     if report.errors.is_empty() {

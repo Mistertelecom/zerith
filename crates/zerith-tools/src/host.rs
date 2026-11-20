@@ -88,8 +88,9 @@ pub trait Services: Send + Sync {
     /// The body of an enabled skill.
     fn skill(&self, name: &str) -> std::result::Result<SkillLoad, String>;
 
-    /// The skills library of this turn, for `skill_search`. `None`: no library.
-    fn skills_root(&self) -> Option<PathBuf> {
+    /// The skills library of this turn (plugin folders included), for
+    /// `skill_search`. `None`: no library.
+    fn skills_root(&self) -> Option<zerith_skills::Library> {
         None
     }
 }
@@ -110,11 +111,15 @@ static READS: Mutex<Option<HashMap<String, Reads>>> = Mutex::new(None);
 
 /// Runs before a tool mutates a file; an `Err` cancels the edit.
 type WriteHook = Arc<dyn Fn(&Path) -> std::result::Result<(), String> + Send + Sync>;
+/// Runs with the workspace before a shell command that may mutate it.
+type ShellHook = Arc<dyn Fn(&Path) + Send + Sync>;
 
 #[derive(Default)]
 pub struct Host {
     /// Called with a path just before a tool mutates it (checkpoints).
     before_write: Mutex<Option<WriteHook>>,
+    /// Called before a shell command that is not read-only (checkpoints).
+    before_shell: Mutex<Option<ShellHook>>,
     bound: Mutex<Option<Bound>>,
     events: EventSink,
     skills: Mutex<HashMap<String, Option<Vec<String>>>>,
@@ -238,6 +243,27 @@ impl Host {
                 ToolError::Failed(format!("checkpoint falhou, edição cancelada: {e}"))
             }),
             None => Ok(()),
+        }
+    }
+
+    /// Registers the hook run before a shell command that is not read-only
+    /// (foreground or background), with the folder it runs in. It cannot
+    /// cancel the command.
+    pub fn on_before_shell(&self, f: impl Fn(&Path) + Send + Sync + 'static) {
+        *self.before_shell.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(f));
+    }
+
+    /// Runs the registered pre-shell hook unless `cmd` is read-only.
+    pub fn before_shell(&self, cmd: &str, workspace: &Path) {
+        let hook = self
+            .before_shell
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(f) = hook {
+            if !zerith_core::shellparse::all_read_only(cmd) {
+                f(workspace);
+            }
         }
     }
 

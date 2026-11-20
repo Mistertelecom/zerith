@@ -218,3 +218,136 @@ fn preview_lists_what_a_restore_would_touch_and_changes_nothing() {
     assert!(b.exists());
     assert_eq!(e.store.message_count(&e.session).unwrap(), 1);
 }
+
+/// A clean folder under `target/test-scratch` (the OS temp dir has a
+/// restricted ACL on some machines).
+fn scratch(tag: &str) -> PathBuf {
+    let d = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/test-scratch")
+        .join(format!("rewind-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+fn git(dir: &Path, args: &[&str]) {
+    let ok = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap()
+        .status
+        .success();
+    assert!(ok, "git {args:?}");
+}
+
+fn read(p: &Path) -> String {
+    std::fs::read_to_string(p).unwrap()
+}
+
+#[test]
+fn code_restore_undoes_what_the_shell_changed_in_a_folder_without_git() {
+    let dir = scratch("shell");
+    let (root, work) = (dir.join("data"), dir.join("work"));
+    std::fs::create_dir_all(work.join("sub")).unwrap();
+    std::fs::write(work.join("a.txt"), "a original").unwrap();
+    std::fs::write(work.join("sub/b.txt"), "b original").unwrap();
+    std::fs::write(work.join(".gitignore"), "build/\n").unwrap();
+    let st = Store::open_in_memory().unwrap();
+    let s = st.create_session("t", SessionSource::Native).unwrap().id;
+
+    let cp = Checkpoint::begin(&st, &root, &s, 1).unwrap();
+    cp.snapshot(&work);
+    // What a shell command does: rm, sed -i, echo > new, a build.
+    std::fs::remove_file(work.join("a.txt")).unwrap();
+    std::fs::write(work.join("sub/b.txt"), "b editado").unwrap();
+    std::fs::write(work.join("c.txt"), "novo").unwrap();
+    std::fs::create_dir_all(work.join("build")).unwrap();
+    std::fs::write(work.join("build/x"), "artefato").unwrap();
+    // Later in the same turn a file tool recreates a.txt: its copy says
+    // "did not exist", the snapshot must still win.
+    cp.snapshot(&work);
+    cp.record_file(&work.join("a.txt")).unwrap();
+    std::fs::write(work.join("a.txt"), "a reescrito").unwrap();
+
+    let p = zerith_sessions::checkpoints::preview(&st, &root, &s, 1).unwrap();
+    let shown = |name: &str, existed: bool| {
+        p.files
+            .iter()
+            .any(|(f, e)| f.replace('\\', "/").ends_with(name) && *e == existed)
+    };
+    assert!(shown("/c.txt", false), "{:?}", p.files);
+    assert!(shown("sub/b.txt", true), "{:?}", p.files);
+    assert!(shown("/a.txt", true), "the snapshot wins: {:?}", p.files);
+    assert!(!p.files.iter().any(|(f, _)| f.contains("build")));
+    assert!(p.notes.is_empty(), "{:?}", p.notes);
+
+    let r = restore(&st, &root, &s, 1, Mode::Code).unwrap();
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!(read(&work.join("a.txt")), "a original");
+    assert_eq!(read(&work.join("sub/b.txt")), "b original");
+    assert!(!work.join("c.txt").exists());
+    assert_eq!(
+        read(&work.join("build/x")),
+        "artefato",
+        "ignored: left alone"
+    );
+    assert!(
+        r.notes.iter().any(|n| n.contains("checkout")),
+        "{:?}",
+        r.notes
+    );
+    // Consumed like the copies: a second restore changes nothing.
+    std::fs::write(work.join("c.txt"), "trabalho novo").unwrap();
+    restore(&st, &root, &s, 1, Mode::Code).unwrap();
+    assert_eq!(read(&work.join("c.txt")), "trabalho novo");
+}
+
+#[test]
+fn the_users_repository_is_untouched_and_the_earliest_turn_wins() {
+    let dir = scratch("repo");
+    let (root, work) = (dir.join("data"), dir.join("work"));
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(work.join("a.txt"), "v0").unwrap();
+    git(&work, &["init", "-q"]);
+    git(&work, &["add", "-A"]);
+    let index = std::fs::read(work.join(".git/index")).unwrap();
+    let st = Store::open_in_memory().unwrap();
+    let s = st.create_session("t", SessionSource::Native).unwrap().id;
+
+    let t1 = Checkpoint::begin(&st, &root, &s, 1).unwrap();
+    t1.snapshot(&work);
+    std::fs::write(work.join("a.txt"), "v1").unwrap();
+    let t2 = Checkpoint::begin(&st, &root, &s, 2).unwrap();
+    t2.snapshot(&work);
+    std::fs::write(work.join("a.txt"), "v2").unwrap();
+    std::fs::write(work.join("novo.txt"), "t2").unwrap();
+
+    restore(&st, &root, &s, 2, Mode::Code).unwrap();
+    assert_eq!(read(&work.join("a.txt")), "v1");
+    assert!(!work.join("novo.txt").exists());
+    restore(&st, &root, &s, 1, Mode::Code).unwrap();
+    assert_eq!(read(&work.join("a.txt")), "v0");
+    assert_eq!(std::fs::read(work.join(".git/index")).unwrap(), index);
+}
+
+#[test]
+fn the_home_folder_is_never_snapshotted_and_restore_says_so() {
+    let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) else {
+        return;
+    };
+    let dir = scratch("home");
+    let st = Store::open_in_memory().unwrap();
+    let s = st.create_session("t", SessionSource::Native).unwrap().id;
+    let cp = Checkpoint::begin(&st, &dir, &s, 1).unwrap();
+    cp.snapshot(Path::new(&home));
+    let failed = turn_dir(&dir, &s, 1).join("shadow.failed");
+    assert!(read(&failed).contains("pasta pessoal"));
+    assert!(!dir.join("checkpoints/.shadow").exists(), "git never ran");
+    let r = restore(&st, &dir, &s, 1, Mode::Code).unwrap();
+    assert!(
+        r.notes.iter().any(|n| n.contains("sem snapshot")),
+        "{:?}",
+        r.notes
+    );
+}

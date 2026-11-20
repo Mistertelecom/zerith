@@ -197,9 +197,45 @@ pub async fn session_messages(
                     content: m.content,
                     reasoning: m.reasoning,
                     tool_name: m.tool_name,
+                    tool_calls: m.tool_calls,
                 })
                 .collect()
         })
+        .map_err(|e| e.to_string())
+}
+
+/// A background shell job (`shell run_in_background`) still running.
+#[derive(Serialize)]
+pub struct JobView {
+    pub id: String,
+    pub command: String,
+    /// The conversation whose turn started it.
+    pub session: Option<String>,
+    /// Seconds since it started.
+    pub secs: u64,
+}
+
+/// Background jobs of every running turn. A turn's tools (and so its jobs)
+/// live only while the turn runs: the window polls this while one does.
+#[tauri::command]
+pub async fn background_jobs() -> Cmd<Vec<JobView>> {
+    Ok(zerith_tools::background_jobs()
+        .into_iter()
+        .map(|j| JobView {
+            id: j.id,
+            command: j.command,
+            session: j.session,
+            secs: j.secs,
+        })
+        .collect())
+}
+
+/// Stops one background job and every process it started.
+#[tauri::command]
+pub async fn background_job_stop(id: String) -> Cmd<String> {
+    tauri::async_runtime::spawn_blocking(move || zerith_tools::stop_background_job(&id))
+        .await
+        .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())
 }
 

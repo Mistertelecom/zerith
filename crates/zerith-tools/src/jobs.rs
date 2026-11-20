@@ -1,22 +1,26 @@
 //! Background shell: `shell{run_in_background:true}` starts a job and returns
 //! its id; `shell_output` reads what it printed since the last look;
 //! `shell_kill` stops it. Jobs belong to the registry's [`crate::Host`] and
-//! die with it, so a closed session leaves no stray process.
+//! die with it, so a closed session leaves no stray process. The window lists
+//! and stops them through [`background_jobs`] / [`stop_background_job`].
 //!
 //! ponytail: output is kept in memory (capped at 1 MB, oldest dropped); a job
 //! that prints gigabytes loses its head, not the process. Spill to a file if
 //! that ever matters.
 
-use std::io::{BufRead, BufReader, Read};
+use std::io::Read;
 use std::path::Path;
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 use serde_json::{json, Value};
+use zerith_security::jail::{Jail, Jailed};
+use zerith_security::Policy;
 
-use crate::builtin::{kill_tree, shell_command};
+use crate::builtin::shell_command;
 use crate::fntool::{make, str_arg};
 use crate::{Permission, Result, Tool, ToolError};
 
@@ -36,16 +40,88 @@ struct Output {
 }
 
 struct Job {
-    child: Child,
+    jailed: Jailed,
     out: Arc<Mutex<Output>>,
     readers: Vec<JoinHandle<()>>,
     command: String,
     exit: Option<String>,
+    /// The session whose turn started it.
+    session: Option<String>,
+    started: Instant,
 }
 
-#[derive(Default)]
+type Table = Mutex<Vec<(String, Job)>>;
+
+/// Every job table alive in this process, so the window can list and stop the
+/// jobs of any turn. Weak: a table still dies with its host.
+static TABLES: Mutex<Vec<Weak<Table>>> = Mutex::new(Vec::new());
+
 pub struct Jobs {
-    jobs: Mutex<Vec<(String, Job)>>,
+    jobs: Arc<Table>,
+}
+
+impl Default for Jobs {
+    fn default() -> Self {
+        let jobs = Arc::new(Table::default());
+        if let Ok(mut all) = TABLES.lock() {
+            all.retain(|t| t.strong_count() > 0);
+            all.push(Arc::downgrade(&jobs));
+        }
+        Self { jobs }
+    }
+}
+
+/// A running background job, as the window lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackgroundJob {
+    pub id: String,
+    pub command: String,
+    /// The session whose turn started it (a subagent's own session for a child).
+    pub session: Option<String>,
+    /// Seconds since it started.
+    pub secs: u64,
+}
+
+fn tables() -> Vec<Arc<Table>> {
+    TABLES
+        .lock()
+        .map(|all| all.iter().filter_map(Weak::upgrade).collect())
+        .unwrap_or_default()
+}
+
+/// Jobs still running, from every live registry of this process.
+pub fn background_jobs() -> Vec<BackgroundJob> {
+    let mut out = Vec::new();
+    for table in tables() {
+        let mut to_join = Vec::new();
+        if let Ok(mut jobs) = table.lock() {
+            for (id, j) in jobs.iter_mut() {
+                to_join.extend(refresh(j));
+                if j.exit.is_none() {
+                    out.push(BackgroundJob {
+                        id: id.clone(),
+                        command: j.command.clone(),
+                        session: j.session.clone(),
+                        secs: j.started.elapsed().as_secs(),
+                    });
+                }
+            }
+        }
+        for r in to_join {
+            let _ = r.join();
+        }
+    }
+    out
+}
+
+/// Stops job `id` wherever it runs (ids are unique per process): the window's
+/// Stop button. The model sees it as ended at its next `shell_output`.
+pub fn stop_background_job(id: &str) -> Result<String> {
+    let table = tables()
+        .into_iter()
+        .find(|t| t.lock().is_ok_and(|jobs| jobs.iter().any(|(i, _)| i == id)))
+        .ok_or_else(|| ToolError::Failed(format!("job desconhecido: {id}")))?;
+    kill_in(&table, id)
 }
 
 fn poisoned() -> ToolError {
@@ -53,57 +129,77 @@ fn poisoned() -> ToolError {
 }
 
 impl Jobs {
-    pub fn start(&self, command: &str, cwd: &Path) -> Result<String> {
-        let mut jobs = self.jobs.lock().map_err(|_| poisoned())?;
-        for (_, j) in jobs.iter_mut() {
-            refresh(j);
+    pub fn start(
+        &self,
+        command: &str,
+        cwd: &Path,
+        policy: &Policy,
+        session: Option<String>,
+    ) -> Result<String> {
+        let mut to_join = Vec::new();
+        let id = {
+            let mut jobs = self.jobs.lock().map_err(|_| poisoned())?;
+            for (_, j) in jobs.iter_mut() {
+                to_join.extend(refresh(j));
+            }
+            let alive = jobs.iter().filter(|(_, j)| j.exit.is_none()).count();
+            if alive >= MAX_JOBS {
+                return Err(ToolError::Failed(format!(
+                    "já há {MAX_JOBS} jobs em segundo plano; encerre um com shell_kill"
+                )));
+            }
+            // Finished jobs whose output was read can go; keep the table small.
+            jobs.retain(|(_, j)| {
+                j.exit.is_none() || j.out.lock().is_ok_and(|o| o.seen < o.text.len())
+            });
+            let jail = Jail::for_policy(policy);
+            let mut cmd = shell_command(command);
+            cmd.current_dir(cwd);
+            let mut cmd = jail.wrap(cmd);
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut jailed = jail.spawn_wrapped(cmd)?;
+            let out = Arc::new(Mutex::new(Output::default()));
+            let readers = vec![
+                pump(jailed.child.stdout.take().map(|s| Box::new(s) as _), &out),
+                pump(jailed.child.stderr.take().map(|s| Box::new(s) as _), &out),
+            ];
+            let id = format!("job-{}", NEXT.fetch_add(1, Ordering::Relaxed));
+            jobs.push((
+                id.clone(),
+                Job {
+                    jailed,
+                    out,
+                    readers,
+                    command: command.to_string(),
+                    exit: None,
+                    session,
+                    started: Instant::now(),
+                },
+            ));
+            id
+        };
+        for r in to_join {
+            let _ = r.join();
         }
-        let alive = jobs.iter().filter(|(_, j)| j.exit.is_none()).count();
-        if alive >= MAX_JOBS {
-            return Err(ToolError::Failed(format!(
-                "já há {MAX_JOBS} jobs em segundo plano; encerre um com shell_kill"
-            )));
-        }
-        // Finished jobs whose output was read can go; keep the table small.
-        jobs.retain(|(_, j)| j.exit.is_none() || j.out.lock().is_ok_and(|o| o.seen < o.text.len()));
-        let mut cmd = shell_command(command);
-        cmd.current_dir(cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        #[cfg(unix)]
-        std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
-        // Same reason as the jail: the windowed app must not flash a console.
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x0800_0000);
-        }
-        let mut child = cmd.spawn()?;
-        let out = Arc::new(Mutex::new(Output::default()));
-        let readers = vec![
-            pump(child.stdout.take().map(|s| Box::new(s) as _), &out),
-            pump(child.stderr.take().map(|s| Box::new(s) as _), &out),
-        ];
-        let id = format!("job-{}", NEXT.fetch_add(1, Ordering::Relaxed));
-        jobs.push((
-            id.clone(),
-            Job {
-                child,
-                out,
-                readers,
-                command: command.to_string(),
-                exit: None,
-            },
-        ));
         Ok(id)
     }
 
     /// New output since the last call, plus the state.
     pub fn read(&self, id: &str) -> Result<String> {
+        // Reap and release the lock before joining reader threads so a
+        // grandchild holding a pipe never deadlocks other job operations.
+        let to_join = {
+            let mut jobs = self.jobs.lock().map_err(|_| poisoned())?;
+            let j = find(&mut jobs, id)?;
+            refresh(j)
+        };
+        for r in to_join {
+            let _ = r.join();
+        }
         let mut jobs = self.jobs.lock().map_err(|_| poisoned())?;
         let j = find(&mut jobs, id)?;
-        refresh(j);
         let mut o = j.out.lock().map_err(|_| poisoned())?;
         let mut cut = o.seen.min(o.text.len());
         while !o.text.is_char_boundary(cut) {
@@ -130,18 +226,26 @@ impl Jobs {
     }
 
     pub fn kill(&self, id: &str) -> Result<String> {
-        let mut jobs = self.jobs.lock().map_err(|_| poisoned())?;
+        kill_in(&self.jobs, id)
+    }
+}
+
+fn kill_in(table: &Table, id: &str) -> Result<String> {
+    let (msg, to_join) = {
+        let mut jobs = table.lock().map_err(|_| poisoned())?;
         let j = find(&mut jobs, id)?;
         if j.exit.is_some() {
             return Ok(format!("{id} já tinha terminado"));
         }
-        kill_tree(&mut j.child);
-        for r in j.readers.drain(..) {
-            let _ = r.join();
-        }
+        j.jailed.kill_tree();
+        let readers = std::mem::take(&mut j.readers);
         j.exit = Some("encerrado".into());
-        Ok(format!("{id} encerrado: {}", j.command))
+        (format!("{id} encerrado: {}", j.command), readers)
+    };
+    for r in to_join {
+        let _ = r.join();
     }
+    Ok(msg)
 }
 
 fn find<'a>(jobs: &'a mut [(String, Job)], id: &str) -> Result<&'a mut Job> {
@@ -156,43 +260,42 @@ impl Drop for Jobs {
         if let Ok(mut jobs) = self.jobs.lock() {
             for (_, j) in jobs.iter_mut() {
                 if j.exit.is_none() {
-                    kill_tree(&mut j.child);
+                    j.jailed.kill_tree();
                 }
             }
         }
     }
 }
 
-/// Notes the exit once; the readers have hit EOF by then and are joined so the
-/// output is complete before it is reported.
-fn refresh(j: &mut Job) {
+/// Notes the exit once and returns the reader handles for the caller to join
+/// outside the `Jobs` mutex.
+fn refresh(j: &mut Job) -> Vec<JoinHandle<()>> {
     if j.exit.is_some() {
-        return;
+        return Vec::new();
     }
-    if let Ok(Some(status)) = j.child.try_wait() {
-        for r in j.readers.drain(..) {
-            let _ = r.join();
-        }
+    if let Ok(Some(status)) = j.jailed.child.try_wait() {
         j.exit = Some(match status.code() {
             Some(c) => format!("exit {c}"),
             None => "sinal".into(),
         });
+        return std::mem::take(&mut j.readers);
     }
+    Vec::new()
 }
 
 fn pump(r: Option<Box<dyn Read + Send>>, out: &Arc<Mutex<Output>>) -> JoinHandle<()> {
     let out = out.clone();
     std::thread::spawn(move || {
-        let Some(r) = r else { return };
-        let mut r = BufReader::new(r);
-        let mut line = Vec::new();
+        let Some(mut r) = r else { return };
+        // Fixed-size chunks: a process printing gigabytes without newlines
+        // cannot grow a single line buffer unboundedly in RAM.
+        let mut buf = [0u8; 8192];
         loop {
-            line.clear();
-            match r.read_until(b'\n', &mut line) {
+            let n = match r.read(&mut buf) {
                 Ok(0) | Err(_) => return,
-                Ok(_) => {}
-            }
-            let s = String::from_utf8_lossy(&line);
+                Ok(n) => n,
+            };
+            let s = String::from_utf8_lossy(&buf[..n]);
             let Ok(mut o) = out.lock() else { return };
             o.text.push_str(&s);
             if o.text.len() > MAX_OUTPUT {
@@ -234,9 +337,54 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
 }
 
 /// Called by `shell` itself for `run_in_background`.
-pub(crate) fn start(args: &Value, cwd: &Path, host: &crate::Host) -> Result<String> {
-    let id = host.jobs().start(str_arg(args, "command")?, cwd)?;
+pub(crate) fn start(
+    args: &Value,
+    cwd: &Path,
+    policy: &Policy,
+    host: &crate::Host,
+) -> Result<String> {
+    let id = host
+        .jobs()
+        .start(str_arg(args, "command")?, cwd, policy, host.session())?;
     Ok(format!(
         "{id} iniciado em segundo plano; use shell_output para ler a saída e shell_kill para encerrar"
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zerith_security::{preset, Mode};
+
+    #[test]
+    fn the_window_lists_and_stops_the_jobs_of_any_registry() {
+        let root =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-scratch");
+        std::fs::create_dir_all(&root).unwrap();
+        let dir = tempfile::Builder::new().tempdir_in(root).unwrap();
+        let policy = Policy::new(preset("workspace-write").unwrap(), Mode::Bypass, dir.path());
+        let long = if cfg!(windows) {
+            "ping -n 30 127.0.0.1 >nul"
+        } else {
+            "sleep 30"
+        };
+        let jobs = Jobs::default();
+        let a = jobs
+            .start(long, dir.path(), &policy, Some("s-ui".into()))
+            .unwrap();
+        let b = jobs.start(long, dir.path(), &policy, None).unwrap();
+        let listed = |id: &str| background_jobs().into_iter().find(|j| j.id == id);
+
+        let seen = listed(&a).expect("a running job is listed");
+        assert_eq!(seen.command, long);
+        assert_eq!(seen.session.as_deref(), Some("s-ui"));
+        assert!(stop_background_job(&a).unwrap().contains("encerrado"));
+        assert!(listed(&a).is_none(), "a stopped job leaves the list");
+        assert!(jobs.read(&a).unwrap().contains("terminou (encerrado)"));
+        assert!(stop_background_job("job-0").is_err());
+
+        assert!(listed(&b).is_some());
+        drop(jobs);
+        assert!(listed(&b).is_none(), "jobs die with their host");
+    }
 }

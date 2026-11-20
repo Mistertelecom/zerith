@@ -347,7 +347,37 @@ export interface PluginView {
   capabilities: string[];
   trusted: boolean;
   enabled: boolean;
+  skills: number;
+  agents: number;
+  /** MCP servers, hooks or a process: off until reviewed. */
+  runsCode: boolean;
 }
+
+/** One plugin a marketplace offers. */
+export interface PluginOffer {
+  market: string;
+  name: string;
+  description: string;
+  version: string;
+  category: string;
+  homepage: string;
+}
+
+export interface PluginsView {
+  installed: PluginView[];
+  offers: PluginOffer[];
+  markets: { name: string; source: string }[];
+}
+
+export type PluginAction =
+  | "install"
+  | "enable"
+  | "disable"
+  | "trust"
+  | "untrust"
+  | "remove"
+  | "market-add"
+  | "market-remove";
 
 export interface SaverView {
   ponytail: string;
@@ -359,6 +389,14 @@ export interface SaverPatch {
   ponytail?: string;
   caveman?: string;
   rtkEnabled?: boolean;
+}
+
+/** billion-context: whether it is on and what the local proxy is doing. */
+export interface LongContextView {
+  enabled: boolean;
+  state: "off" | "missing" | "starting" | "running" | "failed";
+  detail: string;
+  log: string;
 }
 
 export interface StorageView {
@@ -568,7 +606,9 @@ export const api = {
   skillsList: () => invoke<SkillView[]>("skills_list"),
   skillsCatalog: (force = false) =>
     invoke<Catalogue>("skills_catalog", { force }),
-  skillsPlugins: () => invoke<PluginView[]>("skills_plugins"),
+  skillsPlugins: () => invoke<PluginsView>("skills_plugins"),
+  pluginAction: (action: PluginAction, target: string) =>
+    invoke<PluginsView>("plugin_action", { action, target }),
   skillInstall: (from: string) =>
     invoke<SkillView[]>("skill_install", { from }),
   skillToggle: (name: string, enabled: boolean) =>
@@ -612,6 +652,11 @@ export const api = {
   tokenSaver: () => invoke<SaverView>("token_saver"),
   setTokenSaver: (patch: SaverPatch) =>
     invoke<SaverView>("set_token_saver", { patch }),
+  longContext: () => invoke<LongContextView>("long_context"),
+  setLongContext: (enabled: boolean) =>
+    invoke<LongContextView>("set_long_context", { enabled }),
+  installBillionContext: () =>
+    invoke<LongContextView>("install_billion_context"),
   storage: () => invoke<StorageView>("storage"),
   backup: () => invoke<string>("backup"),
   profileLimits: () => invoke<ProfileView[]>("profile_limits"),
@@ -783,15 +828,29 @@ export interface UpdateInfo {
   latest: string | null;
   /** True only when there is a newer installer to run. */
   newer: boolean;
-  url: string | null;
   notes: string;
   /** One pt-BR line for the window. */
   message: string;
   size: number | null;
 }
 
+/** A background shell job (`shell run_in_background`) still running. */
+export interface BackgroundJob {
+  id: string;
+  command: string;
+  /** The conversation whose turn started it (a subagent's own session for a child). */
+  session: string | null;
+  /** Seconds since it started. */
+  secs: number;
+}
+
+export const jobsApi = {
+  list: () => invoke<BackgroundJob[]>("background_jobs"),
+  stop: (id: string) => invoke<string>("background_job_stop", { id }),
+};
+
 export const updateApi = {
   check: () => invoke<UpdateInfo>("update_check"),
-  /** Downloads, checks SHA-256, starts the installer and quits the app. */
-  install: (url: string) => invoke<void>("update_install", { url }),
+  /** Downloads, verifies SHA-256 + Ed25519 signature, starts the installer and quits. */
+  install: () => invoke<void>("update_install"),
 };

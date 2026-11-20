@@ -4,9 +4,11 @@ import { CircleAlert, CircleArrowUp, Download, RefreshCw } from "lucide-react";
 import { updateApi, type UpdateInfo } from "../lib/api";
 import { Row } from "./ui";
 
-/** Last automatic check: `{ at, info }`. One network check per day at most. */
+/** Last automatic check: `{ at, info }`. */
 const KEY = "zerith.updateCheck";
-const DAY = 24 * 60 * 60 * 1000;
+/** A release shows up within this long while the app stays open. GitHub's
+ * anonymous limit is 60 calls/hour, so this is far below it. */
+const EVERY = 3 * 60 * 60 * 1000;
 const DELAY = 15_000;
 
 type Phase = "idle" | "checking" | "downloading" | "error";
@@ -18,18 +20,18 @@ function remember(info: UpdateInfo) {
   window.dispatchEvent(new CustomEvent<UpdateInfo>("zerith:update", { detail: info }));
 }
 
-/** Download + SHA-256 + installer; on success the app closes itself. */
+/** Download + SHA-256 + Ed25519 signature + installer; on success the app closes itself. */
 function install(info: UpdateInfo, setPhase: (p: Phase) => void, setError: (e: string) => void) {
-  if (!info.url) return;
+  if (!info.newer) return;
   setPhase("downloading");
   localStorage.removeItem(KEY); // the next start runs the new version: check fresh
-  updateApi.install(info.url).catch((e) => {
+  updateApi.install().catch((e) => {
     setError(String(e));
     setPhase("error");
   });
 }
 
-/** Title bar pill: 15 s after start, at most one GitHub call per 24 h. */
+/** Title bar pill: checks 15 s after start, then every 3 h while open. */
 export function UpdatePill() {
   const [info, setInfo] = useState<UpdateInfo | null>(null);
   const [phase, setPhase] = useState<Phase>("idle");
@@ -45,28 +47,18 @@ export function UpdatePill() {
   }, []);
 
   useEffect(() => {
-    const t = setTimeout(() => {
-      let saved: { at: number; info: UpdateInfo | null } | null = null;
-      try {
-        saved = JSON.parse(localStorage.getItem(KEY) ?? "null");
-      } catch {
-        /* bad entry: check again */
-      }
-      if (saved && Date.now() - saved.at < DAY) {
-        const cached = saved.info;
-        // still newer than what runs now (the user may have updated by hand)
-        if (cached?.newer)
-          void getVersion()
-            .then((v) => cached.latest !== v && setInfo(cached))
-            .catch(() => undefined);
-        return;
-      }
-      updateApi
+    // offline is not worth a dialog: the next round tries again
+    const check = () =>
+      void updateApi
         .check()
         .then(remember)
-        .catch(() => undefined); // offline at start is not worth a dialog
-    }, DELAY);
-    return () => clearTimeout(t);
+        .catch(() => undefined);
+    const t = setTimeout(check, DELAY);
+    const every = setInterval(check, EVERY);
+    return () => {
+      clearTimeout(t);
+      clearInterval(every);
+    };
   }, []);
 
   if (!info) return null;
@@ -99,6 +91,31 @@ export function UpdatePill() {
         </button>
       ) : null}
     </div>
+  );
+}
+
+/** The running version, small, on the start screen; it also says when a
+ * newer one is out (same event as the title bar pill). */
+export function AppVersion() {
+  const [version, setVersion] = useState("");
+  const [latest, setLatest] = useState<string | null>(null);
+  useEffect(() => {
+    getVersion()
+      .then(setVersion)
+      .catch(() => undefined);
+    const seen = (e: Event) => {
+      const i = (e as CustomEvent<UpdateInfo>).detail;
+      setLatest(i.newer ? i.latest : null);
+    };
+    window.addEventListener("zerith:update", seen);
+    return () => window.removeEventListener("zerith:update", seen);
+  }, []);
+  if (!version) return null;
+  return (
+    <p className="app-version">
+      Zerith v{version}
+      {latest ? <span className="app-version-new"> · nova versão {latest} disponível</span> : null}
+    </p>
   );
 }
 

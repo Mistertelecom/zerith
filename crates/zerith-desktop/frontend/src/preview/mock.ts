@@ -410,24 +410,42 @@ const catalog = {
   })),
 };
 
-const plugins = [
-  {
-    name: "git-tools",
-    version: "0.3.1",
-    description: "Commits, branches e diffs.",
-    capabilities: ["shell", "fs"],
-    trusted: true,
-    enabled: true,
-  },
-  {
-    name: "browser",
-    version: "1.2.0",
-    description: "Navegador controlado pelo agente.",
-    capabilities: ["net"],
-    trusted: false,
-    enabled: false,
-  },
-];
+const offers = [
+  ["claude-bughunter", "security", "Bug bounty e red team externo: 83 skills e 15 comandos (/hunt, /recon, /chain...)."],
+  ["cli-anything", "development", "Gera um CLI completo e com estado para qualquer programa de interface gráfica."],
+  ["stitch-skills", "design", "Google Stitch: design para código (React, shadcn/ui, Remotion) e sistema de design."],
+  ["astryx", "design", "Astryx (Meta), sistema de design e biblioteca de UI pelo comando astryx."],
+  ["billion-context", "productivity", "Conversas longas pelo proxy local billion-context."],
+].map(([name, category, description]) => ({ market: "zerith", name, category, description, version: "", homepage: "" }));
+
+const plugins = {
+  installed: [
+    {
+      name: "claude-bughunter",
+      version: "2.1.0",
+      description: offers[0].description,
+      capabilities: [] as string[],
+      trusted: false,
+      enabled: true,
+      skills: 98,
+      agents: 0,
+      runsCode: true,
+    },
+    {
+      name: "astryx",
+      version: "0.1.0",
+      description: offers[3].description,
+      capabilities: [] as string[],
+      trusted: false,
+      enabled: true,
+      skills: 1,
+      agents: 0,
+      runsCode: false,
+    },
+  ],
+  offers,
+  markets: [{ name: "zerith", source: "Mistertelecom/zerith" }],
+};
 
 const agents = [
   [
@@ -571,7 +589,14 @@ const PREVIEW_CHANGES = [
   },
 ];
 
-let state = { theme: "dark", memory_paused: false };
+let state = {
+  theme: "dark",
+  memory_paused: false,
+  // `&jobs=1` in the preview URL: one hung dev server to stop.
+  jobs: new URLSearchParams(globalThis.location?.search ?? "").has("jobs")
+    ? [{ id: "job-3", command: "npm run dev -- --port 5173", session: "s1", secs: 754 }]
+    : ([] as { id: string; command: string; session: string | null; secs: number }[]),
+};
 
 export function installMock(theme: string) {
   state.theme = theme;
@@ -579,6 +604,13 @@ export function installMock(theme: string) {
     (cmd, args) => {
       const a = (args ?? {}) as Record<string, unknown>;
       switch (cmd) {
+        case "plugin:app|version":
+          return "0.1.1";
+        case "update_check":
+          // &update=1 in the preview URL: a newer release is out
+          return new URLSearchParams(location.search).get("update")
+            ? { current: "0.1.1", latest: "0.1.2", newer: true, notes: "", message: "Nova versão 0.1.2 disponível" }
+            : { current: "0.1.1", latest: "0.1.1", newer: false, notes: "", message: "Você está na versão mais nova" };
         case "boot":
           return {
             root: "C:/Users/Joao/AppData/Roaming/Zerith",
@@ -760,6 +792,23 @@ export function installMock(theme: string) {
           return catalog;
         case "skills_plugins":
           return plugins;
+        case "plugin_action": {
+          const o = offers.find((x) => x.name === a.target);
+          if (a.action === "install" && o && !plugins.installed.some((p) => p.name === o.name)) {
+            plugins.installed.push({
+              name: o.name,
+              version: "1.0.0",
+              description: o.description,
+              capabilities: [],
+              trusted: false,
+              enabled: true,
+              skills: 5,
+              agents: 0,
+              runsCode: false,
+            });
+          }
+          return { ...plugins, installed: [...plugins.installed] };
+        }
         case "hermes_skills":
           return [
             ["", "ab-testing", "Plan and run A/B tests and experiments."],
@@ -805,6 +854,10 @@ export function installMock(theme: string) {
           ];
         case "token_saver":
           return { ponytail: "full", caveman: "off", rtkEnabled: true };
+        case "long_context":
+        case "set_long_context":
+        case "install_billion_context":
+          return { enabled: true, state: "running", detail: "http://127.0.0.1:18787", log: "" };
         case "storage":
           return {
             root: "C:/Users/Joao/AppData/Roaming/Zerith",
@@ -881,6 +934,11 @@ export function installMock(theme: string) {
           return null;
         case "save_prefs":
           return state.theme;
+        case "background_jobs":
+          return state.jobs;
+        case "background_job_stop":
+          state.jobs = state.jobs.filter((j) => j.id !== a.id);
+          return `${a.id} encerrado`;
         default:
           return null;
       }

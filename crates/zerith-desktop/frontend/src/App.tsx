@@ -41,7 +41,9 @@ import { Logo, ZerithMark } from "./components/ui";
 import { catalogEntry, NOT_CHAT } from "./lib/catalog";
 import { titleOf } from "./lib/title";
 import { TitleBar } from "./components/TitleBar";
+import { AppVersion } from "./components/Update";
 import { FolderPill } from "./components/FolderPill";
+import { BackgroundJobs } from "./components/BackgroundJobs";
 
 const MODEL_KEY = "zerith.model";
 
@@ -96,6 +98,8 @@ export default function App() {
   // open keeps its stream, its Stop button and its approval card. `turn` below
   // is the open one.
   const [turns, setTurns] = useState<Record<string, TurnState>>({});
+  const turnsRef = useRef<Record<string, TurnState>>(turns);
+  turnsRef.current = turns;
   const selectedRef = useRef<string | null>(null);
   selectedRef.current = selected;
   const updateTurn = useCallback(
@@ -123,9 +127,14 @@ export default function App() {
   const [liveModels, setLiveModels] = useState<
     Record<string, { id: string; name: string }[]>
   >({});
-  const [hidden, setHidden] = useState<string[]>(() =>
-    JSON.parse(localStorage.getItem(HIDDEN_KEY) ?? "[]"),
-  );
+  const [hidden, setHidden] = useState<string[]>(() => {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(HIDDEN_KEY) ?? "[]");
+      return Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === "string") : [];
+    } catch {
+      return [];
+    }
+  });
   const toggleHidden = useCallback((v: string) => {
     setHidden((prev) => {
       const next = prev.includes(v)
@@ -232,9 +241,11 @@ export default function App() {
 
   // OAuth accounts that publish their models (Antigravity's Gemini 4 Hydrogen
   // is not in any static catalogue); a failure keeps the catalogue list.
+  const fetchedLiveModels = useRef<Set<string>>(new Set());
   useEffect(() => {
-    for (const a of accounts)
-      if (a.enabled && a.auth === "oauth" && !liveModels[a.id])
+    for (const a of accounts) {
+      if (a.enabled && a.auth === "oauth" && !fetchedLiveModels.current.has(a.id)) {
+        fetchedLiveModels.current.add(a.id);
         api
           .accountModels(a.id)
           .then(
@@ -242,7 +253,9 @@ export default function App() {
               list.length && setLiveModels((m) => ({ ...m, [a.id]: list })),
           )
           .catch(() => undefined);
-  }, [accounts, liveModels]);
+      }
+    }
+  }, [accounts]);
 
   const fresh = useRef<string | null>(null);
   // Transcript of the conversation that is open.
@@ -258,11 +271,15 @@ export default function App() {
       fresh.current = null;
       return;
     }
+    let live = true;
     api
       .sessionMessages(selected)
-      .then((list) => setMessages(toBlocks(list)))
-      .catch(() => setMessages([]));
-  }, [selected]);
+      .then((list) => live && setMessages(toBlocks(list)))
+      .catch(() => live && setMessages([]));
+    return () => {
+      live = false;
+    };
+  }, [selected, setTurn]);
 
   // Turn events, for every conversation at once. The state of a chat that is
   // not open is kept here, so switching away and back shows the same stream,
@@ -286,13 +303,14 @@ export default function App() {
       if (id !== selectedRef.current) return;
       void api
         .sessionMessages(id)
-        .then((list) =>
+        .then((list) => {
+          if (id !== selectedRef.current) return;
           setMessages((prev) => {
-            const last = turns[id]?.blocks.at(-1);
+            const last = turnsRef.current[id]?.blocks.at(-1);
             const stored = last?.kind === "assistant" ? last.stored : undefined;
             return borrowIds(prev, list, stored);
-          }),
-        )
+          });
+        })
         .catch(() => undefined);
     });
     const learned = onTurnLearned((id, items) => {
@@ -706,6 +724,11 @@ export default function App() {
               </button>
             ) : null}
           </header>
+          <BackgroundJobs
+            active={Object.values(turns).some((t) => t.busy)}
+            selected={selected}
+            sessions={sessions}
+          />
           <div className="main-body">
             {/* The composer keeps its place in the tree, so the first send from
               the hero does not remount it. */}
@@ -718,6 +741,7 @@ export default function App() {
                     Peça código, revisão ou um plano. As ferramentas rodam no
                     seu computador e pedem aprovação.
                   </p>
+                  <AppVersion />
                 </div>
               ) : (
                 <Transcript

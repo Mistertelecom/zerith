@@ -15,12 +15,14 @@ mod ask_user;
 mod authoring;
 mod browser;
 mod builtin;
+mod diagnostics;
 mod fntool;
 mod host;
 mod jobs;
 mod media;
 mod skill_tool;
 mod tasks;
+mod terminal;
 mod web;
 
 use std::path::{Path, PathBuf};
@@ -35,9 +37,11 @@ pub use ask_user::{parse_questions, Question, QuestionOption};
 pub use authoring::{tools as authoring_tools, Authoring};
 pub use builtin::shell_command;
 pub use host::{AgentRequest, EventSink, Host, HostEvent, Services, SkillLoad};
+pub use jobs::{background_jobs, stop_background_job, BackgroundJob};
 pub use media::{tools as media_tools, tools_with_key as media_tools_with_key};
 pub use skill_tool::check as check_skill_args;
 pub use tasks::{check as check_task_args, STATUSES as TASK_STATUSES};
+pub use terminal::terminal_program;
 pub use web::SearchTool;
 
 /// What a caller may be asked to allow.

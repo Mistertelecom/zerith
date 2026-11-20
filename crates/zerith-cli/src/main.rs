@@ -13,7 +13,7 @@ mod signals;
 use std::process::ExitCode;
 use zerith_core::{secrets, Paths, Settings};
 use zerith_importers::{detect, import, import_jsonl, ImportReport};
-use zerith_memory::{default_scope, Confidence, FactKind, MemoryBackend, Scope, SqliteMemory};
+use zerith_memory::{Confidence, FactKind, MemoryBackend, Scope, SqliteMemory};
 use zerith_providers::{Cancel, ChatMessage, ChatRequest, Client, ProviderError};
 use zerith_runtime::guards::Guards;
 use zerith_runtime::plan::{parse_plan, run_plan};
@@ -276,7 +276,7 @@ fn tools_cmd(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::E
             let workspace = std::env::current_dir().unwrap_or_else(|_| paths.root().to_path_buf());
             let policy = Policy::from_settings(&settings, &workspace)?;
             let memory = SqliteMemory::open(paths.db()).ok();
-            let scope = default_scope();
+            let scope = Scope::workspace(&workspace);
             let ctx = CallCtx {
                 workspace: &workspace,
                 policy: &policy,
@@ -540,7 +540,9 @@ fn plan(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>
                 &plan_id,
                 &model,
                 agents,
-                Some(default_scope()),
+                Some(Scope::workspace(
+                    &std::env::current_dir().unwrap_or_default(),
+                )),
                 |task, state| println!("  {}  {}", state.as_str(), task.title),
             )?;
             println!(
@@ -674,6 +676,31 @@ fn secret_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// `[s]im / [n]ão / [t]odos nesta conversa` on stderr; anything else is no.
+/// The turn waits here, on its own thread, which is what the gate expects.
+fn ask_terminal(tool: &str, summary: &str) -> zerith_runtime::Approval {
+    use std::io::Write;
+    let mut err = std::io::stderr();
+    let _ = write!(
+        err,
+        "\n\x1b[1m[aprovação]\x1b[0m {tool}: {summary}\n  Permitir? [s]im / [n]ão / [t]odos nesta conversa: "
+    );
+    let _ = err.flush();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return zerith_runtime::Approval::Deny;
+    }
+    parse_answer(&line)
+}
+
+fn parse_answer(line: &str) -> zerith_runtime::Approval {
+    match line.trim().to_lowercase().as_str() {
+        "s" | "sim" | "y" | "yes" => zerith_runtime::Approval::AllowOnce,
+        "t" | "todos" | "a" | "all" => zerith_runtime::Approval::AllowSession,
+        _ => zerith_runtime::Approval::Deny,
+    }
+}
+
 /// One turn: resolve the session, stream the answer, persist it whole.
 ///
 /// The turn runs on this thread. A CLI has nothing else to do while it waits,
@@ -692,6 +719,7 @@ fn chat(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>
     if let Some(c) = &contrib {
         c.apply_hooks(&mut settings);
     }
+    zerith_runtime::bili::attach(paths.root(), settings.context.billion_context);
     let cfg = provider_config(&settings)?;
     let model = resolve_model(model_flag, &settings, &cfg)
         .ok_or("sem modelo: use --model, routing.main_model ou ZERITH_MODEL")?;
@@ -728,11 +756,20 @@ fn chat(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>
     let guards = Guards::new(settings.clone(), &mut policy, session_id.clone());
     tools.register(guards.enter_plan_mode_tool());
     tools.register(guards.exit_plan_mode_tool());
+    let have: Vec<String> = tools.specs().iter().map(|s| s.name.clone()).collect();
+    for t in zerith_tools::authoring_tools(zerith_tools::Authoring {
+        paths: paths.clone(),
+        project_dir: Some(workspace.clone()),
+        tools: have,
+        mode: policy.mode().settings_name().to_string(),
+    }) {
+        tools.register(t);
+    }
 
     // Memory shares the same database file: one store, one schema, no second
     // source of truth to keep in sync.
     let memory = SqliteMemory::open(paths.db())?;
-    let scope = default_scope();
+    let scope = Scope::workspace(&workspace);
     let memory = (!settings.memory.paused).then_some(&memory as &dyn MemoryBackend);
 
     // Installed skills are consulted, but only their names and descriptions
@@ -748,6 +785,35 @@ fn chat(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>
     let cancel = Cancel::default();
     signals::install(cancel.clone());
 
+    // A person at a terminal answers s/n; a pipe or CI has no one to ask and
+    // keeps the old answer (denied), so a script never hangs on a prompt.
+    let (approver, gate) = zerith_runtime::approval_channel();
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let opts = AgentOptions {
+        tools: Some(&tools),
+        policy: Some(&policy),
+        approvals: interactive.then_some(&gate),
+        middleware: vec![Box::new(guards)],
+        spill_dir: Some(paths.root().join("spill")),
+        ..AgentOptions::for_profile(zerith_runtime::active_profile())
+    };
+    match zerith_runtime::compact::auto_compact_routed(
+        &store,
+        &settings,
+        &client,
+        &session_id,
+        &model,
+        opts.history,
+        &cancel,
+    ) {
+        Ok(Some(r)) => eprintln!(
+            "zerith: histórico resumido ({} → {} tokens)",
+            r.tokens_before, r.tokens_after
+        ),
+        Ok(None) => {}
+        Err(e) => eprintln!("zerith: resumo automático falhou: {e}"),
+    }
+
     let mut streamed = false;
     let mut digest = zerith_runtime::learn::TurnDigest::new(&prompt);
     let result = run_agent_turn(
@@ -760,13 +826,7 @@ fn chat(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>
             settings: Some(&settings),
             ..TurnContext::default()
         },
-        AgentOptions {
-            tools: Some(&tools),
-            policy: Some(&policy),
-            middleware: vec![Box::new(guards)],
-            spill_dir: Some(paths.root().join("spill")),
-            ..AgentOptions::for_profile(zerith_runtime::active_profile())
-        },
+        opts,
         &session_id,
         &model,
         &prompt,
@@ -780,6 +840,9 @@ fn chat(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>
                     let _ = std::io::Write::flush(&mut std::io::stdout());
                 }
                 RunEvent::Reasoning(r) => eprintln!("[reasoning] {r}"),
+                RunEvent::ApprovalNeeded { id, tool, summary } => {
+                    approver.answer(id, ask_terminal(&tool, &summary));
+                }
                 RunEvent::ToolCall { name, args, .. } => eprintln!("\n[tool] {name} {args}"),
                 RunEvent::ToolResult {
                     name,

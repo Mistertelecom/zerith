@@ -7,7 +7,10 @@ use tauri::State;
 use zerith_memory::{MemoryBackend, SqliteMemory};
 
 use crate::state::AppState;
-use crate::wire::memory_scope;
+/// The memory screen manages every project's facts, not one chat's view.
+fn memory_scope() -> zerith_memory::Scope {
+    zerith_memory::Scope::all()
+}
 
 /// Facts read per load. Bounded so a huge memory never stalls the window.
 const FACT_PAGE: usize = 500;

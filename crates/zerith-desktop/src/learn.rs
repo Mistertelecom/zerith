@@ -31,6 +31,8 @@ pub struct Job {
     pub session_id: String,
     pub model: String,
     pub memory_paused: bool,
+    /// The conversation's memory scope (its project + the user).
+    pub scope: zerith_memory::Scope,
     pub digest: TurnDigest,
 }
 
@@ -55,7 +57,7 @@ pub fn spawn(job: Job) {
         let memory = (!job.memory_paused)
             .then(|| SqliteMemory::open(&job.db).ok())
             .flatten();
-        let scope = crate::wire::memory_scope();
+        let scope = job.scope.clone();
         let skills = zerith_skills::Library::open(job.root.join("skills")).ok();
         let pass = Pass {
             memory: memory.as_ref().map(|m| (m as &dyn MemoryBackend, &scope)),

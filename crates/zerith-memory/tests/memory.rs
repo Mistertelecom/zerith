@@ -90,14 +90,14 @@ fn forget_removes_text_and_keeps_it_forgotten_after_reinsert() {
         .remember(
             &s,
             FactKind::Fact,
-            "senha antiga",
+            "endereco antigo",
             Confidence::Confirmed,
             None,
         )
         .unwrap();
     m.forget(id).unwrap();
 
-    assert!(m.recall(&s, "senha", 10).unwrap().is_empty());
+    assert!(m.recall(&s, "endereco", 10).unwrap().is_empty());
     assert!(m.list(&s, 10).unwrap().is_empty());
     let stored = m.get(id).unwrap();
     assert_eq!(stored.text, "");
@@ -107,7 +107,7 @@ fn forget_removes_text_and_keeps_it_forgotten_after_reinsert() {
         .remember(
             &s,
             FactKind::Fact,
-            "senha antiga",
+            "endereco antigo",
             Confidence::Confirmed,
             None,
         )
@@ -307,4 +307,88 @@ fn facts_round_trip_through_jsonl() {
     let mut one = Vec::new();
     assert_eq!(a.export_jsonl(Some(&u), &mut one).unwrap(), 1);
     assert!(b.import_jsonl(&b"{bad"[..]).is_err());
+}
+
+#[test]
+fn work_facts_stay_in_their_project_and_preferences_follow_the_user() {
+    let m = mem();
+    let base =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-scratch");
+    let (a, b) = (base.join("cliente-a"), base.join("cliente-b"));
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    let (sa, sb) = (Scope::workspace(&a), Scope::workspace(&b));
+    let c = Confidence::Confirmed;
+    m.remember(&sa, FactKind::Fact, "roteador core em 10.0.0.1", c, None)
+        .unwrap();
+    m.remember(&sa, FactKind::Preference, "responder em portugues", c, None)
+        .unwrap();
+    // A fact saved before projects existed (plain user scope).
+    m.remember(
+        &zerith_memory::default_scope(),
+        FactKind::Fact,
+        "roteador antigo legado",
+        c,
+        None,
+    )
+    .unwrap();
+
+    let texts = |s: &Scope| -> Vec<String> {
+        m.recall(s, "roteador portugues", 10)
+            .unwrap()
+            .into_iter()
+            .map(|h| h.fact.text)
+            .collect()
+    };
+    let in_a = texts(&sa);
+    let in_b = texts(&sb);
+    assert!(in_a.iter().any(|t| t.contains("10.0.0.1")), "{in_a:?}");
+    assert!(
+        !in_b.iter().any(|t| t.contains("10.0.0.1")),
+        "leaked to B: {in_b:?}"
+    );
+    assert!(
+        in_b.iter().any(|t| t.contains("portugues")),
+        "preference follows the user: {in_b:?}"
+    );
+    assert!(
+        in_b.iter().any(|t| t.contains("legado")),
+        "old facts stay visible: {in_b:?}"
+    );
+    assert_eq!(
+        m.list(&Scope::all(), 10).unwrap().len(),
+        3,
+        "the memory screen sees all"
+    );
+    assert!(m
+        .remember(&Scope::all(), FactKind::Fact, "x", c, None)
+        .is_err());
+}
+
+#[test]
+fn a_password_is_never_remembered() {
+    let m = mem();
+    let s = Scope::user("joao");
+    let c = Confidence::Confirmed;
+    assert!(m
+        .remember(
+            &s,
+            FactKind::Fact,
+            "A senha do roteador do cliente Alfa é Admin@123",
+            c,
+            None
+        )
+        .is_err());
+    assert!(m
+        .remember(&s, FactKind::Fact, "community SNMP AlphanNet-86", c, None)
+        .is_err());
+    assert!(m
+        .remember(
+            &s,
+            FactKind::Fact,
+            "OLT do cliente Alfa em 10.27.30.2",
+            c,
+            None
+        )
+        .is_ok());
 }

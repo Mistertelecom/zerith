@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 zerith-sessions = { path = "../zerith-sessions" }
+# `mentions_secret`: a password never becomes a remembered fact.
+zerith-security = { path = "../zerith-security" }
 serde.workspace = true
 serde_json.workspace = true
 rusqlite.workspace = true

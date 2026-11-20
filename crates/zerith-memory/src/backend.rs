@@ -20,7 +20,45 @@ impl Scope {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// The scope a conversation in `workspace` uses: facts about the work go
+    /// to the project, so one client's routers never show up in another's
+    /// chat; preferences and instructions stay with the user, everywhere.
+    /// Reads see both, and the facts saved before this split (all `user:`).
+    pub fn workspace(workspace: &std::path::Path) -> Self {
+        let real = workspace
+            .canonicalize()
+            .unwrap_or_else(|_| workspace.to_path_buf());
+        let mut id = real.to_string_lossy().replace('\\', "/");
+        if let Some(rest) = id.strip_prefix("//?/") {
+            id = rest.to_string();
+        }
+        if cfg!(windows) {
+            id = id.to_lowercase();
+        }
+        Scope(format!("project:{id}{SEP}{}", default_scope().0))
+    }
+
+    /// Every scope: the memory screen, which manages all of it.
+    pub fn all() -> Self {
+        Scope("*".into())
+    }
+
+    /// Where a new fact of `kind` is written.
+    pub fn write_for(&self, kind: FactKind) -> &str {
+        let first = self.0.split(SEP).next().unwrap_or("");
+        let last = self.0.rsplit(SEP).next().unwrap_or(first);
+        match kind {
+            FactKind::Preference | FactKind::Instruction => last,
+            _ => first,
+        }
+    }
 }
+
+/// Joins the scopes of a composite read set (no path holds it on Windows).
+// ponytail: a composite scope is one string the SQL matches with instr();
+// a table of scopes if memory ever has more than a few thousand facts.
+pub const SEP: char = '|';
 
 /// The scope CLI and UI both use: `user:$ZERITH_USER`, else `user:local`.
 /// One rule, so a fact stored in one front end is visible in the other.
@@ -121,6 +159,8 @@ pub enum MemoryError {
     NotFound(i64),
     #[error("empty memory text")]
     Empty,
+    #[error("parece conter senha ou chave: guarde no cofre do sistema, não na memória")]
+    Secret,
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("linha {line}: {message}")]

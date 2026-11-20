@@ -177,17 +177,23 @@ impl MemoryBackend for SqliteMemory {
         if text.is_empty() {
             return Err(MemoryError::Empty);
         }
+        if scope.as_str() == "*" {
+            return Err(MemoryError::Empty);
+        }
+        if zerith_security::mentions_secret(text) {
+            return Err(MemoryError::Secret);
+        }
         let ts = now_ms();
         self.conn.execute(
             "INSERT INTO memory_facts(scope, kind, text, source, confidence, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
              ON CONFLICT(scope, text) WHERE deleted = 0
              DO UPDATE SET updated_at = excluded.updated_at",
-            params![scope.as_str(), kind.as_str(), text, source, confidence.as_str(), ts],
+            params![scope.write_for(kind), kind.as_str(), text, source, confidence.as_str(), ts],
         )?;
         let id: i64 = self.conn.query_row(
             "SELECT id FROM memory_facts WHERE scope = ?1 AND text = ?2 AND deleted = 0",
-            params![scope.as_str(), text],
+            params![scope.write_for(kind), text],
             |r| r.get(0),
         )?;
         Ok(id)
@@ -201,7 +207,7 @@ impl MemoryBackend for SqliteMemory {
                           f.created_at, f.updated_at, f.superseded_by, bm25(memory_fts) AS score
                    FROM memory_fts
                    JOIN memory_facts f ON f.id = memory_fts.rowid
-                   WHERE memory_fts MATCH ?1 AND f.scope = ?2 AND f.deleted = 0
+                   WHERE memory_fts MATCH ?1 AND (?2 = '*' OR instr('|' || ?2 || '|', '|' || f.scope || '|') > 0) AND f.deleted = 0
                    ORDER BY score LIMIT ?3";
         let mut st = self.conn.prepare(sql)?;
         let rows = st.query_map(params![query, scope.as_str(), limit as i64], |r| {
@@ -217,7 +223,7 @@ impl MemoryBackend for SqliteMemory {
         self.select_where(
             &format!(
                 "SELECT {COLUMNS} FROM memory_facts
-                 WHERE scope = ?1 AND deleted = 0
+                 WHERE (?1 = '*' OR instr('|' || ?1 || '|', '|' || scope || '|') > 0) AND deleted = 0
                  ORDER BY updated_at DESC LIMIT ?2"
             ),
             &[&scope.as_str(), &(limit as i64)],
@@ -283,7 +289,7 @@ impl MemoryBackend for SqliteMemory {
     fn export(&self, scope: &Scope) -> Result<Vec<Fact>> {
         self.select_where(
             &format!(
-                "SELECT {COLUMNS} FROM memory_facts WHERE scope = ?1 AND deleted = 0 ORDER BY id"
+                "SELECT {COLUMNS} FROM memory_facts WHERE (?1 = '*' OR instr('|' || ?1 || '|', '|' || scope || '|') > 0) AND deleted = 0 ORDER BY id"
             ),
             &[&scope.as_str()],
         )

@@ -1,5 +1,5 @@
-//! The few plain types the bridge and the window share: no Rune, no Tauri,
-//! no I/O. They are the vocabulary the commands speak.
+//! The few plain types the bridge and the window share: no Tauri, no I/O.
+//! They are the vocabulary the commands speak.
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -193,6 +193,10 @@ pub struct ChatMessage {
     pub content: String,
     pub reasoning: Option<String>,
     pub tool_name: Option<String>,
+    /// As stored: `[{id, name, arguments}]` on a step that called tools,
+    /// `{tool_call_id}` on a tool result. The transcript pairs them.
+    #[serde(default)]
+    pub tool_calls: Option<serde_json::Value>,
 }
 
 /// A question the model asked, ready for the card that draws it.

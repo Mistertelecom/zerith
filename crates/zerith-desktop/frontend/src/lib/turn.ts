@@ -199,7 +199,7 @@ export function toBlocks(list: ChatMessage[]): Block[] {
   const out: Block[] = [];
   let a: (Block & { kind: "assistant" }) | null = null;
   // `tool_calls`: [{id, name, arguments}] on a step, {tool_call_id} on a result
-  // (only when the core sends them; the tool line just lacks its argument).
+  // (old rows may lack them; the tool line then just lacks its argument).
   const calls = new Map<string, string>();
   for (const m of list) {
     if (m.role === "user") {
@@ -211,8 +211,7 @@ export function toBlocks(list: ChatMessage[]): Block[] {
     const tc = m.tool_calls as { id?: string; arguments?: string; tool_call_id?: string }[] | { tool_call_id?: string } | null | undefined;
     if (m.role === "tool") {
       const id = Array.isArray(tc) ? undefined : tc?.tool_call_id;
-      // ponytail: the store keeps no success flag for a tool; output = done.
-      a.tools.push({ id: id ?? `row${m.id ?? a.tools.length}`, name: m.tool_name ?? "ferramenta", args: (id && calls.get(id)) || "", ok: true, preview: m.content });
+      a.tools.push({ id: id ?? `row${m.id ?? a.tools.length}`, name: m.tool_name ?? "ferramenta", args: (id && calls.get(id)) || "", ok: !toolFailed(m.content), preview: m.content });
       continue;
     }
     if (Array.isArray(tc)) for (const c of tc) if (c.id) calls.set(c.id, c.arguments ?? "");
@@ -221,6 +220,16 @@ export function toBlocks(list: ChatMessage[]): Block[] {
     if (m.role === "assistant") a.stored = m.id;
   }
   return out.filter((b) => b.kind !== "assistant" || b.text || b.tools.length || b.reasoning);
+}
+
+/** A stored tool output the runtime wrote for a failed call: `erro: …`
+ * (the tool returned an error), `negado…` (policy, hook or the person) or
+ * `[cancelado]`.
+ * ponytail: the store keeps no success flag, so this reads the prefix; a
+ * successful output that itself starts with `erro:` shows as failed. Store
+ * `ok` next to `tool_call_id` in the runtime if that ever matters. */
+export function toolFailed(output: string): boolean {
+  return /^(erro:|negado|\[cancelado\])/.test(output);
 }
 
 /** Token count as the meter shows it. */

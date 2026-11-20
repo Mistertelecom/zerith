@@ -1,7 +1,7 @@
 // node scripts/turn.check.ts — the turn reducer, the stored-chat rebuild and
 // the prompt id borrow.
 import assert from "node:assert";
-import { applyEvent, borrowIds, emptyTurn, finishTurn, toBlocks, type Block, type TurnState } from "../src/lib/turn.ts";
+import { applyEvent, borrowIds, emptyTurn, finishTurn, toBlocks, toolFailed, type Block, type TurnState } from "../src/lib/turn.ts";
 import type { ChatMessage } from "../src/lib/api.ts";
 
 const run = (s: TurnState, evs: unknown[]) => evs.reduce<TurnState>((acc, ev) => applyEvent(acc, ev as never), s);
@@ -61,6 +61,19 @@ assert.deepEqual(a1.tools, [{ id: "c1", name: "list_dir", args: '{"path":"."}', 
 assert.equal(asst(blocks[3]).tools[0].name, "shell", "works without tool_calls too");
 assert.equal(asst(blocks[3]).stored, 8);
 assert.equal(toBlocks([{ id: 1, role: "assistant", content: "", reasoning: null, tool_name: null }] as ChatMessage[]).length, 0);
+
+// reopened chat: real arguments per call id, and failed calls stay failed
+const failedRows = [
+  { id: 1, role: "user", content: "Rode", reasoning: null, tool_name: null },
+  { id: 2, role: "assistant", content: "", reasoning: null, tool_name: null, tool_calls: [{ id: "a", name: "shell", arguments: '{"command":"cargo test"}' }, { id: "b", name: "write_file", arguments: '{"path":"x"}' }] },
+  { id: 3, role: "tool", content: "erro: exit 101\n--- stderr\nfalhou", reasoning: null, tool_name: "shell", tool_calls: { tool_call_id: "a" } },
+  { id: 4, role: "tool", content: "negado pelo usuário", reasoning: null, tool_name: "write_file", tool_calls: { tool_call_id: "b" } },
+  { id: 5, role: "assistant", content: "Os testes falham.", reasoning: null, tool_name: null },
+] as ChatMessage[];
+const ft = asst(toBlocks(failedRows)[1]).tools;
+assert.deepEqual(ft.map((t) => [t.id, t.args, t.ok]), [["a", '{"command":"cargo test"}', false], ["b", '{"path":"x"}', false]]);
+assert.ok(toolFailed("[cancelado]") && toolFailed("negado: fora do workspace"));
+assert.ok(!toolFailed("exit 0\n--- stdout\nok") && !toolFailed("AGENTS.md"));
 
 // the sent prompt borrows its row id by position, even when the text repeats
 const live: Block[] = [...blocks, { kind: "user", text: "Liste" }];

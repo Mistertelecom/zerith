@@ -299,6 +299,7 @@ pub fn run_agent_turn(
             name,
             state: "cancelled".into(),
             summary: "parado: a conversa terminou antes dele".into(),
+            model: String::new(),
         });
     }
     match &result {

@@ -47,6 +47,8 @@ pub enum HostEvent {
         /// `running`, `done`, `failed` or `cancelled`.
         state: String,
         summary: String,
+        /// The model the child runs on (empty when it could not be known).
+        model: String,
     },
     /// The session's task list changed; the loop reloads and publishes it.
     Tasks,

@@ -114,6 +114,8 @@ pub enum RunEvent {
         name: String,
         state: String,
         summary: String,
+        /// The model the child runs on: the window shows who is doing the work.
+        model: String,
     },
     /// The turn is blocked until `QuestionSender::answer(id, ..)` is called.
     Question {

@@ -104,6 +104,8 @@ export type TurnEvent =
       name: string;
       state: string;
       summary: string;
+      /** The model the child runs on (empty when unknown). */
+      model: string;
     }
   | { type: "question"; id: number; questions: Question[] }
   | {

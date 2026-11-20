@@ -37,7 +37,20 @@ export interface TurnState {
   usage: { input: number; output: number } | null;
   saved: number;
   route: { provider: string; model: string } | null;
+  /** Children the turn delegated to, live: who runs on which model. */
+  subagents: SubagentRun[];
   busy: boolean;
+}
+
+export interface SubagentRun {
+  id: string;
+  name: string;
+  /** The model the child runs on (empty when unknown). */
+  model: string;
+  state: string;
+  summary: string;
+  /** Epoch ms of the last update. */
+  at: number;
 }
 
 export const emptyTurn: TurnState = {
@@ -48,6 +61,7 @@ export const emptyTurn: TurnState = {
   usage: null,
   saved: 0,
   route: null,
+  subagents: [],
   busy: false,
 };
 
@@ -133,7 +147,20 @@ export function applyEvent(prev: TurnState, ev: TurnEvent): TurnState {
         failed: "falhou",
         cancelled: "parado",
       };
-      const text = `Subagente ${ev.name}: ${word[ev.state] ?? ev.state}${ev.summary ? " — " + ev.summary : ""}`;
+      const who = ev.model ? ` (${ev.model})` : "";
+      const text = `Subagente ${ev.name}${who}: ${word[ev.state] ?? ev.state}${ev.summary ? " — " + ev.summary : ""}`;
+      state.subagents = [...(state.subagents ?? [])];
+      const run: SubagentRun = {
+        id: ev.id,
+        name: ev.name,
+        model: ev.model ?? "",
+        state: ev.state,
+        summary: ev.summary,
+        at: Date.now(),
+      };
+      const known = state.subagents.findIndex((s) => s.id === ev.id);
+      if (known >= 0) state.subagents[known] = run;
+      else state.subagents.push(run);
       const at = state.blocks.findIndex((b) => b.kind === "note" && b.sub === ev.id);
       state.blocks = [...state.blocks];
       if (at >= 0) state.blocks[at] = { kind: "note", text, sub: ev.id };

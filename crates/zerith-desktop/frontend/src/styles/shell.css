@@ -637,6 +637,22 @@
 .insp-task.in_progress > svg {
   color: var(--label-primary);
 }
+/* A subagent row carries its model and the step it is on. */
+.insp-model {
+  display: block;
+  font-size: var(--fs-caption);
+  color: var(--label-caption);
+  font-variant-numeric: tabular-nums;
+}
+.insp-sub {
+  font-size: var(--fs-caption);
+  font-style: normal;
+  color: var(--label-tertiary);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
 .insp-task.completed {
   color: var(--label-tertiary);
   text-decoration: line-through;

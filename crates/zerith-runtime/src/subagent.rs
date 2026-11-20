@@ -478,6 +478,7 @@ pub(crate) fn run_child_with(
                         name: name.clone(),
                         state: "running".into(),
                         summary,
+                        model: spec.model.clone(),
                     };
                     match (&spec.approvals, &sink) {
                         (Some(g), _) => g.relay(ev),
@@ -487,6 +488,7 @@ pub(crate) fn run_child_with(
                                 name,
                                 state,
                                 summary,
+                                model,
                             } = ev
                             {
                                 s.push(HostEvent::Subagent {
@@ -494,6 +496,7 @@ pub(crate) fn run_child_with(
                                     name,
                                     state,
                                     summary,
+                                    model,
                                 });
                             }
                         }
@@ -506,6 +509,7 @@ pub(crate) fn run_child_with(
                         name,
                         state,
                         summary,
+                        model,
                     },
                     Some(s),
                 ) = (e, &sink)
@@ -515,6 +519,7 @@ pub(crate) fn run_child_with(
                         name,
                         state,
                         summary,
+                        model,
                     });
                 }
             },
@@ -779,11 +784,13 @@ pub(crate) fn flush(
                 name,
                 state,
                 summary,
+                model,
             } => on_event(RunEvent::Subagent {
                 id,
                 name,
                 state,
                 summary,
+                model,
             }),
             HostEvent::Tasks => tasks = true,
         }
@@ -905,12 +912,14 @@ impl Services for Runtime {
         let announce = {
             let sink = sink.clone();
             let (id, name, description) = (id.clone(), name.clone(), description.clone());
+            let child_model = spec.model.clone();
             move |state: &str, summary: &str| {
                 sink.push(HostEvent::Subagent {
                     id: id.clone(),
                     name: format!("{name}: {description}"),
                     state: state.into(),
                     summary: one_line(summary),
+                    model: child_model.clone(),
                 });
             }
         };

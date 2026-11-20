@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  Bot,
   Bug,
   CheckCircle2,
   CircleDashed,
@@ -812,6 +813,53 @@ export default function App() {
             </div>
             {selected && inspector ? (
               <aside className="inspector" aria-label="Detalhes da conversa">
+                {turn.subagents?.length ? (
+                  <section className="insp-card">
+                    <header className="insp-head">
+                      <span className="insp-icon">
+                        <Bot size={14} strokeWidth={2} />
+                      </span>
+                      <h3>Subagentes</h3>
+                      <span className="insp-meta">
+                        {turn.subagents.some((s) => s.state === "running")
+                          ? `${turn.subagents.filter((s) => s.state === "running").length} rodando`
+                          : `${turn.subagents.length} no turno`}
+                      </span>
+                    </header>
+                    <ul className="insp-tasks">
+                      {turn.subagents.map((s) => (
+                        <li
+                          key={s.id}
+                          title={s.summary || s.name}
+                          className={
+                            "insp-task " +
+                            (s.state === "running"
+                              ? "in_progress"
+                              : s.state === "done"
+                                ? "completed"
+                                : "")
+                          }
+                        >
+                          {s.state === "running" ? (
+                            <Loader size={14} strokeWidth={2} className="insp-spin" />
+                          ) : s.state === "done" ? (
+                            <CheckCircle2 size={14} strokeWidth={2} />
+                          ) : (
+                            <CircleDashed size={14} strokeWidth={2} />
+                          )}
+                          <span>
+                            {s.name}
+                            {s.model ? <code className="insp-model">{s.model}</code> : null}
+                            {s.summary ? (
+                              <em className="insp-sub">{s.summary}</em>
+                            ) : null}
+                          </span>
+                        </li>
+                      ))}
+                    </ul>
+                  </section>
+                ) : null}
+
                 <section className="insp-card">
                   <header className="insp-head">
                     <span className="insp-icon">

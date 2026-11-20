@@ -83,6 +83,7 @@ pub enum TurnEvent {
         name: String,
         state: String,
         summary: String,
+        model: String,
     },
     Question {
         id: u64,
@@ -141,11 +142,13 @@ fn shape(ev: RunEvent) -> Option<TurnEvent> {
             name,
             state,
             summary,
+            model,
         } => TurnEvent::Subagent {
             id,
             name,
             state,
             summary,
+            model,
         },
         RunEvent::Question { id, questions } => TurnEvent::Question {
             id,

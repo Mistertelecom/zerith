@@ -535,6 +535,20 @@ export function Transcript(props: {
           }
           return <AssistantBlock key={key} block={b} sessionId={props.sessionId} onBranch={onBranch} />;
         })}
+        {/*
+          The answer block is born on the first event, so a slow turn used to
+          look frozen: the dots stand in for it while the turn is running.
+        */}
+        {props.busy &&
+        !(
+          props.blocks[props.blocks.length - 1]?.kind === "assistant" &&
+          (props.blocks[props.blocks.length - 1] as { streaming?: boolean }).streaming
+        ) ? (
+          <AssistantBlock
+            block={{ kind: "assistant", text: "", reasoning: "", tools: [], streaming: true }}
+            sessionId={props.sessionId}
+          />
+        ) : null}
         {props.tail}
       </div>
     </div>

@@ -66,7 +66,7 @@ ferramentas MCP aparecem como `cancellable: false`.
 - Prompts: `McpRegistry::prompt_commands()` lista como `/mcp__<servidor>__<prompt>`
   com argumentos e `get_prompt(servidor, prompt, args)` expande para texto.
 
-**Estado real:** `zerith -p`, `zerith chat` e a janela (`zerith-ui`) carregam o
+**Estado real:** `zerith -p`, `zerith chat` e a janela (`zerith-desktop`) carregam o
 `McpRegistry` (incluindo servidores de plugins habilitados e revisados),
 conectam e registram as ferramentas com `register_into` e expandem menções
 `@servidor:recurso` no texto enviado. Os helpers `prompt_commands()` e

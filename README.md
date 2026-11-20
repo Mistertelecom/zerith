@@ -2,7 +2,7 @@
 
 Harness de agentes de IA nativo, escrito em Rust: chat com ferramentas e
 aprovação humana, memória local, skills, MCP, planos com subagentes e uma
-janela desktop desenhada pela GPU (Rune), sem webview, Electron ou Tauri.
+janela desktop em Tauri 2 (`zerith-desktop`) sobre o núcleo Rust.
 
 O Zerith é um projeto próprio. Estudou ideias de outros harnesses (OpenHuman,
 Claude Code, DeepSeek Harness, Hermes) e reimplementou em Rust o que fazia
@@ -25,7 +25,7 @@ que veio de cada uma estão em [UPSTREAMS.md](UPSTREAMS.md).
 | `zerith-plugins` | Manifestos de plugin (inclui pacotes de skills/agentes/hooks/MCP), ativação e revisão explícita |
 | `zerith-security` | Presets de sandbox, vereditos, redação de segredos |
 | `zerith-cli` | Binário `zerith` |
-| `zerith-ui` | Janela nativa em Rune: chat, histórico, agentes, skills, memória, provedores, configurações |
+| `zerith-desktop` | Janela desktop em Tauri 2 + React/TypeScript: chat, histórico, agentes, skills, memória, MCP, provedores, mídia, configurações e atualização automática assinada (Ed25519) |
 
 Um banco só: `zerith-sessions` é dono do schema; `zerith-memory` usa o mesmo
 arquivo e as mesmas migrações.
@@ -232,31 +232,33 @@ de dedupe não o ressuscita).
 ## Janela
 
 ```bash
-cargo run -p zerith-ui              # abre a janela
-cargo run -p zerith-ui -- --snap ui.png   # render headless, sem display
-cargo run -p zerith-ui -- --tree          # árvore de elementos, sem display
+cd crates/zerith-desktop/frontend && npm install && npm run build
+cd ../..
+cargo run -p zerith-desktop          # abre a janela Tauri 2
 ```
 
-A janela desenha em Rune — sem webview, sem Chromium, sem JavaScript. O turno
-roda em thread de trabalho e volta por `AppHandle::update`, então um modelo
-lento nunca trava o frame.
+Para desenvolvimento com hot reload (Vite + Tauri 2):
+
+```bash
+cd crates/zerith-desktop && npx @tauri-apps/cli@2 dev
+```
+
+O turno roda em thread de trabalho e emite eventos ao frontend via Tauri, então
+um modelo lento nunca trava a interface.
 
 ## Testes
 
-`cargo test --workspace --exclude zerith-ui` — a UI fica de fora do caminho
-padrão porque compila o Rune (wgpu, winit) e leva minutos. Ela tem testes
-próprios (`cargo test -p zerith-ui`, que não abrem janela) e é verificada de
-ponta a ponta pelos modos headless acima.
+```bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
 
-Antes de qualquer push: `cargo fmt --all --check`,
-`cargo clippy --workspace --exclude zerith-ui --all-targets -j 1 -- -D warnings`
-e `cargo clippy -p zerith-ui --all-targets -j 1 -- -D warnings`.
-
-O CI (`.github/workflows/zerith.yml`) roda os três em Linux e Windows, mais um
-job que renderiza `--tree` e publica a árvore como artefato. Uma tag
-`zerith-v*` dispara `.github/workflows/zerith-release.yml` (zip no Windows,
-`tar.gz` no Linux e no macOS, com `.sha256`; sem instalador e sem assinatura;
-ainda nunca executado).
+O CI (`.github/workflows/zerith.yml`) roda fmt, clippy e `cargo test --workspace`
+em Linux e Windows, além do build/typecheck do frontend (`tsc --noEmit && vite build`).
+Uma tag `zerith-v*` dispara `.github/workflows/zerith-release.yml` (CLI portátil em
+Windows, Linux e macOS + instalador NSIS do `zerith-desktop` no Windows com `.sha256`
+e assinatura Ed25519 `.sig`).
 
 Detalhes de toolchain, memória e caminhos: [docs/build.md](docs/build.md).
 

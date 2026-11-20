@@ -98,7 +98,7 @@ pub fn repair_steps(data_dir: &Path) -> Vec<String> {
                     folder.display(),
                     data_dir.display()
                 ),
-                "Opção 1, sem mexer em permissões: copie zerith.exe / zerith-ui.exe para uma pasta sem esse rótulo (por exemplo, Documentos) e rode de lá."
+                "Opção 1, sem mexer em permissões: copie zerith.exe / zerith-desktop.exe para uma pasta sem esse rótulo (por exemplo, Documentos) e rode de lá."
                     .to_string(),
                 format!(
                     "Opção 2, se a ferramenta de sandbox não é mais usada: icacls \"{}\" /setintegritylevel (OI)(CI)M /T",

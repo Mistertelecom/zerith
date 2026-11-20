@@ -17,7 +17,7 @@ O Zerith fala diretamente com APIs **OpenAI-compatible** (`POST {base}/chat/comp
 
 ## Gateway Multi-Conta, Cotas e Failover Automático
 
-É possível conectar **mais de uma conta por provedor** via `[[accounts]]` em `settings.toml` ou pelo CLI (`zerith accounts`) e tela **Provedores & Gateway Local** em `zerith-ui`:
+É possível conectar **mais de uma conta por provedor** via `[[accounts]]` em `settings.toml` ou pelo CLI (`zerith accounts`) e tela **Contas / Provedores** em `zerith-desktop`:
 
 ```toml
 [[accounts]]

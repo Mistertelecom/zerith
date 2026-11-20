@@ -8,7 +8,6 @@ members = [
     "crates/zerith-providers",
     "crates/zerith-runtime",
     "crates/zerith-importers",
-    "crates/zerith-ui",
     "crates/zerith-skills",
     "crates/zerith-mcp",
     "crates/zerith-plugins",
@@ -42,14 +41,3 @@ keyring = { version = "3.6", features = ["apple-native", "windows-native", "linu
 # so dev builds compile without it. Remove when the toolset is fixed.
 [profile.dev]
 debug = false
-
-# Rune's own vendored patches. A dependency's [patch] table does not apply to the
-# workspace that depends on it, so every app that builds Rune patches these too.
-# Copied verbatim from rune/vendor at rev bc05f817; refresh with
-# scripts/vendor-*.sh in the Rune checkout when bumping the revision.
-[patch.crates-io]
-parley_engine = { path = "vendor/parley_engine" }
-winit = { path = "vendor/winit" }
-wgpu-hal = { path = "vendor/wgpu-hal" }
-accesskit_windows = { path = "vendor/accesskit_windows" }
-accesskit_macos = { path = "vendor/accesskit_macos" }

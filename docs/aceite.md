@@ -9,16 +9,15 @@ evidência executada, não código escrito. Onde falta, está dito o que falta.
 | --- | --- | --- |
 | Código de terceiros documentado | Feito | `UPSTREAMS.md`, `THIRD_PARTY_NOTICES.md`, `DEPENDENCY_LICENSES.md` |
 | Licenças auditadas e avisos incluídos | Feito | `THIRD_PARTY_NOTICES.md`; GPL-3.0-only em `LICENSE` e no `license` do workspace |
-| Rune é a interface desktop principal | Feito | `zerith-ui` usa `rune`; provado headless com `--tree` e `--snap` |
-| Sem Electron, Tauri ou Chromium | Feito | nenhuma dependência dessas no `Cargo.toml`; a UI é `rune` |
-| Núcleo Rust e UI separados | Feito | `zerith-core`/`-runtime` não dependem de `rune` |
+| Tauri 2 (`zerith-desktop`) é a interface desktop principal | Feito | `zerith-desktop` (Tauri 2 + React/TypeScript) sobre o núcleo Rust; `zerith-ui` (Rune) e `vendor/` removidos |
+| Núcleo Rust e UI separados | Feito | `zerith-core`/`-runtime` não dependem de `tauri` |
 
 ## Chat e providers
 
 | Item | Estado | Evidência |
 | --- | --- | --- |
 | Usuário configura um provider | Feito | `ZERITH_PROVIDER`, `ZERITH_BASE_URL`, `ZERITH_API_KEY`, `ZERITH_MODEL`; `zerith providers probe` |
-| Gateway local nativo multi-conta + failover + Quota Tracker + Token Saver | Feito | `zerith-providers::gateway` (multi-conta + failover + combos), `zerith-sessions::usage` (migração `V7` com `usage_records`/`account_cooldowns`), `zerith-runtime::tokensaver` (`Ponytail`/`Caveman`/`RTK`), CLI `usage`/`quota`/`accounts`/`routing`/`tokensaver` e tela `Provedores & Gateway Local` em `zerith-ui`, verificados em `cargo test --workspace` |
+| Gateway local nativo multi-conta + failover + Quota Tracker + Token Saver | Feito | `zerith-providers::gateway` (multi-conta + failover + combos), `zerith-sessions::usage` (migração `V7` com `usage_records`/`account_cooldowns`), `zerith-runtime::tokensaver` (`Ponytail`/`Caveman`/`RTK`), CLI `usage`/`quota`/`accounts`/`routing`/`tokensaver` e tela de Contas/Cotas em `zerith-desktop`, verificados em `cargo test --workspace` |
 | Streaming funciona | Feito | turno real com `DEEPSEEKV4.1`: `[turn] tokens 2878→83`; SSE com `reasoning_content` |
 | Cancelamento funciona | Parcial — em correção; não reverificado nesta rodada | botão "parar" com `Cancel`; teste `stop_cancels_the_token_and_does_nothing_without_a_turn`. **O token só é checado entre linhas SSE**: um servidor que não envia nada (conexão presa, primeiro byte lento) não é interrompido até o timeout |
 | Erros de rede úteis | Feito | `ProviderError::Http{status,body}`; `main()` imprime com `redact` |
@@ -42,7 +41,7 @@ evidência executada, não código escrito. Onde falta, está dito o que falta.
 | Importa do banco | Feito | 5 testes em `zerith-importers/tests/hermes.rs` |
 | Preserva mensagens, ordem e metadados | Feito | todas as colunas em `raw`; teste `unknown_columns_survive_in_raw` |
 | Importação repetida não duplica | Feito | `sessions_source_key` único; teste `a_second_run_imports_nothing...` |
-| Importação interrompida pode ser retomada | Feito | cursor por mensagem (`cursor()` no SQLite via `raw.id`, salto por `message_count()` no JSONL), `preview()`, `import_selected()` e painel visual `Importar Hermes` em `zerith-ui` (`Histórico`); verificado em `zerith-importers/tests/hermes.rs` (8/8), `hermes_jsonl.rs` (3/3) e `zerith-ui/tests/shell.rs` (`hermes_import_panel_previews_and_imports_selected_sessions`) |
+| Importação interrompida pode ser retomada | Feito | cursor por mensagem (`cursor()` no SQLite via `raw.id`, salto por `message_count()` no JSONL), `preview()`, `import_selected()` e painel visual `Importar Hermes` em `zerith-desktop` (`Histórico`); verificado em `zerith-importers/tests/hermes.rs` (8/8) e `hermes_jsonl.rs` (3/3) |
 | Originais inalterados | Feito | aberto read-only; teste `the_source_database_is_not_modified` |
 
 ## Skills
@@ -95,9 +94,9 @@ evidência executada, não código escrito. Onde falta, está dito o que falta.
 | `-p` com `--max-turns`, `--allowed-tools`, `--permission-mode`, `--json-schema`, `--max-budget-usd` | Parcial | parsers, validador de schema, custo e política testados (`args`, `schema`, `headless`); **nenhum teste executa um turno `-p` contra um modelo**. Orçamento exige preços informados pelo usuário; o schema cobre só `type`/`enum`/`required`/`properties`/`items` |
 | Código de saída 130/143 em Ctrl+C / SIGTERM | Parcial | código do primeiro sinal testado; o tratador real foi **compilado só no Windows** e não foi acionado por um sinal de verdade; o ramo Unix não foi compilado |
 | `doctor` estendido (configuração, cofre, sandbox, provider, MCP, plugins, banco) | Feito | executado no binário com `--offline`; o teste de alcance do provider (sem `--offline`) não foi rodado |
-| MCP no laço do agente (`mcp__<servidor>__<ferramenta>`) | Parcial | `McpRegistry` é carregado e conectado (`register_into`, servidores de plugins e expansão de `@servidor:recurso`) em `zerith -p`, `zerith chat` e `zerith-ui`; `zerith-mcp` passou 19/19 testes (HTTP/transports/config/handshake) e os hosts compilaram e passaram os testes, mas **não** foi exercitado por stdio contra servidor externo real em turno completo |
+| MCP no laço do agente (`mcp__<servidor>__<ferramenta>`) | Parcial | `McpRegistry` é carregado e conectado (`register_into`, servidores de plugins e expansão de `@servidor:recurso`) em `zerith -p`, `zerith chat` e `zerith-desktop`; `zerith-mcp` passou os testes (HTTP/transports/config/handshake) e os hosts compilaram e passaram os testes, mas **não** foi exercitado por stdio contra servidor externo real em turno completo |
 | Servidor MCP de projeto exige aprovação do usuário | Feito | `a_project_cannot_approve_its_own_server`, `approval_from_the_user_file_lets_the_project_server_run` |
-| Plugins em pacote (skills, agentes, hooks, MCP) | Feito | `Library::contributions()` entrega `skill_dirs()`, `agent_defs()`, `apply_hooks()` e `mcp`, carregados no CLI (`chat`, `-p`, `agents list`) e na UI (`zerith-ui` no envio do chat e na tela `Agentes`) apenas para plugins `enabled` + `trusted`; verificado em `zerith-plugins/tests/library.rs` (8/8), `zerith-cli` (28/28) e `zerith-ui` (35/35) |
+| Plugins em pacote (skills, agentes, hooks, MCP) | Feito | `Library::contributions()` entrega `skill_dirs()`, `agent_defs()`, `apply_hooks()` e `mcp`, carregados no CLI (`chat`, `-p`, `agents list`) e na janela (`zerith-desktop`) apenas para plugins `enabled` + `trusted`; verificado em `zerith-plugins/tests/library.rs` e `zerith-cli` |
 | Importar JSONL do Hermes pelo CLI | Parcial | `import hermes --jsonl` usa o importador de `hermes_jsonl.rs` (3/3 aprovados) e pré-visualização `.jsonl` na UI (`shell.rs`); ainda não testado contra uma exportação real externa do Hermes |
 
 ## Resumo
@@ -108,7 +107,7 @@ Contagem refeita a partir das tabelas acima (não de memória):
 - Parcial: 9 (os itens de segurança/cancelamento ainda marcados como não reverificados nesta tabela, além de benchmark CPU, instalador, `-p` vs modelo real, sinal 130/143, MCP stdio externo e exportação real externa do Hermes).
 - Pendente: 1 (`Builds em Windows, Linux e macOS`: só Windows compilado e verificado localmente).
 
-Validação executada nesta rodada após os ajustes finais (`cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --exclude zerith-ui` com 357 aprovados / 0 falhas / 1 ignorado, e `cargo test -p zerith-ui` com 35 aprovados / 0 falhas).
+Validação executada via `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings` e `cargo test --workspace`.
 
 Nenhum destes "parcial" ou "pendente" foi escrito como se estivesse pronto: o
 spec proíbe marcar pronto sem evidência, e é mais útil saber onde dói.

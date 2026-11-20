@@ -20,7 +20,7 @@ não significa paridade de comportamento.
 | Skills (formato Agent Skills) | Implementado | `zerith-skills` |
 | Subagentes e planos | Implementado em modo plano | `zerith-runtime/src/plan.rs` |
 | Agentes nomeados em Markdown | Implementado | `zerith-core/agents.rs` |
-| MCP (stdio e HTTP), ferramentas, recursos, prompts | Cliente e registro implementados; ligado a `-p`, `chat` e `zerith-ui` (incluindo servidores de plugins e `@servidor:recurso`) | `zerith-mcp` (`docs/mcp.md`) |
+| MCP (stdio e HTTP), ferramentas, recursos, prompts | Cliente e registro implementados; ligado a `-p`, `chat` e `zerith-desktop` (incluindo servidores de plugins e `@servidor:recurso`) | `zerith-mcp` (`docs/mcp.md`) |
 | Plugins em pacote | Implementado: manifesto, confiança (`enable` + `trust`) e carga de skills, agentes, hooks e MCP via `contributions()` no CLI e na UI | `zerith-plugins` (`docs/plugins.md`) |
 | `/rewind` (checkpoints de arquivos e conversa) | Implementado: runtime abre checkpoint por turno e `write_file`/`edit_file` chamam `before_write` → `record_file` (`shell` fica fora do rastreamento) | `docs/checkpoints.md` |
 | `--resume`, `--continue`, `--fork`, nome de sessão | Implementado | `zerith-cli` |
@@ -28,9 +28,9 @@ não significa paridade de comportamento.
 | `--max-budget-usd` | Implementado **com preços informados pelo usuário** (sem tabela própria) | `zerith-cli` |
 | Memória entre sessões | Implementado (SQLite + FTS5), com pausa e exportação | `zerith-memory` |
 | Compactação de contexto | Existe em `zerith-runtime` (`compact.rs`); critérios em constante evolução | |
-| Rebobinar e interface na janela | Implementado em Rune: botão `Rebobinar` com resumo de arquivos/linhas alteradas do turno, `/rewind` e `/mode`, números de linha reais no diff inline, preview em andamento de ferramentas em execução e borda semântica de modo no composer | `zerith-ui` |
-| Gateway nativo multi-conta, cotas e delegação entre modelos | Implementado: `[[accounts]]`, cooldown + failover antes do primeiro token, `usage_records`/`account_cooldowns` (`V7`), `[routing]` (`main_model` + `subagent_model`/`explore_model`/`plan_model`/`role_models` + combos), CLI `usage`/`quota`/`accounts`/`routing` e tela **Provedores & Gateway Local** | `zerith-providers`, `zerith-sessions`, `zerith-runtime`, `zerith-cli`, `zerith-ui` |
-| Token Saver (`Ponytail`, `Caveman`, `RTK`) | Implementado com métricas individuais por protocolo (`saved_rtk_tokens`, `saved_ponytail_tokens`, `saved_caveman_tokens`) em `tokensaver.rs`, `usage_records`, CLI `tokensaver`/`usage` e **Configurações** | `zerith-runtime`, `zerith-sessions`, `zerith-cli`, `zerith-ui` |
+| Rebobinar e interface na janela | Implementado em Tauri 2 (`zerith-desktop`): alterações por arquivo com `Desfazer`, `/rewind` e `/mode`, diffs inline, edição/fork de conversa e auto-updater com assinatura Ed25519 | `zerith-desktop` |
+| Gateway nativo multi-conta, cotas e delegação entre modelos | Implementado: `[[accounts]]`, cooldown + failover antes do primeiro token, `usage_records`/`account_cooldowns` (`V7`), `[routing]` (`main_model` + `subagent_model`/`explore_model`/`plan_model`/`role_models` + combos), CLI `usage`/`quota`/`accounts`/`routing` e tela **Contas / Cotas / Delegação** | `zerith-providers`, `zerith-sessions`, `zerith-runtime`, `zerith-cli`, `zerith-desktop` |
+| Token Saver (`Ponytail`, `Caveman`, `RTK`) | Implementado com métricas individuais por protocolo (`saved_rtk_tokens`, `saved_ponytail_tokens`, `saved_caveman_tokens`) em `tokensaver.rs`, `usage_records`, CLI `tokensaver`/`usage` e **Ajustes** | `zerith-runtime`, `zerith-sessions`, `zerith-cli`, `zerith-desktop` |
 
 ## Conceitos do DeepSeek Harness
 

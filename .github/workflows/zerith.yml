@@ -1,10 +1,7 @@
 name: Zerith
 
-# The Zerith workspace is the repository root and is a plain Cargo workspace: no
-# Node and no Rune build in the default lane (Rune pulls wgpu and winit). Tauri
-# (zerith-desktop) does build here, against the system WebKitGTK on Linux.
-# Rune is compiled in its own job so a UI regression cannot hide behind a
-# minutes-long build in the main lane.
+# Cargo workspace (CLI, core crates, and Tauri 2 desktop app `zerith-desktop`)
+# plus frontend TypeScript/Vite build verification.
 
 on:
   push:
@@ -33,44 +30,45 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: .
-      # `zerith-desktop` is Tauri: on Linux it links WebKitGTK and GTK.
+      # `zerith-desktop` is Tauri 2: on Linux it links WebKitGTK and GTK.
       - name: Linux Tauri dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
-      # `zerith-ui` is excluded: it compiles Rune and the workspace tests do not
-      # need a GPU. The `ui` job below builds it.
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --exclude zerith-ui --all-targets -- -D warnings
-      - run: cargo test --workspace --exclude zerith-ui
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
 
-  ui:
-    name: ui (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
+  frontend:
+    name: frontend
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
         with:
-          workspaces: .
-      - name: Linux window dependencies
-        if: runner.os == 'Linux'
+          node-version: 22
+      - name: Install dependencies
+        working-directory: crates/zerith-desktop/frontend
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libxcursor-dev libvulkan-dev mesa-vulkan-drivers
-      - run: cargo build -p zerith-ui
-      # Headless render: proves the window builds a real element tree and
-      # paints without a display, which is the only UI check CI can make.
-      - run: cargo run -p zerith-ui -- --tree tree.json
-      # No ZERITH_HOME: the run creates a throwaway database in the default
-      # location, which on a CI runner is empty.
-      - uses: actions/upload-artifact@v4
-        with:
-          name: zerith-tree-${{ runner.os }}
-          path: tree.json
-          if-no-files-found: error
+          if [ -f package-lock.json ]; then npm ci; else npm install --no-audit --no-fund; fi
+      - name: Typecheck and build
+        working-directory: crates/zerith-desktop/frontend
+        run: npm run build
+      - name: Run frontend unit checks
+        working-directory: crates/zerith-desktop/frontend
+        run: |
+          node --experimental-strip-types scripts/markdown.check.ts
+          node --experimental-strip-types scripts/title.check.ts
+          node --experimental-strip-types scripts/turn.check.ts
+      - name: Smoke-test update signing script
+        run: |
+          set -euo pipefail
+          out="$(node scripts/sign-update.mjs keygen)"
+          pub="$(printf '%s\n' "$out" | sed -n 's/^ZERITH_UPDATE_PUBKEY=//p')"
+          priv="$(printf '%s\n' "$out" | sed -n 's/^ZERITH_UPDATE_SIGNING_KEY=//p')"
+          tmp="$(mktemp -d)"
+          printf 'test-installer' > "${tmp}/Zerith_0.2.0_x64-setup.exe"
+          ZERITH_UPDATE_SIGNING_KEY="$priv" node scripts/sign-update.mjs sign "${tmp}/Zerith_0.2.0_x64-setup.exe" "0.2.0"
+          node scripts/sign-update.mjs verify "${tmp}/Zerith_0.2.0_x64-setup.exe" "0.2.0" "${tmp}/Zerith_0.2.0_x64-setup.exe.sig" "$pub"
+          rm -rf "$tmp"

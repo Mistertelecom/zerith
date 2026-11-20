@@ -7,35 +7,29 @@ Tudo abaixo roda da raiz do repositório, que é o workspace Cargo.
 | Item | Versão |
 | --- | --- |
 | Rust | 1.99.1 (`rust-toolchain.toml`) |
-| Toolchain | MSVC no Windows; GNU precisa de MinGW binutils |
+| Toolchain | MSVC no Windows; no Linux requer `libwebkit2gtk-4.1-dev`, `libgtk-3-dev`, `libayatana-appindicator3-dev`, `librsvg2-dev` |
+| Node.js | 22+ (frontend React/Vite de `zerith-desktop` e script `scripts/sign-update.mjs`) |
 | SQLite | embutido (`rusqlite` com `bundled`) — nada a instalar |
-| GPU | Vulkan/DX12/Metal via wgpu, só para a janela |
 
 ## Comandos
 
 ```bash
 cd zerith
-cargo build -j 1                       # núcleo, CLI e providers
-cargo build -p zerith-ui -j 1          # janela Rune (compila wgpu/winit)
-cargo test --workspace --exclude zerith-ui
-cargo clippy --workspace --exclude zerith-ui --all-targets -j 1 -- -D warnings
+cargo build -j 1                       # núcleo, CLI e desktop Tauri 2
+cargo test --workspace
+cargo clippy --workspace --all-targets -j 1 -- -D warnings
 cargo fmt --all --check
 ```
 
-`-j 1` não é preferência: nesta máquina o build paralelo estoura a memória e
-o rustc reporta erros falsos de toolchain (`only metadata stub found for rlib
-dependency core`, `failed to mmap rmeta ... os error 1455`). Com `-j 1` passa.
-`cargo clean` não resolve esses erros — é memória, não cache.
-
-## Modos headless da janela
+## Frontend e janela desktop (`zerith-desktop`)
 
 ```bash
-cargo run -p zerith-ui -- --tree            # árvore de elementos
-cargo run -p zerith-ui -- --snap ui.png     # render para PNG
+cd crates/zerith-desktop/frontend
+npm install
+npm run build                          # tsc --noEmit && vite build
+cd ..
+npx @tauri-apps/cli@2 dev              # janela em desenvolvimento com hot reload
 ```
-
-Servem para provar que a UI desenha sem display — é assim que a janela é
-verificada em CI.
 
 ## Configuração
 
@@ -93,7 +87,7 @@ zerith import hermes              # read-only, idempotente
 | Saída | Caminho |
 | --- | --- |
 | CLI | `target/debug/zerith.exe` |
-| Janela | `target/debug/zerith-ui.exe` |
+| Janela (Tauri 2) | `target/debug/zerith-desktop.exe` |
 | Banco | `%APPDATA%\Zerith\zerith.db` |
 
 O banco é criado no primeiro comando. `zerith doctor` abre, roda
@@ -102,12 +96,9 @@ O banco é criado no primeiro comando. `zerith doctor` abre, roda
 ## Release
 
 Uma tag `zerith-v*` dispara `.github/workflows/zerith-release.yml`, que
-compila `cargo build --release -p zerith-cli -p zerith-ui` em Windows, Linux e
-macOS e empacota (zip no Windows, `tar.gz` nos outros, com `.sha256`). O
-workflow **nunca foi executado**; ver `docs/release.md`. Localmente:
-`cargo build --release -p zerith-cli -p zerith-ui -j 1`, com as mesmas `[patch]`
-de `vendor/` — um `[patch]` de dependência não se aplica ao workspace que
-depende dela, então as cópias corrigidas do Rune precisam ficar aqui.
+compila o CLI portátil em Windows, Linux e macOS (`zip` no Windows, `tar.gz`
+nos outros, com `.sha256`) e, no Windows, gera o instalador NSIS do
+`zerith-desktop` assinado com Ed25519 (`.sha256` + `.sig`). Ver `docs/release.md`.
 
 ## Segmentos que dependem do SO
 

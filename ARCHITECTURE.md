@@ -1,19 +1,21 @@
 # Arquitetura
 
-Um workspace Cargo na raiz do repositório. Sem tokio, sem reqwest: I/O bloqueante em threads, HTTP via
-`ureq`, um banco SQLite.
+Um workspace Cargo na raiz do repositório. O núcleo (CLI, runtime, providers,
+memória, sessões, MCP) usa I/O bloqueante em threads, HTTP via `ureq` e um único
+banco SQLite; a camada desktop (`zerith-desktop`) usa Tauri 2 + React/TypeScript
+chamando o mesmo núcleo Rust.
 
 ## Crates e dependências
 
 ```text
-zerith-cli ─┬─ zerith-runtime ─┬─ zerith-providers
-            │                  ├─ zerith-sessions ── SQLite (rusqlite, bundled)
-            │                  ├─ zerith-memory  ─── mesmo arquivo SQLite (FTS5)
-            │                  └─ zerith-skills
-            ├─ zerith-tools ── zerith-security
-            ├─ zerith-mcp, zerith-plugins, zerith-importers
-            └─ zerith-core  (usado por todos)
-zerith-ui  ── Rune (git, rev bc05f817) + os mesmos crates de núcleo
+zerith-cli ─────┬─ zerith-runtime ─┬─ zerith-providers
+                │                  ├─ zerith-sessions ── SQLite (rusqlite, bundled)
+                │                  ├─ zerith-memory  ─── mesmo arquivo SQLite (FTS5)
+                │                  └─ zerith-skills
+                ├─ zerith-tools ── zerith-security
+                ├─ zerith-mcp, zerith-plugins, zerith-importers
+                └─ zerith-core  (usado por todos)
+zerith-desktop ── Tauri 2 + React/TypeScript + os mesmos crates de núcleo
 ```
 
 | Crate | Responsabilidade |
@@ -30,11 +32,11 @@ zerith-ui  ── Rune (git, rev bc05f817) + os mesmos crates de núcleo
 | `zerith-plugins` | Manifestos, ativação, revisão explícita e contribuições de pacote (`skills`, `agents`, `hooks`, `mcp`) |
 | `zerith-importers` | Import read-only do Hermes (SQLite e JSONL), pré-visualização e retomada incremental por mensagem |
 | `zerith-cli` | Binário `zerith` |
-| `zerith-ui` | Janela nativa em Rune |
+| `zerith-desktop` | Janela desktop em Tauri 2 + frontend React/TypeScript (e auto-updater com assinatura Ed25519) |
 
 ## Fluxo de um turno
 
-1. O host (CLI `-p`/`chat` ou janela `zerith-ui`) resolve provider/contas e
+1. O host (CLI `-p`/`chat` ou janela `zerith-desktop`) resolve provider/contas e
    modelo (`--model`, `ZERITH_MODEL`, `[routing] main_model`, `model`,
    `[[accounts]]`), carrega as contribuições de plugins habilitados e
    revisados (`skills`, `agents`, `hooks`, `mcp`) e conecta o `McpRegistry`.
@@ -65,17 +67,16 @@ zerith-ui  ── Rune (git, rev bc05f817) + os mesmos crates de núcleo
    inteira é gravada; nada parcial é persistido. Nos hosts CLI (`headless` e
    `chat`), `SessionEnd` roda ao encerrar.
 
-## Interface desktop (`zerith-ui`)
+## Interface desktop (`zerith-desktop`)
 
-A janela em Rune renderiza o transcript com números de linha reais (1-based) no
-diff inline, resumo de arquivos e linhas alteradas no turno junto ao botão
-**Rebobinar**, preview em andamento de ferramentas em execução, comandos
-`/rewind` e `/mode` no composer, borda semântica de modo no composer (`Plano`
-e `Livre` destacados), rota ativa e pill de tokens economizados no chat,
-painel **Provedores & Gateway Local** (presets nativos, múltiplas contas,
-delegação `[routing]` e painel **Quota & Uso (24h)**), seção **Token Saver**
-em **Configurações** com detalhamento por protocolo e painel visual
-**Importar Hermes** na tela **Histórico**.
+A janela em Tauri 2 + React/TypeScript renderiza o transcript em Markdown (AST
+segura sem injeção de HTML), diffs inline por arquivo com confirmação ao desfazer,
+edição e ramificação (fork) de conversa, pasta de workspace por conversa, anexos
+de imagem e mídia inline, comandos de barra no composer, painel de **Contas /
+Provedores & Gateway Local** (OAuth, presets nativos, múltiplas contas, delegação
+`[routing]` e **Cotas & Uso**), gerenciamento de **MCP**, **Skills**, **Agentes**,
+**Memória**, seção **Token Saver**, **Importar Hermes** e atualização automática
+com verificação obrigatória de SHA-256 + assinatura Ed25519.
 
 ## Configuração
 
@@ -93,6 +94,5 @@ projeto < projeto-local < env.
 - **Sandbox e `shell`:** a política é checada no processo; não há jaula de SO
   completa em todas as plataformas ([docs/sandbox.md](docs/sandbox.md)), e
   edições feitas por `shell` ficam fora do rastreamento de checkpoints.
-- **`tools call` e `policy` no CLI:** esses subcomandos avulsos ainda usam
-  `Policy::from_env` (os fluxos de agente `-p`, `chat` e `zerith-ui` usam
-  `Policy::from_settings` + `Guards`).
+- **`tools call` e `policy` no CLI:** hoje todos os fluxos principais (`-p`,
+  `chat`, `tools call`, `policy` e `zerith-desktop`) usam `Policy::from_settings`.

@@ -1,9 +1,9 @@
 # Testes
 
 ```bash
-cargo test --workspace --exclude zerith-ui   # caminho padrão (CI)
-cargo test -p zerith-ui                      # compila Rune; não abre janela
+cargo test --workspace                       # todos os crates (incluindo zerith-desktop)
 cargo test -p zerith-core -p zerith-cli
+cargo test -p zerith-desktop
 ```
 
 ## Regras

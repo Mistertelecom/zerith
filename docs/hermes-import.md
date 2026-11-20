@@ -22,7 +22,7 @@ zerith import hermes --jsonl export.jsonl [--profile <nome>]   # `hermes session
   `import_selected(path, profile, store, include_archived, only_ids)` permite
   filtrar sessões arquivadas e restringir por IDs selecionados.
 
-## Interface na janela (`zerith-ui`)
+## Interface na janela (`zerith-desktop`)
 
 Na tela **Histórico**, o botão **Importar Hermes** abre um painel visual com:
 
@@ -37,9 +37,9 @@ Na tela **Histórico**, o botão **Importar Hermes** abre um painel visual com:
 `--jsonl` lê um arquivo de exportação: uma linha por sessão (com `messages`)
 ou por mensagem, mesma chave de idempotência e `raw` para o que não é mapeado.
 Sem `--profile`, o perfil gravado é `jsonl`. Cobertura: os testes de
-`zerith-importers/tests/hermes.rs`, `zerith-importers/tests/hermes_jsonl.rs` e
-`zerith-ui/tests/shell.rs`; o JSONL ainda **não** foi testado contra uma
-exportação real do Hermes nesta máquina.
+`zerith-importers/tests/hermes.rs` e `zerith-importers/tests/hermes_jsonl.rs`;
+o JSONL ainda **não** foi testado contra uma exportação real do Hermes nesta
+máquina.
 
 Relatório: sessões vistas/importadas/puladas/retomadas, mensagens
 importadas/puladas, falhas (uma por linha em stderr no CLI, ou exibidas no

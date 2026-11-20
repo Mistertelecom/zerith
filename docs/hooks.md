@@ -11,7 +11,7 @@ por chamada de ferramenta via `zerith_runtime::guards::Guards` (middleware em
 mensagem da sessão), `UserPromptSubmit` (antes de gravar o prompt),
 `PreCompact` (antes de sumarizar) e `Stop` (quando o modelo termina sem chamadas
 de ferramenta). `SessionEnd` é disparado ao encerrar pelos hosts CLI
-(`headless` e `chat`). Os hosts (`zerith -p`, `zerith chat` e `zerith-ui`)
+(`headless` e `chat`). Os hosts (`zerith -p`, `zerith chat` e `zerith-desktop`)
 também aplicam os hooks de plugins habilitados e revisados no `Settings` do
 turno.
 

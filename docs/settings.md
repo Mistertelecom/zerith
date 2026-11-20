@@ -108,16 +108,16 @@ O perfil é relido a cada turno, então trocar na janela vale já no próximo.
 
 | Campo | Usado por |
 | --- | --- |
-| `model` / `routing.main_model` | `zerith chat`, `zerith -p`, `zerith-ui` (quando `--model`/`ZERITH_MODEL` não estão definidos) |
-| `accounts[]` | Gateway local nativo (`zerith-runtime::resolve_gateway`, CLI e `zerith-ui`), failover, cotas e cofre |
+| `model` / `routing.main_model` | `zerith chat`, `zerith -p`, `zerith-desktop` (quando `--model`/`ZERITH_MODEL` não estão definidos) |
+| `accounts[]` | Gateway local nativo (`zerith-runtime::resolve_gateway`, CLI e `zerith-desktop`), failover, cotas e cofre |
 | `routing.*` | Delegação de subagentes (`subagent_model`, `explore_model`, `plan_model`, `role_models`) e `combos` |
 | `token_saver.*` | Prompt e compressão RTK por turno (`ponytail`, `caveman`, `rtk_enabled`) |
-| `providers[].api_key_ref` | `zerith chat`, `zerith -p`, `zerith providers` e `zerith-ui` (busca no cofre) |
-| `memory.paused` | `zerith -p`, `zerith chat`, `zerith-ui` |
+| `providers[].api_key_ref` | `zerith chat`, `zerith -p`, `zerith providers` e `zerith-desktop` (busca no cofre) |
+| `memory.paused` | `zerith -p`, `zerith chat`, `zerith-desktop` |
 | `profile` | turnos (histórico) e `zerith plan run` (subagentes) |
 | `ui.*` | a janela lê e grava (tema, movimento reduzido) |
-| `permissions.*`, `hooks.*` | `Policy::from_settings` + `Guards` e runner de hooks em `zerith -p`, `zerith chat` e `zerith-ui` |
-| `provider`, `base_url` | `provider_config` em CLI/headless e `configured_providers` em `zerith-ui` (`ZERITH_PROVIDER`/`ZERITH_BASE_URL` ainda têm precedência) |
+| `permissions.*`, `hooks.*` | `Policy::from_settings` + `Guards` e runner de hooks em `zerith -p`, `zerith chat` e `zerith-desktop` |
+| `provider`, `base_url` | `provider_config` em CLI/headless e `configured_providers` em `zerith-desktop` (`ZERITH_PROVIDER`/`ZERITH_BASE_URL` ainda têm precedência) |
 
 ## Gravar
 

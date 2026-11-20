@@ -4,9 +4,9 @@
 
 ```bash
 cargo fmt --all --check
-cargo clippy --workspace --exclude zerith-ui --all-targets -- -D warnings
-cargo test --workspace --exclude zerith-ui
-cargo clippy -p zerith-ui --all-targets -- -D warnings   # compila Rune, demora
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cd crates/zerith-desktop/frontend && npm run build
 ```
 
 ## Estilo

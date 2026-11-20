@@ -37,7 +37,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// The system prompt for a native session.
 ///
-/// Kept in core because the CLI, the Rune window and a future RPC host must
+/// Kept in core because the CLI, the desktop window and a future RPC host must
 /// send the same text: a prompt that differs per host makes the provider's
 /// prefix cache useless and the model's behavior unpredictable.
 ///

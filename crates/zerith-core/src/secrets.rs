@@ -104,8 +104,12 @@ pub fn oauth_entry(account_id: &str) -> String {
 // incremental writes only if a save ever gets slow enough to notice.
 const OAUTH_CHUNK_CHARS: usize = 1024;
 
-fn chunk_key(entry: &str, i: usize) -> String {
-    format!("{entry}.{i}")
+fn chunk_key(entry: &str, gen: u64, i: usize) -> String {
+    if gen == 0 {
+        format!("{entry}.{i}")
+    } else {
+        format!("{entry}.g{gen}.{i}")
+    }
 }
 
 pub fn save_oauth(
@@ -116,16 +120,43 @@ pub fn save_oauth(
     let json = serde_json::to_string(cred)
         .map_err(|e| SecretError::Unavailable(format!("credencial não serializável: {e}")))?;
     let chars: Vec<char> = json.chars().collect();
-    // Clear first: a shorter credential must not leave tail chunks behind.
-    clear_oauth(store, account_id)?;
     let entry = oauth_entry(account_id);
+    // The chunks go under a generation the header does not point at yet, and
+    // the header flips last: a crash anywhere leaves the old credential or
+    // the new one readable, never half of each.
+    let old = store.get(&entry).ok();
+    let gen = match old.as_deref().and_then(parse_header) {
+        Some((g, _)) => g + 1,
+        None => 1,
+    };
     let mut n = 0;
     for chunk in chars.chunks(OAUTH_CHUNK_CHARS) {
         let piece: String = chunk.iter().collect();
-        store.set(&chunk_key(&entry, n), &piece)?;
+        store.set(&chunk_key(&entry, gen, n), &piece)?;
         n += 1;
     }
-    store.set(&entry, &n.to_string())
+    store.set(&entry, &format!("{gen}:{n}"))?;
+    // Tail left by an earlier save of this generation that died midway.
+    let mut i = n;
+    while store.delete(&chunk_key(&entry, gen, i)).is_ok() {
+        i += 1;
+    }
+    // Only now the previous generation is garbage.
+    if let Some((g, count)) = old.as_deref().and_then(parse_header) {
+        for i in 0..count {
+            let _ = store.delete(&chunk_key(&entry, g, i));
+        }
+    }
+    Ok(())
+}
+
+/// `gen:count`; a bare `count` is the layout before generations (gen 0).
+fn parse_header(h: &str) -> Option<(u64, usize)> {
+    let h = h.trim();
+    match h.split_once(':') {
+        Some((g, n)) => Some((g.parse().ok()?, n.parse().ok()?)),
+        None => Some((0, h.parse().ok()?)),
+    }
 }
 
 pub fn load_oauth(
@@ -142,13 +173,11 @@ pub fn load_oauth(
         if header.trim_start().starts_with('{') {
             header // legacy: the whole credential in one entry
         } else {
-            let n: usize = header
-                .trim()
-                .parse()
-                .map_err(|_| SecretError::Unavailable("cabeçalho oauth inválido".into()))?;
+            let (gen, n) = parse_header(&header)
+                .ok_or_else(|| SecretError::Unavailable("cabeçalho oauth inválido".into()))?;
             let mut buf = String::new();
             for i in 0..n {
-                buf.push_str(&store.get(&chunk_key(&entry, i)).map_err(|_| {
+                buf.push_str(&store.get(&chunk_key(&entry, gen, i)).map_err(|_| {
                     SecretError::Unavailable(format!("parte {i} da credencial sumiu"))
                 })?);
             }
@@ -161,11 +190,9 @@ pub fn load_oauth(
 
 pub fn clear_oauth(store: &dyn SecretStore, account_id: &str) -> Result<(), SecretError> {
     let entry = oauth_entry(account_id);
-    if let Ok(header) = store.get(&entry) {
-        if let Ok(n) = header.trim().parse::<usize>() {
-            for i in 0..n {
-                let _ = store.delete(&chunk_key(&entry, i));
-            }
+    if let Some((gen, n)) = store.get(&entry).ok().as_deref().and_then(parse_header) {
+        for i in 0..n {
+            let _ = store.delete(&chunk_key(&entry, gen, i));
         }
     }
     match store.delete(&entry) {
@@ -271,6 +298,84 @@ mod tests {
         }
     }
 
+    /// A store that dies after `left` writes: what a crash mid-save leaves.
+    struct Dying(Mem, std::cell::Cell<usize>);
+
+    impl SecretStore for Dying {
+        fn get(&self, n: &str) -> Result<String, SecretError> {
+            self.0.get(n)
+        }
+        fn set(&self, n: &str, v: &str) -> Result<(), SecretError> {
+            if self.1.get() == 0 {
+                return Err(SecretError::Unavailable("caiu".into()));
+            }
+            self.1.set(self.1.get() - 1);
+            self.0.set(n, v)
+        }
+        fn delete(&self, n: &str) -> Result<(), SecretError> {
+            self.0.delete(n)
+        }
+    }
+
+    #[test]
+    fn a_save_that_dies_midway_leaves_the_old_credential_readable() {
+        let cred = |tok: &str, len: usize| zerith_providers::OAuthCredential {
+            access_token: format!("{tok}{}", "x".repeat(len)),
+            refresh_token: Some("R".into()),
+            expires_at: 42,
+            account_id: None,
+            tool: zerith_providers::OAuthTool::ClaudeCode,
+        };
+        // Old layout (bare count, gen 0) is still read, then upgraded.
+        let store = Dying(
+            Mem(RefCell::default(), false),
+            std::cell::Cell::new(usize::MAX),
+        );
+        store
+            .set(
+                "a.oauth.0",
+                &serde_json::to_string(&cred("OLD", 10)).unwrap(),
+            )
+            .unwrap();
+        store.set("a.oauth", "1").unwrap();
+        assert!(load_oauth(&store, "a")
+            .unwrap()
+            .unwrap()
+            .access_token
+            .starts_with("OLD"));
+
+        // 3 chunks needed, the store dies after 2 writes: old one still there.
+        store.1.set(2);
+        assert!(save_oauth(&store, "a", &cred("NEW", 2500)).is_err());
+        assert!(load_oauth(&store, "a")
+            .unwrap()
+            .unwrap()
+            .access_token
+            .starts_with("OLD"));
+
+        // A full save flips to the new one and leaves no old chunks behind.
+        store.1.set(usize::MAX);
+        save_oauth(&store, "a", &cred("NEW", 2500)).unwrap();
+        assert!(load_oauth(&store, "a")
+            .unwrap()
+            .unwrap()
+            .access_token
+            .starts_with("NEW"));
+        save_oauth(&store, "a", &cred("SHORT", 1)).unwrap();
+        assert_eq!(
+            load_oauth(&store, "a").unwrap().unwrap().access_token,
+            "SHORTx"
+        );
+        let keys: Vec<String> = store.0 .0.borrow().keys().cloned().collect();
+        assert_eq!(
+            keys.len(),
+            2,
+            "header + 1 chunk, nothing left over: {keys:?}"
+        );
+        clear_oauth(&store, "a").unwrap();
+        assert!(load_oauth(&store, "a").unwrap().is_none());
+    }
+
     #[test]
     fn oauth_credential_round_trips_under_the_account_entry() {
         let store = Mem(RefCell::default(), false);
@@ -319,10 +424,10 @@ mod tests {
         save_oauth(&store, "big", &cred).unwrap();
 
         let header = store.get(&oauth_entry("big")).unwrap();
-        let n: usize = header.parse().expect("cabeçalho é o número de partes");
+        let (gen, n) = parse_header(&header).expect("cabeçalho é geração:partes");
         assert!(n >= 3, "6000 chars não couberam em menos de 3 partes: {n}");
         for i in 0..n {
-            let piece = store.get(&format!("{}.{i}", oauth_entry("big"))).unwrap();
+            let piece = store.get(&chunk_key(&oauth_entry("big"), gen, i)).unwrap();
             assert!(piece.chars().count() <= OAUTH_CHUNK_CHARS);
         }
 
@@ -331,7 +436,7 @@ mod tests {
 
         clear_oauth(&store, "big").unwrap();
         for i in 0..n {
-            assert!(store.get(&format!("{}.{i}", oauth_entry("big"))).is_err());
+            assert!(store.get(&chunk_key(&oauth_entry("big"), gen, i)).is_err());
         }
         assert!(load_oauth(&store, "big").unwrap().is_none());
     }

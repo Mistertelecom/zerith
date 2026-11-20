@@ -119,3 +119,78 @@ fn a_missing_credential_leaves_the_account_without_any_secret() {
     assert!(cand.config.oauth.is_none());
     assert_eq!(cand.config.api_key, None);
 }
+
+/// Thread-safe store for the parallel test (the `Mem` above is single-thread).
+struct Shared(std::sync::Mutex<HashMap<String, String>>);
+
+impl SecretStore for Shared {
+    fn get(&self, n: &str) -> Result<String, SecretError> {
+        let m = self.0.lock().unwrap();
+        m.get(n)
+            .cloned()
+            .ok_or_else(|| SecretError::NotFound(n.into()))
+    }
+    fn set(&self, n: &str, v: &str) -> Result<(), SecretError> {
+        self.0.lock().unwrap().insert(n.into(), v.into());
+        Ok(())
+    }
+    fn delete(&self, n: &str) -> Result<(), SecretError> {
+        let mut m = self.0.lock().unwrap();
+        m.remove(n)
+            .map(|_| ())
+            .ok_or_else(|| SecretError::NotFound(n.into()))
+    }
+}
+
+fn expired(tool: OAuthTool) -> OAuthCredential {
+    OAuthCredential {
+        access_token: "old".into(),
+        refresh_token: Some("rotating".into()),
+        expires_at: 0,
+        account_id: None,
+        tool,
+    }
+}
+
+#[test]
+fn parallel_turns_refresh_a_rotating_token_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let store = Shared(Default::default());
+    let mut acc = oauth_account();
+    acc.id = "claude-par".into();
+    secrets::save_oauth(&store, &acc.id, &expired(OAuthTool::ClaudeCode)).unwrap();
+    let calls = AtomicUsize::new(0);
+    let refresh = |c: &OAuthCredential| {
+        calls.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let mut f = c.clone();
+        f.access_token = "fresh".into();
+        f.expires_at = i64::MAX / 2;
+        Ok(f)
+    };
+    let got: Vec<String> = std::thread::scope(|s| {
+        let hs: Vec<_> = (0..6)
+            .map(|_| {
+                s.spawn(|| {
+                    zerith_runtime::hydrate_oauth_with(&acc, &store, &refresh)
+                        .unwrap()
+                        .access_token
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "one refresh for six turns");
+    assert!(got.iter().all(|t| t == "fresh"), "{got:?}");
+}
+
+#[test]
+fn a_codex_token_is_never_refreshed_by_zerith() {
+    let store = Shared(Default::default());
+    let mut acc = oauth_account();
+    acc.id = "codex-x".into();
+    secrets::save_oauth(&store, &acc.id, &expired(OAuthTool::Codex)).unwrap();
+    let out =
+        zerith_runtime::hydrate_oauth_with(&acc, &store, &|_| panic!("codex refreshed")).unwrap();
+    assert_eq!(out.access_token, "old");
+}

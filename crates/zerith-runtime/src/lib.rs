@@ -1,7 +1,7 @@
 //! One agent turn, from user text to a stored assistant message.
 //!
 //! The whole harness lives here rather than in the CLI, because the same turn
-//! has to run from the shell, from the Rune window and from a future RPC host.
+//! has to run from the shell, from the desktop window and from a future RPC host.
 //!
 //! Two rules, both from the spec:
 //!
@@ -14,6 +14,7 @@
 //! The tool loop is in [`agent`]; the plain turn is that loop with tools off.
 
 pub mod agent;
+pub mod bili;
 pub mod compact;
 pub mod events;
 pub mod guards;
@@ -563,17 +564,60 @@ pub fn hydrate_oauth(
     acc: &AccountEntry,
     store: &dyn zerith_core::secrets::SecretStore,
 ) -> Option<zerith_providers::OAuthCredential> {
-    let mut cred = zerith_core::secrets::load_oauth(store, &acc.id)
-        .ok()
-        .flatten()?;
-    if cred.needs_refresh(oauth_now()) {
-        if let Ok(fresh) = zerith_providers::oauth::refresh(cred.tool, &cred) {
+    hydrate_oauth_with(acc, store, &|c| {
+        zerith_providers::oauth::refresh(c.tool, c).map_err(|e| e.to_string())
+    })
+}
+
+/// Same as `hydrate_oauth`, with the refresh call injected. Test seam.
+pub fn hydrate_oauth_with(
+    acc: &AccountEntry,
+    store: &dyn zerith_core::secrets::SecretStore,
+    refresh: &dyn Fn(
+        &zerith_providers::OAuthCredential,
+    ) -> std::result::Result<zerith_providers::OAuthCredential, String>,
+) -> Option<zerith_providers::OAuthCredential> {
+    let load = || {
+        zerith_core::secrets::load_oauth(store, &acc.id)
+            .ok()
+            .flatten()
+    };
+    let cred = load()?;
+    // Codex's refresh token rotates on use: renewing it here would log the
+    // user's own `codex` CLI out. Its token is used as it is.
+    if cred.tool == zerith_providers::OAuthTool::Codex || !cred.needs_refresh(oauth_now()) {
+        return Some(cred);
+    }
+    // Parallel turns and subagents hit this together; a rotating refresh
+    // token used twice loses the login. One refresh per account at a time,
+    // and whoever waited reads what the first one saved.
+    let lock = refresh_lock(&acc.id);
+    let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let cred = load()?;
+    if !cred.needs_refresh(oauth_now()) {
+        return Some(cred);
+    }
+    match refresh(&cred) {
+        Ok(fresh) => {
             // ponytail: a failed write only costs one extra refresh next turn.
             let _ = zerith_core::secrets::save_oauth(store, &acc.id, &fresh);
-            cred = fresh;
+            Some(fresh)
         }
+        Err(_) => Some(cred),
     }
-    Some(cred)
+}
+
+fn refresh_lock(account: &str) -> std::sync::Arc<std::sync::Mutex<()>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+    LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(account.to_string())
+        .or_default()
+        .clone()
 }
 
 fn oauth_now() -> i64 {
@@ -667,7 +711,8 @@ pub fn candidate_from_account_with(
         .unwrap_or(fallback_cfg.timeout_ms);
     cfg.context_limit = entry
         .and_then(|e| e.context_limit)
-        .or(fallback_cfg.context_limit);
+        .or(fallback_cfg.context_limit)
+        .or_else(|| zerith_providers::models::context_window(&model));
     cfg.account_id = Some(acc.id.clone());
 
     // An OAuth account carries no key: the credential replaces it, and a stale
@@ -773,9 +818,21 @@ fn candidate_from_fallback(spec_model: &str, fallback_cfg: &ProviderConfig) -> R
     }
 }
 
+/// Two accounts that serve the same models the same way: same provider, auth,
+/// OAuth tool, endpoint and protocol. A custom endpoint under another account
+/// is not a twin, its model list may differ.
+fn same_account_kind(a: &AccountEntry, b: &AccountEntry) -> bool {
+    a.provider.eq_ignore_ascii_case(&b.provider)
+        && a.auth == b.auth
+        && a.oauth_tool == b.oauth_tool
+        && a.base_url == b.base_url
+        && a.protocol == b.protocol
+}
+
 /// Resolves a model string (plain model, `provider/model`, `account:model`, or
 /// combo name) into an ordered [`Gateway`] of [`RouteCandidate`]s plus the
-/// primary display model name.
+/// primary display model name. A pinned account keeps first place and its
+/// twins ([`same_account_kind`]) follow as failover.
 pub fn resolve_gateway(
     settings: &Settings,
     requested_model: &str,
@@ -809,6 +866,23 @@ pub fn resolve_gateway(
                         &spec.model,
                         fallback_cfg,
                     ));
+                    // The pinned account first, then the other enabled accounts
+                    // of the same provider (a second subscription), so a 429 on
+                    // one moves to the next instead of failing the turn.
+                    let mut twins: Vec<&AccountEntry> = accounts
+                        .iter()
+                        .copied()
+                        .filter(|a| a.enabled && a.id != acc.id && same_account_kind(a, acc))
+                        .collect();
+                    twins.sort_by_key(|a| a.priority);
+                    for twin in twins {
+                        candidates.push(candidate_from_account(
+                            settings,
+                            twin,
+                            &spec.model,
+                            fallback_cfg,
+                        ));
+                    }
                 } else {
                     saw_explicit_disabled = true;
                 }
@@ -1326,6 +1400,32 @@ mod gateway_tests {
     use zerith_core::settings::ProviderEntry;
     use zerith_core::ComboEntry;
 
+    /// An account with no `context_limit` gets its model's window, so a 1M
+    /// model is not summarized at 96k as if it were the 128k default.
+    #[test]
+    fn an_account_without_a_context_limit_gets_its_models_window() {
+        let settings = Settings {
+            accounts: vec![AccountEntry {
+                id: "or".into(),
+                provider: "openrouter".into(),
+                base_url: Some("http://127.0.0.1:2009/v1".into()),
+                enabled: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let fb = ProviderConfig::new(ProviderKind::OpenRouter);
+        let window = |m: &str| {
+            resolve_gateway(&settings, m, &fb).0.candidates[0]
+                .config
+                .context_limit
+        };
+        assert_eq!(window("or:anthropic/claude-sonnet-4-6"), Some(1_000_000));
+        assert_eq!(window("or:google/gemini-3.1-pro-preview"), Some(1_048_576));
+        assert_eq!(window("or:anthropic/claude-haiku-4.5"), Some(200_000));
+        assert_eq!(window("or:some/unknown-model"), None);
+    }
+
     #[test]
     fn custom_fallback_is_preserved_when_accounts_and_provider_entries_are_empty() {
         let settings = Settings::default();
@@ -1412,6 +1512,58 @@ mod gateway_tests {
         // Explicitly targeting a disabled account leaves candidates empty.
         let (gw, _) = resolve_gateway(&settings, "openai-disabled:gpt-4o", &fb);
         assert!(gw.candidates.is_empty());
+    }
+
+    /// Two Claude subscriptions: `claude:model` (what the model picker saves)
+    /// must fall over to `claude-2` when the first one is rate limited. A
+    /// different provider is never pulled in by a pin.
+    #[test]
+    fn a_pinned_account_falls_over_to_its_twin_subscription() {
+        let sub = |id: &str, priority| AccountEntry {
+            id: id.into(),
+            provider: "anthropic".into(),
+            auth: zerith_core::settings::AuthMode::Oauth,
+            oauth_tool: Some("claude-code".into()),
+            priority,
+            enabled: true,
+            ..Default::default()
+        };
+        let or = AccountEntry {
+            id: "openrouter".into(),
+            provider: "openrouter".into(),
+            enabled: true,
+            ..Default::default()
+        };
+        let mut off = sub("claude-off", 0);
+        off.enabled = false;
+        let settings = Settings {
+            accounts: vec![
+                sub("claude", 0),
+                or,
+                sub("claude-3", 5),
+                off,
+                sub("claude-2", 1),
+            ],
+            ..Default::default()
+        };
+        let fb = ProviderConfig::new(ProviderKind::Anthropic);
+        let ids = |m: &str| -> Vec<String> {
+            resolve_gateway(&settings, m, &fb)
+                .0
+                .candidates
+                .into_iter()
+                .map(|c| c.account_id)
+                .collect()
+        };
+        assert_eq!(
+            ids("claude:claude-sonnet-5-5"),
+            ["claude", "claude-2", "claude-3"]
+        );
+        assert_eq!(
+            ids("claude-3:claude-sonnet-5-5"),
+            ["claude-3", "claude", "claude-2"]
+        );
+        assert_eq!(ids("openrouter:anthropic/claude-haiku-4.5"), ["openrouter"]);
     }
 
     #[test]

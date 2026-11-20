@@ -245,8 +245,11 @@ pub fn html_to_text(html: &str) -> String {
                 });
                 continue;
             }
-            let end = html[i..].find('>').map_or(b.len(), |p| i + p + 1);
-            let tag = lower[i + 1..end.saturating_sub(1).max(i + 1)]
+            let (tag_end, end) = match html[i..].find('>') {
+                Some(p) => (i + p, i + p + 1),
+                None => (b.len(), b.len()),
+            };
+            let tag = lower[i + 1..tag_end.max(i + 1)]
                 .trim_start_matches('/')
                 .split(|c: char| !c.is_ascii_alphanumeric())
                 .next()

@@ -1,7 +1,9 @@
 //! Server configuration layers and the project-approval rule.
 
 use zerith_core::Paths;
-use zerith_mcp::config::{add_server, approve_server, load_servers, parse_add, remove_server};
+use zerith_mcp::config::{
+    add_server, approve_project_server, load_servers, parse_add, remove_server,
+};
 use zerith_mcp::Origin;
 
 fn scratch() -> tempfile::TempDir {
@@ -52,11 +54,33 @@ fn approval_from_the_user_file_lets_the_project_server_run() {
     assert!(l.servers.is_empty());
     assert_eq!(l.unapproved.len(), 1);
 
-    approve_server(&paths, "evil").unwrap();
+    approve_project_server(&paths, &project, &l.unapproved[0]).unwrap();
     let l = load_servers(&paths, Some(&project));
     assert_eq!(l.servers.len(), 1);
     assert_eq!(l.servers[0].origin, Origin::Project);
     assert!(l.unapproved.is_empty());
+
+    // A different repository with the same server name is NOT approved.
+    let other_proj = t.path().join("other-proj");
+    std::fs::create_dir_all(other_proj.join(".zerith")).unwrap();
+    std::fs::write(
+        other_proj.join(".zerith").join("settings.toml"),
+        "[[mcp.servers]]\nname = \"evil\"\ncommand = \"calc\"\n",
+    )
+    .unwrap();
+    let l_other = load_servers(&paths, Some(&other_proj));
+    assert!(l_other.servers.is_empty());
+    assert_eq!(l_other.unapproved.len(), 1);
+
+    // Changing the command inside the SAME repository invalidates approval.
+    std::fs::write(
+        project.join(".zerith").join("settings.toml"),
+        "[[mcp.servers]]\nname = \"evil\"\ncommand = \"powershell\"\nargs = [\"-c\", \"whoami\"]\n",
+    )
+    .unwrap();
+    let l_changed = load_servers(&paths, Some(&project));
+    assert!(l_changed.servers.is_empty());
+    assert_eq!(l_changed.unapproved.len(), 1);
 }
 
 #[test]

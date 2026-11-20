@@ -219,9 +219,15 @@ pub fn load_servers(paths: &Paths, project_dir: Option<&Path>) -> Loaded {
         if let Some(x) = extras.get(&s.name).filter(|_| s.origin == Origin::User) {
             out.extras.insert(s.name.clone(), x.clone());
         }
-        if s.origin == Origin::Project && !approved.contains(&s.name) {
-            out.unapproved.push(s);
-        } else if disabled.contains(&s.name) {
+        if s.origin == Origin::Project {
+            let is_approved =
+                project_dir.is_some_and(|dir| approved.contains(&project_approval_key(dir, &s)));
+            if !is_approved {
+                out.unapproved.push(s);
+                continue;
+            }
+        }
+        if disabled.contains(&s.name) {
             out.disabled.push(s);
         } else {
             out.servers.push(s);
@@ -260,7 +266,9 @@ pub fn remove_server(paths: &Paths, name: &str) -> Result<bool, String> {
         let before = s.servers.len();
         s.servers.retain(|x| x.name != name);
         found = s.servers.len() != before;
-        s.approved.retain(|x| x != name);
+        let v2_prefix = format!("v2:{name}:");
+        s.approved
+            .retain(|x| x != name && !x.starts_with(&v2_prefix));
         s.disabled.retain(|x| x != name);
         s.env.remove(name);
         s.headers.remove(name);
@@ -292,7 +300,65 @@ pub fn set_extra(paths: &Paths, name: &str, extra: &Extra) -> Result<(), String>
     })
 }
 
-/// Lets a project-defined server of this name run.
+/// Canonical scoped approval key binding a project server to the exact
+/// repository directory and server definition (`command`, `args`, `url`).
+/// Approving `"github"` in repo A never approves a different repo or a modified
+/// command in the same repo.
+pub fn project_approval_key(project_dir: &Path, server: &ServerConfig) -> String {
+    let canon = project_dir
+        .canonicalize()
+        .unwrap_or_else(|_| project_dir.to_path_buf());
+    let dir = {
+        let s = canon.to_string_lossy().replace('\\', "/");
+        if cfg!(windows) {
+            s.to_ascii_lowercase()
+        } else {
+            s
+        }
+    };
+    let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+    ctx.update(b"zerith-mcp-approval-v2\0");
+    ctx.update(dir.as_bytes());
+    ctx.update(b"\0");
+    ctx.update(server.name.as_bytes());
+    ctx.update(b"\0");
+    if let Some(cmd) = &server.command {
+        ctx.update(cmd.as_bytes());
+    }
+    ctx.update(b"\0");
+    for arg in &server.args {
+        ctx.update(arg.as_bytes());
+        ctx.update(b"\0");
+    }
+    if let Some(url) = &server.url {
+        ctx.update(url.as_bytes());
+    }
+    let hex: String = ctx
+        .finish()
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!("v2:{}:{hex}", server.name)
+}
+
+/// Lets a project-defined server run, scoped to `project_dir` and its exact
+/// command/args/url fingerprint.
+pub fn approve_project_server(
+    paths: &Paths,
+    project_dir: &Path,
+    server: &ServerConfig,
+) -> Result<(), String> {
+    let key = project_approval_key(project_dir, server);
+    edit_user(paths, |s| {
+        if !s.approved.iter().any(|x| x == &key) {
+            s.approved.push(key);
+        }
+    })
+}
+
+/// Deprecated unscoped name-only helper retained only for API compatibility.
+/// Project servers now require [`approve_project_server`].
 pub fn approve_server(paths: &Paths, name: &str) -> Result<(), String> {
     edit_user(paths, |s| {
         if !s.approved.iter().any(|x| x == name) {

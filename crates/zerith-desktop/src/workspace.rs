@@ -89,14 +89,55 @@ fn image_mime(path: &Path) -> Option<&'static str> {
             "webp" => "image/webp",
             "bmp" => "image/bmp",
             "avif" => "image/avif",
-            // Scripts inside an SVG do not run when it is shown through <img>.
-            "svg" => "image/svg+xml",
             "mp4" | "m4v" => "video/mp4",
             "webm" => "video/webm",
             "mov" => "video/quicktime",
             _ => return None,
         },
     )
+}
+
+/// Checks file magic bytes match a real raster image or video container.
+fn matches_media_magic(mime: &str, bytes: &[u8]) -> bool {
+    match mime {
+        "image/png" => bytes.starts_with(&[0x89, b'P', b'N', b'G']),
+        "image/jpeg" => bytes.starts_with(&[0xFF, 0xD8, 0xFF]),
+        "image/gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+        "image/webp" => bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP",
+        "image/bmp" => bytes.starts_with(b"BM"),
+        "image/avif" => bytes.len() >= 12 && &bytes[4..8] == b"ftyp",
+        "video/mp4" | "video/quicktime" => bytes.len() >= 8 && &bytes[4..8] == b"ftyp",
+        "video/webm" => bytes.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]),
+        _ => false,
+    }
+}
+
+/// Canonical directories from which the transcript may read/open local media:
+/// attachments, generated media, browser screenshots, and session workspaces.
+fn allowed_media_roots(root: &Path, db: &Path) -> Vec<PathBuf> {
+    let mut raw = vec![
+        root.join("attachments"),
+        root.join("media"),
+        wire::media_dir(root),
+        root.join("browser").join("shots"),
+        crate::turn::default_workspace(),
+    ];
+    if let Ok(st) = zerith_sessions::Store::open(db) {
+        if let Ok(dirs) = st.workspaces() {
+            for ws in dirs.into_values() {
+                raw.push(PathBuf::from(ws));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for r in raw {
+        if let Ok(c) = r.canonicalize() {
+            if !out.contains(&c) {
+                out.push(c);
+            }
+        }
+    }
+    out
 }
 
 /// `file:///C:/a.png`, `C:\a.png` or a path relative to the workspace, as the
@@ -156,12 +197,19 @@ if ($d.ShowDialog($f) -eq 'OK') { $d.SelectedPath }";
     }
 }
 
-/// A local image checked against the rules above.
-fn checked_image(raw: &str) -> Cmd<(PathBuf, &'static str)> {
+/// A local image checked against the rules above and confined to `roots`
+/// (after canonicalizing symlinks).
+fn checked_image_in(raw: &str, roots: &[PathBuf]) -> Cmd<(PathBuf, &'static str)> {
     let path = image_path(raw);
     let mime = image_mime(&path)
-        .ok_or("só abro imagens (png, jpg, gif, webp, bmp, avif, svg) e vídeos (mp4, webm, mov)")?;
-    let meta = std::fs::metadata(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        .ok_or("só abro imagens (png, jpg, gif, webp, bmp, avif) e vídeos (mp4, webm, mov)")?;
+    let canon = path
+        .canonicalize()
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    if !roots.iter().any(|r| canon.starts_with(r)) {
+        return Err("só abro mídia do workspace, anexos ou pasta de mídia do Zerith".into());
+    }
+    let meta = std::fs::metadata(&canon).map_err(|e| format!("{}: {e}", canon.display()))?;
     if !meta.is_file() {
         return Err(format!("{} não é um arquivo", path.display()));
     }
@@ -171,13 +219,16 @@ fn checked_image(raw: &str) -> Cmd<(PathBuf, &'static str)> {
     if !mime.starts_with("video/") && meta.len() > IMAGE_CAP {
         return Err("imagem maior que 20 MB".into());
     }
-    Ok((path, mime))
+    Ok((canon, mime))
 }
 
-fn image_data_url(raw: &str) -> Cmd<String> {
+fn image_data_url_in(raw: &str, roots: &[PathBuf]) -> Cmd<String> {
     use base64::Engine;
-    let (path, mime) = checked_image(raw)?;
+    let (path, mime) = checked_image_in(raw, roots)?;
     let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if !matches_media_magic(mime, &bytes) {
+        return Err("o conteúdo do arquivo não corresponde a uma imagem ou vídeo válido".into());
+    }
     Ok(format!(
         "data:{mime};base64,{}",
         base64::engine::general_purpose::STANDARD.encode(bytes)
@@ -187,19 +238,31 @@ fn image_data_url(raw: &str) -> Cmd<String> {
 /// A local image the assistant wrote as `![](path)`, as a data URL the
 /// webview can show without the asset protocol.
 #[tauri::command]
-pub async fn read_image(path: String) -> Cmd<String> {
-    tauri::async_runtime::spawn_blocking(move || image_data_url(&path))
-        .await
-        .map_err(|e| e.to_string())?
+pub async fn read_image(state: State<'_, AppState>, path: String) -> Cmd<String> {
+    let root = state.root().to_path_buf();
+    let db = state.db();
+    tauri::async_runtime::spawn_blocking(move || {
+        let roots = allowed_media_roots(&root, &db);
+        image_data_url_in(&path, &roots)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Opens a local image in the system's default viewer.
 #[tauri::command]
-pub async fn open_image(path: String) -> Cmd<()> {
-    let (path, _) = checked_image(&path)?;
-    // Native separators: `explorer C:/a/b.png` does not find the file.
-    let native: PathBuf = path.components().collect();
-    wire::reveal(&native)
+pub async fn open_image(state: State<'_, AppState>, path: String) -> Cmd<()> {
+    let root = state.root().to_path_buf();
+    let db = state.db();
+    tauri::async_runtime::spawn_blocking(move || {
+        let roots = allowed_media_roots(&root, &db);
+        let (canon, _) = checked_image_in(&path, &roots)?;
+        // Native separators: `explorer C:/a/b.png` does not find the file.
+        let native: PathBuf = canon.components().collect();
+        wire::reveal(&native)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Which turns this conversation can be rewound to.
@@ -276,13 +339,15 @@ mod tests {
         d
     }
 
-    /// Only images, read whole, as a data URL; anything else is refused.
+    /// Only real images/videos inside an allowed root are read as data URLs;
+    /// files outside the allowed roots, SVGs, or spoofed headers are refused.
     #[test]
     fn read_image_inlines_images_and_refuses_other_files() {
         let d = scratch("read-image");
+        let roots = vec![d.canonicalize().unwrap()];
         let png = d.join("a.PNG");
         std::fs::write(&png, [0x89, b'P', b'N', b'G']).unwrap();
-        let url = image_data_url(&png.to_string_lossy()).unwrap();
+        let url = image_data_url_in(&png.to_string_lossy(), &roots).unwrap();
         assert_eq!(url, "data:image/png;base64,iVBORw==");
 
         let file_url = format!(
@@ -292,32 +357,49 @@ mod tests {
                 .trim_start_matches('/')
         );
         assert_eq!(
-            image_data_url(&file_url).unwrap(),
+            image_data_url_in(&file_url, &roots).unwrap(),
             url,
             "file:// urls name the same file"
         );
 
         let mp4 = d.join("v.mp4");
-        std::fs::write(&mp4, [0, 0, 0]).unwrap();
+        std::fs::write(&mp4, [0, 0, 0, 0x18, b'f', b't', b'y', b'p']).unwrap();
         assert_eq!(
-            image_data_url(&mp4.to_string_lossy()).unwrap(),
-            "data:video/mp4;base64,AAAA",
+            image_data_url_in(&mp4.to_string_lossy(), &roots).unwrap(),
+            "data:video/mp4;base64,AAAAGGZ0eXA=",
             "a generated video plays in the chat"
+        );
+
+        // Spoofed extension (text disguised as .png) must fail magic check.
+        let fake_png = d.join("fake.png");
+        std::fs::write(&fake_png, b"not a png").unwrap();
+        assert!(
+            image_data_url_in(&fake_png.to_string_lossy(), &roots).is_err(),
+            "spoofed png must be refused"
+        );
+
+        // File outside allowed roots must be refused even with valid PNG bytes.
+        let outside = scratch("outside-image");
+        let out_png = outside.join("secret.png");
+        std::fs::write(&out_png, [0x89, b'P', b'N', b'G']).unwrap();
+        assert!(
+            image_data_url_in(&out_png.to_string_lossy(), &roots).is_err(),
+            "outside allowed roots must be refused"
         );
 
         let secret = d.join("auth.json");
         std::fs::write(&secret, "{}").unwrap();
         assert!(
-            image_data_url(&secret.to_string_lossy()).is_err(),
+            image_data_url_in(&secret.to_string_lossy(), &roots).is_err(),
             "not an image"
         );
         assert!(
-            image_data_url(&d.join("nada.png").to_string_lossy()).is_err(),
+            image_data_url_in(&d.join("nada.png").to_string_lossy(), &roots).is_err(),
             "missing"
         );
         std::fs::create_dir_all(d.join("pasta.png")).unwrap();
         assert!(
-            image_data_url(&d.join("pasta.png").to_string_lossy()).is_err(),
+            image_data_url_in(&d.join("pasta.png").to_string_lossy(), &roots).is_err(),
             "a directory"
         );
     }
@@ -341,7 +423,8 @@ fn check_url(url: &str) -> Result<(), String> {
     let ok = lower.starts_with("https://")
         || lower.starts_with("http://")
         || lower.starts_with("mailto:");
-    if !ok || (u.contains(char::is_whitespace) && !lower.starts_with("mailto:")) {
+    let has_ctrl = u.chars().any(char::is_control);
+    if !ok || has_ctrl || (u.contains(char::is_whitespace) && !lower.starts_with("mailto:")) {
         return Err(format!("link recusado: {u}"));
     }
     Ok(())

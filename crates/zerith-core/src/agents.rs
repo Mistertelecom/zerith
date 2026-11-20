@@ -25,7 +25,7 @@
 //! | `permissionMode` | `default`, `acceptEdits`, `plan`, `dontAsk`, `bypassPermissions` |
 //! | `maxTurns` | step limit for this agent |
 //! | `skills` | skills preloaded for this agent |
-//! | `isolation` | `worktree`: run in its own git worktree |
+//! | `isolation` | `worktree`: run in its own git worktree (not run yet: warns, uses the workspace) |
 //! | `background` | run without blocking the parent |
 //!
 //! Lists are `a, b`, `[a, b]` or YAML `- a` lines. Unknown keys are ignored so
@@ -216,11 +216,21 @@ fn collect(
     if !include_disabled {
         out.retain(|a| !a.disabled);
     }
-    if !include_disabled {
-        out.retain(|a| !a.disabled);
-    }
     out.sort_by(|a, b| a.name.cmp(&b.name));
+    warnings.extend(out.iter().filter_map(worktree_warning));
     (out, warnings)
+}
+
+/// `isolation: worktree` is read but nothing creates the worktree yet: say so
+/// instead of letting the person believe the agent is isolated.
+pub fn worktree_warning(a: &AgentDef) -> Option<String> {
+    (a.isolation == Isolation::Worktree).then(|| {
+        format!(
+            "{}: agente `{}` pede `isolation: worktree`, que ainda não é suportado; ele roda no workspace da conversa",
+            a.path.display(),
+            a.name
+        )
+    })
 }
 
 /// The named agent, or `None` for `default` and for names nobody defined.
@@ -534,6 +544,25 @@ mod tests {
         assert_eq!(all[0].instructions, "primeiro");
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("repetido"));
+    }
+
+    #[test]
+    fn worktree_isolation_warns_that_it_runs_in_the_workspace() {
+        let tmp = scratch();
+        let paths = Paths::with_root(tmp.path().join("home"));
+        std::fs::create_dir_all(paths.agents()).unwrap();
+        std::fs::write(
+            paths.agents().join("iso.md"),
+            "---\nisolation: worktree\n---\nx",
+        )
+        .unwrap();
+        std::fs::write(paths.agents().join("plain.md"), "y").unwrap();
+        let (all, warnings) = list_checked(&paths, None);
+        assert_eq!(all.len(), 2, "the agent still loads");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("`iso`") && warnings[0].contains("ainda não é suportado"));
+        assert!(warnings[0].contains("roda no workspace"));
+        assert!(worktree_warning(&all[1]).is_none());
     }
 
     #[test]

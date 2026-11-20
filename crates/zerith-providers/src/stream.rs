@@ -145,8 +145,15 @@ impl OpenAiStream {
             .pointer("/choices/0/delta/tool_calls")
             .and_then(Value::as_array)
         {
+            const MAX_TOOL_CALLS: usize = 128;
             for (pos, frag) in frags.iter().enumerate() {
-                let i = frag["index"].as_u64().map(|i| i as usize).unwrap_or(pos);
+                let raw_idx = frag["index"].as_u64().unwrap_or(pos as u64);
+                let Ok(i) = usize::try_from(raw_idx) else {
+                    continue;
+                };
+                if i >= MAX_TOOL_CALLS {
+                    continue;
+                }
                 if self.calls.len() <= i {
                     self.calls.resize_with(i + 1, ToolCall::default);
                 }

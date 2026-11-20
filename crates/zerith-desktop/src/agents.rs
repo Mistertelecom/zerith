@@ -106,14 +106,14 @@ pub fn render_file(f: &AgentForm) -> String {
     let tools: Vec<String> = f
         .tools
         .split(',')
-        .map(|t| t.trim().to_string())
-        .filter(|t| !t.is_empty())
+        .map(one_line)
+        .filter(|t| !t.is_empty() && !t.contains("---"))
         .collect();
     if !tools.is_empty() {
         head.push_str(&format!("tools: {}\n", tools.join(", ")));
     }
-    let model = f.model.trim();
-    if !model.is_empty() {
+    let model = one_line(&f.model);
+    if !model.is_empty() && !model.contains("---") {
         head.push_str(&format!("model: {model}\n"));
     }
     let body = f.instructions.trim();

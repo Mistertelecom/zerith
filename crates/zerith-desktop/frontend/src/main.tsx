@@ -1,4 +1,4 @@
-import { StrictMode } from "react";
+import { Component, StrictMode, type ErrorInfo, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
 import App from "./App";
@@ -20,8 +20,50 @@ document.addEventListener(
   true,
 );
 
+class ErrorBoundary extends Component<{ children: ReactNode }, { error: string | null }> {
+  state: { error: string | null } = { error: null };
+
+  static getDerivedStateFromError(error: unknown) {
+    return { error: error instanceof Error ? error.message : String(error) };
+  }
+
+  componentDidCatch(error: unknown, info: ErrorInfo) {
+    console.error("Zerith UI render error:", error, info.componentStack);
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <div
+          style={{
+            padding: "32px",
+            fontFamily: "system-ui, sans-serif",
+            color: "var(--fg, #e5e5e5)",
+            background: "var(--bg, #111)",
+            height: "100vh",
+            boxSizing: "border-box",
+          }}
+        >
+          <h2 style={{ marginTop: 0 }}>Ocorreu um erro inesperado na interface</h2>
+          <p style={{ opacity: 0.8 }}>{this.state.error}</p>
+          <button
+            type="button"
+            className="btn btn-primary"
+            onClick={() => window.location.reload()}
+          >
+            Recarregar janela
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
-    <App />
+    <ErrorBoundary>
+      <App />
+    </ErrorBoundary>
   </StrictMode>,
 );

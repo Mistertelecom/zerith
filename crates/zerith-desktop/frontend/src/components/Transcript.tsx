@@ -101,6 +101,12 @@ function MdImage({ src, alt }: { src: string; alt: string }) {
   const [failed, setFailed] = useState<string | null>(null);
   const [zoom, setZoom] = useState(false);
   useEffect(() => {
+    setAllowed(!remote);
+    setUrl(isWeb(src) && !remote ? src : null);
+    setFailed(null);
+    setZoom(false);
+  }, [src, remote]);
+  useEffect(() => {
     if (remote) {
       if (!allowed) return;
       setUrl(src);
@@ -115,7 +121,7 @@ function MdImage({ src, alt }: { src: string; alt: string }) {
     return () => {
       live = false;
     };
-  }, [src]);
+  }, [src, remote, allowed]);
   if (failed) {
     return (
       <span className="md-img-fail" title={failed}>

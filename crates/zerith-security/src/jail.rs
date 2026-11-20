@@ -180,6 +180,14 @@ impl Jail {
     /// failing closed beats running unjailed.
     pub fn spawn(&self, cmd: Command) -> std::io::Result<Jailed> {
         let cmd = self.wrap(cmd);
+        self.spawn_wrapped(cmd)
+    }
+
+    /// Spawns a command already prepared with [`Jail::wrap`]. Prefer
+    /// `wrap` → configure `stdin`/`stdout`/`stderr` → `spawn_wrapped`, because
+    /// on macOS `wrap` builds a fresh `sandbox-exec` `Command` that cannot
+    /// inherit stdio configured earlier.
+    pub fn spawn_wrapped(&self, cmd: Command) -> std::io::Result<Jailed> {
         #[cfg(windows)]
         {
             win::spawn(cmd, self)

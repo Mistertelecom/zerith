@@ -126,6 +126,19 @@ pub fn validate_new(new: &NewAgent, creator: &Creator<'_>) -> Result<Vec<String>
             }
         }
     }
+    if let Some(m) = new.model.as_deref() {
+        let m = m.trim();
+        if m.contains(['\n', '\r'])
+            || m.chars().any(char::is_control)
+            || m.contains("---")
+            || m.chars().count() > 200
+        {
+            return Err(
+                "o modelo deve ser uma única linha sem caracteres de controle (máx. 200 caracteres)"
+                    .into(),
+            );
+        }
+    }
     if let Some(n) = new.max_turns {
         if n == 0 || n > 100 {
             return Err("maxTurns deve ficar entre 1 e 100".into());
@@ -412,6 +425,12 @@ mod tests {
         let mut a = agent("ok");
         a.max_turns = Some(0);
         assert!(validate_new(&a, &creator()).is_err());
+        let mut a = agent("ok");
+        a.model = Some("gpt-4o\ndisabled: false\n---".into());
+        assert!(
+            validate_new(&a, &creator()).is_err(),
+            "model must not inject YAML frontmatter"
+        );
     }
 
     #[test]

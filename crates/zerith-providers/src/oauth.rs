@@ -548,28 +548,58 @@ fn credential_from_body_keeping(
 }
 
 /// `expires_at` carries `expires_in` until the caller adds `now`.
+/// RFC 6749 token endpoints return JSON even when the request body was
+/// `application/x-www-form-urlencoded`, so JSON is always tried first and form
+/// decoding is used only as a fallback. Error messages never echo raw token
+/// bodies.
 fn parse_token(body: &str, enc: Encoding) -> Result<OAuthCredential> {
-    let (access, refresh, expires_in) = match enc {
-        Encoding::Json => {
-            let v: serde_json::Value =
-                serde_json::from_str(body).map_err(|e| OAuthError::Parse(e.to_string()))?;
-            (
-                v["access_token"].as_str().unwrap_or_default().to_string(),
-                v["refresh_token"].as_str().map(str::to_string),
-                v["expires_in"].as_i64().unwrap_or(3600),
-            )
-        }
-        Encoding::Form => (
+    let parsed_json = serde_json::from_str::<serde_json::Value>(body).ok();
+    let (access, refresh, expires_in) = if let Some(v) = &parsed_json {
+        (
+            v["access_token"].as_str().unwrap_or_default().to_string(),
+            v["refresh_token"].as_str().map(str::to_string),
+            v["expires_in"].as_i64().unwrap_or(3600),
+        )
+    } else if enc == Encoding::Form {
+        (
             query_param(body, "access_token").unwrap_or_default(),
             query_param(body, "refresh_token"),
             query_param(body, "expires_in")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(3600),
-        ),
+        )
+    } else {
+        return Err(OAuthError::Parse(
+            "resposta OAuth inválida (JSON esperado)".into(),
+        ));
     };
     if access.is_empty() {
-        // the body may be an error document; it never holds a token here
-        return Err(OAuthError::Parse(body.chars().take(200).collect()));
+        // Extract only safe OAuth error fields; never echo raw response bodies
+        // that could contain credentials or session material.
+        let safe_msg = parsed_json
+            .as_ref()
+            .and_then(|v| {
+                let err = v["error"].as_str();
+                let desc = v["error_description"].as_str();
+                match (err, desc) {
+                    (Some(e), Some(d)) => Some(format!("{e}: {d}")),
+                    (Some(e), None) => Some(e.to_string()),
+                    (None, Some(d)) => Some(d.to_string()),
+                    (None, None) => None,
+                }
+            })
+            .or_else(|| {
+                let err = query_param(body, "error");
+                let desc = query_param(body, "error_description");
+                match (err, desc) {
+                    (Some(e), Some(d)) => Some(format!("{e}: {d}")),
+                    (Some(e), None) => Some(e),
+                    (None, Some(d)) => Some(d),
+                    (None, None) => None,
+                }
+            })
+            .unwrap_or_else(|| "resposta OAuth sem access_token".into());
+        return Err(OAuthError::Parse(safe_msg));
     }
     Ok(OAuthCredential {
         access_token: access,
@@ -580,9 +610,29 @@ fn parse_token(body: &str, enc: Encoding) -> Result<OAuthCredential> {
     })
 }
 
+/// Validates that `url` uses an allowed web/mailto scheme with no control
+/// characters before handing it to the OS handler.
+fn validate_browser_url(url: &str) -> std::io::Result<()> {
+    let u = url.trim();
+    let lower = u.to_ascii_lowercase();
+    let ok_scheme = lower.starts_with("https://")
+        || lower.starts_with("http://")
+        || lower.starts_with("mailto:");
+    let has_ctrl = u.chars().any(char::is_control);
+    let has_ws = !lower.starts_with("mailto:") && u.chars().any(char::is_whitespace);
+    if !ok_scheme || has_ctrl || has_ws {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("endereço recusado para abrir no navegador: {u}"),
+        ));
+    }
+    Ok(())
+}
+
 /// Opens the URL in the user's default browser.
 pub fn open_browser(url: &str) -> std::io::Result<()> {
-    browser_command(url).spawn().map(|_| ())
+    validate_browser_url(url)?;
+    browser_command(url.trim()).spawn().map(|_| ())
 }
 
 /// On Windows, no `cmd`: it splits on `&` (every OAuth URL has one) and
@@ -1441,5 +1491,28 @@ mod tests {
         if cfg!(target_os = "windows") {
             assert_eq!(c.get_program(), "rundll32");
         }
+    }
+
+    #[test]
+    fn form_encoding_endpoints_parse_json_responses_and_errors_never_leak_tokens() {
+        let json_resp =
+            r#"{"access_token":"tok_live_123","refresh_token":"ref_456","expires_in":7200}"#;
+        let cred = credential_from_body(json_resp, Encoding::Form, OAuthTool::Codex, 1000)
+            .expect("Codex/Antigravity JSON responses must parse even when request used Form");
+        assert_eq!(cred.access_token, "tok_live_123");
+        assert_eq!(cred.refresh_token.as_deref(), Some("ref_456"));
+        assert_eq!(cred.expires_at, 8200);
+
+        let err_resp = r#"{"error":"invalid_grant","error_description":"expired","secret":"super_secret_should_not_leak"}"#;
+        let err = credential_from_body(err_resp, Encoding::Form, OAuthTool::Codex, 1000)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid_grant"), "{err}");
+        assert!(!err.contains("super_secret_should_not_leak"), "{err}");
+
+        assert!(validate_browser_url("https://example.com/auth").is_ok());
+        assert!(validate_browser_url("file:///C:/Windows/win.ini").is_err());
+        assert!(validate_browser_url("ms-settings:privacy").is_err());
+        assert!(validate_browser_url("https://example.com/\r\nbad").is_err());
     }
 }

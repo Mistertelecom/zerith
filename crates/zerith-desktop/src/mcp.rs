@@ -11,7 +11,7 @@ use tauri::State;
 use zerith_core::Paths;
 use zerith_importers::hermes_setup::{self, SetupReport};
 use zerith_mcp::config::{
-    add_server, approve_server, load_servers, remove_server, set_enabled, set_extra,
+    add_server, approve_project_server, load_servers, remove_server, set_enabled, set_extra,
 };
 use zerith_mcp::{oauth, Extra, McpRegistry, Origin, ServerConfig};
 
@@ -214,24 +214,35 @@ pub async fn mcp_toggle(
 pub async fn mcp_approve(state: State<'_, AppState>, name: String) -> Result<Vec<McpView>, String> {
     let paths = Paths::with_root(state.root());
     blocking(move || {
-        approve_server(&paths, &name)?;
+        let proj = project(&paths).ok_or("nenhum projeto ativo para aprovar servidor MCP")?;
+        let l = load_servers(&paths, Some(&proj));
+        let server = l
+            .unapproved
+            .iter()
+            .find(|s| s.name == name)
+            .ok_or_else(|| format!("nenhum servidor de projeto pendente chamado {name}"))?;
+        approve_project_server(&paths, &proj, server)?;
         Ok(list(&paths))
     })
     .await
 }
 
-/// Starts the server, lists its tools, stops it. Disabled and unapproved
-/// servers are tested too: the person clicked "Testar" on that row.
+/// Starts the server, lists its tools, stops it. Unapproved project servers
+/// must be approved first before any process is spawned.
 #[tauri::command]
 pub async fn mcp_test(state: State<'_, AppState>, name: String) -> Result<Vec<McpTool>, String> {
     let paths = Paths::with_root(state.root());
     blocking(move || {
         let l = load_servers(&paths, project(&paths).as_deref());
+        if l.unapproved.iter().any(|s| s.name == name) {
+            return Err(format!(
+                "aprove o servidor de projeto '{name}' antes de testá-lo"
+            ));
+        }
         let mut cfg = l
             .servers
             .into_iter()
             .chain(l.disabled)
-            .chain(l.unapproved)
             .find(|s| s.name == name)
             .ok_or_else(|| format!("servidor MCP desconhecido: {name}"))?;
         cfg.timeout_ms = Some(

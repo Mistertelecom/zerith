@@ -12,7 +12,10 @@ zerith-memory = { path = "../zerith-memory" }
 zerith-skills = { path = "../zerith-skills" }
 zerith-tools = { path = "../zerith-tools" }
 zerith-security = { path = "../zerith-security" }
+# `which` for the billion-context launcher (PATHEXT on Windows).
+zerith-mcp = { path = "../zerith-mcp" }
 serde_json.workspace = true
+ureq.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

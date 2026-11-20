@@ -13,7 +13,7 @@ use std::fmt;
 use zerith_core::settings::{ProviderEntry, WireProtocol};
 use zerith_core::{secrets, AccountEntry, Paths, Settings};
 use zerith_mcp::McpRegistry;
-use zerith_memory::{default_scope, MemoryBackend, SqliteMemory};
+use zerith_memory::{MemoryBackend, Scope, SqliteMemory};
 use zerith_providers::{Cancel, Client, Protocol, ProviderConfig, ProviderError, ProviderKind};
 use zerith_runtime::{run_agent_turn, AgentOptions, RunError, RunEvent, TurnContext, TurnReport};
 use zerith_security::{Mode, Policy, Rule, RuleKind};
@@ -343,6 +343,8 @@ pub fn run(paths: &Paths, args: &[String]) -> Result<(), Boxed> {
     if let Some(c) = &contrib {
         c.apply_hooks(&mut settings);
     }
+    // Rides the window's billion-context proxy when it is open; else direct.
+    zerith_runtime::bili::attach(paths.root(), settings.context.billion_context);
     let cfg = provider_config(&settings)?;
     let model = resolve_model(h.model.clone(), &settings, &cfg)
         .ok_or("sem modelo: use --model, routing.main_model ou ZERITH_MODEL")?;
@@ -372,6 +374,16 @@ pub fn run(paths: &Paths, args: &[String]) -> Result<(), Boxed> {
         tools.register(g.enter_plan_mode_tool());
         tools.register(g.exit_plan_mode_tool());
         guards = Some(g);
+        // Create skills/agents, as in the window.
+        let have: Vec<String> = tools.specs().iter().map(|s| s.name.clone()).collect();
+        for t in zerith_tools::authoring_tools(zerith_tools::Authoring {
+            paths: paths.clone(),
+            project_dir: Some(workspace.clone()),
+            tools: have,
+            mode: policy.mode().settings_name().to_string(),
+        }) {
+            tools.register(t);
+        }
     }
     // `@server:resource` in the prompt becomes inline context.
     let prompt = if h.no_tools || mcp.is_empty() {
@@ -385,7 +397,7 @@ pub fn run(paths: &Paths, args: &[String]) -> Result<(), Boxed> {
     };
 
     let memory = SqliteMemory::open(paths.db())?;
-    let scope = default_scope();
+    let scope = Scope::workspace(&workspace);
     let memory = (!settings.memory.paused).then_some(&memory as &dyn MemoryBackend);
     let skills = Library::open(paths.skills()).ok().map(|l| {
         if let Some(c) = &contrib {
@@ -400,6 +412,24 @@ pub fn run(paths: &Paths, args: &[String]) -> Result<(), Boxed> {
 
     let mut opts = AgentOptions::for_profile(zerith_runtime::active_profile());
     opts.spill_dir = Some(paths.root().join("spill"));
+    // Same pre-turn summary as the window: a long `--resume` chain would
+    // otherwise only be trimmed under pressure, mid-turn.
+    match zerith_runtime::compact::auto_compact_routed(
+        &store,
+        &settings,
+        &client,
+        &session_id,
+        &model,
+        opts.history,
+        &cancel,
+    ) {
+        Ok(Some(r)) => eprintln!(
+            "zerith: histórico resumido ({} → {} tokens)",
+            r.tokens_before, r.tokens_after
+        ),
+        Ok(None) => {}
+        Err(e) => eprintln!("zerith: resumo automático falhou: {e}"),
+    }
     if let Some(g) = guards {
         opts.tools = Some(&tools);
         opts.policy = Some(&policy);

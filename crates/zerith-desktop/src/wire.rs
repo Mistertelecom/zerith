@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 
 use zerith_core::settings::{self, AuthMode as AuthModeSettings, ProviderEntry, WireProtocol};
 use zerith_core::{Paths, Settings};
-use zerith_memory::Scope;
 use zerith_providers::{
     infer_provider, AuthMode, ModelSpec, OAuthTool, Protocol, ProviderConfig, ProviderKind,
 };
@@ -17,11 +16,6 @@ use zerith_sessions::{Store, UsageSummary};
 
 use crate::types::{Approval, Decision};
 use crate::types::{Profile, Theme};
-
-/// The memory scope of this install; the same one the CLI uses.
-pub fn memory_scope() -> Scope {
-    zerith_memory::default_scope()
-}
 
 fn load(root: &Path) -> Settings {
     let paths = Paths::with_root(root);
@@ -544,6 +538,18 @@ pub fn load_token_saver(root: &Path) -> settings::TokenSaverSettings {
     load(root).token_saver
 }
 
+pub fn load_context(root: &Path) -> settings::ContextSettings {
+    load(root).context
+}
+
+/// Persists the long-conversation switch in the user settings layer.
+pub fn save_context(root: &Path, on: bool) -> Result<(), String> {
+    Settings::save_user(&Paths::with_root(root), |s| {
+        s.context.billion_context = on;
+    })
+    .map_err(|e| e.to_string())
+}
+
 /// Persists Token Saver configuration in the user settings layer.
 pub fn save_token_saver(root: &Path, ts: &settings::TokenSaverSettings) -> Result<(), String> {
     let ts = ts.clone();
@@ -691,7 +697,7 @@ pub fn save_prefs(root: &Path, prefs: UiPrefs, inline: bool) {
             };
         });
         if let Err(e) = r {
-            eprintln!("zerith-ui: não consegui salvar as configurações: {e}");
+            eprintln!("zerith-desktop: não consegui salvar as configurações: {e}");
         }
     };
     if inline {
@@ -754,17 +760,24 @@ pub fn media_dir(root: &Path) -> PathBuf {
     load(root).media.resolve_output_dir(&paths)
 }
 
-/// Opens a generated file with the OS default app. Refuses anything that is
-/// not a file under `dir`: no URL, no relative path, no `..`.
+/// Opens a generated file with the OS default app. Refuses anything whose
+/// canonical path is not a regular file under the canonical `dir` (blocks
+/// URLs, `..`, and symlinks pointing outside `dir`).
 pub fn open_media(dir: &Path, path: &Path) -> Result<(), String> {
     if !crate::types::is_under(dir, path) {
         return Err("Só abro arquivos da pasta de mídia.".into());
     }
+    let canon_dir = dir
+        .canonicalize()
+        .map_err(|_| "Pasta de mídia não encontrada.".to_string())?;
+    let canon_path = path
+        .canonicalize()
+        .map_err(|_| format!("O arquivo não existe mais: {}", path.display()))?;
+    if !canon_path.starts_with(&canon_dir) || !canon_path.is_file() {
+        return Err("Só abro arquivos da pasta de mídia.".into());
+    }
     // Native separators: `explorer C:/a/b.png` does not find the file.
     let native: PathBuf = path.components().collect();
-    if !native.is_file() {
-        return Err(format!("O arquivo não existe mais: {}", native.display()));
-    }
     reveal(&native)
 }
 
@@ -838,10 +851,15 @@ pub fn rewind_latest(db: &Path, session: &str) -> Result<String, String> {
         .ok_or("nenhum ponto de restauração")?;
     let r =
         checkpoints::restore(&st, root, session, turn, Mode::Both).map_err(|e| e.to_string())?;
-    Ok(format!(
+    let mut text = format!(
         "Rebobinado: {} arquivo(s) restaurados, {} removidos, {} mensagem(ns) arquivadas",
         r.files_restored, r.files_removed, r.messages_archived
-    ))
+    );
+    for n in &r.notes {
+        text.push_str(". ");
+        text.push_str(n);
+    }
+    Ok(text)
 }
 
 /// Hands the answers of an `ask_user` card to the runtime.

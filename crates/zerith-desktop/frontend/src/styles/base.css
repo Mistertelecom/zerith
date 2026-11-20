@@ -579,6 +579,19 @@ textarea.input,
   font-weight: 400;
   color: var(--label-secondary);
 }
+
+/* Credit line under a setting that uses a third-party project. */
+.setting-credit {
+  margin: calc(-1 * var(--s-2)) 0 var(--s-3);
+  color: var(--label-secondary);
+  font-size: var(--fs-small);
+  line-height: 1.5;
+}
+.setting-credit a {
+  color: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
 .setting-control {
   display: flex;
   align-items: center;

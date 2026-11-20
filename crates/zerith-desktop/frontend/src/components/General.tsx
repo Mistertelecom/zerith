@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
-import { Archive, CircleAlert, CircleArrowUp, Database, FolderOpen, Gauge, Leaf, Palette, ShieldCheck } from "lucide-react";
-import { api, learnApi, type ProfileView, type StorageView } from "../lib/api";
+import { Archive, CircleAlert, CircleArrowUp, Database, Download, FolderOpen, Gauge, Leaf, Palette, ShieldCheck } from "lucide-react";
+import { api, learnApi, type LongContextView, type ProfileView, type StorageView } from "../lib/api";
 import { Card, Row, Segmented, Switch } from "./ui";
 import { UpdateRow } from "./Update";
 
@@ -246,9 +246,74 @@ export function GeneralTab(props: GeneralProps) {
       </Card>
 
       <Card title="Economia de tokens" icon={Leaf} description="Menos tokens por turno, mesma resposta.">
+        <LongContextRow />
         <SaverRows />
       </Card>
     </div>
+  );
+}
+
+const LONG_STATE: Record<LongContextView["state"], string> = {
+  off: "Desligado: o Zerith resume a conversa sozinho quando ela enche.",
+  missing: "Não instalado neste computador.",
+  starting: "Iniciando…",
+  running: "Ativo: o histórico antigo é dobrado antes de ir ao modelo.",
+  failed: "Não iniciou; o chat segue direto.",
+};
+
+/// billion-context: one switch, the proxy's state, and an install button when
+/// `bili` is missing. Uses billion-context (MIT), credited here as its license asks.
+function LongContextRow() {
+  const [v, setV] = useState<LongContextView | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const run = (p: Promise<LongContextView>) => {
+    setBusy(true);
+    p.then((x) => {
+      setV(x);
+      setError(null);
+    })
+      .catch((e) => setError(String(e)))
+      .finally(() => setBusy(false));
+  };
+  useEffect(() => {
+    api.longContext().then(setV).catch((e) => setError(String(e)));
+  }, []);
+  // Starting takes a few seconds on the first launch: read it again.
+  useEffect(() => {
+    if (v?.state !== "starting") return;
+    const t = setTimeout(() => api.longContext().then(setV).catch(() => undefined), 1500);
+    return () => clearTimeout(t);
+  }, [v]);
+  const hint = v ? LONG_STATE[v.state] + (v.state === "failed" && v.detail ? ` ${v.detail}` : "") : "Lendo…";
+  return (
+    <>
+      <Row label="Conversas longas" tech="billion-context" hint={hint}>
+        {v?.state === "missing" ? (
+          <button className="btn btn-sm" disabled={busy} onClick={() => run(api.installBillionContext())}>
+            {busy ? <span className="spinner" /> : <Download size={14} strokeWidth={2} />} {busy ? "Instalando…" : "Instalar"}
+          </button>
+        ) : (
+          <Switch
+            label="Conversas longas"
+            checked={v?.enabled ?? true}
+            disabled={!v || busy}
+            onChange={(on) => run(api.setLongContext(on))}
+          />
+        )}
+      </Row>
+      {error ? (
+        <div className="pn-callout danger">
+          <CircleAlert size={14} strokeWidth={2} />
+          <span>{error}</span>
+        </div>
+      ) : null}
+      <p className="setting-credit">
+        Usa o{" "}
+        <a href="https://github.com/ranxianglei/billion-context">billion-context</a> (MIT) para
+        dobrar o histórico: modelos de 1M de contexto e conversas de semanas sem perder o fio.
+      </p>
+    </>
   );
 }
 

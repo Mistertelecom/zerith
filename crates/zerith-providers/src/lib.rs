@@ -10,12 +10,14 @@
 
 mod anthropic;
 mod antigravity;
+pub mod bili;
 mod codex;
 mod config;
 pub mod explain;
 pub mod gateway;
 pub mod images;
 pub mod media;
+pub mod models;
 pub mod oauth;
 mod openai;
 mod retry;

@@ -418,6 +418,51 @@ pub fn needs_compaction(tokens: usize, context_limit: Option<u32>) -> bool {
     tokens * 100 > window * AUTO_COMPACT_PCT
 }
 
+/// `auto_compact` for the account `model` is routed to: its window (the
+/// account's, else the model table), its client as the summarizer, and no
+/// summary at all when billion-context folds that account's history. The
+/// one every host calls before a turn.
+pub fn auto_compact_routed(
+    store: &Store,
+    settings: &zerith_core::Settings,
+    client: &Client,
+    session_id: &str,
+    model: &str,
+    history: usize,
+    cancel: &Cancel,
+) -> Result<Option<CompactReport>> {
+    let first = crate::resolve_gateway(settings, model, client.config())
+        .0
+        .candidates
+        .into_iter()
+        .next();
+    // billion-context folds on the wire; a summary here would be a second
+    // compressor rewriting the prefix it caches.
+    if zerith_providers::bili::routes(first.as_ref().map_or(client.config(), |c| &c.config)) {
+        return Ok(None);
+    }
+    let limit = first
+        .as_ref()
+        .and_then(|c| c.config.context_limit)
+        .or(client.config().context_limit)
+        .or_else(|| {
+            zerith_providers::models::context_window(first.as_ref().map_or(model, |c| &c.model))
+        });
+    let routed = first.and_then(|c| Client::new(c.config).ok().map(|cl| (cl, c.model)));
+    let (client, model) = match &routed {
+        Some((cl, m)) => (cl, m.as_str()),
+        None => (client, model),
+    };
+    auto_compact(
+        store,
+        session_id,
+        history,
+        limit,
+        &ClientSummarizer { client, model },
+        cancel,
+    )
+}
+
 /// Before a turn: when the `history` rows the turn will replay pass the
 /// threshold, the same summary as `/compact` replaces the older ones.
 /// `Ok(None)`: below the threshold, or nothing to summarize.

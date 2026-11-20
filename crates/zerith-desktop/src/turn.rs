@@ -190,6 +190,9 @@ pub fn run(
     let store = Store::open(&setup.db).map_err(|e| e.to_string())?;
     let paths = zerith_core::Paths::with_root(&setup.root);
     let cfg = zerith_core::Settings::load(&paths, Some(&setup.workspace)).settings;
+    // Usually already up (started with the app). One that died restarts in the
+    // background; this turn goes direct instead of waiting for the boot.
+    zerith_runtime::bili::ensure(&setup.root, cfg.context.billion_context, false);
     // User messages replayed per turn: the execution profile's, as in the CLI.
     let history = cfg.profile.limits().history_window;
     // `configured_providers` already puts the routed primary first, so the head
@@ -205,7 +208,7 @@ pub fn run(
     } else {
         SqliteMemory::open(&setup.db).ok()
     };
-    let scope = crate::wire::memory_scope();
+    let scope = zerith_memory::Scope::workspace(&setup.workspace);
     let contrib = zerith_plugins::Library::open(&setup.root.join("plugins"))
         .and_then(|l| l.contributions())
         .ok();
@@ -333,6 +336,7 @@ pub fn run(
                 session_id: session_id.to_string(),
                 model: model.to_string(),
                 memory_paused: setup.memory_paused,
+                scope: scope.clone(),
                 digest,
             });
             Ok(())
@@ -362,31 +366,8 @@ fn auto_compact(
     cancel: &Cancel,
     on: &mut dyn FnMut(TurnEvent),
 ) {
-    let first = zerith_runtime::resolve_gateway(settings, model, client.config())
-        .0
-        .candidates
-        .into_iter()
-        .next();
-    let limit = first
-        .as_ref()
-        .and_then(|c| c.config.context_limit)
-        .or(client.config().context_limit);
-    let routed = first.and_then(|c| Client::new(c.config).ok().map(|cl| (cl, c.model)));
-    let (sum_client, sum_model) = match &routed {
-        Some((cl, m)) => (cl, m.as_str()),
-        None => (client, model),
-    };
-    let summarizer = zerith_runtime::compact::ClientSummarizer {
-        client: sum_client,
-        model: sum_model,
-    };
-    match zerith_runtime::compact::auto_compact(
-        store,
-        session_id,
-        history,
-        limit,
-        &summarizer,
-        cancel,
+    match zerith_runtime::compact::auto_compact_routed(
+        store, settings, client, session_id, model, history, cancel,
     ) {
         Ok(Some(r)) => on(TurnEvent::AutoCompacted {
             before: r.tokens_before,

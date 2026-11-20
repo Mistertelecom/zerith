@@ -262,6 +262,12 @@ pub fn run_agent_turn(
     mut on_event: impl FnMut(RunEvent),
 ) -> Result<TurnReport> {
     let on_event: &mut dyn FnMut(RunEvent) = &mut on_event;
+    let mut agent = agent;
+    // Subagents run their tools through the very same instances: a hook's
+    // deny binds them as it binds this turn.
+    let inherited = subagent::share(&mut agent.middleware);
+    // billion-context keys its compression state on this id.
+    let _conversation = zerith_providers::bili::conversation(session_id);
     let session = store
         .session(session_id)?
         .ok_or_else(|| RunError::NoSession(session_id.to_string()))?;
@@ -276,6 +282,7 @@ pub fn run_agent_turn(
         client,
         ctx,
         &agent,
+        &inherited,
         &session.title,
         session_id,
         model,
@@ -316,6 +323,7 @@ fn turn_body(
     client: &Client,
     ctx: TurnContext<'_>,
     agent: &AgentOptions<'_>,
+    inherited: &[subagent::SharedMiddleware],
     title: &str,
     session_id: &str,
     model: &str,
@@ -380,9 +388,17 @@ fn turn_body(
         let opened = checkpoints::next_turn(store, session_id)
             .and_then(|turn| checkpoints::Checkpoint::begin(store, &root, session_id, turn));
         match opened {
-            Ok(cp) => r
-                .host()
-                .on_before_write(move |p| cp.record_file(p).map_err(|e| e.to_string())),
+            Ok(cp) => {
+                // The whole workspace is snapshotted at the turn's first
+                // mutation, so rewind also undoes what the shell changed.
+                let cp = Arc::new(cp);
+                let (w, ws) = (cp.clone(), cwd.clone());
+                r.host().on_before_write(move |p| {
+                    w.snapshot(&ws);
+                    w.record_file(p).map_err(|e| e.to_string())
+                });
+                r.host().on_before_shell(move |ws| cp.snapshot(ws));
+            }
             Err(e) => eprintln!("zerith: checkpoint indisponível: {e}"),
         }
     }
@@ -406,12 +422,45 @@ fn turn_body(
             session_id,
             &agent.subagents,
             agent.approvals,
+            inherited,
         ))
     } else {
         None
     };
+    // The window of the account this turn is routed to: the account's or the
+    // provider's number, else the model table (1M for the long-context
+    // families), else the default, so in-turn compaction is always on.
+    let first = ctx.settings.and_then(|st| {
+        crate::resolve_gateway(st, model, client.config())
+            .0
+            .candidates
+            .into_iter()
+            .next()
+    });
+    let routed_cfg = first.as_ref().map_or(client.config(), |c| &c.config);
+    let window = first
+        .as_ref()
+        .and_then(|c| c.config.context_limit)
+        .or(client.config().context_limit)
+        .or_else(|| {
+            zerith_providers::models::context_window(first.as_ref().map_or(model, |c| &c.model))
+        })
+        .filter(|&l| l > 0)
+        .map_or(crate::compact::DEFAULT_CONTEXT, |l| l as usize);
+    // billion-context folds the history on the wire: it gets the whole
+    // conversation, and nothing here prunes or summarizes it (two compressors
+    // over one history fight, and a rewritten prefix loses its cache).
+    let folded = || zerith_providers::bili::routes(routed_cfg);
+    // A 1M window holds far more than the profile's 40 prompts.
+    // ponytail: 2000 prompts through the proxy; the proxy's own store is the
+    // real history past that.
+    let replay = if folded() {
+        2000
+    } else {
+        agent.history.max(1) * (window / crate::compact::DEFAULT_CONTEXT).clamp(1, 8)
+    };
     // The newest rows, which include the prompt just appended.
-    let rows = store.history_rows(session_id, agent.history.max(1))?;
+    let rows = store.history_rows(session_id, replay)?;
     let mut hist = History::new(system, replay_items(&rows));
     for text in prompt_context {
         if text.trim().is_empty() {
@@ -442,21 +491,6 @@ fn turn_body(
                 .collect()
         })
         .unwrap_or_default();
-    // Unknown window: assume the default one, so in-turn compaction is on for
-    // every provider, not only for those whose context_limit the user typed.
-    let window = ctx
-        .settings
-        .and_then(|st| {
-            crate::resolve_gateway(st, model, client.config())
-                .0
-                .candidates
-                .into_iter()
-                .next()
-                .and_then(|c| c.config.context_limit)
-        })
-        .or(client.config().context_limit)
-        .filter(|&l| l > 0)
-        .map_or(crate::compact::DEFAULT_CONTEXT, |l| l as usize);
     // The tool schemas ride on every request: their share of the window is
     // not history's to use.
     // ponytail: floor at a quarter of the window so a huge non-deferred
@@ -499,7 +533,7 @@ fn turn_body(
         steer(store, session_id, agent, &mut hist, log)?;
 
         if let Some(b) = budget {
-            if hist.tokens() > b {
+            if hist.tokens() > shrink_at(window, schema_tokens, b, folded()) {
                 shrink(
                     store,
                     session_id,
@@ -758,7 +792,26 @@ fn turn_body(
                         crate::tokensaver::compress_tool_output(&call.name, &outcome.output);
                     if compressed.saved_bytes > 0 {
                         let after_bytes = compressed.text.len();
-                        outcome.output = compressed.text;
+                        // What RTK dropped stays readable: a cut `show run` or
+                        // build log the model cannot get back makes it guess.
+                        let kept = spilled
+                            .is_none()
+                            .then_some(agent.spill_dir.as_deref())
+                            .flatten()
+                            .and_then(|root| {
+                                let p = crate::spill::spill_path(root, session_id, &call.id);
+                                std::fs::create_dir_all(p.parent()?).ok()?;
+                                std::fs::write(&p, &outcome.output).ok()?;
+                                Some(p)
+                            });
+                        outcome.output = match kept {
+                            Some(p) => format!(
+                                "{}\n[resumido; saída completa: {}; use read_file com offset/limit ou grep]",
+                                compressed.text,
+                                p.display()
+                            ),
+                            None => compressed.text,
+                        };
                         pending_rtk_tokens += compressed.saved_tokens;
                         total_saved_rtk_tokens += compressed.saved_tokens;
                         log.emit(
@@ -862,6 +915,20 @@ fn turn_body(
 
 /// Brings the history under `budget`: prune tool bodies, then summarize the
 /// oldest span, then drop whole old turns. Never fails the turn.
+#[allow(clippy::too_many_arguments)]
+/// Tokens of history past which the turn shrinks it. With billion-context
+/// folding on the wire Zerith stays out of the way and steps in only near
+/// the window's edge, where the provider would refuse the request.
+fn shrink_at(window: usize, schema_tokens: usize, budget: usize, folded: bool) -> usize {
+    if folded {
+        (window * 95 / 100)
+            .saturating_sub(schema_tokens)
+            .max(budget)
+    } else {
+        budget
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn shrink(
     store: &Store,
@@ -1462,4 +1529,19 @@ fn request(
             caveman: step_caveman,
         },
     ))
+}
+
+#[cfg(test)]
+mod shrink_tests {
+    use super::shrink_at;
+
+    #[test]
+    fn with_billion_context_zerith_only_shrinks_near_the_edge() {
+        // 1M window, 20k of tool schemas, the usual 80% budget.
+        let budget = 1_000_000 * 8 / 10 - 20_000;
+        assert_eq!(shrink_at(1_000_000, 20_000, budget, false), budget);
+        assert_eq!(shrink_at(1_000_000, 20_000, budget, true), 930_000);
+        // Never below the normal budget, even when the schemas eat the window.
+        assert_eq!(shrink_at(100_000, 90_000, 25_000, true), 25_000);
+    }
 }

@@ -55,8 +55,8 @@ fn boot_log(msg: &str) {
 }
 
 /// The skills that ship with the app arrive installed (disabled until the user
-/// turns them on, like the Rune window). Installed builds carry them as a
-/// bundle resource beside the exe; a dev build reads the checkout's folder.
+/// turns them on). Installed builds carry them as a bundle resource beside the
+/// exe; a dev build reads the checkout's folder.
 fn seed_bundled_skills(root: &std::path::Path) {
     let bundle = zerith_core::Paths::with_root(root)
         .bundled_skills()
@@ -80,6 +80,16 @@ fn seed_bundled_skills(root: &std::path::Path) {
 pub fn run() {
     let root = data_root();
     seed_bundled_skills(&root);
+    // billion-context comes up while the window loads; the first turn waits
+    // for it only if it is still starting.
+    {
+        let paths = zerith_core::Paths::with_root(&root);
+        let on = zerith_core::Settings::load(&paths, None)
+            .settings
+            .context
+            .billion_context;
+        zerith_runtime::bili::ensure(&root, on, false);
+    }
     // WebView2 profile: %LOCALAPPDATA%\Zerith\webview, or whatever
     // `ZERITH_WEBVIEW_DIR` pins. `ZERITH_HOME` may point at a roaming folder,
     // and WebView2 refuses to boot a profile from there (0x8000FFFF).
@@ -176,6 +186,8 @@ pub fn run() {
             chat::answer_question,
             commands::boot,
             commands::list_sessions,
+            commands::background_jobs,
+            commands::background_job_stop,
             commands::create_session,
             commands::session_messages,
             commands::session_fork,
@@ -211,6 +223,7 @@ pub fn run() {
             skills::skills_list,
             skills::skills_catalog,
             skills::skills_plugins,
+            skills::plugin_action,
             skills::skill_install,
             skills::skills_remote,
             skills::skill_install_remote,
@@ -247,6 +260,9 @@ pub fn run() {
             media::media_open_dir,
             prefs::token_saver,
             prefs::set_token_saver,
+            prefs::long_context,
+            prefs::set_long_context,
+            prefs::install_billion_context,
             prefs::storage,
             prefs::backup,
             prefs::profile_limits,

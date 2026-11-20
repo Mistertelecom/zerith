@@ -67,6 +67,68 @@ pub async fn set_token_saver(state: State<'_, AppState>, patch: SaverPatch) -> C
     Ok(SaverView::of(&ts))
 }
 
+/// Long conversations, as Ajustes › Geral shows them.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LongContextView {
+    pub enabled: bool,
+    /// `off`, `missing`, `starting`, `running`, `failed`.
+    pub state: &'static str,
+    pub detail: String,
+    pub log: String,
+}
+
+fn long_context_view(root: &std::path::Path) -> LongContextView {
+    use zerith_runtime::bili::Status;
+    let enabled = wire::load_context(root).billion_context;
+    let (state, detail) = match zerith_runtime::bili::status() {
+        Status::Off => ("off", String::new()),
+        Status::Missing => ("missing", "npm install -g billion-context".into()),
+        Status::Starting => ("starting", String::new()),
+        Status::Running(o) => ("running", o),
+        Status::Failed(e) => ("failed", e),
+    };
+    LongContextView {
+        enabled,
+        state,
+        detail,
+        log: zerith_runtime::bili::log_path(root).display().to_string(),
+    }
+}
+
+#[tauri::command]
+pub async fn long_context(state: State<'_, AppState>) -> Cmd<LongContextView> {
+    let root = state.root().to_path_buf();
+    Ok(long_context_view(&root))
+}
+
+/// Saves the switch and starts or stops the proxy before answering, so the
+/// screen shows what really happened.
+#[tauri::command]
+pub async fn set_long_context(state: State<'_, AppState>, enabled: bool) -> Cmd<LongContextView> {
+    let root = state.root().to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || {
+        wire::save_context(&root, enabled)?;
+        zerith_runtime::bili::ensure(&root, enabled, true);
+        Ok(long_context_view(&root))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// `npm install -g billion-context`, then start it.
+#[tauri::command]
+pub async fn install_billion_context(state: State<'_, AppState>) -> Cmd<LongContextView> {
+    let root = state.root().to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || {
+        zerith_runtime::bili::install()?;
+        zerith_runtime::bili::ensure(&root, wire::load_context(&root).billion_context, true);
+        Ok(long_context_view(&root))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StorageView {

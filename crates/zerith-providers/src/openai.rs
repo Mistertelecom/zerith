@@ -167,12 +167,20 @@ impl Client {
     // `ureq::Error` is large by its own design; boxing it here buys nothing.
     #[allow(clippy::result_large_err)]
     pub(crate) fn post(&self, path: &str, body: &Value, cancel: &Cancel) -> Result<ureq::Response> {
-        let url = self.endpoint(path);
+        let url = crate::bili::url(&self.cfg, self.endpoint(path));
         retry::send(&self.retry, cancel, || {
-            self.authored(self.agent.post(&url))
+            self.routed(self.authored(self.agent.post(&url)))
                 .set("Content-Type", "application/json")
                 .send_json(body)
         })
+    }
+
+    /// The conversation id, when the request goes through billion-context.
+    fn routed(&self, req: ureq::Request) -> ureq::Request {
+        match crate::bili::session_header(&self.cfg) {
+            Some(id) => req.set("x-acp-session", &id),
+            None => req,
+        }
     }
 
     /// Same as `post`, declaring an SSE answer. Streaming endpoints refuse a
@@ -184,9 +192,9 @@ impl Client {
         body: &Value,
         cancel: &Cancel,
     ) -> Result<ureq::Response> {
-        let url = self.endpoint(path);
+        let url = crate::bili::url(&self.cfg, self.endpoint(path));
         retry::send(&self.retry, cancel, || {
-            self.authored(self.agent.post(&url))
+            self.routed(self.authored(self.agent.post(&url)))
                 .set("Content-Type", "application/json")
                 .set("Accept", "text/event-stream")
                 .send_json(body)

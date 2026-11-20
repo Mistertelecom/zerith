@@ -336,14 +336,24 @@ fn memory_save_writes_once_and_respects_the_pause() {
 
 /// `cmd` never understood the `\"` that Rust wrote through `.arg`: every path
 /// with a space and every `-m "..."` broke.
+/// Same check for Git Bash, the default shell when it is installed.
 #[cfg(windows)]
 #[test]
-fn quotes_reach_cmd_verbatim() {
+fn quotes_reach_the_shell_verbatim() {
     let dir = scratch();
     let p = policy(dir.path(), Mode::Bypass);
     std::fs::write(dir.path().join("a b.txt"), "conteudo").unwrap();
+    let show = if zerith_core::shellparse::windows_bash().is_some() {
+        "cat"
+    } else {
+        "type"
+    };
     let ok = Registry::new()
-        .call("shell", &json!({"command": "type \"a b.txt\""}), &ctx(&p))
+        .call(
+            "shell",
+            &json!({"command": format!("{show} \"a b.txt\"")}),
+            &ctx(&p),
+        )
         .expect("a quoted path with a space");
     assert!(ok.contains("conteudo"), "{ok}");
     let echo = Registry::new()
@@ -424,4 +434,28 @@ fn a_grandchild_holding_the_pipe_does_not_hang_the_shell() {
     let took = started.elapsed();
     assert!(took < Duration::from_secs(8), "took {took:?}");
     assert!(out.contains("exit 0"), "{out}");
+}
+
+/// Rewind snapshots the workspace before a shell command that may change it,
+/// in the foreground or the background, and never before a read-only one.
+#[test]
+fn the_shell_hook_fires_only_for_commands_that_may_mutate() {
+    let dir = scratch();
+    let p = policy(dir.path(), Mode::Bypass);
+    let (r, c) = (Registry::new(), ctx(&p));
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    r.host()
+        .on_before_shell(move |ws| log.lock().unwrap().push(ws.to_path_buf()));
+    r.call("shell", &json!({"command": "echo oi"}), &c).unwrap();
+    assert!(seen.lock().unwrap().is_empty(), "read-only: no snapshot");
+    r.call("shell", &json!({"command": "echo x > f.txt"}), &c)
+        .unwrap();
+    r.call(
+        "shell",
+        &json!({"command": "echo y > g.txt", "run_in_background": true}),
+        &c,
+    )
+    .unwrap();
+    assert_eq!(*seen.lock().unwrap(), vec![dir.path().to_path_buf(); 2]);
 }

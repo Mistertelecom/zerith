@@ -594,10 +594,16 @@ fn the_shell_finds_a_program_that_ships_with_the_app() {
         .unwrap();
     let tools = dir.path().join("tools");
     std::fs::create_dir_all(&tools).unwrap();
-    // A batch file named like a program: `zerith-bundled-probe` on PATH.
+    // A program named `zerith-bundled-probe` in the bundled folder: a batch
+    // file for cmd, a script for Git Bash (which does not run `.cmd` by name).
     std::fs::write(
         tools.join("zerith-bundled-probe.cmd"),
         "@echo bundled-ok\r\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tools.join("zerith-bundled-probe"),
+        "#!/bin/sh\necho bundled-ok\n",
     )
     .unwrap();
 

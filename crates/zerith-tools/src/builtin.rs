@@ -138,7 +138,7 @@ pub(crate) fn all() -> Vec<Box<dyn crate::Tool>> {
         ),
         tool(
             "grep",
-            "Procura texto (substring) em arquivos. Diferencia maiúsculas só com \"-i\": false.",
+            "Procura em arquivos por regex (ex.: `vlan 13[0-9]`, `^interface`); texto que não é regex válida é buscado literalmente. Diferencia maiúsculas só com \"-i\": false.",
             json!({"type": "object", "properties": {
                 "query": {"type": "string"},
                 "path": {"type": "string", "description": "diretório ou arquivo (padrão: workspace)"},
@@ -155,7 +155,7 @@ pub(crate) fn all() -> Vec<Box<dyn crate::Tool>> {
         ),
         tool(
             "shell",
-            "Executa um comando no shell do sistema (cmd no Windows, sh nos demais) dentro do workspace.",
+            "Executa um comando no shell dentro do workspace: bash (Git Bash no Windows, quando instalado; senão cmd), sh nos demais.",
             json!({"type": "object", "properties": {
                 "command": {"type": "string"},
                 "timeout_secs": {"type": "integer", "description": "padrão 120, máximo 600"},
@@ -476,16 +476,20 @@ fn glob(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
 }
 
 fn grep(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
-    // ponytail: substring match only; `regex` is not in Cargo.lock, and a new
-    // dependency for this is not worth it yet. Swap the `contains` below for a
-    // compiled `Regex` (default-features = false) if the model needs patterns.
     let insensitive = args["-i"].as_bool().unwrap_or(true);
     let raw = str_arg(args, "query")?;
-    let query = if insensitive {
-        raw.to_lowercase()
-    } else {
-        raw.to_string()
-    };
+    // A regex (`vlan 13[0-9]`, `^interface`); text that is not a valid
+    // pattern (`foo(`) is searched literally, as before.
+    let re = regex::RegexBuilder::new(raw)
+        .case_insensitive(insensitive)
+        .size_limit(1 << 20)
+        .build()
+        .or_else(|_| {
+            regex::RegexBuilder::new(&regex::escape(raw))
+                .case_insensitive(insensitive)
+                .build()
+        })
+        .map_err(|e| ToolError::BadArguments(e.to_string()))?;
     let mode = args["output_mode"].as_str().unwrap_or("content");
     if !matches!(mode, "content" | "files" | "count") {
         return Err(ToolError::BadArguments(
@@ -518,12 +522,7 @@ fn grep(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
         };
         let mut hits = 0;
         for (i, line) in text.lines().enumerate() {
-            let found = if insensitive {
-                line.to_lowercase().contains(&query)
-            } else {
-                line.contains(&query)
-            };
-            if !found {
+            if !re.is_match(line) {
                 continue;
             }
             hits += 1;
@@ -564,7 +563,13 @@ fn grep(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
 /// or the user's own `PATH` changing. A program of the same name already on
 /// `PATH` wins.
 pub fn shell_command(cmd: &str) -> Command {
-    let mut c = if cfg!(windows) {
+    let bash = zerith_core::shellparse::windows_bash();
+    let mut c = if let Some(bash) = bash {
+        // Git Bash: `$HOME`, `&&`, `grep`, quotes as a developer writes them.
+        let mut c = Command::new(bash);
+        c.arg("-c").arg(cmd);
+        c
+    } else if cfg!(windows) {
         let mut c = Command::new("cmd");
         // Through `.arg`, Rust escapes the quotes as `\"`, which cmd does not
         // understand: `git commit -m "msg"` and every path with a space broke.
@@ -603,27 +608,30 @@ fn path_with(existing: Option<std::ffi::OsString>, dir: &std::path::Path) -> std
 
 fn shell(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
     let cmd = str_arg(args, "command")?;
+    // Before either branch: a background job mutates the workspace too.
+    exec.host.before_shell(cmd, ctx.workspace);
     if args["run_in_background"].as_bool().unwrap_or(false) {
-        return crate::jobs::start(args, ctx.workspace, exec.host);
+        return crate::jobs::start(args, ctx.workspace, ctx.policy, exec.host);
     }
     let secs = args["timeout_secs"].as_u64().unwrap_or(120).clamp(1, 600);
     let deadline = exec
         .deadline
         .min(std::time::Instant::now() + Duration::from_secs(secs));
+    let jail = zerith_security::jail::Jail::for_policy(ctx.policy);
+    // Wrap BEFORE configuring stdio: on macOS `sandbox_exec` creates a fresh
+    // `Command`, so stdio set earlier would be dropped.
     let mut command = shell_command(cmd);
+    command.current_dir(ctx.workspace);
+    let mut command = jail.wrap(command);
     command
-        .current_dir(ctx.workspace)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    // Own process group, so a timeout can kill the shell and everything it started.
-    #[cfg(unix)]
-    std::os::unix::process::CommandExt::process_group(&mut command, 0);
     // The jail attaches the process to a Job Object on Windows (kill-on-close,
     // process and memory caps) and wraps it in `sandbox-exec` on macOS. It
     // fails closed: no jail, no process. What it does and does not confine is
     // in `zerith policy` and `docs/sandbox.md`.
-    let mut jailed = zerith_security::jail::Jail::for_policy(ctx.policy).spawn(command)?;
+    let mut jailed = jail.spawn_wrapped(command)?;
     let child = &mut jailed.child;
     // Pipes are drained on threads: a child that fills a pipe buffer would
     // otherwise block forever while we wait for it to exit.
@@ -779,35 +787,6 @@ fn memory_save(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<Strin
     )
     .map_err(|e| ToolError::Failed(e.to_string()))?;
     Ok(format!("salvo na memória ({}): {text}", kind.as_str()))
-}
-
-/// Kills the shell and every process it started.
-///
-/// Windows: `taskkill /T /F` walks the tree by parent pid. Unix: the child
-/// leads its own group (see `process_group` in `shell`), so `kill -KILL -pgid`
-/// reaches all of it.
-// ponytail: a grandchild that detached itself (setsid, `start`, double fork)
-// escapes both. A Windows job object / Linux cgroup would catch it; add if a
-// real tool leaks.
-pub(crate) fn kill_tree(child: &mut std::process::Child) {
-    let pid = child.id().to_string();
-    let mut killer = if cfg!(windows) {
-        let mut c = Command::new("taskkill");
-        c.args(["/T", "/F", "/PID", &pid]);
-        c
-    } else {
-        let mut c = Command::new("kill");
-        c.args(["-KILL", "--", &format!("-{pid}")]);
-        c
-    };
-    let _ = killer
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    // Covers a missing taskkill/kill binary, and reaps the zombie.
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 #[cfg(test)]

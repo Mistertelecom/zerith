@@ -15,7 +15,13 @@ zerith-providers = { path = "../zerith-providers" }
 serde_json.workspace = true
 thiserror.workspace = true
 walkdir = "2"
+# Already in Cargo.lock (through other crates): grep patterns.
+regex = "1"
 ureq.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# ConPTY for `terminal_*` (already in Cargo.lock through zerith-security).
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_Pipes", "Win32_System_Threading"] }
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -33,19 +33,59 @@ pub enum Dialect {
 }
 
 impl Dialect {
-    /// The shell the `shell` tool runs: `cmd /S /C` on Windows, `sh -c` elsewhere.
-    pub const NATIVE: Dialect = if cfg!(windows) {
-        Dialect::Cmd
-    } else {
-        Dialect::Sh
-    };
+    /// The grammar of the shell the `shell` tool runs right now: Git Bash on
+    /// Windows when it is installed (what a developer types), `cmd`
+    /// otherwise; `sh` elsewhere. One answer for the runner and the policy,
+    /// or a line would be judged in one grammar and run in another.
+    #[allow(non_snake_case)]
+    pub fn NATIVE() -> Dialect {
+        if !cfg!(windows) || windows_bash().is_some() {
+            Dialect::Sh
+        } else {
+            Dialect::Cmd
+        }
+    }
+}
+
+/// Git Bash, when the `shell` tool should use it. `ZERITH_SHELL=cmd` keeps
+/// cmd; `ZERITH_SHELL=<path to bash.exe>` picks another bash.
+pub fn windows_bash() -> Option<&'static std::path::Path> {
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
+    static BASH: OnceLock<Option<PathBuf>> = OnceLock::new();
+    BASH.get_or_init(|| {
+        if !cfg!(windows) {
+            return None;
+        }
+        let pick = std::env::var("ZERITH_SHELL").unwrap_or_default();
+        if pick.eq_ignore_ascii_case("cmd") {
+            return None;
+        }
+        if !pick.is_empty() && !pick.eq_ignore_ascii_case("bash") {
+            let p = PathBuf::from(pick);
+            return p.is_file().then_some(p);
+        }
+        // Git for Windows' bash (not WSL's System32\bash.exe, a Linux VM).
+        let roots = ["ProgramFiles", "ProgramW6432", "LOCALAPPDATA"]
+            .iter()
+            .filter_map(|v| std::env::var_os(v).map(PathBuf::from));
+        roots
+            .flat_map(|r| {
+                [
+                    r.join("Git/bin/bash.exe"),
+                    r.join("Programs/Git/bin/bash.exe"),
+                ]
+            })
+            .find(|p| p.is_file())
+    })
+    .as_deref()
 }
 
 const MAX_DEPTH: usize = 3;
 
 /// [`analyze_in`] with the platform shell's grammar.
 pub fn analyze(cmd: &str) -> Analysis {
-    analyze_in(cmd, Dialect::NATIVE)
+    analyze_in(cmd, Dialect::NATIVE())
 }
 
 pub fn analyze_in(cmd: &str, d: Dialect) -> Analysis {
@@ -158,19 +198,45 @@ pub fn split_compound(cmd: &str, d: Dialect) -> Vec<String> {
 }
 
 /// Text up to the `)` that closes an already-open `(`, and the index after it.
+/// Tracks quotes and backslash escapes so `$(echo ')'; rm -rf /)` cannot close
+/// early.
 fn matching_paren(chars: &[char], from: usize) -> (String, usize) {
-    let mut depth = 1;
+    let mut depth = 1usize;
     let mut i = from;
+    let mut quote: Option<char> = None;
     while i < chars.len() {
-        match chars[i] {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return (chars[from..i].iter().collect(), i + 1);
+        let c = chars[i];
+        match quote {
+            Some('\'') => {
+                if c == '\'' {
+                    quote = None;
                 }
             }
-            _ => {}
+            Some('"') => {
+                if c == '\\' && i + 1 < chars.len() {
+                    i += 2;
+                    continue;
+                }
+                if c == '"' {
+                    quote = None;
+                }
+            }
+            Some(_) => unreachable!(),
+            None => match c {
+                '\\' if i + 1 < chars.len() => {
+                    i += 2;
+                    continue;
+                }
+                '\'' | '"' => quote = Some(c),
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return (chars[from..i].iter().collect(), i + 1);
+                    }
+                }
+                _ => {}
+            },
         }
         i += 1;
     }
@@ -382,11 +448,11 @@ const GIT_READ_ONLY: &[&str] = &[
 /// One simple command that cannot write or run other programs, as far as
 /// its text shows. A redirection (`>`) always disqualifies it.
 pub fn is_read_only(part: &str) -> bool {
-    is_read_only_in(part, Dialect::NATIVE)
+    is_read_only_in(part, Dialect::NATIVE())
 }
 
 pub fn is_read_only_in(part: &str, d: Dialect) -> bool {
-    if part.contains('>') {
+    if part.contains(['>', '<']) {
         return false;
     }
     // cmd expands %VAR% and !VAR! anywhere, and the text says nothing about
@@ -429,13 +495,31 @@ pub fn is_read_only_in(part: &str, d: Dialect) -> bool {
 
 /// Every simple command in `cmd` is read-only (and there is at least one).
 pub fn all_read_only(cmd: &str) -> bool {
-    all_read_only_in(cmd, Dialect::NATIVE)
+    all_read_only_in(cmd, Dialect::NATIVE())
+}
+
+/// True if `part` begins with an environment mutation (`VAR=val ...` or
+/// `env ...`), which can hijack execution (`LD_PRELOAD`, `PATH`, `GIT_PAGER`,
+/// `env -S`) even when the wrapped command looks read-only.
+fn mutates_env(part: &str, d: Dialect) -> bool {
+    let t = tokens(part, d);
+    let Some(first) = t.first() else {
+        return false;
+    };
+    is_assignment(first) || base_name(first) == "env"
 }
 
 /// Same, read with `d`'s grammar: the shell the command will really run in.
 pub fn all_read_only_in(cmd: &str, d: Dialect) -> bool {
+    // Command substitutions in POSIX sh can execute arbitrary nested commands
+    // inside quotes or arguments: fail closed and require approval.
+    if d == Dialect::Sh && (cmd.contains("$(") || cmd.contains('`')) {
+        return false;
+    }
     let a = analyze_in(cmd, d);
-    !a.inner.is_empty() && a.inner.iter().all(|p| is_read_only_in(p, d))
+    !a.inner.is_empty()
+        && !a.raw.iter().any(|p| mutates_env(p, d))
+        && a.inner.iter().all(|p| is_read_only_in(p, d))
 }
 
 /// The arguments of one simple command that name a file: not a flag, and
@@ -559,6 +643,7 @@ mod tests {
         for bad in [
             "ls > out.txt",
             "echo hi >> a",
+            "cat </etc/passwd",
             "git push",
             "git -c core.pager=evil log",
             "git diff --output=x",
@@ -568,9 +653,22 @@ mod tests {
             "ls $(rm a)",
             "bash -c ls",
             "cargo test",
+            "LD_PRELOAD=/tmp/evil.so ls",
+            "GIT_PAGER=sh git log",
+            "env -S sh ls",
+            "env PATH=/tmp ls",
             "",
         ] {
             assert!(!all_read_only(bad), "{bad}");
         }
+        assert!(
+            !all_read_only_in("echo \"$(echo ')'; rm -rf /)\"", Dialect::Sh),
+            "quoted ')' inside $() must not bypass read-only check"
+        );
+        let split = split_compound_sh("echo \"$(echo ')'; rm -rf /)\"");
+        assert!(
+            split.iter().any(|p| p.contains("rm -rf /")),
+            "quote-aware matching_paren must surface nested commands: {split:?}"
+        );
     }
 }

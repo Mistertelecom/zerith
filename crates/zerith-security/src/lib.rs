@@ -333,6 +333,28 @@ fn command_glob(pat: &str, text: &str) -> bool {
     glob_match(&pat, text, false) || pat.strip_suffix(" *").is_some_and(|p| p == text)
 }
 
+/// `C:/Windows/System32/OpenSSH/ssh.exe -V` → `ssh -V`: a deny or ask rule
+/// on `ssh *` must not be dodged by spelling the program's path or `.exe`.
+fn bare_program(cmd: &str) -> String {
+    let cmd = cmd.trim_start();
+    let (prog, rest) = match cmd.strip_prefix('"') {
+        Some(q) => q.split_once('"').unwrap_or((q, "")),
+        None => cmd.split_once(char::is_whitespace).unwrap_or((cmd, "")),
+    };
+    let name = prog.rsplit(['/', '\\']).next().unwrap_or(prog);
+    let lower = name.to_ascii_lowercase();
+    let name = match [".exe", ".cmd", ".bat", ".com"]
+        .iter()
+        .find(|e| lower.ends_with(*e))
+    {
+        Some(e) => &name[..name.len() - e.len()],
+        None => name,
+    };
+    format!("{name} {}", rest.trim_start())
+        .trim_end()
+        .to_string()
+}
+
 /// A path the way rules see it.
 #[derive(Debug, Clone)]
 struct PathSubject {
@@ -555,7 +577,7 @@ impl Policy {
     fn read_only_verdict(&self, cmd: &str) -> Verdict {
         let bypass = self.mode() == Mode::Bypass;
         for part in shellparse::analyze(cmd).inner {
-            for path in shellparse::file_args(&part, shellparse::Dialect::NATIVE) {
+            for path in shellparse::file_args(&part, shellparse::Dialect::NATIVE()) {
                 let ps = self.path_subject(&path);
                 if let Some(r) = self.rules.iter().find(|r| {
                     r.kind == RuleKind::Deny && r.tool_matches("read_file") && r.path_matches(&ps)
@@ -674,7 +696,10 @@ impl Policy {
             (Subject::Shell(whole), Some(a)) => {
                 r.pattern.is_none()
                     || r.text_matches(whole)
-                    || a.raw.iter().chain(&a.inner).any(|p| r.text_matches(p))
+                    || a.raw
+                        .iter()
+                        .chain(&a.inner)
+                        .any(|p| r.text_matches(p) || r.text_matches(&bare_program(p)))
             }
             (Subject::Text(t), _) => r.text_matches(t),
             (Subject::Shell(_), None) => false,
@@ -773,7 +798,13 @@ impl Policy {
         let mut clean = PathBuf::new();
         for c in path.components() {
             match c {
+                // `link/..` is the parent of where the link points, as the OS
+                // walks it, not the folder holding the link: resolve the real
+                // path first, or a link to outside plus `..` reads as inside.
                 Component::ParentDir => {
+                    if let Ok(real) = clean.canonicalize() {
+                        clean = real;
+                    }
                     clean.pop();
                 }
                 Component::CurDir => {}
@@ -807,7 +838,8 @@ impl Policy {
     }
 
     /// Files that decide the agent's own limits: the project's `.zerith/`
-    /// settings, the git hooks that run on the next commit, and `.mcp.json`.
+    /// settings, the git hooks that run on the next commit, `.git/config`
+    /// (which can point git at other hooks) and `.mcp.json`.
     fn is_own_control(&self, path: &Path) -> bool {
         let abs = self.resolve(path);
         let Ok(base) = self.workspace.canonicalize() else {
@@ -817,7 +849,11 @@ impl Policy {
             return false;
         };
         let rel = slashes(rel).to_ascii_lowercase();
-        rel.starts_with(".zerith/") || rel == ".mcp.json" || rel.starts_with(".git/hooks/")
+        // `.git/config` runs code too: core.hooksPath, core.fsmonitor.
+        rel.starts_with(".zerith/")
+            || rel == ".mcp.json"
+            || rel.starts_with(".git/hooks/")
+            || rel == ".git/config"
     }
 }
 
@@ -833,28 +869,135 @@ fn slashes(p: &Path) -> String {
 /// negative leaks a key into a file the user may share.
 pub fn redact(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
+    // The word after a password keyword is the password, whatever it looks
+    // like: `sshpass -p Admin@123`, `plink -pw x`, `password cipher x`,
+    // `snmp-server community x`, `secret 5 $1$...`.
+    let mut hide_next = false;
+    let mut prev = String::new();
     for token in text.split_inclusive(char::is_whitespace) {
         let body = token.trim_end();
         let trail = &token[body.len()..];
-        out.push_str(&redact_token(body));
+        let lower = body.to_ascii_lowercase();
+        if body.is_empty() {
+        } else if hide_next && is_cipher_type(&lower) {
+            out.push_str(body);
+        } else if hide_next {
+            out.push_str("[redacted]");
+            hide_next = false;
+        } else if let Some(i) = body
+            .find(['=', ':'])
+            .filter(|&i| i + 1 < body.len() && is_password_key(&lower[..i], &prev))
+        {
+            out.push_str(&body[..=i]);
+            out.push_str("[redacted]");
+        } else {
+            out.push_str(&redact_token(body));
+            hide_next = is_password_key(&lower, &prev);
+        }
+        if !body.is_empty() {
+            prev = lower;
+        }
+        if trail.contains('\n') {
+            hide_next = false;
+        }
         out.push_str(trail);
     }
     out
 }
 
+/// A word whose next word (or `=value`) is a password. `-p` only after
+/// `sshpass`: elsewhere it is a port (`ssh -p 22`) or `mkdir -p`.
+fn is_password_key(w: &str, prev: &str) -> bool {
+    let w = w.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+    matches!(
+        w,
+        "password"
+            | "passwd"
+            | "pwd"
+            | "pw"
+            | "secret"
+            | "community"
+            | "key-string"
+            | "pre-shared-key"
+            | "psk"
+            | "auth-key"
+            | "authentication-key"
+    ) || (w == "p" && prev == "sshpass")
+}
+
+/// Text that must not go into memory or a skill: a key-shaped string, or a
+/// password written in prose ("a senha do roteador é X"), which no pattern
+/// can cut out reliably. Credentials belong in the OS vault.
+pub fn mentions_secret(text: &str) -> bool {
+    if redact(text) != text {
+        return true;
+    }
+    let lower = text.to_lowercase();
+    [
+        "senha",
+        "password",
+        "passwd",
+        "community",
+        "secret ",
+        "token de acesso",
+        "api key",
+        "chave de api",
+    ]
+    .iter()
+    .any(|w| lower.contains(w))
+}
+
+/// Cisco `secret 5`, Huawei `password cipher`: the type word, not the secret.
+fn is_cipher_type(w: &str) -> bool {
+    matches!(
+        w,
+        "0" | "5" | "7" | "8" | "9" | "cipher" | "simple" | "irreversible-cipher"
+    )
+}
+
 fn redact_token(token: &str) -> String {
-    let prefixes = ["sk-", "sk_", "ghp_", "gho_", "xoxb-", "AKIA"];
-    if prefixes.iter().any(|p| token.starts_with(p)) && token.len() > 8 {
-        return "[redacted]".to_string();
+    // The secret may sit inside JSON or `key=value`: `{"token":"eyJ…","n":1}`,
+    // so every run of token characters is checked, not the word as a whole.
+    let word = |c: char| c.is_ascii_alphanumeric() || "-_.~+/".contains(c);
+    let mut out = String::with_capacity(token.len());
+    let mut rest = token;
+    while let Some(start) = rest.find(word) {
+        out.push_str(&rest[..start]);
+        let run = &rest[start..];
+        let end = run.find(|c: char| !word(c)).unwrap_or(run.len());
+        let core = run[..end].trim_end_matches('.');
+        let core = if core.is_empty() { &run[..end] } else { core };
+        out.push_str(if is_secret(core) { "[redacted]" } else { core });
+        rest = &run[core.len()..];
     }
-    if token.len() > 40
-        && token
-            .chars()
+    out.push_str(rest);
+    out
+}
+
+fn is_secret(s: &str) -> bool {
+    let prefixes = [
+        "sk-",
+        "sk_",
+        "ghp_",
+        "gho_",
+        "ghs_",
+        "github_pat_",
+        "glpat-",
+        "xoxb-",
+        "xoxp-",
+        "AKIA",
+        "AIza",
+    ];
+    if prefixes.iter().any(|p| s.starts_with(p)) && s.len() > 12 {
+        return true;
+    }
+    // A JWT: three base64url parts, the first one a JSON header.
+    if s.starts_with("eyJ") && s.split('.').filter(|p| !p.is_empty()).count() == 3 {
+        return true;
+    }
+    s.len() > 40
+        && s.chars()
             .all(|c| c.is_ascii_hexdigit() || c == '-' || c == '_')
-    {
-        return "[redacted]".to_string();
-    }
-    token.to_string()
 }
 
 /// Redacts header-shaped text, where the secret follows the name.
@@ -864,7 +1007,7 @@ pub fn redact_headers(text: &str) -> String {
         let lower = line.to_ascii_lowercase();
         if lower.contains("authorization:")
             || lower.contains("api-key:")
-            || lower.contains("x-api-key:")
+            || lower.contains("cookie:")
         {
             out.push_str("[redacted header]\n");
         } else {
@@ -882,6 +1025,72 @@ mod tests {
     fn a_key_is_replaced_and_ordinary_text_survives() {
         let s = redact("chave sk-f7949b9d5b2e4f1a e texto normal");
         assert_eq!(s, "chave [redacted] e texto normal");
+    }
+
+    #[test]
+    fn jwts_google_keys_and_tokens_inside_json_are_redacted() {
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.c2lnbmF0dXJh";
+        let google = format!("AIza{}", "S".repeat(35));
+        let pat = format!("github_pat_{}", "1".repeat(30));
+        for (input, gone) in [
+            (format!("token {jwt} fim"), jwt.to_string()),
+            (format!("{{\"key\":\"{google}\",\"n\":1}}"), google.clone()),
+            (format!("GITHUB_TOKEN={pat}"), pat.clone()),
+            (
+                format!("glpat-{} e xoxp-{}", "a".repeat(20), "b".repeat(20)),
+                "a".repeat(20),
+            ),
+        ] {
+            let out = redact(&input);
+            assert!(!out.contains(&gone), "{input} -> {out}");
+            assert!(out.contains("[redacted]"), "{out}");
+        }
+        assert_eq!(
+            redact("{\"key\":\"AIzaXXXX\",\"n\":1}"),
+            "{\"key\":\"AIzaXXXX\",\"n\":1}",
+            "short text that only looks like a prefix stays"
+        );
+        let plain = "interface ether1 mtu=1500 comment=\"uplink: eyJ\" ok.";
+        assert_eq!(redact(plain), plain);
+        let h = redact_headers("GET /\nCookie: session=abc123\nSet-Cookie: id=9\nok\n");
+        assert!(
+            !h.contains("abc123") && !h.contains("id=9") && h.contains("ok"),
+            "{h}"
+        );
+    }
+
+    #[test]
+    fn device_passwords_are_redacted_and_ordinary_flags_are_not() {
+        for (input, gone) in [
+            ("sshpass -p Admin@123 ssh admin@10.0.0.1", "Admin@123"),
+            ("plink -batch -pw S3nh@ x@host", "S3nh@"),
+            (
+                "local-user admin password irreversible-cipher Abc123xyz",
+                "Abc123xyz",
+            ),
+            ("enable secret 5 $1$mERr$hx5rVt7rPNoS4wqbXKX7m0", "$1$mERr"),
+            ("snmp-server community AlphanNet-86 RW", "AlphanNet-86"),
+            ("/user add name=x password=Qwe!2025 group=full", "Qwe!2025"),
+            ("{\"password\":\"segredo1\"}", "segredo1"),
+        ] {
+            let out = redact(input);
+            assert!(!out.contains(gone), "{input} -> {out}");
+        }
+        for plain in [
+            "ssh -p 22 admin@10.0.0.1",
+            "mkdir -p src/a",
+            "display current-configuration",
+        ] {
+            assert_eq!(redact(plain), plain);
+        }
+        assert_eq!(
+            bare_program("C:/Windows/System32/OpenSSH/ssh.exe -V"),
+            "ssh -V"
+        );
+        assert_eq!(
+            bare_program("\"C:/Program Files/PuTTY/plink.exe\" -batch h"),
+            "plink -batch h"
+        );
     }
 
     #[test]
@@ -907,6 +1116,38 @@ mod tests {
             policy.check(&Action::Write(outside("system.ini"))),
             Verdict::Ask(_)
         ));
+    }
+
+    #[test]
+    fn a_link_to_outside_followed_by_dotdot_is_outside() {
+        let ws = scratch_dir();
+        let far = scratch_dir();
+        std::fs::create_dir_all(far.path().join("deep")).unwrap();
+        let link = ws.path().join("link");
+        // A junction needs no admin rights on Windows; a symlink on Unix.
+        #[cfg(windows)]
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(far.path().join("deep"))
+            .output()
+            .is_ok_and(|o| o.status.success());
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(far.path().join("deep"), &link).is_ok();
+        if !made {
+            eprintln!("sem link de diretório nesta máquina; teste pulado");
+            return;
+        }
+        let p = Policy::new(
+            preset("workspace-write").unwrap(),
+            Mode::AcceptEdits,
+            ws.path(),
+        );
+        // link/../x is far/x as the OS walks it.
+        let escaped = p.check(&Action::Write(PathBuf::from("link/../x.txt")));
+        assert!(matches!(escaped, Verdict::Ask(_)), "{escaped:?}");
+        let plain = p.check(&Action::Write(PathBuf::from("sub/../ok.txt")));
+        assert_eq!(plain, Verdict::Allow);
     }
 
     #[test]
@@ -998,6 +1239,7 @@ mod tests {
             ".zerith/settings.toml",
             ".mcp.json",
             ".git/hooks/pre-commit",
+            ".git/config",
         ] {
             let v = p.check(&Action::Write(dir.path().join(own)));
             assert!(matches!(v, Verdict::Ask(_)), "{own}: {v:?}");

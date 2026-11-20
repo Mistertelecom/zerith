@@ -217,7 +217,18 @@ impl Pipeline<'_> {
         }
 
         let need = match (policy_ask, ask) {
-            (Some(why), _) => Some((why, false)),
+            // If middleware explicitly asked, keep `forced = true` even when
+            // policy also asked, so a prior AllowSession cannot waive a hook.
+            (Some(why), Some(_)) => Some((why, true)),
+            // Same for an `ask` rule the user wrote (`shell(ssh *)`: every
+            // command on a production router is shown), and for any remote
+            // access, whose blast radius is another machine.
+            // ponytail: the rule is recognized by its message prefix; a
+            // Verdict::AskRule variant if a second caller needs it.
+            (Some(why), None) => {
+                let forced = why.starts_with("regra ") || remote_access(&inv.name, &inv.args);
+                Some((why, forced))
+            }
             (None, Some(s)) => Some((s, true)),
             (None, None) => None,
         };
@@ -414,6 +425,36 @@ impl Pipeline<'_> {
     }
 }
 
+/// A shell command that reaches another machine's prompt (SSH, Telnet, serial
+/// tools). Each one is approved on its own, never by a session grant.
+fn remote_access(tool: &str, args: &Value) -> bool {
+    const REMOTE: &[&str] = &[
+        "ssh", "plink", "telnet", "sshpass", "scp", "sftp", "putty", "kitty",
+    ];
+    let owned;
+    let cmd = match tool {
+        "shell" | "terminal_open" => args["command"].as_str().unwrap_or(""),
+        // Every line typed into an ssh/telnet session reaches the router.
+        "terminal_send" => {
+            owned = zerith_tools::terminal_program(args["id"].as_str().unwrap_or(""))
+                .unwrap_or_default();
+            &owned
+        }
+        _ => return false,
+    };
+    let a = zerith_core::shellparse::analyze(cmd);
+    a.raw.iter().chain(&a.inner).any(|piece| {
+        let prog = piece.split_whitespace().next().unwrap_or("");
+        let name = prog
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(prog)
+            .to_ascii_lowercase();
+        let name = name.strip_suffix(".exe").unwrap_or(&name);
+        REMOTE.contains(&name)
+    })
+}
+
 fn parse_args(raw: &str) -> Result<Value, serde_json::Error> {
     serde_json::from_str(if raw.trim().is_empty() { "{}" } else { raw })
 }
@@ -434,5 +475,23 @@ fn run_plain(
     match tools.run_raw(&inv.name, &inv.args, &ctx, cancel) {
         Ok(o) => (true, o),
         Err(e) => (false, format!("erro: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod remote_tests {
+    use super::remote_access;
+    use serde_json::json;
+
+    #[test]
+    fn every_way_of_reaching_a_router_is_remote_and_local_commands_are_not() {
+        let sh = |c: &str| remote_access("shell", &json!({ "command": c }));
+        assert!(sh("ssh admin@10.0.0.1 /system resource print"));
+        assert!(sh("C:/Windows/System32/OpenSSH/ssh.exe -V"));
+        assert!(sh("cd x && plink -batch -pw y host < cmds.txt"));
+        assert!(sh("telnet 10.248.20.2"));
+        assert!(!sh("cargo test -q"));
+        assert!(!sh("git status"));
+        assert!(!remote_access("read_file", &json!({ "path": "ssh" })));
     }
 }

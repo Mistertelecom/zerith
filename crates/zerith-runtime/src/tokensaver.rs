@@ -202,8 +202,10 @@ fn head_complete_lines(head: &str, is_full_text: bool) -> Vec<&str> {
 
 /// Applies deterministic RTK compression filters to tool outputs before they
 /// are persisted or sent back to the model.
-pub fn compress_tool_output(_tool_name: &str, text: &str) -> RtkOutcome {
-    if text.len() < RTK_MIN_BYTES || text.len() > RTK_MAX_BYTES {
+pub fn compress_tool_output(tool_name: &str, text: &str) -> RtkOutcome {
+    // read_file already has offset/limit: the model asked for those lines,
+    // and a cut there makes it invent the missing ones.
+    if tool_name == "read_file" || text.len() < RTK_MIN_BYTES || text.len() > RTK_MAX_BYTES {
         return unchanged(text);
     }
 
@@ -1187,6 +1189,13 @@ mod tests {
             out.text
         );
         assert!(!out.text.contains("value_15"));
+    }
+
+    #[test]
+    fn read_file_output_is_never_cut() {
+        let s: String = (0..600).map(|i| format!("interface Gi0/0/{i}\n")).collect();
+        assert_eq!(compress_tool_output("read_file", &s).saved_bytes, 0);
+        assert!(compress_tool_output("shell", &s).saved_bytes > 0);
     }
 
     #[test]

@@ -30,12 +30,12 @@ export function ApprovalCard(props: {
           Negar
         </button>
         <span className="spacer" />
-        <button className="btn" onClick={() => props.onAnswer("once")}>
-          Permitir uma vez
-        </button>
-        <button className="btn btn-primary" onClick={() => props.onAnswer("session")}>
-          <ShieldCheck size={16} strokeWidth={1.75} />
+        <button className="btn" onClick={() => props.onAnswer("session")}>
           Permitir nesta conversa
+        </button>
+        <button className="btn btn-primary" onClick={() => props.onAnswer("once")}>
+          <ShieldCheck size={16} strokeWidth={1.75} />
+          Permitir uma vez
         </button>
       </div>
     </div>

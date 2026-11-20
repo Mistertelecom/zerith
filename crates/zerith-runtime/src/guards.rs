@@ -181,8 +181,9 @@ pub struct Guards {
     gate: PlanGate,
     session_id: String,
     errors: Mutex<Vec<String>>,
-    /// Hook context from `before`, delivered by `after`, keyed by call id.
-    pending: Mutex<HashMap<String, Vec<String>>>,
+    /// Hook context from `before`, delivered by `after`, keyed by session and
+    /// call id: subagents share this instance and their ids may repeat.
+    pending: Mutex<HashMap<(String, String), Vec<String>>>,
 }
 
 impl Guards {
@@ -324,7 +325,7 @@ impl Middleware for Guards {
         }
         if !pre.additional_context.is_empty() {
             if let Ok(mut p) = self.pending.lock() {
-                p.entry(call.id.clone())
+                p.entry((call.session_id.clone(), call.id.clone()))
                     .or_default()
                     .extend(pre.additional_context.iter().cloned());
             }
@@ -368,7 +369,7 @@ impl Middleware for Guards {
             .pending
             .lock()
             .ok()
-            .and_then(|mut p| p.remove(&call.id))
+            .and_then(|mut p| p.remove(&(call.session_id.clone(), call.id.clone())))
         {
             result.context.extend(ctx);
         }

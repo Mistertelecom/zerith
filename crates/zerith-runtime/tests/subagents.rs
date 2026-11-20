@@ -13,8 +13,8 @@ use serde_json::{json, Value};
 use zerith_providers::{Cancel, Client, Protocol, ProviderConfig, ProviderKind};
 use zerith_runtime::plan::{parse_plan, run_plan, run_plan_opts, PlanOptions, TaskBudget};
 use zerith_runtime::{
-    approval_channel, question_channel, run_agent_turn, AgentOptions, Approval, RunError, RunEvent,
-    SubagentOptions, TurnContext,
+    approval_channel, question_channel, run_agent_turn, AgentOptions, Approval, Flow, Middleware,
+    RunError, RunEvent, SubagentOptions, ToolInvocation, TurnContext,
 };
 use zerith_security::{preset, Mode, Policy};
 use zerith_sessions::{Role, SessionSource, Store, TodoStatus};
@@ -496,6 +496,65 @@ fn explore_cannot_write_even_when_the_policy_would_allow_it() {
         "{}",
         last.content
     );
+}
+
+#[test]
+fn the_parents_middleware_denies_inside_the_child() {
+    struct NoWrites(Arc<Mutex<Vec<String>>>);
+    impl Middleware for NoWrites {
+        fn before(&self, call: &mut ToolInvocation) -> Flow {
+            self.0.lock().unwrap().push(call.session_id.clone());
+            if call.name == "write_file" {
+                Flow::Deny("regra do usuário".into())
+            } else {
+                Flow::Continue
+            }
+        }
+    }
+    let url = serve(|b| match (prompt_of(b).as_str(), tool_msgs(b).first()) {
+        ("PAI", None) => calls(&[(
+            "c1",
+            "agent",
+            json!({"description": "x", "prompt": "ESCREVE", "agent": "general"}),
+        )]),
+        ("ESCREVE", None) => {
+            calls(&[("w1", "write_file", json!({"path": "x.txt", "content": "c"}))])
+        }
+        (_, Some(m)) => text(&format!("visto: {}", m["content"].as_str().unwrap())),
+        _ => text("?"),
+    });
+    // Bypass: the policy allows the write, so only the middleware can stop it.
+    let e = env(Mode::Bypass);
+    let reg = Registry::new();
+    let seen: Arc<Mutex<Vec<String>>> = Default::default();
+    turn(
+        &e,
+        &url,
+        &reg,
+        AgentOptions {
+            subagents: subs(2),
+            middleware: vec![Box::new(NoWrites(seen.clone()))],
+            ..AgentOptions::default()
+        },
+        TurnContext::default(),
+        "PAI",
+        &Cancel::default(),
+        |_| {},
+    )
+    .unwrap();
+    assert!(
+        !e.dir.path().join("x.txt").exists(),
+        "the child bypassed the middleware"
+    );
+    let kid = &e.store.subagent_sessions(&e.sid).unwrap()[0];
+    let last = e.store.messages(&kid.id, 100, 0).unwrap().pop().unwrap();
+    assert!(
+        last.content.contains("negado: regra do usuário"),
+        "{}",
+        last.content
+    );
+    // The same instance saw the parent's `agent` call and the child's write.
+    assert_eq!(*seen.lock().unwrap(), [e.sid.clone(), kid.id.clone()]);
 }
 
 #[test]

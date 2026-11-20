@@ -17,9 +17,13 @@
 //!
 //! Children share the parent's [`ApprovalGate`]: a call the policy would *ask*
 //! about is queued on it and the root turn shows the prompt in the person's
-//! chat; no gate (plan runner, bare CLI) still refuses. They get none of the
-//! host's middleware. The policy itself (mode, rules, workspace) is the
-//! parent's, made stricter by a definition, never looser.
+//! chat; no gate (plan runner, bare CLI) still refuses. They also run every
+//! tool through the parent's middleware, the same instances (hooks, rules,
+//! the plan gate): a `PreToolUse` deny binds a child exactly as it binds the
+//! parent. Parallel children call it at once, so a middleware that keeps
+//! state across `before`/`after` must key it by `(session_id, call id)`, as
+//! [`crate::guards::Guards`] does. The policy itself (mode, rules, workspace)
+//! is the parent's, made stricter by a definition, never looser.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -35,7 +39,39 @@ use zerith_security::{Mode, ModeHandle, Policy};
 use zerith_sessions::{Role, Store};
 use zerith_tools::{AgentRequest, EventSink, HostEvent, Registry, Services, SkillLoad};
 
+use crate::pipeline::{Flow, Middleware, ToolInvocation, ToolOutcome};
 use crate::{ApprovalGate, RunError, RunEvent, TurnContext};
+
+/// A turn's middleware as its subagents hold it: outlives the turn's borrow
+/// (a background child may still be stopping when the turn returns).
+pub(crate) type SharedMiddleware = Arc<dyn Middleware + Send + Sync>;
+
+/// One shared middleware in a turn's own list.
+struct Inherited(SharedMiddleware);
+
+impl Middleware for Inherited {
+    fn before(&self, call: &mut ToolInvocation) -> Flow {
+        self.0.before(call)
+    }
+    fn after(&self, call: &ToolInvocation, result: &mut ToolOutcome) {
+        self.0.after(call, result)
+    }
+}
+
+fn boxed(shared: &[SharedMiddleware]) -> Vec<Box<dyn Middleware + Send + Sync>> {
+    shared
+        .iter()
+        .map(|m| Box::new(Inherited(m.clone())) as Box<dyn Middleware + Send + Sync>)
+        .collect()
+}
+
+/// Moves `mw` behind `Arc`s and leaves forwarders in its place: the turn
+/// keeps using it, and its subagents get the very same instances.
+pub(crate) fn share(mw: &mut Vec<Box<dyn Middleware + Send + Sync>>) -> Vec<SharedMiddleware> {
+    let shared: Vec<SharedMiddleware> = std::mem::take(mw).into_iter().map(Arc::from).collect();
+    *mw = boxed(&shared);
+    shared
+}
 
 /// Deepest chain of subagents: root -> child -> grandchild.
 pub const MAX_DEPTH: usize = 2;
@@ -290,7 +326,8 @@ pub struct ChildSpec {
     pub prompt: String,
     pub model: String,
     pub def: Option<AgentDef>,
-    pub skills_root: Option<PathBuf>,
+    /// The parent's skills, plugin folders included.
+    pub skills_root: Option<zerith_skills::Library>,
     pub scope: Option<Scope>,
     pub max_steps: usize,
     /// The child's own depth (1 for a direct child).
@@ -354,8 +391,17 @@ impl Saved {
 /// adds them to its report; the database keeps one row per request.
 pub(crate) type SavedTotals = Arc<Mutex<Saved>>;
 
-/// Runs one child to completion on the calling thread.
+/// Runs one child to completion on the calling thread, with no middleware
+/// (the plan runner has none to hand down).
 pub fn run_child(spec: ChildSpec) -> Result<ChildOutput, ChildError> {
+    run_child_with(spec, &[])
+}
+
+/// [`run_child`] with the parent's middleware around every tool call.
+pub(crate) fn run_child_with(
+    spec: ChildSpec,
+    middleware: &[SharedMiddleware],
+) -> Result<ChildOutput, ChildError> {
     let fail = |e: &dyn std::fmt::Display| ChildError::Failed(e.to_string());
     let store = Store::open(&spec.db).map_err(|e| fail(&e))?;
     let session = store
@@ -366,10 +412,7 @@ pub fn run_child(spec: ChildSpec) -> Result<ChildOutput, ChildError> {
         .scope
         .as_ref()
         .and_then(|_| SqliteMemory::open(&spec.db).ok());
-    let skills = spec
-        .skills_root
-        .as_ref()
-        .and_then(|r| zerith_skills::Library::open(r).ok());
+    let skills = spec.skills_root.clone();
 
     let cancel = Cancel::default();
     // Every child ends: with no deadline from the caller (plan runner without
@@ -383,6 +426,7 @@ pub fn run_child(spec: ChildSpec) -> Result<ChildOutput, ChildError> {
         tools: Some(&spec.registry),
         policy: Some(&spec.policy),
         approvals: spec.approvals.as_ref(),
+        middleware: boxed(middleware),
         max_steps: spec.max_steps.max(1),
         subagents: SubagentOptions {
             depth: spec.depth,
@@ -631,13 +675,14 @@ struct Runtime {
     cfg: ProviderConfig,
     policy: Policy,
     base: Registry,
-    skills_root: Option<PathBuf>,
+    skills_root: Option<zerith_skills::Library>,
     model: String,
     depth: usize,
     gate: Arc<Gate>,
     limit: Option<usize>,
     settings: Option<zerith_core::Settings>,
     approvals: Option<ApprovalGate>,
+    middleware: Vec<SharedMiddleware>,
     saved: SavedTotals,
 }
 
@@ -655,6 +700,7 @@ pub(crate) fn bind(
     session_id: &str,
     opts: &SubagentOptions,
     approvals: Option<&ApprovalGate>,
+    middleware: &[SharedMiddleware],
 ) -> SavedTotals {
     let db = store
         .conn()
@@ -666,13 +712,14 @@ pub(crate) fn bind(
         cfg: client.config().clone(),
         policy: policy.clone(),
         base: tools.subset(|_| true),
-        skills_root: ctx.skills.map(|l| l.root().to_path_buf()),
+        skills_root: ctx.skills.cloned(),
         model: model.to_string(),
         depth: opts.depth,
         gate: opts.gate.clone().unwrap_or_else(Gate::global),
         limit: opts.max_concurrent,
         settings: ctx.settings.cloned(),
         approvals: approvals.cloned(),
+        middleware: middleware.to_vec(),
         saved: SavedTotals::default(),
     };
     let saved = rt.saved.clone();
@@ -851,6 +898,7 @@ impl Services for Runtime {
             announce: Some((id.clone(), format!("{name}: {description}"))),
         };
         let totals = self.saved.clone();
+        let middleware = self.middleware.clone();
         // Only the first level takes a permit; deeper children run under it.
         let permit_gate = (self.depth == 0).then(|| (self.gate.clone(), self.limit));
         let limit = self.limit.unwrap_or_else(profile_limit);
@@ -874,7 +922,7 @@ impl Services for Runtime {
                 None => None,
             };
             announce("running", &spec.prompt);
-            match run_child(spec) {
+            match run_child_with(spec, &middleware) {
                 Ok(o) => {
                     if let Ok(mut t) = totals.lock() {
                         t.add(o.saved);
@@ -944,11 +992,10 @@ impl Services for Runtime {
     }
 
     fn skill(&self, name: &str) -> Result<SkillLoad, String> {
-        let root = self
+        let lib = self
             .skills_root
             .as_ref()
             .ok_or_else(|| "nenhuma biblioteca de skills neste turno".to_string())?;
-        let lib = zerith_skills::Library::open(root).map_err(|e| e.to_string())?;
         let body = lib
             .skill_body(name)
             .ok_or_else(|| format!("skill não encontrada ou desativada: {name}"))?;
@@ -958,7 +1005,7 @@ impl Services for Runtime {
         })
     }
 
-    fn skills_root(&self) -> Option<PathBuf> {
+    fn skills_root(&self) -> Option<zerith_skills::Library> {
         self.skills_root.clone()
     }
 }

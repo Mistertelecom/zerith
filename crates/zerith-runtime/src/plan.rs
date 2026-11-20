@@ -497,7 +497,7 @@ fn run_one(
         prompt: task.prompt.clone(),
         model,
         def: Some(resolved.def),
-        skills_root: Some(paths.skills()),
+        skills_root: zerith_skills::Library::open(paths.skills()).ok(),
         scope: scope.cloned(),
         max_steps: steps,
         depth: 1,

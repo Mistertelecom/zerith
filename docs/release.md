@@ -7,33 +7,32 @@ já existe. Onde não há evidência, está dito.
 
 | Plataforma | Arquivo | Conteúdo |
 | --- | --- | --- |
-| Windows | `zerith-<tag>-windows-x86_64.zip` + `.sha256` | `zerith.exe`, `zerith-ui.exe` |
-| Linux | `zerith-<tag>-linux-x86_64.tar.gz` + `.sha256` | `zerith`, `zerith-ui` |
-| macOS | `zerith-<tag>-macos-<arch>.tar.gz` + `.sha256` | `zerith`, `zerith-ui` |
+| Windows (CLI) | `zerith-<tag>-windows-x86_64.zip` + `.sha256` | `zerith.exe` |
+| Windows (Desktop) | `Zerith_<ver>_x64-setup.exe` + `.sha256` + `.sig` | Instalador NSIS do `zerith-desktop` (Tauri 2) assinado com Ed25519 |
+| Linux (CLI) | `zerith-<tag>-linux-x86_64.tar.gz` + `.sha256` | `zerith` |
+| macOS (CLI) | `zerith-<tag>-macos-<arch>.tar.gz` + `.sha256` | `zerith` |
 
-Cada arquivo traz também README, LICENSE, avisos de terceiros e estes docs. É
-um **arquivo de binários**: não há instalador, desinstalador, entrada de menu,
-assinatura nem notarização.
+Cada arquivo portátil traz também README, LICENSE, avisos de terceiros e estes
+docs. O instalador desktop NSIS no Windows é usado pelo auto-updater embutido
+(`crates/zerith-desktop/src/update.rs`), que verifica obrigatoriamente tanto o
+`.sha256` quanto a assinatura Ed25519 (`.sig`) contra a chave pública embutida
+no binário.
 
 O workflow `.github/workflows/zerith-release.yml` roda, na matriz
-`windows-latest`, `ubuntu-latest`, `macos-latest`: `cargo test --workspace
---exclude zerith-ui`, `cargo build --release -p zerith-cli -p zerith-ui`,
-empacota e calcula o SHA-256. Numa tag `zerith-v*`, um job final cria um
-**rascunho** de release no GitHub com os arquivos e as limitações conhecidas;
-uma execução manual só gera artefatos.
+`windows-latest`, `ubuntu-latest`, `macos-latest`: `cargo test --workspace`,
+`cargo build --release -p zerith-cli`, empacota os arquivos portáteis, e no
+Windows constrói e assina o instalador NSIS do `zerith-desktop`. Numa tag
+`zerith-v*`, um job final cria um **rascunho** de release no GitHub com os
+arquivos e as limitações conhecidas; uma execução manual só gera artefatos.
 
-**Não executado ainda.** O YAML foi validado com `yaml.safe_load`, nada além
-disso: o workflow nunca rodou no GitHub. Só o Windows foi compilado nesta
-máquina. A matriz é a intenção declarada, não um resultado. A UI não é testada
-no lane de release (compila Rune); só é construída.
+## Instalação
 
-## Instalação portátil (única forma suportada hoje)
-
-Não há instalador nem desinstalador. Copiar os dois binários e rodar:
+- **Windows (desktop):** execute `Zerith_<ver>_x64-setup.exe` (instalador NSIS
+  com atalho, desinstalador e atualização automática assinada).
+- **Portátil (CLI):** copie `zerith` (ou `zerith.exe`) e rode:
 
 ```bash
 ./zerith doctor        # cria o banco, roda integrity_check
-./zerith-ui            # janela
 ```
 
 Os dados ficam fora da pasta dos binários, então apagar a pasta desinstala sem
@@ -59,11 +58,41 @@ SQLite (nunca cópia de arquivo WAL vivo). `zerith restore <arquivo>` exige
 `integrity_check` no backup e salva o banco atual como
 `before-restore-<stamp>.db` antes de trocar.
 
-## Assinatura
+## Assinatura do auto-updater (Ed25519)
 
-Nenhum artefato é assinado. Não há certificado de código, nem notarização de
-macOS, nem repositório apt. `SHA256SUMS.txt` permite conferir o download, não
-prova autoria.
+O instalador Windows (`Zerith_<ver>_x64-setup.exe`) carrega uma assinatura
+Ed25519 destacada (`.sig`) sobre a mensagem canônica:
+
+```text
+zerith-update-v1
+version=<versão>
+file=<nome-do-instalador>
+sha256=<digest-sha256-hex>
+```
+
+Como configurar as chaves uma única vez:
+
+1. Gere o par de chaves localmente:
+   ```bash
+   node scripts/sign-update.mjs keygen
+   ```
+2. Cole o valor de `ZERITH_UPDATE_PUBKEY` (32 bytes em base64) em
+   `crates/zerith-desktop/update-pubkey.txt` e commite no repositório.
+3. Cadastre o valor de `ZERITH_UPDATE_SIGNING_KEY` nos Secrets do GitHub
+   (**Settings -> Secrets and variables -> Actions**). **Nunca commite a chave
+   privada.**
+
+No release (`zerith-v*`), o workflow valida que `ZERITH_UPDATE_SIGNING_KEY`
+corresponde a `update-pubkey.txt`, embute a chave pública no binário via
+`ZERITH_UPDATE_PUBKEY` e gera + verifica `.sha256` e `.sig`. Se `.sig` ou
+`.sha256` estiverem ausentes ou inválidos — ou se o build não tiver chave
+pública configurada — o auto-updater falha fechado e recusa instalar.
+
+**Assinatura de SO (Authenticode / Gatekeeper):** ainda não há certificado
+Authenticode do Windows nem notarização do macOS, então o SmartScreen/Gatekeeper
+pode exibir aviso na primeira instalação manual. Para atualizações feitas pelo
+próprio app, a assinatura Ed25519 garante autoria e integridade contra a chave
+pública embutida.
 
 ## Benchmarks
 

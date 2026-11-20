@@ -37,3 +37,6 @@ base64 = "0.22"
 ureq.workspace = true
 ring = "0.17"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+
+[dev-dependencies]
+tempfile.workspace = true

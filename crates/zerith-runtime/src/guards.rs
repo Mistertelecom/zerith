@@ -257,7 +257,9 @@ impl Guards {
     /// `Ask` becomes `Deny` in `dontAsk`.
     fn ask(&self, why: String) -> Flow {
         if self.policy.mode() == Mode::DontAsk {
-            Flow::Deny(format!("modo dontAsk: {why}"))
+            Flow::Deny(format!(
+                "modo dontAsk: {why} (comandos e rede ficam de fora; use Livre para isso)"
+            ))
         } else {
             Flow::Ask(why)
         }

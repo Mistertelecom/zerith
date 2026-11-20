@@ -564,9 +564,9 @@ impl Policy {
     /// In `dontAsk` anything that would ask is denied.
     fn dont_ask(&self, v: Verdict) -> Verdict {
         match v {
-            Verdict::Ask(why) if self.mode() == Mode::DontAsk => {
-                Verdict::Deny(format!("modo dontAsk: {why}"))
-            }
+            Verdict::Ask(why) if self.mode() == Mode::DontAsk => Verdict::Deny(format!(
+                "modo dontAsk: {why} (comandos e rede ficam de fora; use Livre para isso)"
+            )),
             other => other,
         }
     }
@@ -620,7 +620,10 @@ impl Policy {
                         path.display()
                     ));
                 }
-                if bypass || (inside && mode == Mode::AcceptEdits) {
+                // `dontAsk` never asks, so a write that would ask is one it
+                // must simply do: inside the workspace it edits like
+                // `acceptEdits` (the control files above still ask → deny).
+                if bypass || (inside && matches!(mode, Mode::AcceptEdits | Mode::DontAsk)) {
                     Verdict::Allow
                 } else if inside {
                     Verdict::Ask(format!("escrever {}", path.display()))

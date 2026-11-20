@@ -22,7 +22,7 @@ abaixo do teto (`permissions.default_mode` ou `ZERITH_MODE`; qualquer grafia:
 | `default` | leitura no workspace roda; escrita, comando e rede perguntam |
 | `acceptEdits` | escrita dentro do workspace roda; o resto pergunta |
 | `plan` | só leitura; escrita e shell são **negados** (ver "Plano") |
-| `dontAsk` | tudo que perguntaria é **negado**; só roda o que uma regra `allow`, o preset ou o modo já aprovam |
+| `dontAsk` | como `acceptEdits` na escrita dentro do workspace (grava sem perguntar) e **nega** o que perguntaria: comando, rede, arquivo de controle e escrita fora do workspace |
 | `bypassPermissions` | tudo roda, **exceto** o que uma regra `deny`/`ask` ou o preset barra |
 
 Sem `default_mode`, vale o implícito do preset (`workspace-write` →

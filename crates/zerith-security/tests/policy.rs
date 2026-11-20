@@ -101,7 +101,7 @@ fn read_only_shell_never_asks_in_any_mode_except_plan_denials_of_writes() {
 }
 
 #[test]
-fn dont_ask_turns_every_ask_into_a_deny_but_allow_rules_still_run() {
+fn dont_ask_edits_inside_the_workspace_and_denies_the_rest() {
     let dir = scratch();
     let p = policy(
         dir.path(),
@@ -113,8 +113,14 @@ ask = ["shell(git push *)"]"#,
     assert_eq!(sh(&p, "cargo test"), Verdict::Allow);
     assert!(matches!(sh(&p, "cargo build"), Verdict::Deny(_)));
     assert!(matches!(sh(&p, "git push"), Verdict::Deny(_)));
+    // "Sem perguntas": a plain write inside the folder is done, not denied.
     let w = Action::Write(dir.path().join("a.txt"));
-    assert!(matches!(p.check_tool("write_file", &w), Verdict::Deny(_)));
+    assert_eq!(p.check_tool("write_file", &w), Verdict::Allow);
+    // Control files still stop, and so does a write outside the folder.
+    let own = Action::Write(dir.path().join(".zerith/settings.toml"));
+    assert!(matches!(p.check_tool("write_file", &own), Verdict::Deny(_)), "control file");
+    let outside = Action::Write(dir.path().parent().unwrap().join("fora.txt"));
+    assert!(matches!(p.check_tool("write_file", &outside), Verdict::Deny(_)), "outside");
     let out = Action::Read(PathBuf::from(if cfg!(windows) {
         "C:/Windows/win.ini"
     } else {

@@ -156,6 +156,34 @@ export function Composer(props: {
       r.readAsDataURL(f);
     }
   };
+  /** Pasted files: images attach; anything else says why nothing happened. */
+  const pasteFiles = (list: FileList) => {
+    const all = [...list];
+    const pics = all.filter((f) => f.type.startsWith("image/"));
+    addFiles(pics);
+    if (pics.length < all.length)
+      setNote("Aqui só entram texto e imagens; para outro arquivo, cite o caminho ou use @");
+  };
+
+  // Ctrl+V with the focus elsewhere (a conversation just picked in the list,
+  // a suggestion card, the transcript) went nowhere: it lands in the box.
+  useEffect(() => {
+    const onPaste = (e: ClipboardEvent) => {
+      const el = box.current;
+      const at = e.target as HTMLElement | null;
+      if (!el || !e.clipboardData) return;
+      if (at?.closest?.("input, textarea, [contenteditable], [role=dialog]")) return;
+      e.preventDefault();
+      el.focus();
+      el.setSelectionRange(el.value.length, el.value.length);
+      const text = e.clipboardData.getData("text/plain");
+      // insertText keeps Ctrl+Z working and fires React's onChange
+      if (text) document.execCommand("insertText", false, text);
+      else pasteFiles(e.clipboardData.files);
+    };
+    document.addEventListener("paste", onPaste);
+    return () => document.removeEventListener("paste", onPaste);
+  }, []);
 
   // The window takes OS file drops itself (Tauri), so the HTML drop below
   // never sees those files: the webview event hands over paths instead.
@@ -385,13 +413,11 @@ export function Composer(props: {
               setDismissed(null);
             }}
             onPaste={(e) => {
-              const files = [...e.clipboardData.files].filter((f) =>
-                f.type.startsWith("image/"),
-              );
               // Word/Excel put a picture of the copied text beside it: text wins
-              if (!files.length || e.clipboardData.getData("text/plain")) return;
+              const data = e.clipboardData;
+              if (!data.files.length || data.getData("text/plain")) return;
               e.preventDefault();
-              addFiles(files);
+              pasteFiles(data.files);
             }}
             onKeyDown={(e) => {
               if (rows.length && trigger) {

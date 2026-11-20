@@ -130,7 +130,7 @@ ask = ["shell(git push *)"]"#,
 }
 
 #[test]
-fn bypass_still_honours_deny_and_ask_rules() {
+fn bypass_never_asks_and_still_honours_deny_rules() {
     let dir = scratch();
     let p = policy(
         dir.path(),
@@ -141,7 +141,13 @@ ask = ["shell(git push *)"]"#,
     );
     assert_eq!(sh(&p, "cargo build"), Verdict::Allow);
     assert!(matches!(sh(&p, "rm -rf x"), Verdict::Deny(_)));
-    assert!(matches!(sh(&p, "git push"), Verdict::Ask(_)));
+    // An `ask` rule is a question, and `bypass` asks nothing: it just runs.
+    assert_eq!(sh(&p, "git push"), Verdict::Allow);
+    // Without the workspace even a write outside it runs: no prompt, no deny.
+    assert_eq!(
+        p.check_tool("write_file", &Action::Write(dir.path().join("fora.txt"))),
+        Verdict::Allow
+    );
     let w = Action::Write(dir.path().join("a/.env"));
     assert!(matches!(p.check_tool("write_file", &w), Verdict::Deny(_)));
 }

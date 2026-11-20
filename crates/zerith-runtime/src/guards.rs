@@ -254,8 +254,11 @@ impl Guards {
         out
     }
 
-    /// `Ask` becomes `Deny` in `dontAsk`.
+    /// `Bypass` asks nothing; `Ask` becomes `Deny` in `dontAsk`.
     fn ask(&self, why: String) -> Flow {
+        if self.policy.mode() == Mode::Bypass {
+            return Flow::Continue;
+        }
         if self.policy.mode() == Mode::DontAsk {
             Flow::Deny(format!(
                 "modo dontAsk: {why} (comandos e rede ficam de fora; use Livre para isso)"

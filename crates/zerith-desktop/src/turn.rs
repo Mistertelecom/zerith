@@ -386,7 +386,9 @@ pub fn parse_mode(s: &str) -> Mode {
     match s {
         "acceptEdits" | "accept_edits" => Mode::AcceptEdits,
         "plan" => Mode::Plan,
-        "dontAsk" | "dont_ask" => Mode::DontAsk,
+        // The window no longer offers `dontAsk`; an old saved value means the
+        // mode that asks nothing.
+        "dontAsk" | "dont_ask" => Mode::Bypass,
         "bypass" => Mode::Bypass,
         _ => Mode::Default,
     }

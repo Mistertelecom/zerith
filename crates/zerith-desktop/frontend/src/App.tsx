@@ -51,12 +51,12 @@ const MODEL_KEY = "zerith.model";
 // Models the user took out of the chat menu (`account:model` values).
 const HIDDEN_KEY = "zerith.hiddenModels";
 
+// Same four as Claude Code: `Bypass` is the one that asks nothing at all.
 const MODES = [
   ["default", "Padrão"],
   ["acceptEdits", "Aceitar edições"],
   ["plan", "Plano"],
-  ["dontAsk", "Sem perguntas"],
-  ["bypass", "Livre"],
+  ["bypass", "Bypass"],
 ] as const;
 
 // Starters on the empty conversation; a click puts the prompt in the draft.

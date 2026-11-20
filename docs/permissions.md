@@ -22,8 +22,8 @@ abaixo do teto (`permissions.default_mode` ou `ZERITH_MODE`; qualquer grafia:
 | `default` | leitura no workspace roda; escrita, comando e rede perguntam |
 | `acceptEdits` | escrita dentro do workspace roda; o resto pergunta |
 | `plan` | só leitura; escrita e shell são **negados** (ver "Plano") |
-| `dontAsk` | como `acceptEdits` na escrita dentro do workspace (grava sem perguntar) e **nega** o que perguntaria: comando, rede, arquivo de controle e escrita fora do workspace |
-| `bypassPermissions` | tudo roda, **exceto** o que uma regra `deny`/`ask` ou o preset barra |
+| `dontAsk` | como `acceptEdits` na escrita dentro do workspace (grava sem perguntar) e **nega** o que perguntaria: comando, rede, arquivo de controle e escrita fora do workspace. Não aparece na janela: a lista tem os mesmos quatro do Claude Code |
+| `bypassPermissions` ("Bypass") | **não pergunta nada**: comando, rede, escrita fora do workspace e regra `ask` rodam direto. Só barra `deny` e preset `read-only` — bloqueio não é pergunta |
 
 Sem `default_mode`, vale o implícito do preset (`workspace-write` →
 `acceptEdits`, `danger-full-access` → bypass, `read-only` → `default`).

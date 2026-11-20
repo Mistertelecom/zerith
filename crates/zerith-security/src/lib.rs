@@ -561,6 +561,16 @@ impl Policy {
         self.dont_ask(self.check_base(action))
     }
 
+    /// `bypassPermissions` ("Bypass") asks nothing: whatever would prompt runs.
+    /// A `deny` rule and a read-only preset still stop the call — a block is
+    /// not a question.
+    fn no_ask(&self, v: Verdict) -> Verdict {
+        match v {
+            Verdict::Ask(_) if self.mode() == Mode::Bypass => Verdict::Allow,
+            other => other,
+        }
+    }
+
     /// In `dontAsk` anything that would ask is denied.
     fn dont_ask(&self, v: Verdict) -> Verdict {
         match v {
@@ -670,7 +680,7 @@ impl Policy {
             Action::Network(c) => Subject::Text(c.clone()),
         };
         let v = self.rule_verdict(tool, &subject).unwrap_or(base);
-        self.dont_ask(v)
+        self.dont_ask(self.no_ask(v))
     }
 
     /// Rules only, for a tool call that has no [`Action`] (MCP tools, skills,
@@ -678,7 +688,8 @@ impl Policy {
     /// URL, ...). `None`: no rule spoke, the caller's default stands.
     pub fn check_rules(&self, tool: &str, subject: Option<&str>) -> Option<Verdict> {
         let s = Subject::Text(subject.unwrap_or("").to_string());
-        self.rule_verdict(tool, &s).map(|v| self.dont_ask(v))
+        self.rule_verdict(tool, &s)
+            .map(|v| self.dont_ask(self.no_ask(v)))
     }
 
     /// The first rule verdict, deny → ask → allow.

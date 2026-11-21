@@ -62,6 +62,9 @@ import { translateText, tr, useDomTranslator, useLang } from "./lib/i18n";
 const Settings = lazy(() =>
   import("./components/Settings").then((m) => ({ default: m.Settings })),
 );
+const WorkflowsStudio = lazy(() =>
+  import("./components/Workflows").then((m) => ({ default: m.WorkflowsStudio })),
+);
 
 const MODEL_KEY = "zerith.model";
 const EXECUTOR_MODEL_KEY = "zerith.executorModel";
@@ -251,6 +254,7 @@ export default function App() {
   const [paletteQuery, setPaletteQuery] = useState("");
   const [memoryPaused, setMemoryPaused] = useState(false);
   const [settings, setSettings] = useState<SettingsTab | null>(null);
+  const [workflowsOpen, setWorkflowsOpen] = useState(false);
   const [status, setStatus] = useState("");
   const [inspector, setInspector] = useState(true);
   // Folders used before (newest first, from the store) and the one picked for
@@ -1055,6 +1059,7 @@ export default function App() {
           }}
           onSettings={() => setSettings("Geral")}
           onQuotas={() => setSettings("Cotas")}
+          onWorkflows={() => setWorkflowsOpen(true)}
           memoryPaused={memoryPaused}
           onToggleMemory={() => {
             const next = !memoryPaused;
@@ -1429,6 +1434,14 @@ export default function App() {
             />
           </Suspense>
         ) : null}
+        {workflowsOpen ? (
+          <Suspense fallback={null}>
+            <WorkflowsStudio
+              models={models}
+              onClose={() => setWorkflowsOpen(false)}
+            />
+          </Suspense>
+        ) : null}
         {paletteOpen ? (
           <CommandPalette
             query={paletteQuery}
@@ -1466,6 +1479,11 @@ export default function App() {
                 label: inspector ? "Ocultar painel lateral" : "Mostrar painel lateral",
                 hint: "Inspetor",
                 run: () => setInspector((v) => !v),
+              },
+              {
+                label: "Abrir Workflows & Automações",
+                hint: "Visual Studio",
+                run: () => setWorkflowsOpen(true),
               },
               {
                 label: "Abrir Delegação & Modelos",

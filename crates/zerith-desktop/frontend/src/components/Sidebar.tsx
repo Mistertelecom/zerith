@@ -13,6 +13,7 @@ import {
   Settings,
   SquarePen,
   Trash2,
+  Workflow,
   X,
 } from "lucide-react";
 import type { Session } from "../lib/api";
@@ -53,6 +54,7 @@ export function Sidebar(props: {
   onNew: () => void;
   onSettings: () => void;
   onQuotas: () => void;
+  onWorkflows?: () => void;
   memoryPaused: boolean;
   onToggleMemory: () => void;
   pinned?: string[];
@@ -404,6 +406,12 @@ export function Sidebar(props: {
               : tr(lang, "ativa", "active")}
           </span>
         </button>
+        {props.onWorkflows ? (
+          <button className="list-row side-foot-row" onClick={props.onWorkflows}>
+            <Workflow size={16} strokeWidth={1.75} />
+            <span className="side-row-title">{tr(lang, "Automações", "Workflows")}</span>
+          </button>
+        ) : null}
         <button className="list-row side-foot-row" onClick={props.onQuotas}>
           <Gauge size={16} strokeWidth={1.75} />
           <span className="side-row-title">{tr(lang, "Cotas", "Quotas")}</span>

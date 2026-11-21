@@ -933,3 +933,158 @@ export const updateApi = {
   /** Downloads, verifies SHA-256 + Ed25519 signature, starts the installer and quits. */
   install: () => invoke<void>("update_install"),
 };
+
+export type NodeKind =
+  | "trigger_cron"
+  | "trigger_manual"
+  | "shell"
+  | "ssh_command"
+  | "http_request"
+  | "ai_agent"
+  | "condition"
+  | "transform"
+  | "notify_channel"
+  | "save_file";
+
+export type ChannelKind =
+  | "evolution_api"
+  | "waha"
+  | "whatsapp_cloud"
+  | "telegram"
+  | "discord_webhook"
+  | "slack_webhook"
+  | "generic_webhook"
+  | "desktop_notify";
+
+export interface WorkflowNode {
+  id: string;
+  kind: NodeKind;
+  label: string;
+  x: number;
+  y: number;
+  config: Record<string, unknown>;
+}
+
+export interface WorkflowEdge {
+  id: string;
+  from: string;
+  to: string;
+  branch?: string | null;
+}
+
+export interface Workflow {
+  id: string;
+  name: string;
+  description: string;
+  icon: string;
+  enabled: boolean;
+  nodes: WorkflowNode[];
+  edges: WorkflowEdge[];
+  created_at_ms: number;
+  updated_at_ms: number;
+  last_run_at_ms?: number | null;
+  last_status?: string | null;
+}
+
+export interface ChannelConfig {
+  id: string;
+  name: string;
+  kind: ChannelKind;
+  enabled: boolean;
+  config: Record<string, unknown>;
+  updated_at_ms: number;
+}
+
+export interface NodeRunLog {
+  node_id: string;
+  label: string;
+  kind: NodeKind;
+  status: string;
+  output: string;
+  duration_ms: number;
+}
+
+export interface WorkflowRun {
+  id: string;
+  workflow_id: string;
+  trigger_source: string;
+  status: string;
+  started_at_ms: number;
+  finished_at_ms?: number | null;
+  summary: string;
+  node_logs: NodeRunLog[];
+}
+
+export interface NodeEvent {
+  workflow_id: string;
+  run_id: string;
+  node_id: string;
+  status: string;
+  output: string;
+}
+
+export const workflowsApi = {
+  list: () => invoke<Workflow[]>("workflow_list"),
+  save: (workflow: Workflow) => invoke<Workflow>("workflow_save", { workflow }),
+  delete: (id: string) => invoke<void>("workflow_delete", { id }),
+  toggle: (id: string, enabled: boolean) =>
+    invoke<void>("workflow_toggle", { id, enabled }),
+  runNow: (id: string, tzOffsetMinutes?: number) =>
+    invoke<WorkflowRun>("workflow_run_now", {
+      id,
+      tzOffsetMinutes: tzOffsetMinutes ?? -new Date().getTimezoneOffset(),
+    }),
+  runs: (id: string, limit = 25) =>
+    invoke<WorkflowRun[]>("workflow_runs", { id, limit }),
+  generateFromPrompt: (prompt: string, tzOffsetMinutes?: number) =>
+    invoke<Workflow>("workflow_generate_from_prompt", {
+      prompt,
+      tzOffsetMinutes: tzOffsetMinutes ?? -new Date().getTimezoneOffset(),
+    }),
+  templates: () => invoke<Workflow[]>("workflow_templates"),
+  testNode: (
+    node: WorkflowNode,
+    sampleInput?: string,
+    tzOffsetMinutes?: number,
+  ) =>
+    invoke<string>("workflow_test_node", {
+      node,
+      sampleInput: sampleInput ?? "",
+      tzOffsetMinutes: tzOffsetMinutes ?? -new Date().getTimezoneOffset(),
+    }),
+};
+
+export const channelsApi = {
+  list: () => invoke<ChannelConfig[]>("channel_list"),
+  save: (channel: ChannelConfig) =>
+    invoke<ChannelConfig>("channel_save", { channel }),
+  delete: (id: string) => invoke<void>("channel_delete", { id }),
+  test: (id: string, target?: string, message?: string) =>
+    invoke<string>("channel_test", {
+      id,
+      target: target ?? null,
+      message: message ?? null,
+    }),
+};
+
+export function onWorkflowEvent(
+  handler: (ev: NodeEvent) => void,
+): Promise<UnlistenFn> {
+  return listen<NodeEvent>("workflow:event", (e) => handler(e.payload)).catch(
+    () => () => undefined,
+  );
+}
+
+export function onWorkflowDone(
+  handler: (run: WorkflowRun) => void,
+): Promise<UnlistenFn> {
+  return listen<WorkflowRun>("workflow:done", (e) => handler(e.payload)).catch(
+    () => () => undefined,
+  );
+}
+
+export function onWorkflowsChanged(handler: () => void): Promise<UnlistenFn> {
+  return listen<void>("workflows:changed", () => handler()).catch(
+    () => () => undefined,
+  );
+}

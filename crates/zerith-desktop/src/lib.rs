@@ -22,6 +22,7 @@ pub mod turn;
 pub mod types;
 pub mod update;
 pub mod wire;
+pub mod workflows;
 pub mod workspace;
 
 /// Where the data root lives: `ZERITH_HOME` wins so a test or a second profile
@@ -77,7 +78,7 @@ fn seed_bundled_skills(root: &std::path::Path) {
 }
 
 /// Official Zerith plugins (`zerith-netops`, `zerith-proxmox`, `zerith-noc-observability`,
-/// `zerith-ftth-olt`, `zerith-linux-devops`) arrive installed and enabled by default
+/// `zerith-ftth-olt`, `zerith-linux-devops`, `zerith-workflows`) arrive installed and enabled by default
 /// so their skills and agents are immediately active without manual setup.
 fn seed_bundled_plugins(root: &std::path::Path) {
     let bundle = zerith_core::Paths::with_root(root)
@@ -151,9 +152,11 @@ pub fn run() {
         root.display(),
         std::env::var_os("WEBVIEW2_USER_DATA_FOLDER")
     ));
+    let scheduler_root = root.clone();
     tauri::Builder::default()
         .setup(move |app| {
             learn::bind(app.handle());
+            workflows::spawn_scheduler(app.handle().clone(), scheduler_root);
             let term_handle = app.handle().clone();
             zerith_tools::set_terminal_change_hook(std::sync::Arc::new(move || {
                 use tauri::Emitter;
@@ -322,6 +325,19 @@ pub fn run() {
             learn::learning,
             learn::set_learning,
             learn::learn_undo,
+            workflows::workflow_list,
+            workflows::workflow_save,
+            workflows::workflow_delete,
+            workflows::workflow_toggle,
+            workflows::workflow_run_now,
+            workflows::workflow_runs,
+            workflows::workflow_generate_from_prompt,
+            workflows::workflow_templates,
+            workflows::workflow_test_node,
+            workflows::channel_list,
+            workflows::channel_save,
+            workflows::channel_delete,
+            workflows::channel_test,
             update::update_check,
             update::update_install,
         ])

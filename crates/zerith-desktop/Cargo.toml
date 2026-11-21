@@ -28,6 +28,7 @@ zerith-plugins = { path = "../zerith-plugins" }
 zerith-security = { path = "../zerith-security" }
 zerith-mcp = { path = "../zerith-mcp" }
 zerith-importers = { path = "../zerith-importers" }
+zerith-workflows = { path = "../zerith-workflows" }
 tauri = { version = "2", features = [] }
 serde.workspace = true
 serde_json.workspace = true

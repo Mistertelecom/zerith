@@ -973,6 +973,39 @@ export default function App() {
     </>
   );
 
+  const activeBotSpec = useMemo(
+    () => (activeAgent ? agents.find((a) => a.name === activeAgent) ?? null : null),
+    [agents, activeAgent],
+  );
+
+  const selectBot = useCallback(
+    (bot: AgentView) => {
+      setActiveAgent(bot.name);
+      try {
+        const raw = localStorage.getItem("zerith.botSessions");
+        const map = raw ? (JSON.parse(raw) as Record<string, string>) : {};
+        const sid = map[bot.name];
+        if (sid && sessions.some((s) => s.id === sid && !s.archived)) {
+          setSelected(sid);
+          return;
+        }
+      } catch {
+        // ignore storage errors
+      }
+      setSelected(null);
+      setMessages([]);
+      draftRef.current?.focus();
+    },
+    [sessions],
+  );
+
+  const handleSwitchView = useCallback((v: AppView) => {
+    setActiveView(v);
+    if (v === "bots") {
+      void api.agentsList().then(setAgents).catch(() => undefined);
+    }
+  }, []);
+
   if (error && !boot) {
     return (
       <main className="boot">
@@ -1017,39 +1050,6 @@ export default function App() {
     boot.providers.find((p) => p.name === route?.provider)?.account_id ??
     null;
   const doneTasks = turn.tasks.filter((t) => t.status === "completed").length;
-
-  const activeBotSpec = useMemo(
-    () => (activeAgent ? agents.find((a) => a.name === activeAgent) ?? null : null),
-    [agents, activeAgent],
-  );
-
-  const selectBot = useCallback(
-    (bot: AgentView) => {
-      setActiveAgent(bot.name);
-      try {
-        const raw = localStorage.getItem("zerith.botSessions");
-        const map = raw ? (JSON.parse(raw) as Record<string, string>) : {};
-        const sid = map[bot.name];
-        if (sid && sessions.some((s) => s.id === sid && !s.archived)) {
-          setSelected(sid);
-          return;
-        }
-      } catch {
-        // ignore storage errors
-      }
-      setSelected(null);
-      setMessages([]);
-      draftRef.current?.focus();
-    },
-    [sessions],
-  );
-
-  const handleSwitchView = useCallback((v: AppView) => {
-    setActiveView(v);
-    if (v === "bots") {
-      void api.agentsList().then(setAgents).catch(() => undefined);
-    }
-  }, []);
 
   return (
     <div className="frame">

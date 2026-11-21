@@ -71,6 +71,16 @@ impl Paths {
         explicit.into_iter().chain(beside_exe).find(|p| p.is_dir())
     }
 
+    /// Official plugins that ship with the app: a `bundled-plugins` folder next
+    /// to the executable, or `ZERITH_BUNDLED_PLUGINS` to point elsewhere.
+    pub fn bundled_plugins(&self) -> Option<PathBuf> {
+        let explicit = std::env::var_os("ZERITH_BUNDLED_PLUGINS").map(PathBuf::from);
+        let beside_exe = std::env::current_exe()
+            .ok()
+            .and_then(|e| e.parent().map(|d| d.join("bundled-plugins")));
+        explicit.into_iter().chain(beside_exe).find(|p| p.is_dir())
+    }
+
     /// Programs that ship with the app and that skills rely on (for example
     /// `agent-desktop`): a `bundled-tools` folder next to the executable, or
     /// `ZERITH_BUNDLED_TOOLS`. `None` when there is none.

@@ -122,8 +122,14 @@ impl Index {
     fn build(lib: &Library, rows: &[crate::Installed]) -> Self {
         let mut docs = Vec::with_capacity(rows.len());
         for r in rows {
-            let text = std::fs::read_to_string(lib.root().join(&r.dir).join("SKILL.md"))
-                .unwrap_or_default();
+            let direct = std::path::Path::new(&r.dir).join("SKILL.md");
+            let text = if direct.is_file() {
+                std::fs::read_to_string(direct).unwrap_or_default()
+            } else {
+                std::fs::read_to_string(lib.root().join(&r.dir).join("SKILL.md"))
+                    .or_else(|_| lib.load_body(&r.name))
+                    .unwrap_or_default()
+            };
             let (fm, body) = match crate::parse(&text) {
                 Ok((fm, body)) => (Some(fm), body),
                 Err(_) => (None, ""),
@@ -374,6 +380,19 @@ const GLOSSARY: &[(&str, &str)] = &[
     ("baixar", "download"),
     ("correio", "email"),
     ("reuniao", "meeting"),
+    ("tunel", "wireguard"),
+    ("virtualizacao", "proxmox"),
+    ("monitoramento", "zabbix"),
+    ("alerta", "alert"),
+    ("incidente", "incident"),
+    ("lentidao", "latency"),
+    ("queda", "outage"),
+    ("sinal", "optical"),
+    ("atenuacao", "attenuation"),
+    ("firewall", "fortigate"),
+    ("container", "docker"),
+    ("disco", "disk"),
+    ("memoria", "memory"),
 ];
 
 /// The query's words, stop words out, each with its glossary twins (the word

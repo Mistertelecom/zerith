@@ -76,10 +76,34 @@ fn seed_bundled_skills(root: &std::path::Path) {
     }
 }
 
+/// Official Zerith plugins (`zerith-netops`, `zerith-proxmox`, `zerith-noc-observability`,
+/// `zerith-ftth-olt`, `zerith-linux-devops`) arrive installed and enabled by default
+/// so their skills and agents are immediately active without manual setup.
+fn seed_bundled_plugins(root: &std::path::Path) {
+    let bundle = zerith_core::Paths::with_root(root)
+        .bundled_plugins()
+        .or_else(|| {
+            let dev = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins");
+            dev.is_dir().then_some(dev)
+        });
+    let Some(bundle) = bundle else { return };
+    match zerith_plugins::Library::open(&root.join("plugins")).and_then(|l| l.seed_enabled(&bundle))
+    {
+        Ok((_, failed)) => failed
+            .iter()
+            .for_each(|f| eprintln!("zerith-desktop: plugin embutido ignorado: {f}")),
+        Err(e) => {
+            eprintln!("zerith-desktop: não consegui preparar os plugins embutidos: {e}");
+            boot_log(&format!("plugins: {e}"));
+        }
+    }
+}
+
 /// Builds and runs the window.
 pub fn run() {
     let root = data_root();
     seed_bundled_skills(&root);
+    seed_bundled_plugins(&root);
     // billion-context comes up while the window loads; the first turn waits
     // for it only if it is still starting.
     {

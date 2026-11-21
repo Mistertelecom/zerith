@@ -356,6 +356,72 @@ impl Library {
             .ok_or_else(|| PluginError::Missing(name.into()))
     }
 
+    /// Installs and enables official bundled plugins once on startup.
+    ///
+    /// - Plugins removed or disabled by the user stay untouched (tracked in
+    ///   `bundled-seen.json`).
+    /// - If an already-installed enabled bundled plugin gained new skills or
+    ///   agents in a newer app release, its files are refreshed in place while
+    ///   preserving its status and trust flag.
+    pub fn seed_enabled(&self, bundle: &Path) -> Result<(Vec<String>, Vec<String>)> {
+        let seen_path = self.root.join("bundled-seen.json");
+        let mut seen: Vec<String> = std::fs::read(&seen_path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+        let mut added = Vec::new();
+        let mut failed = Vec::new();
+        let Ok(entries) = std::fs::read_dir(bundle) else {
+            return Ok((added, failed));
+        };
+        let mut dirs: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.join(".claude-plugin").join(MANIFEST).is_file() || p.join(MANIFEST).is_file()
+            })
+            .collect();
+        dirs.sort();
+        for dir in dirs {
+            let folder = dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if seen.contains(&folder) {
+                // Refresh in-place if the user kept it enabled and the bundle has new skills.
+                if let Ok(existing) = self.get(&folder) {
+                    let bundle_skills = std::fs::read_dir(dir.join("skills"))
+                        .map(|rd| rd.flatten().filter(|e| e.path().is_dir()).count())
+                        .unwrap_or(0);
+                    if existing.status == Status::Enabled
+                        && bundle_skills > existing.manifest.skills.len()
+                    {
+                        let was_trusted = existing.trusted;
+                        let _ = self.remove(&existing.manifest.name);
+                        if let Ok(p) = self.install(&dir) {
+                            let _ = self.set_status(&p.manifest.name, Status::Enabled);
+                            if was_trusted {
+                                let _ = self.trust(&p.manifest.name);
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+            match self.install(&dir) {
+                Ok(p) => {
+                    let _ = self.set_status(&p.manifest.name, Status::Enabled);
+                    added.push(p.manifest.name);
+                    seen.push(folder);
+                }
+                Err(PluginError::Exists(_)) => seen.push(folder),
+                Err(e) => failed.push(format!("{folder}: {e}")),
+            }
+        }
+        std::fs::write(&seen_path, serde_json::to_vec_pretty(&seen)?)?;
+        Ok((added, failed))
+    }
+
     /// What enabled plugins add. Skills and agents are text the model reads
     /// (a skill's `allowed-tools` grants nothing, and every command still
     /// goes through approval), so they load once the plugin is enabled; hooks

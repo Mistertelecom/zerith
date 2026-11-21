@@ -42,7 +42,8 @@
       "icons/icon.ico"
     ],
     "resources": {
-      "../../bundled-skills": "bundled-skills"
+      "../../bundled-skills": "bundled-skills",
+      "../../plugins": "bundled-plugins"
     }
   }
 }

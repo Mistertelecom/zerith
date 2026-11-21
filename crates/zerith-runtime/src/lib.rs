@@ -411,6 +411,12 @@ pub fn build_prompt_context(
                     }
                     static_system.push_str("\n\n");
                     static_system.push_str(&sec);
+                    if skill_tool {
+                        let inlined = auto_inline_skills(lib, &catalog, prompt, 3600);
+                        if !inlined.is_empty() {
+                            dyn_parts.push(inlined);
+                        }
+                    }
                 } else if skill_tool {
                     // Static pointer stays in the cached system prompt; BM25
                     // hits for this turn travel in the transient reminder.
@@ -421,6 +427,10 @@ pub fn build_prompt_context(
                     let ranked = skills_index(lib, prompt, SKILLS_BUDGET_CHARS);
                     if !ranked.is_empty() {
                         dyn_parts.push(ranked);
+                    }
+                    let inlined = auto_inline_skills(lib, &catalog, prompt, 3600);
+                    if !inlined.is_empty() {
+                        dyn_parts.push(inlined);
                     }
                 } else {
                     let block = skills_block(lib, prompt, SKILLS_BUDGET_CHARS);
@@ -1188,6 +1198,11 @@ pub(crate) fn tool_guidance(tools: &zerith_tools::Registry) -> String {
             "\n\n# Subagentes\nUse `agent` para explorar o código ou pesquisar sem encher o seu contexto: só a resposta final volta. Para trabalho independente, chame vários `agent` na mesma mensagem. O prompt precisa bastar sozinho.",
         );
     }
+    if has("skill") {
+        out.push_str(
+            "\n\n# Skills\nQuando uma skill relevante já vier pré-carregada em `<system-reminder>`, siga as instruções dela diretamente sem chamar `skill` de novo. Para outra tarefa especializada (equipamento de rede, Proxmox, WireGuard, OLT, Zabbix, Linux ou procedimento), carregue a skill listada com `skill` (ou busque com `skill_search`) no primeiro passo antes de executar comandos.",
+        );
+    }
     if has("ask_user") {
         out.push_str(
             "\n\n# Perguntas\nSe falta uma decisão que só o usuário pode tomar, use `ask_user` em vez de adivinhar.",
@@ -1296,6 +1311,65 @@ pub fn skills_block(lib: &zerith_skills::Library, prompt: &str, budget: usize) -
         }
     }
     out
+}
+
+/// Automatically pre-loads up to 2 high-confidence skills into the transient
+/// `<system-reminder>` on tool-enabled turns so the model follows the right
+/// operational procedure immediately on Step 1 without burning a separate
+/// `skill` tool-call round-trip.
+fn auto_inline_skills(
+    lib: &zerith_skills::Library,
+    catalog: &[(String, String)],
+    prompt: &str,
+    budget: usize,
+) -> String {
+    let mut chosen: Vec<String> = catalog
+        .iter()
+        .filter(|(n, _)| names_skill(prompt, n))
+        .map(|(n, _)| n.clone())
+        .take(2)
+        .collect();
+    if chosen.len() < 2 {
+        for hit in zerith_skills::search::search(lib, prompt, 3) {
+            if chosen.len() >= 2 {
+                break;
+            }
+            let strong = hit.score >= 3.5 || hit.matched.len() >= 2;
+            if strong && !chosen.contains(&hit.name) {
+                chosen.push(hit.name);
+            }
+        }
+    }
+    if chosen.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "# Skills pré-carregadas para este pedido (siga diretamente sem chamar `skill` para elas)",
+    );
+    let mut spent = out.len();
+    let mut added = false;
+    for name in &chosen {
+        if let Some(body) = lib.skill_body(name) {
+            let room = budget.saturating_sub(spent);
+            if room < 160 {
+                break;
+            }
+            let take: String = body.chars().take(room).collect();
+            if !take.trim().is_empty() {
+                out.push_str("\n\n## ");
+                out.push_str(name);
+                out.push('\n');
+                out.push_str(take.trim());
+                spent += take.len() + name.len() + 6;
+                added = true;
+            }
+        }
+    }
+    if added {
+        out
+    } else {
+        String::new()
+    }
 }
 
 /// Which skills a section lists, and whether that is only part of them.
@@ -1487,6 +1561,35 @@ mod skills_tests {
         assert!(block.contains("CORPO-video-subtitles"), "{block}");
         assert!(!block.contains("filler-00"));
         assert!(block.contains("Há 42 skills instaladas"));
+    }
+
+    #[test]
+    fn high_confidence_skill_is_auto_inlined_in_dynamic_reminder_on_tool_turns() {
+        let tmp = tempfile::tempdir_in(scratch()).unwrap();
+        let lib = big_library(tmp.path());
+        let ctx = TurnContext {
+            skills: Some(&lib),
+            no_project_instructions: true,
+            ..TurnContext::default()
+        };
+        let built = build_prompt_context(
+            "NetOps",
+            ctx,
+            true,
+            "s1",
+            "Como entro numa MikroTik RouterOS por SSH?",
+        );
+        let rem = built
+            .dynamic_reminder
+            .expect("deve gerar dynamic_reminder com a skill pré-carregada");
+        assert!(
+            rem.contains("CORPO-mikrotik-routeros-cli"),
+            "deve injetar o corpo da skill relevante no reminder sem quebrar o static_system: {rem}"
+        );
+        assert!(
+            !built.static_system.contains("CORPO-mikrotik-routeros-cli"),
+            "o static_system deve permanecer invariável para preservar o prompt cache"
+        );
     }
 
     #[test]

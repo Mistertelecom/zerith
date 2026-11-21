@@ -37,7 +37,7 @@ base64 = "0.22"
 # Already in the tree (zerith-providers): the self-update check and SHA-256.
 ureq.workspace = true
 ring = "0.17"
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "net", "io-util"] }
 
 [dev-dependencies]
 tempfile.workspace = true

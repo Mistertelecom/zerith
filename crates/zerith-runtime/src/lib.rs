@@ -1871,6 +1871,8 @@ mod gateway_tests {
             background: false,
             created_by_ai: false,
             disabled: false,
+            icon: None,
+            quick_prompts: Vec::new(),
         };
         let prompt = system_prompt(
             "t",

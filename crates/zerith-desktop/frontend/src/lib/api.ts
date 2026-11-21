@@ -507,6 +507,8 @@ export interface AgentView {
   background: boolean;
   createdByAi: boolean;
   disabled: boolean;
+  icon?: string | null;
+  quickPrompts?: string[];
 }
 
 export interface AgentForm {
@@ -515,6 +517,8 @@ export interface AgentForm {
   instructions: string;
   tools: string;
   model: string;
+  icon?: string;
+  quickPrompts?: string[];
 }
 
 export interface SessionRow {
@@ -724,6 +728,10 @@ export const api = {
   agentsList: () => invoke<AgentView[]>("agents_list"),
   agentCreate: (form: AgentForm) =>
     invoke<AgentView[]>("agent_create", { form }),
+  agentSave: (form: AgentForm) =>
+    invoke<AgentView[]>("agent_save", { form }),
+  agentDelete: (name: string) =>
+    invoke<AgentView[]>("agent_delete", { name }),
   agentToggle: (name: string, disabled: boolean) =>
     invoke<AgentView[]>("agent_toggle", { name, disabled }),
   agentReveal: () => invoke<void>("agent_reveal"),
@@ -937,12 +945,15 @@ export const updateApi = {
 export type NodeKind =
   | "trigger_cron"
   | "trigger_manual"
+  | "trigger_webhook"
   | "shell"
   | "ssh_command"
   | "http_request"
   | "ai_agent"
   | "condition"
   | "transform"
+  | "delay"
+  | "loop"
   | "notify_channel"
   | "save_file";
 
@@ -984,6 +995,7 @@ export interface Workflow {
   updated_at_ms: number;
   last_run_at_ms?: number | null;
   last_status?: string | null;
+  bot_name?: string | null;
 }
 
 export interface ChannelConfig {
@@ -1052,6 +1064,7 @@ export const workflowsApi = {
       sampleInput: sampleInput ?? "",
       tzOffsetMinutes: tzOffsetMinutes ?? -new Date().getTimezoneOffset(),
     }),
+  webhookBaseUrl: () => invoke<string>("workflow_webhook_base_url"),
 };
 
 export const channelsApi = {
@@ -1087,4 +1100,21 @@ export function onWorkflowsChanged(handler: () => void): Promise<UnlistenFn> {
   return listen<void>("workflows:changed", () => handler()).catch(
     () => () => undefined,
   );
+}
+
+export interface BotWorkflowReport {
+  botName: string;
+  sessionId: string;
+  workflowId: string;
+  workflowName: string;
+  status: string;
+  summary: string;
+}
+
+export function onBotWorkflowReport(
+  handler: (report: BotWorkflowReport) => void,
+): Promise<UnlistenFn> {
+  return listen<BotWorkflowReport>("bot:workflow_report", (e) =>
+    handler(e.payload),
+  ).catch(() => () => undefined);
 }

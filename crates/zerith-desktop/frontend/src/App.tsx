@@ -19,21 +19,29 @@ import {
   ListChecks,
   Loader,
   PanelRight,
+  Pencil,
+  Play,
   Route,
   Search,
+  Sparkles,
+  Workflow as WorkflowIcon,
   type LucideIcon,
 } from "lucide-react";
 import {
   api,
+  onBotWorkflowReport,
   onTurnDone,
   onTurnEvent,
   onTurnLearned,
+  onWorkflowsChanged,
+  workflowsApi,
   type Account,
   type AgentView,
   type Boot,
   type Routing,
   type Session,
   type SessionUsageTotals,
+  type Workflow,
 } from "./lib/api";
 import {
   applyEvent,
@@ -55,6 +63,7 @@ import { catalogEntry, NOT_CHAT } from "./lib/catalog";
 import { titleOf } from "./lib/title";
 import { TitleBar, type AppView } from "./components/TitleBar";
 import { BotEmblem, emblemForAgent } from "./components/BotEmblem";
+import { BotModal } from "./components/BotModal";
 import { AppVersion } from "./components/Update";
 import { FolderPill } from "./components/FolderPill";
 import { BackgroundJobs } from "./components/BackgroundJobs";
@@ -259,6 +268,12 @@ export default function App() {
   const [activeView, setActiveView] = useState<AppView>("chat");
   const [agents, setAgents] = useState<AgentView[]>([]);
   const [activeAgent, setActiveAgent] = useState<string | null>(null);
+  const [botModal, setBotModal] = useState<{ open: boolean; editing: AgentView | null }>({
+    open: false,
+    editing: null,
+  });
+  const [workflowsList, setWorkflowsList] = useState<Workflow[]>([]);
+  const [runningWfId, setRunningWfId] = useState<string | null>(null);
   const [status, setStatus] = useState("");
   const [inspector, setInspector] = useState(true);
   // Folders used before (newest first, from the store) and the one picked for
@@ -332,6 +347,10 @@ export default function App() {
         void api
           .agentsList()
           .then(setAgents)
+          .catch(() => undefined);
+        void workflowsApi
+          .list()
+          .then(setWorkflowsList)
           .catch(() => undefined);
         document.documentElement.dataset.theme =
           b.theme === "light"
@@ -407,6 +426,35 @@ export default function App() {
       live = false;
     };
   }, [selected, setTurn]);
+
+  useEffect(() => {
+    let u1: (() => void) | undefined;
+    let u2: (() => void) | undefined;
+    void onWorkflowsChanged(() => {
+      void workflowsApi.list().then(setWorkflowsList).catch(() => undefined);
+    }).then((fn) => {
+      u1 = fn;
+    });
+    void onBotWorkflowReport((report) => {
+      setStatus(`Workflow "${report.workflowName}" concluído (${report.status})`);
+      void api
+        .boot()
+        .then((b) => setSessions(b.sessions))
+        .catch(() => undefined);
+      if (selectedRef.current === report.sessionId) {
+        void api
+          .sessionMessages(report.sessionId)
+          .then((list) => setMessages(toBlocks(list)))
+          .catch(() => undefined);
+      }
+    }).then((fn) => {
+      u2 = fn;
+    });
+    return () => {
+      u1?.();
+      u2?.();
+    };
+  }, []);
 
   useEffect(() => {
     if (!selected) {
@@ -538,9 +586,56 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [updateTurn, flushDeltas]);
 
-  const send = useCallback(async () => {
-    const prompt = draft.trim();
+  const send = useCallback(async (overridePrompt?: string) => {
+    const prompt = (overridePrompt ?? draft).trim();
     if (!prompt) return;
+    // Intercept /workflows and /run <id|name> slash shortcuts cleanly without an LLM round-trip.
+    if (prompt === "/workflows") {
+      if (!overridePrompt) setDraft("");
+      const wfs = workflowsList.length ? workflowsList : await workflowsApi.list().catch(() => []);
+      setMessages((prev) => [
+        ...prev,
+        {
+          kind: "note",
+          text: wfs.length
+            ? "Workflows disponíveis (`/run <nome>`):\n" +
+              wfs.map((w) => `• ${w.name} (${w.id})`).join("\n")
+            : "Nenhum workflow cadastrado.",
+        },
+      ]);
+      return;
+    }
+    if (prompt.startsWith("/run ")) {
+      const q = prompt.slice(5).trim().toLowerCase();
+      if (!q) return;
+      if (!overridePrompt) setDraft("");
+      const wfs = workflowsList.length ? workflowsList : await workflowsApi.list().catch(() => []);
+      const match =
+        wfs.find((w) => w.id.toLowerCase() === q) ??
+        wfs.find((w) => w.name.toLowerCase().includes(q));
+      if (!match) {
+        setStatus(`Workflow não encontrado para "/run ${q}"`);
+        return;
+      }
+      setRunningWfId(match.id);
+      setStatus(`Executando "${match.name}"…`);
+      try {
+        const run = await workflowsApi.runNow(match.id);
+        setStatus(`"${match.name}" finalizado (${run.status})`);
+        setMessages((prev) => [
+          ...prev,
+          {
+            kind: "note",
+            text: `⚡ **${match.name}** (${run.status}):\n${run.summary || "Concluído sem saída textual."}`,
+          },
+        ]);
+      } catch (e) {
+        setStatus(`Erro ao executar "${match.name}": ${e}`);
+      } finally {
+        setRunningWfId(null);
+      }
+      return;
+    }
     // Enter while the answer streams: the backend would refuse the second
     // turn and the transcript would split. Keep the draft and say why.
     if (selected && (turns[selected]?.busy ?? false)) {
@@ -552,7 +647,7 @@ export default function App() {
       return;
     }
     setError(null);
-    setDraft("");
+    if (!overridePrompt) setDraft("");
     let id = selected;
     try {
       if (!id) {
@@ -612,6 +707,7 @@ export default function App() {
     effort,
     selected,
     activeAgent,
+    workflowsList,
     turns,
     folder,
     updateTurn,
@@ -1003,6 +1099,22 @@ export default function App() {
     setActiveView(v);
     if (v === "bots") {
       void api.agentsList().then(setAgents).catch(() => undefined);
+      void workflowsApi.list().then(setWorkflowsList).catch(() => undefined);
+    } else if (v === "chat") {
+      void workflowsApi.list().then(setWorkflowsList).catch(() => undefined);
+    }
+  }, []);
+
+  const runBotWorkflow = useCallback(async (wf: Workflow) => {
+    setRunningWfId(wf.id);
+    setStatus(`Executando "${wf.name}"…`);
+    try {
+      const res = await workflowsApi.runNow(wf.id);
+      setStatus(`Workflow "${wf.name}" finalizado (${res.status})`);
+    } catch (e) {
+      setStatus(`Erro em "${wf.name}": ${e}`);
+    } finally {
+      setRunningWfId(null);
     }
   }, []);
 
@@ -1074,6 +1186,9 @@ export default function App() {
           agents={agents}
           activeBot={activeAgent}
           onSelectBot={selectBot}
+          onSelectBotSession={(sid) => setSelected(sid)}
+          onCreateBot={() => setBotModal({ open: true, editing: null })}
+          onEditBot={(bot) => setBotModal({ open: true, editing: bot })}
           onNewBotChat={() => {
             if (activeAgent) {
               try {
@@ -1160,12 +1275,27 @@ export default function App() {
           <header className="topbar">
             <h1 className="topbar-title" style={{ display: "flex", alignItems: "center", gap: 8 }}>
               {activeAgent ? (
-                <BotEmblem icon={emblemForAgent(activeAgent)} size={22} status="on" />
+                <BotEmblem
+                  icon={activeBotSpec?.icon || emblemForAgent(activeAgent)}
+                  size={22}
+                  status="on"
+                />
               ) : null}
               <span>
                 {current?.title ??
                   (activeAgent ? `@${activeAgent}` : tr(lang, "Nova conversa", "New chat"))}
               </span>
+              {activeBotSpec ? (
+                <button
+                  type="button"
+                  className="icon-btn sm"
+                  onClick={() => setBotModal({ open: true, editing: activeBotSpec })}
+                  title={tr(lang, "Configurar este bot", "Configure this bot")}
+                  aria-label={tr(lang, "Configurar este bot", "Configure this bot")}
+                >
+                  <Pencil size={13} strokeWidth={2} />
+                </button>
+              ) : null}
             </h1>
             {turn.busy ? (
               <span className="top-pill busy" role="status">
@@ -1226,8 +1356,8 @@ export default function App() {
                   {activeBotSpec ? (
                     <>
                       <BotEmblem
-                        icon={emblemForAgent(activeBotSpec.name)}
-                        size={48}
+                        icon={activeBotSpec.icon || emblemForAgent(activeBotSpec.name)}
+                        size={54}
                         status="on"
                       />
                       <h2>@{activeBotSpec.name}</h2>
@@ -1239,6 +1369,65 @@ export default function App() {
                             "Specialist bot ready to act in your workspace.",
                           )}
                       </p>
+                      <div className="bot-hero-actions">
+                        <button
+                          type="button"
+                          className="btn sm"
+                          onClick={() => setBotModal({ open: true, editing: activeBotSpec })}
+                        >
+                          <Pencil size={13} />
+                          <span>{tr(lang, "Editar bot", "Edit bot")}</span>
+                        </button>
+                        <button
+                          type="button"
+                          className="btn sm"
+                          onClick={() => setActiveView("workflows")}
+                        >
+                          <WorkflowIcon size={13} />
+                          <span>Workflows</span>
+                        </button>
+                      </div>
+                      {(activeBotSpec.quickPrompts?.length ?? 0) > 0 ? (
+                        <div className="bot-quick-prompts">
+                          {activeBotSpec.quickPrompts!.map((qp) => (
+                            <button
+                              key={qp}
+                              type="button"
+                              className="bot-quick-chip"
+                              onClick={() => void send(qp)}
+                            >
+                              <Sparkles size={12} />
+                              <span>{qp}</span>
+                            </button>
+                          ))}
+                        </div>
+                      ) : null}
+                      {(() => {
+                        const linked = workflowsList.filter(
+                          (w) => w.bot_name === activeBotSpec.name,
+                        );
+                        if (!linked.length) return null;
+                        return (
+                          <div className="bot-linked-wfs">
+                            <span className="bot-linked-label">
+                              {tr(lang, "Workflows vinculados:", "Linked workflows:")}
+                            </span>
+                            {linked.map((wf) => (
+                              <button
+                                key={wf.id}
+                                type="button"
+                                className="bot-wf-pill"
+                                disabled={runningWfId === wf.id}
+                                onClick={() => void runBotWorkflow(wf)}
+                                title={wf.description || wf.name}
+                              >
+                                <Play size={11} />
+                                <span>{runningWfId === wf.id ? "…" : wf.name}</span>
+                              </button>
+                            ))}
+                          </div>
+                        );
+                      })()}
                     </>
                   ) : (
                     <>
@@ -1623,6 +1812,22 @@ export default function App() {
             ]}
           />
         ) : null}
+        <BotModal
+          open={botModal.open}
+          editing={botModal.editing}
+          models={models}
+          onClose={() => setBotModal({ open: false, editing: null })}
+          onSaved={(updated, savedName) => {
+            setAgents(updated);
+            if (savedName) {
+              setActiveAgent(savedName);
+            } else if (botModal.editing && activeAgent === botModal.editing.name) {
+              setActiveAgent(updated[0]?.name ?? null);
+              setSelected(null);
+              setMessages([]);
+            }
+          }}
+        />
       </div>
     </div>
   );

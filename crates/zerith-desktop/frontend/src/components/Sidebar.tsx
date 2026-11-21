@@ -9,6 +9,7 @@ import {
   Pencil,
   Pin,
   PinOff,
+  Plus,
   Search,
   Settings,
   SquarePen,
@@ -61,6 +62,9 @@ export function Sidebar(props: {
   agents?: AgentView[];
   activeBot?: string | null;
   onSelectBot?: (bot: AgentView) => void;
+  onSelectBotSession?: (id: string) => void;
+  onCreateBot?: () => void;
+  onEditBot?: (bot: AgentView) => void;
   onNewBotChat?: () => void;
   memoryPaused: boolean;
   onToggleMemory: () => void;
@@ -207,7 +211,20 @@ export function Sidebar(props: {
       {props.view === "bots" ? (
         <nav className="side-list" aria-label="Bots">
           <section className="side-group">
-            <h2 className="side-group-label">{tr(lang, "Bots Especialistas", "Specialist Bots")}</h2>
+            <div className="bot-section-head">
+              <h2 className="side-group-label">{tr(lang, "Bots Especialistas", "Specialist Bots")}</h2>
+              {props.onCreateBot ? (
+                <button
+                  type="button"
+                  className="bot-add-btn"
+                  onClick={props.onCreateBot}
+                  title={tr(lang, "Criar novo bot especialista", "Create new specialist bot")}
+                >
+                  <Plus size={12} strokeWidth={2.4} />
+                  <span>{tr(lang, "Novo", "New")}</span>
+                </button>
+              ) : null}
+            </div>
             {(props.agents ?? [])
               .filter((b) => !b.disabled)
               .filter((b) => {
@@ -218,23 +235,108 @@ export function Sidebar(props: {
                   b.description.toLowerCase().includes(q)
                 );
               })
-              .map((bot) => (
-                <button
-                  key={bot.name}
-                  className={"bot-roster-row" + (props.activeBot === bot.name ? " on" : "")}
-                  onClick={() => props.onSelectBot?.(bot)}
-                  title={bot.description || bot.name}
-                >
-                  <BotEmblem icon={emblemForAgent(bot.name)} size={34} status="on" />
-                  <div className="bot-roster-info">
-                    <span className="bot-roster-name">{bot.name}</span>
-                    <span className="bot-roster-desc">
-                      {bot.description || bot.layer}
-                    </span>
+              .map((bot) => {
+                const botSessions = props.sessions.filter((s) =>
+                  s.title.startsWith(`@${bot.name}`),
+                );
+                const liveStates = botSessions
+                  .map((s) => props.status?.(s.id))
+                  .filter(Boolean);
+                const emblemStatus: "on" | "running" | "error" = liveStates.includes(
+                  "waiting",
+                )
+                  ? "error"
+                  : liveStates.includes("busy")
+                    ? "running"
+                    : "on";
+                return (
+                  <div
+                    key={bot.name}
+                    className={
+                      "bot-roster-item" + (props.activeBot === bot.name ? " on" : "")
+                    }
+                  >
+                    <button
+                      type="button"
+                      className={
+                        "bot-roster-row" + (props.activeBot === bot.name ? " on" : "")
+                      }
+                      onClick={() => props.onSelectBot?.(bot)}
+                      title={bot.description || bot.name}
+                    >
+                      <BotEmblem
+                        icon={bot.icon || emblemForAgent(bot.name)}
+                        size={34}
+                        status={emblemStatus}
+                      />
+                      <div className="bot-roster-info">
+                        <span className="bot-roster-name">
+                          @{bot.name}
+                          {botSessions.length > 0 ? (
+                            <span className="bot-roster-count">{botSessions.length}</span>
+                          ) : null}
+                        </span>
+                        <span className="bot-roster-desc">
+                          {bot.description || bot.layer}
+                        </span>
+                      </div>
+                    </button>
+                    {props.onEditBot ? (
+                      <button
+                        type="button"
+                        className="icon-btn sm bot-roster-edit"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          props.onEditBot?.(bot);
+                        }}
+                        title={tr(lang, "Editar bot", "Edit bot")}
+                        aria-label={tr(lang, "Editar bot", "Edit bot")}
+                      >
+                        <Pencil size={12} strokeWidth={2} />
+                      </button>
+                    ) : null}
                   </div>
-                </button>
-              ))}
+                );
+              })}
           </section>
+          {props.activeBot ? (() => {
+            const activeRows = props.sessions.filter((s) =>
+              s.title.startsWith(`@${props.activeBot}`),
+            );
+            return activeRows.length > 0 ? (
+              <section className="side-group">
+                <h2 className="side-group-label">
+                  {tr(lang, `Histórico de @${props.activeBot}`, `@${props.activeBot} History`)}
+                </h2>
+                {activeRows.map((s) => {
+                  const ts = s.updated_at < 1e12 ? s.updated_at * 1000 : s.updated_at;
+                  const cleanTitle = s.title
+                    .replace(`@${props.activeBot}`, "")
+                    .replace(/^\s*·\s*/, "")
+                    .trim() || tr(lang, "Conversa", "Chat");
+                  const state = props.status?.(s.id);
+                  return (
+                    <button
+                      key={s.id}
+                      type="button"
+                      className={"list-row side-row" + (s.id === props.selected ? " on" : "")}
+                      onClick={() => props.onSelectBotSession?.(s.id)}
+                      title={s.title}
+                    >
+                      <MessageSquare size={14} strokeWidth={1.75} />
+                      <span className="side-row-title">{cleanTitle}</span>
+                      {state ? (
+                        <span className={"side-row-state " + state}>
+                          {state === "waiting" ? "!" : <Loader size={11} strokeWidth={2.5} />}
+                        </span>
+                      ) : null}
+                      <span className="side-row-time">{when(ts, 0)}</span>
+                    </button>
+                  );
+                })}
+              </section>
+            ) : null;
+          })() : null}
         </nav>
       ) : (
       <nav className="side-list" aria-label={tr(lang, "Conversas", "Chats")}>

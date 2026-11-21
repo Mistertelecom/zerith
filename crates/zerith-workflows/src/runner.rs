@@ -15,6 +15,11 @@ use crate::{now_ms, unix_secs, Result, WorkflowError};
 
 pub trait AiExecutor: Send + Sync {
     fn complete(&self, model: Option<&str>, system: &str, prompt: &str) -> Result<String>;
+
+    /// Optional specialist bot lookup returning `(preferred_model, instructions)`.
+    fn resolve_bot(&self, _bot_name: &str) -> Option<(Option<String>, String)> {
+        None
+    }
 }
 
 pub struct NoopAiExecutor;
@@ -31,6 +36,7 @@ pub struct RunOptions<'a> {
     pub ai: &'a dyn AiExecutor,
     pub trigger_source: &'a str,
     pub tz_offset_minutes: i32,
+    pub initial_input: Option<&'a str>,
     pub on_event: &'a mut (dyn FnMut(NodeEvent) + Send),
 }
 
@@ -126,7 +132,7 @@ pub fn execute_workflow(wf: &Workflow, opts: &mut RunOptions<'_>) -> Result<Work
 
         let prev = last_incoming.get(node_id).cloned().unwrap_or_default();
         let t0 = Instant::now();
-        let res = run_node(node, &prev, &outputs, &now_dt, opts);
+        let res = run_node_with_controls(node, &prev, &outputs, &now_dt, opts);
         let duration_ms = t0.elapsed().as_millis() as u64;
 
         match res {
@@ -234,6 +240,137 @@ fn enqueue_children<'a>(
     }
 }
 
+fn run_node_with_controls(
+    node: &WorkflowNode,
+    prev: &str,
+    outputs: &HashMap<String, String>,
+    now_dt: &LocalDateTime,
+    opts: &RunOptions<'_>,
+) -> Result<(String, Option<String>)> {
+    let cfg = &node.config;
+    // Pin / Mock output bypasses real external execution for safe downstream testing.
+    if cfg.get("pin_enabled").and_then(|v| v.as_bool()) == Some(true) {
+        let pinned = cfg
+            .get("pinned_output")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        return Ok((pinned, None));
+    }
+
+    let retry_count = cfg
+        .get("retry_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+        .clamp(0, 5);
+    let retry_delay_secs = cfg
+        .get("retry_delay_secs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(2)
+        .clamp(1, 60);
+
+    let mut attempt = 0u64;
+    loop {
+        match run_node(node, prev, outputs, now_dt, opts) {
+            Ok(ok) => return Ok(ok),
+            Err(err) if attempt < retry_count => {
+                attempt += 1;
+                std::thread::sleep(Duration::from_secs(retry_delay_secs));
+                let _ = err;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+struct HttpCall<'a> {
+    cfg: &'a Value,
+    method: &'a str,
+    url: &'a str,
+    body: &'a str,
+    allow_err: bool,
+    prev: &'a str,
+    outputs: &'a HashMap<String, String>,
+    now_dt: &'a LocalDateTime,
+}
+
+fn execute_http(call: HttpCall<'_>) -> Result<String> {
+    let mut req = ureq::request(call.method, call.url).timeout(Duration::from_secs(30));
+    if let Some(obj) = call.cfg.get("headers").and_then(|h| h.as_object()) {
+        for (k, v) in obj {
+            if let Some(vs) = v.as_str() {
+                req = req.set(k, &interpolate(vs, call.prev, call.outputs, call.now_dt));
+            }
+        }
+    }
+    let resp = if matches!(call.method, "POST" | "PUT" | "PATCH") {
+        if call
+            .cfg
+            .get("headers")
+            .and_then(|h| h.get("Content-Type"))
+            .is_none()
+        {
+            req = req.set("Content-Type", "application/json");
+        }
+        req.send_string(call.body)
+    } else {
+        req.call()
+    };
+    match resp {
+        Ok(r) => {
+            let status = r.status();
+            let text = r.into_string().unwrap_or_default();
+            let clipped = clip_text(&text, 12_000);
+            Ok(format!("HTTP {status}\n{clipped}"))
+        }
+        Err(ureq::Error::Status(code, r)) => {
+            let text = r.into_string().unwrap_or_default();
+            let clipped = clip_text(&text, 4000);
+            let formatted = format!("HTTP {code}\n{clipped}");
+            if call.allow_err {
+                Ok(formatted)
+            } else {
+                Err(WorkflowError::Exec(formatted))
+            }
+        }
+        Err(e) => {
+            if call.allow_err {
+                Ok(format!("HTTP ERROR: {e}"))
+            } else {
+                Err(WorkflowError::Exec(e.to_string()))
+            }
+        }
+    }
+}
+
+fn parse_loop_items(raw_items: Option<&str>, prev: &str, outputs: &HashMap<String, String>, now_dt: &LocalDateTime) -> Vec<String> {
+    let source = match raw_items {
+        Some(raw) if !raw.is_empty() => interpolate(raw, prev, outputs, now_dt),
+        _ => prev.to_string(),
+    };
+    let trimmed = source.trim();
+    if trimmed.starts_with('[') {
+        if let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(trimmed) {
+            return arr
+                .into_iter()
+                .take(50)
+                .map(|v| match v {
+                    Value::String(s) => s,
+                    other => other.to_string(),
+                })
+                .filter(|s| !s.trim().is_empty())
+                .collect();
+        }
+    }
+    trimmed
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .take(50)
+        .map(str::to_string)
+        .collect()
+}
+
 fn run_node(
     node: &WorkflowNode,
     prev: &str,
@@ -252,6 +389,21 @@ fn run_node(
             ),
             None,
         )),
+        NodeKind::TriggerWebhook => {
+            if let Some(payload) = opts.initial_input.map(str::trim).filter(|s| !s.is_empty()) {
+                Ok((payload.to_string(), None))
+            } else {
+                Ok((
+                    format!(
+                        "Webhook disparado ({}) em {} {}",
+                        opts.trigger_source,
+                        now_dt.date_string(),
+                        now_dt.time_string()
+                    ),
+                    None,
+                ))
+            }
+        }
         NodeKind::Shell => {
             let raw_cmd = cfg_str(cfg, "command").unwrap_or("");
             if raw_cmd.is_empty() {
@@ -330,61 +482,37 @@ fn run_node(
                 .get("allow_error_status")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-
-            let mut req = ureq::request(&method, &url).timeout(Duration::from_secs(30));
-            if let Some(obj) = cfg.get("headers").and_then(|h| h.as_object()) {
-                for (k, v) in obj {
-                    if let Some(vs) = v.as_str() {
-                        req = req.set(k, &interpolate(vs, prev, outputs, now_dt));
-                    }
-                }
-            }
-            let resp = if matches!(method.as_str(), "POST" | "PUT" | "PATCH") {
-                if cfg
-                    .get("headers")
-                    .and_then(|h| h.get("Content-Type"))
-                    .is_none()
-                {
-                    req = req.set("Content-Type", "application/json");
-                }
-                req.send_string(&body)
-            } else {
-                req.call()
-            };
-            match resp {
-                Ok(r) => {
-                    let status = r.status();
-                    let text = r.into_string().unwrap_or_default();
-                    let clipped = clip_text(&text, 12_000);
-                    Ok((format!("HTTP {status}\n{clipped}"), None))
-                }
-                Err(ureq::Error::Status(code, r)) => {
-                    let text = r.into_string().unwrap_or_default();
-                    let clipped = clip_text(&text, 4000);
-                    let formatted = format!("HTTP {code}\n{clipped}");
-                    if allow_err {
-                        Ok((formatted, None))
-                    } else {
-                        Err(WorkflowError::Exec(formatted))
-                    }
-                }
-                Err(e) => {
-                    if allow_err {
-                        Ok((format!("HTTP ERROR: {e}"), None))
-                    } else {
-                        Err(WorkflowError::Exec(e.to_string()))
-                    }
-                }
-            }
+            let out = execute_http(HttpCall {
+                cfg,
+                method: &method,
+                url: &url,
+                body: &body,
+                allow_err,
+                prev,
+                outputs,
+                now_dt,
+            })?;
+            Ok((out, None))
         }
         NodeKind::AiAgent => {
-            let model = cfg_str(cfg, "model");
-            let system_raw =
-                cfg_str(cfg, "system").unwrap_or("You are a helpful automation agent.");
+            let explicit_model = cfg_str(cfg, "model");
+            let bot_meta = cfg_str(cfg, "bot_name").and_then(|name| opts.ai.resolve_bot(name));
+            let resolved_model = explicit_model
+                .map(str::to_string)
+                .or_else(|| bot_meta.as_ref().and_then(|(m, _)| m.clone()));
+            let node_sys = cfg_str(cfg, "system").unwrap_or("");
+            let combined_sys = match (bot_meta.as_ref().map(|(_, i)| i.trim()), node_sys.trim()) {
+                (Some(bot_inst), "") if !bot_inst.is_empty() => bot_inst.to_string(),
+                (Some(bot_inst), custom) if !bot_inst.is_empty() => {
+                    format!("{bot_inst}\n\nInstruções adicionais do nó:\n{custom}")
+                }
+                (_, "") => "You are a helpful automation agent.".to_string(),
+                (_, custom) => custom.to_string(),
+            };
             let prompt_raw = cfg_str(cfg, "prompt").unwrap_or("{{prev}}");
-            let system = interpolate(system_raw, prev, outputs, now_dt);
+            let system = interpolate(&combined_sys, prev, outputs, now_dt);
             let prompt = interpolate(prompt_raw, prev, outputs, now_dt);
-            let out = opts.ai.complete(model, &system, &prompt)?;
+            let out = opts.ai.complete(resolved_model.as_deref(), &system, &prompt)?;
             Ok((out, None))
         }
         NodeKind::Condition => {
@@ -425,6 +553,72 @@ fn run_node(
                 }
             };
             Ok((out, None))
+        }
+        NodeKind::Delay => {
+            let secs = cfg
+                .get("seconds")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(5)
+                .clamp(1, 300);
+            std::thread::sleep(Duration::from_secs(secs));
+            Ok((prev.to_string(), None))
+        }
+        NodeKind::Loop => {
+            let items = parse_loop_items(cfg_str(cfg, "items"), prev, outputs, now_dt);
+            if items.is_empty() {
+                return Ok((String::new(), None));
+            }
+            let mode = cfg_str(cfg, "mode").unwrap_or("template");
+            let sep = cfg
+                .get("separator")
+                .and_then(|v| v.as_str())
+                .unwrap_or("\n");
+            let mut results = Vec::with_capacity(items.len());
+            for (idx, item) in items.iter().enumerate() {
+                let idx_str = idx.to_string();
+                let res = match mode {
+                    "shell" => {
+                        let cmd_tpl = cfg_str(cfg, "command").unwrap_or("echo {{item}}");
+                        let cmd = interpolate(cmd_tpl, prev, outputs, now_dt)
+                            .replace("{{item}}", item)
+                            .replace("{{index}}", &idx_str);
+                        let out = run_shell_command(&cmd, None, Duration::from_secs(30))?;
+                        format!("{item}: {out}")
+                    }
+                    "http" => {
+                        let url_tpl = cfg_str(cfg, "url").unwrap_or("");
+                        if url_tpl.is_empty() {
+                            return Err(WorkflowError::Exec("URL HTTP vazia no nó Loop".into()));
+                        }
+                        let url = interpolate(url_tpl, prev, outputs, now_dt)
+                            .replace("{{item}}", item)
+                            .replace("{{index}}", &idx_str);
+                        let method = cfg_str(cfg, "method").unwrap_or("GET").to_ascii_uppercase();
+                        let body = interpolate(cfg_str(cfg, "body").unwrap_or(""), prev, outputs, now_dt)
+                            .replace("{{item}}", item)
+                            .replace("{{index}}", &idx_str);
+                        let out = execute_http(HttpCall {
+                            cfg,
+                            method: &method,
+                            url: &url,
+                            body: &body,
+                            allow_err: true,
+                            prev,
+                            outputs,
+                            now_dt,
+                        })?;
+                        format!("{item}: {out}")
+                    }
+                    _ => {
+                        let tpl = cfg_str(cfg, "template").unwrap_or("{{item}}");
+                        interpolate(tpl, prev, outputs, now_dt)
+                            .replace("{{item}}", item)
+                            .replace("{{index}}", &idx_str)
+                    }
+                };
+                results.push(res);
+            }
+            Ok((results.join(sep), None))
         }
         NodeKind::NotifyChannel => {
             let channel_id = cfg_str(cfg, "channel_id").ok_or_else(|| {
@@ -638,8 +832,17 @@ mod tests {
 
     struct EchoAi;
     impl AiExecutor for EchoAi {
-        fn complete(&self, _model: Option<&str>, _system: &str, prompt: &str) -> Result<String> {
-            Ok(format!("AI_REPORT: {prompt}"))
+        fn complete(&self, model: Option<&str>, system: &str, prompt: &str) -> Result<String> {
+            let m = model.unwrap_or("default");
+            Ok(format!("AI_REPORT[{m}|{system}]: {prompt}"))
+        }
+
+        fn resolve_bot(&self, bot_name: &str) -> Option<(Option<String>, String)> {
+            if bot_name == "noc-engineer" {
+                Some((Some("gpt-4o-mini".into()), "NOC specialist".into()))
+            } else {
+                None
+            }
         }
     }
 
@@ -743,6 +946,7 @@ mod tests {
             updated_at_ms: 1,
             last_run_at_ms: None,
             last_status: None,
+            bot_name: None,
         };
 
         store.save_workflow(&wf).unwrap();
@@ -754,6 +958,7 @@ mod tests {
             ai: &ai,
             trigger_source: "test",
             tz_offset_minutes: -180,
+            initial_input: None,
             on_event: &mut |ev| events.push(ev),
         };
         let run = execute_workflow(&wf, &mut opts).unwrap();
@@ -762,7 +967,7 @@ mod tests {
         assert!(!dir.path().join("out_false.txt").is_file());
         let saved = std::fs::read_to_string(dir.path().join("out_true.txt")).unwrap();
         assert!(
-            saved.contains("AI_REPORT: Check: OFFLINE_SWITCH_01"),
+            saved.contains("AI_REPORT[default|You are a helpful automation agent.]: Check: OFFLINE_SWITCH_01"),
             "{saved}"
         );
         assert!(events
@@ -782,6 +987,7 @@ mod tests {
             ai: &ai,
             trigger_source: "test",
             tz_offset_minutes: -180,
+            initial_input: None,
             on_event: &mut |_| {},
         };
         let n_json = WorkflowNode {
@@ -810,5 +1016,89 @@ mod tests {
         };
         let out_f = test_single_node(&n_filter, "SW-01 UP\nOLT-02 DOWN\nSW-03 UP", &opts).unwrap();
         assert_eq!(out_f, "OLT-02 DOWN");
+    }
+
+    #[test]
+    fn webhook_pin_loop_and_bot_binding_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("w.db")).unwrap();
+        let ai = EchoAi;
+        let mut opts = RunOptions {
+            store: &store,
+            data_root: dir.path(),
+            ai: &ai,
+            trigger_source: "webhook",
+            tz_offset_minutes: -180,
+            initial_input: Some("[\"10.0.0.1\",\"10.0.0.2\"]"),
+            on_event: &mut |_| {},
+        };
+        let wf = Workflow {
+            id: "hook-wf".into(),
+            name: "Hook + Loop + Mock + Bot".into(),
+            description: "".into(),
+            icon: "workflow".into(),
+            enabled: true,
+            bot_name: Some("noc-engineer".into()),
+            nodes: vec![
+                WorkflowNode {
+                    id: "wh".into(),
+                    kind: NodeKind::TriggerWebhook,
+                    label: "Webhook".into(),
+                    x: 0.0,
+                    y: 0.0,
+                    config: json!({ "slug": "zabbix" }),
+                },
+                WorkflowNode {
+                    id: "lp".into(),
+                    kind: NodeKind::Loop,
+                    label: "Format IPs".into(),
+                    x: 100.0,
+                    y: 0.0,
+                    config: json!({
+                        "mode": "template",
+                        "template": "#{{index}} host={{item}}",
+                        "separator": ", "
+                    }),
+                },
+                WorkflowNode {
+                    id: "mk".into(),
+                    kind: NodeKind::Shell,
+                    label: "Mocked Probe".into(),
+                    x: 200.0,
+                    y: 0.0,
+                    config: json!({
+                        "command": "exit 1",
+                        "pin_enabled": true,
+                        "pinned_output": "PINNED_OK"
+                    }),
+                },
+                WorkflowNode {
+                    id: "ai".into(),
+                    kind: NodeKind::AiAgent,
+                    label: "Bot Summary".into(),
+                    x: 300.0,
+                    y: 0.0,
+                    config: json!({
+                        "bot_name": "noc-engineer",
+                        "prompt": "{{node.lp}} | {{prev}}"
+                    }),
+                },
+            ],
+            edges: vec![
+                WorkflowEdge { id: "e1".into(), from: "wh".into(), to: "lp".into(), branch: None },
+                WorkflowEdge { id: "e2".into(), from: "lp".into(), to: "mk".into(), branch: None },
+                WorkflowEdge { id: "e3".into(), from: "mk".into(), to: "ai".into(), branch: None },
+            ],
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            last_run_at_ms: None,
+            last_status: None,
+        };
+        let run = execute_workflow(&wf, &mut opts).unwrap();
+        assert_eq!(run.status, "ok");
+        assert_eq!(
+            run.summary,
+            "AI_REPORT[gpt-4o-mini|NOC specialist]: #0 host=10.0.0.1, #1 host=10.0.0.2 | PINNED_OK"
+        );
     }
 }

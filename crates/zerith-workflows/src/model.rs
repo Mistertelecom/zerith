@@ -6,12 +6,15 @@ use serde_json::Value;
 pub enum NodeKind {
     TriggerCron,
     TriggerManual,
+    TriggerWebhook,
     Shell,
     SshCommand,
     HttpRequest,
     AiAgent,
     Condition,
     Transform,
+    Delay,
+    Loop,
     NotifyChannel,
     SaveFile,
 }
@@ -21,19 +24,25 @@ impl NodeKind {
         match self {
             Self::TriggerCron => "trigger_cron",
             Self::TriggerManual => "trigger_manual",
+            Self::TriggerWebhook => "trigger_webhook",
             Self::Shell => "shell",
             Self::SshCommand => "ssh_command",
             Self::HttpRequest => "http_request",
             Self::AiAgent => "ai_agent",
             Self::Condition => "condition",
             Self::Transform => "transform",
+            Self::Delay => "delay",
+            Self::Loop => "loop",
             Self::NotifyChannel => "notify_channel",
             Self::SaveFile => "save_file",
         }
     }
 
     pub fn is_trigger(&self) -> bool {
-        matches!(self, Self::TriggerCron | Self::TriggerManual)
+        matches!(
+            self,
+            Self::TriggerCron | Self::TriggerManual | Self::TriggerWebhook
+        )
     }
 }
 
@@ -77,6 +86,9 @@ pub struct Workflow {
     pub last_run_at_ms: Option<i64>,
     #[serde(default)]
     pub last_status: Option<String>,
+    /// Optional owning specialist bot name (Bots <-> Workflows integration).
+    #[serde(default)]
+    pub bot_name: Option<String>,
 }
 
 fn default_icon() -> String {

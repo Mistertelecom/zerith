@@ -44,7 +44,8 @@ impl Store {
                 created_at_ms INTEGER NOT NULL,
                 updated_at_ms INTEGER NOT NULL,
                 last_run_at_ms INTEGER,
-                last_status TEXT
+                last_status TEXT,
+                bot_name TEXT
             );
 
             CREATE TABLE IF NOT EXISTS channels (
@@ -71,6 +72,8 @@ impl Store {
                 ON workflow_runs(workflow_id, started_at_ms DESC);
             "#,
         )?;
+        // Idempotent migration for existing databases created prior to v0.3.3.
+        let _ = conn.execute("ALTER TABLE workflows ADD COLUMN bot_name TEXT", []);
         Ok(())
     }
 
@@ -94,7 +97,7 @@ impl Store {
         let conn = self.conn.lock().map_err(|_| WorkflowError::Lock)?;
         let mut stmt = conn.prepare(
             "SELECT id, name, description, icon, enabled, nodes_json, edges_json,
-                    created_at_ms, updated_at_ms, last_run_at_ms, last_status
+                    created_at_ms, updated_at_ms, last_run_at_ms, last_status, bot_name
              FROM workflows
              ORDER BY updated_at_ms DESC, name ASC",
         )?;
@@ -110,7 +113,7 @@ impl Store {
         let conn = self.conn.lock().map_err(|_| WorkflowError::Lock)?;
         conn.query_row(
             "SELECT id, name, description, icon, enabled, nodes_json, edges_json,
-                    created_at_ms, updated_at_ms, last_run_at_ms, last_status
+                    created_at_ms, updated_at_ms, last_run_at_ms, last_status, bot_name
              FROM workflows WHERE id = ?1",
             params![id],
             row_to_workflow,
@@ -134,11 +137,17 @@ impl Store {
         } else {
             now
         };
+        let bot_name = wf
+            .bot_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
         conn.execute(
             "INSERT INTO workflows (
                 id, name, description, icon, enabled, nodes_json, edges_json,
-                created_at_ms, updated_at_ms, last_run_at_ms, last_status
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                created_at_ms, updated_at_ms, last_run_at_ms, last_status, bot_name
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 description = excluded.description,
@@ -146,7 +155,8 @@ impl Store {
                 enabled = excluded.enabled,
                 nodes_json = excluded.nodes_json,
                 edges_json = excluded.edges_json,
-                updated_at_ms = excluded.updated_at_ms",
+                updated_at_ms = excluded.updated_at_ms,
+                bot_name = excluded.bot_name",
             params![
                 wf.id,
                 wf.name,
@@ -158,7 +168,8 @@ impl Store {
                 created,
                 updated,
                 wf.last_run_at_ms,
-                wf.last_status
+                wf.last_status,
+                bot_name
             ],
         )?;
         drop(conn);
@@ -331,6 +342,7 @@ fn row_to_workflow(row: &rusqlite::Row<'_>) -> rusqlite::Result<Workflow> {
         updated_at_ms: row.get(8)?,
         last_run_at_ms: row.get(9)?,
         last_status: row.get(10)?,
+        bot_name: row.get(11)?,
     })
 }
 
@@ -441,6 +453,7 @@ pub fn starter_templates() -> Vec<Workflow> {
         updated_at_ms: now - 3000,
         last_run_at_ms: None,
         last_status: None,
+        bot_name: Some("noc-engineer".into()),
     });
     base.push(Workflow {
         id: "api-ai-executive-brief".into(),
@@ -518,6 +531,7 @@ pub fn starter_templates() -> Vec<Workflow> {
         updated_at_ms: now - 4000,
         last_run_at_ms: None,
         last_status: None,
+        bot_name: Some("workflow-architect".into()),
     });
     base
 }
@@ -593,6 +607,7 @@ fn default_templates(now: i64) -> Vec<Workflow> {
             updated_at_ms: now,
             last_run_at_ms: None,
             last_status: None,
+            bot_name: Some("noc-engineer".into()),
         },
         Workflow {
             id: "api-health-monitor".into(),
@@ -653,6 +668,7 @@ fn default_templates(now: i64) -> Vec<Workflow> {
             updated_at_ms: now - 1000,
             last_run_at_ms: None,
             last_status: None,
+            bot_name: Some("noc-engineer".into()),
         },
         Workflow {
             id: "daily-workspace-digest".into(),
@@ -713,6 +729,7 @@ fn default_templates(now: i64) -> Vec<Workflow> {
             updated_at_ms: now - 2000,
             last_run_at_ms: None,
             last_status: None,
+            bot_name: Some("workflow-architect".into()),
         },
     ]
 }

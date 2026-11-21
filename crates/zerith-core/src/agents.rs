@@ -68,6 +68,10 @@ pub struct AgentDef {
     /// `disabled: true`: on disk but invisible to [`list`] and [`find`] until
     /// the person enables it ([`set_disabled`]). AI-created agents start so.
     pub disabled: bool,
+    /// Visual emblem id for desktop Bots roster (`activity`, `bot`, `trending-up`, ...).
+    pub icon: Option<String>,
+    /// Quick-action starter prompts shown on the bot welcome screen.
+    pub quick_prompts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -331,6 +335,8 @@ pub fn parse(name: String, text: &str, path: PathBuf, layer: &'static str) -> Ag
     let mut background = false;
     let mut created_by_ai = false;
     let mut disabled = false;
+    let mut icon = None;
+    let mut quick_prompts = Vec::new();
     let lines: Vec<&str> = header.lines().collect();
     let mut i = 0;
     while i < lines.len() {
@@ -378,6 +384,8 @@ pub fn parse(name: String, text: &str, path: PathBuf, layer: &'static str) -> Ag
             "background" => background = v == "true",
             "created-by" | "created_by" => created_by_ai = v.eq_ignore_ascii_case("ai"),
             "disabled" => disabled = v.eq_ignore_ascii_case("true"),
+            "icon" if !v.is_empty() => icon = Some(v),
+            "quickPrompts" | "quick_prompts" => quick_prompts = list(),
             _ => {}
         }
     }
@@ -417,6 +425,8 @@ pub fn parse(name: String, text: &str, path: PathBuf, layer: &'static str) -> Ag
         background,
         created_by_ai,
         disabled,
+        icon,
+        quick_prompts,
     }
 }
 
@@ -517,6 +527,12 @@ mod tests {
         assert_eq!(a.isolation, Isolation::Worktree);
         assert!(a.background);
         assert_eq!(a.instructions, "corpo");
+
+        let rich = def(
+            "---\nicon: activity\nquickPrompts:\n  - Verificar interfaces\n  - Auditar BGP\n---\ncorpo",
+        );
+        assert_eq!(rich.icon.as_deref(), Some("activity"));
+        assert_eq!(rich.quick_prompts, ["Verificar interfaces", "Auditar BGP"]);
 
         let plain = def("só corpo");
         assert!(plain.tools.is_none() && plain.skills.is_empty() && !plain.background);

@@ -96,6 +96,7 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
                     "name": {"type": "string", "description": "título curto do workflow"},
                     "description": {"type": "string", "description": "resumo de 1 frase do que a automação faz"},
                     "icon": {"type": "string", "enum": ["workflow", "activity", "globe", "bot", "bell", "terminal", "file-text"], "description": "ícone no roster lateral"},
+                    "bot_name": {"type": "string", "description": "nome opcional do bot especialista responsável pelo workflow"},
                     "enabled": {"type": "boolean", "description": "true para ativar o agendamento cron automaticamente; false para salvar pausado (padrão false)"},
                     "nodes": {
                         "type": "array",
@@ -103,7 +104,7 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
                             "type": "object",
                             "properties": {
                                 "id": {"type": "string"},
-                                "kind": {"type": "string", "enum": ["trigger_cron", "trigger_manual", "shell", "ssh_command", "http_request", "ai_agent", "condition", "transform", "notify_channel", "save_file"]},
+                                "kind": {"type": "string", "enum": ["trigger_cron", "trigger_manual", "trigger_webhook", "shell", "ssh_command", "http_request", "ai_agent", "condition", "transform", "delay", "loop", "notify_channel", "save_file"]},
                                 "label": {"type": "string"},
                                 "x": {"type": "number"},
                                 "y": {"type": "number"},
@@ -347,6 +348,9 @@ fn workflow_create_or_update(args: &Value, _: &CallCtx<'_>, _: &Exec<'_>) -> Res
         updated_at_ms: now,
         last_run_at_ms: existing.as_ref().and_then(|e| e.last_run_at_ms),
         last_status: existing.as_ref().and_then(|e| e.last_status.clone()),
+        bot_name: opt_str(args, "bot_name")
+            .map(str::to_string)
+            .or_else(|| existing.as_ref().and_then(|e| e.bot_name.clone())),
     };
 
     let saved = store
@@ -461,6 +465,7 @@ fn workflow_run(args: &Value, _: &CallCtx<'_>, _: &Exec<'_>) -> Result<String> {
         ai: ai_ref,
         trigger_source: "ai_tool",
         tz_offset_minutes: -180,
+        initial_input: None,
         on_event: &mut noop,
     };
     let run = execute_workflow(&wf, &mut opts).map_err(|e| ToolError::Failed(e.to_string()))?;

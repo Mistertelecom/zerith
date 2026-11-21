@@ -4,15 +4,19 @@ import {
   Bot,
   Clock,
   Copy,
+  Download,
   FileText,
   GitBranch,
   Globe,
+  Hourglass,
   LayoutGrid,
   Maximize2,
   PanelRight,
   Play,
   Plus,
+  Redo2,
   RefreshCw,
+  Repeat,
   Save,
   Send,
   Server,
@@ -20,7 +24,10 @@ import {
   Sparkles,
   Terminal,
   Trash2,
+  Undo2,
+  Upload,
   Wand2,
+  Webhook,
   Workflow as WorkflowIcon,
   X,
   ZoomIn,
@@ -28,11 +35,13 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import {
+  api,
   channelsApi,
   onWorkflowDone,
   onWorkflowEvent,
   onWorkflowsChanged,
   workflowsApi,
+  type AgentView,
   type ChannelConfig,
   type ChannelKind,
   type NodeEvent,
@@ -73,6 +82,14 @@ const NODE_META: Record<
     color: "#fbbf24",
     icon: Play,
     defaultCfg: () => ({}),
+  },
+  trigger_webhook: {
+    pt: "Webhook HTTP",
+    en: "HTTP Webhook",
+    cat: "trigger",
+    color: "#f59e0b",
+    icon: Webhook,
+    defaultCfg: () => ({ slug: "", secret: "" }),
   },
   shell: {
     pt: "Shell / Script",
@@ -127,10 +144,27 @@ const NODE_META: Record<
     color: "#c4b5fd",
     icon: Bot,
     defaultCfg: () => ({
+      bot_name: "",
       model: "",
       system: "Summarize concisely and highlight actionable issues.",
       prompt: "{{prev}}",
     }),
+  },
+  delay: {
+    pt: "Aguardar (Delay)",
+    en: "Delay",
+    cat: "logic",
+    color: "#94a3b8",
+    icon: Hourglass,
+    defaultCfg: () => ({ seconds: 5 }),
+  },
+  loop: {
+    pt: "Loop / ForEach",
+    en: "Loop / ForEach",
+    cat: "logic",
+    color: "#60a5fa",
+    icon: Repeat,
+    defaultCfg: () => ({ mode: "template", items: "", template: "{{item}}", separator: "\n" }),
   },
   notify_channel: {
     pt: "Notificar Canal",
@@ -151,20 +185,23 @@ const NODE_META: Record<
 };
 
 const NODE_CATEGORIES: { cat: "trigger" | "collect" | "logic" | "deliver"; pt: string; en: string; kinds: NodeKind[] }[] = [
-  { cat: "trigger", pt: "Gatilhos", en: "Triggers", kinds: ["trigger_cron", "trigger_manual"] },
+  { cat: "trigger", pt: "Gatilhos", en: "Triggers", kinds: ["trigger_cron", "trigger_manual", "trigger_webhook"] },
   { cat: "collect", pt: "Coleta & Ação", en: "Collect & Act", kinds: ["shell", "ssh_command", "http_request"] },
-  { cat: "logic", pt: "IA & Lógica", en: "AI & Logic", kinds: ["ai_agent", "condition", "transform"] },
+  { cat: "logic", pt: "IA & Lógica", en: "AI & Logic", kinds: ["ai_agent", "condition", "transform", "loop", "delay"] },
   { cat: "deliver", pt: "Entrega", en: "Delivery", kinds: ["notify_channel", "save_file"] },
 ];
 
 const NODE_KINDS: NodeKind[] = [
   "trigger_cron",
   "trigger_manual",
+  "trigger_webhook",
   "shell",
   "ssh_command",
   "http_request",
   "transform",
   "condition",
+  "loop",
+  "delay",
   "ai_agent",
   "notify_channel",
   "save_file",
@@ -204,6 +241,12 @@ function nodeSubPreview(n: WorkflowNode, channels: ChannelConfig[]): string {
       return String(c.cron ?? "0 8 * * *");
     case "trigger_manual":
       return "on-demand";
+    case "trigger_webhook":
+      return `/webhook/${String(c.slug || n.id)}`;
+    case "delay":
+      return `${Number(c.seconds ?? 5)}s`;
+    case "loop":
+      return `${String(c.mode ?? "template")} · foreach`;
     case "shell":
       return String(c.command ?? "");
     case "ssh_command":
@@ -215,7 +258,7 @@ function nodeSubPreview(n: WorkflowNode, channels: ChannelConfig[]): string {
     case "condition":
       return `${String(c.mode ?? "not_empty")} ${String(c.pattern ?? "")}`.trim();
     case "ai_agent":
-      return String(c.model || "default model");
+      return c.bot_name ? `@${String(c.bot_name)}` : String(c.model || "default model");
     case "notify_channel": {
       const ch = channels.find((x) => x.id === c.channel_id);
       return ch ? `${ch.name}${c.target ? " → " + String(c.target) : ""}` : "select channel";
@@ -276,9 +319,15 @@ export function WorkflowsStudio(props: {
   const lang = useLang();
   const [workflows, setWorkflows] = useState<Workflow[]>([]);
   const [channels, setChannels] = useState<ChannelConfig[]>([]);
+  const [agents, setAgents] = useState<AgentView[]>([]);
+  const [webhookBase, setWebhookBase] = useState("http://127.0.0.1:47891/webhook/");
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [draft, setDraft] = useState<Workflow | null>(null);
   const [dirty, setDirty] = useState(false);
+  const pastRef = useRef<Workflow[]>([]);
+  const futureRef = useRef<Workflow[]>([]);
+  const [histLen, setHistLen] = useState({ undo: 0, redo: 0 });
+  const importRef = useRef<HTMLInputElement>(null);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [inspOpen, setInspOpen] = useState(true);
   const [inspTab, setInspTab] = useState<"insp" | "runs">("insp");
@@ -360,9 +409,14 @@ export function WorkflowsStudio(props: {
 
   const loadAll = useCallback(async (keepSelection = true) => {
     try {
-      const [wfs, chs] = await Promise.all([workflowsApi.list(), channelsApi.list()]);
+      const [wfs, chs, ags] = await Promise.all([
+        workflowsApi.list(),
+        channelsApi.list(),
+        api.agentsList().catch(() => [] as AgentView[]),
+      ]);
       setWorkflows(wfs);
       setChannels(chs);
+      setAgents(ags.filter((a) => !a.disabled));
       setSelectedId((prev) => {
         if (keepSelection && prev && wfs.some((w) => w.id === prev)) return prev;
         return wfs[0]?.id ?? null;
@@ -374,6 +428,7 @@ export function WorkflowsStudio(props: {
 
   useEffect(() => {
     void loadAll(false);
+    void workflowsApi.webhookBaseUrl().then(setWebhookBase).catch(() => undefined);
   }, [loadAll]);
 
   useEffect(() => {
@@ -386,6 +441,9 @@ export function WorkflowsStudio(props: {
     if (found && !dirty) {
       const cloned = structuredClone(found);
       setDraft(cloned);
+      pastRef.current = [];
+      futureRef.current = [];
+      setHistLen({ undo: 0, redo: 0 });
       setSelectedNodeId((prev) =>
         prev && found.nodes.some((n) => n.id === prev) ? prev : found.nodes[0]?.id ?? null,
       );
@@ -429,8 +487,39 @@ export function WorkflowsStudio(props: {
     };
   }, [loadAll, selectedId, lang]);
 
+  const handleUndo = useCallback(() => {
+    const prev = pastRef.current.pop();
+    if (!prev || !draft) return;
+    futureRef.current.push(structuredClone(draft));
+    setDraft(prev);
+    setDirty(true);
+    setHistLen({ undo: pastRef.current.length, redo: futureRef.current.length });
+  }, [draft]);
+
+  const handleRedo = useCallback(() => {
+    const next = futureRef.current.pop();
+    if (!next || !draft) return;
+    pastRef.current.push(structuredClone(draft));
+    setDraft(next);
+    setDirty(true);
+    setHistLen({ undo: pastRef.current.length, redo: futureRef.current.length });
+  }, [draft]);
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement | null)?.tagName;
+      const inInput = tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
+      if (!inInput && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") {
+        e.preventDefault();
+        if (e.shiftKey) handleRedo();
+        else handleUndo();
+        return;
+      }
+      if (!inInput && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "y") {
+        e.preventDefault();
+        handleRedo();
+        return;
+      }
       if (e.key === "Escape") {
         if (connectingFrom) setConnectingFrom(null);
         else if (addMenuOpen) setAddMenuOpen(false);
@@ -440,16 +529,77 @@ export function WorkflowsStudio(props: {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [props, channelsOpen, templatesOpen, connectingFrom, addMenuOpen, emblemMenuOpen]);
+  }, [
+    props,
+    channelsOpen,
+    templatesOpen,
+    connectingFrom,
+    addMenuOpen,
+    emblemMenuOpen,
+    handleUndo,
+    handleRedo,
+  ]);
 
   const selectedNode = useMemo(
     () => draft?.nodes.find((n) => n.id === selectedNodeId) ?? null,
     [draft, selectedNodeId],
   );
 
-  const patchDraft = (fn: (w: Workflow) => Workflow) => {
-    setDraft((prev) => (prev ? fn(prev) : prev));
+  const patchDraft = (fn: (w: Workflow) => Workflow, recordHistory = true) => {
+    setDraft((prev) => {
+      if (!prev) return prev;
+      if (recordHistory) {
+        pastRef.current = [...pastRef.current.slice(-39), structuredClone(prev)];
+        futureRef.current = [];
+        setHistLen({ undo: pastRef.current.length, redo: 0 });
+      }
+      return fn(prev);
+    });
     setDirty(true);
+  };
+
+  const handleExportJson = () => {
+    if (!draft) return;
+    const blob = new Blob([JSON.stringify(draft, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${draft.name.toLowerCase().replace(/[^a-z0-9_-]+/g, "-") || draft.id}.workflow.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const handleImportJson = async (file: File) => {
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text) as Partial<Workflow>;
+      if (!parsed || !Array.isArray(parsed.nodes)) {
+        setBanner({ text: tr(lang, "JSON inválido de workflow.", "Invalid workflow JSON."), tone: "err" });
+        return;
+      }
+      const now = Date.now();
+      const fresh: Workflow = {
+        id: `wf-${now}`,
+        name: String(parsed.name || file.name.replace(/\.json$/i, "")),
+        description: String(parsed.description || ""),
+        icon: String(parsed.icon || "workflow"),
+        enabled: false,
+        bot_name: parsed.bot_name ?? null,
+        nodes: parsed.nodes,
+        edges: Array.isArray(parsed.edges) ? parsed.edges : [],
+        created_at_ms: now,
+        updated_at_ms: now,
+        last_run_at_ms: null,
+        last_status: null,
+      };
+      const saved = await workflowsApi.save(fresh);
+      setDirty(false);
+      await loadAll(false);
+      setSelectedId(saved.id);
+      setBanner({ text: tr(lang, "Workflow importado!", "Workflow imported!"), tone: "ok" });
+    } catch (err) {
+      setBanner({ text: String(err), tone: "err" });
+    }
   };
 
   const handleSave = async (): Promise<Workflow | null> => {
@@ -842,6 +992,26 @@ export function WorkflowsStudio(props: {
               {tr(lang, "Canais", "Channels")} ({channels.length})
             </span>
           </button>
+          <button
+            type="button"
+            className="btn btn-sm"
+            onClick={() => importRef.current?.click()}
+            title={tr(lang, "Importar workflow JSON", "Import workflow JSON")}
+          >
+            <Upload size={14} strokeWidth={2} />
+            <span>{tr(lang, "Importar JSON", "Import JSON")}</span>
+          </button>
+          <input
+            ref={importRef}
+            type="file"
+            accept=".json,application/json"
+            style={{ display: "none" }}
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              e.target.value = "";
+              if (f) void handleImportJson(f);
+            }}
+          />
         </div>
       </aside>
 
@@ -888,6 +1058,28 @@ export function WorkflowsStudio(props: {
                 onChange={(e) => patchDraft((w) => ({ ...w, name: e.target.value }))}
                 aria-label={tr(lang, "Nome do workflow", "Workflow name")}
               />
+              <select
+                className="wf-bot-select"
+                value={draft.bot_name ?? ""}
+                onChange={(e) =>
+                  patchDraft((w) => ({
+                    ...w,
+                    bot_name: e.target.value ? e.target.value : null,
+                  }))
+                }
+                title={tr(
+                  lang,
+                  "Bot responsável: recebe resumos automáticos no chat e aparece na página do bot",
+                  "Owning bot: receives automatic run reports in chat and links on the bot screen",
+                )}
+              >
+                <option value="">{tr(lang, "Sem bot vinculado", "No linked bot")}</option>
+                {agents.map((a) => (
+                  <option key={a.name} value={a.name}>
+                    @{a.name}
+                  </option>
+                ))}
+              </select>
               <div className="wf-add-pop-wrap">
                 <button
                   type="button"
@@ -939,6 +1131,14 @@ export function WorkflowsStudio(props: {
               >
                 <Save size={14} strokeWidth={2} />
                 <span>{tr(lang, "Salvar", "Save")}</span>
+              </button>
+              <button
+                type="button"
+                className="icon-btn sm"
+                title={tr(lang, "Exportar JSON", "Export JSON")}
+                onClick={handleExportJson}
+              >
+                <Download size={14} strokeWidth={2} />
               </button>
               <button
                 type="button"
@@ -1052,10 +1252,13 @@ export function WorkflowsStudio(props: {
             if (!dn) return;
             const nx = Math.round(dn.origX + (e.clientX - dn.startX) / zoom);
             const ny = Math.round(dn.origY + (e.clientY - dn.startY) / zoom);
-            patchDraft((w) => ({
-              ...w,
-              nodes: w.nodes.map((n) => (n.id === dn.id ? { ...n, x: nx, y: ny } : n)),
-            }));
+            patchDraft(
+              (w) => ({
+                ...w,
+                nodes: w.nodes.map((n) => (n.id === dn.id ? { ...n, x: nx, y: ny } : n)),
+              }),
+              false,
+            );
           }}
           onPointerUp={() => {
             dragNodeRef.current = null;
@@ -1161,6 +1364,11 @@ export function WorkflowsStudio(props: {
                         return;
                       }
                       e.currentTarget.setPointerCapture(e.pointerId);
+                      if (draft) {
+                        pastRef.current = [...pastRef.current.slice(-39), structuredClone(draft)];
+                        futureRef.current = [];
+                        setHistLen({ undo: pastRef.current.length, redo: 0 });
+                      }
                       dragNodeRef.current = {
                         id: n.id,
                         startX: e.clientX,
@@ -1214,6 +1422,9 @@ export function WorkflowsStudio(props: {
                     <div className={`wf-node-head kind-${n.kind}`}>
                       <Icon size={13} strokeWidth={2.2} />
                       <span>{lang === "pt-BR" ? meta.pt : meta.en}</span>
+                      {n.config?.pin_enabled ? (
+                        <span className="wf-mock-badge">MOCK</span>
+                      ) : null}
                       {latestLog ? (
                         <span className="wf-node-dur">{latestLog.duration_ms}ms</span>
                       ) : null}
@@ -1357,6 +1568,25 @@ export function WorkflowsStudio(props: {
               <button
                 type="button"
                 className="wf-hud-btn"
+                disabled={histLen.undo === 0}
+                onClick={handleUndo}
+                title={tr(lang, "Desfazer (Ctrl+Z)", "Undo (Ctrl+Z)")}
+              >
+                <Undo2 size={12} />
+              </button>
+              <button
+                type="button"
+                className="wf-hud-btn"
+                disabled={histLen.redo === 0}
+                onClick={handleRedo}
+                title={tr(lang, "Refazer (Ctrl+Y)", "Redo (Ctrl+Y)")}
+              >
+                <Redo2 size={12} />
+              </button>
+              <span className="wf-hud-sep" />
+              <button
+                type="button"
+                className="wf-hud-btn"
                 onClick={() => fitToView(draft)}
                 title={tr(lang, "Ajustar todos os blocos na tela", "Fit to view")}
               >
@@ -1368,14 +1598,13 @@ export function WorkflowsStudio(props: {
                 className="wf-hud-btn"
                 onClick={() => {
                   const arranged = autoArrange(draft);
-                  setDraft(arranged);
-                  setDirty(true);
+                  patchDraft(() => arranged);
                   requestAnimationFrame(() => fitToView(arranged));
                 }}
                 title={tr(lang, "Auto-organizar blocos", "Auto-arrange blocks")}
               >
                 <Wand2 size={12} />
-                <span>{tr(lang, "Organizar", "Arrange")}</span>
+                <span>{tr(lang, "Auto-Organizar", "Auto-Arrange")}</span>
               </button>
               <span className="wf-hud-sep" />
               <button
@@ -1452,8 +1681,11 @@ export function WorkflowsStudio(props: {
               {selectedNode && draft ? (
                 <NodeInspector
                   node={selectedNode}
+                  workflowId={draft.id}
+                  webhookBase={webhookBase}
                   allNodes={draft.nodes}
                   channels={channels}
+                  agents={agents}
                   models={props.models}
                   lang={lang}
                   onOpenChannels={() => setChannelsOpen(true)}
@@ -1586,8 +1818,11 @@ export function WorkflowsStudio(props: {
 
 function NodeInspector(props: {
   node: WorkflowNode;
+  workflowId: string;
+  webhookBase: string;
   allNodes: WorkflowNode[];
   channels: ChannelConfig[];
+  agents: AgentView[];
   models: { value: string; label: string }[];
   lang: Lang;
   onChange: (n: WorkflowNode) => void;
@@ -1603,6 +1838,16 @@ function NodeInspector(props: {
   const cfg = node.config ?? {};
   const setCfg = (patch: Record<string, unknown>) =>
     props.onChange({ ...node, config: { ...cfg, ...patch } });
+  const webhookSlug = String(cfg.slug || props.workflowId);
+  const webhookUrl = `${props.webhookBase}${webhookSlug}`;
+  const supportsRetry = [
+    "shell",
+    "ssh_command",
+    "http_request",
+    "ai_agent",
+    "notify_channel",
+    "loop",
+  ].includes(node.kind);
 
   const insertVar = (field: string, token: string) => {
     const cur = String(cfg[field] ?? "");
@@ -1659,6 +1904,119 @@ function NodeInspector(props: {
           lang={lang}
           onChange={(cron, tz) => setCfg({ cron, tz_offset_minutes: tz })}
         />
+      ) : null}
+
+      {node.kind === "trigger_webhook" ? (
+        <>
+          <div className="wf-field">
+            <label>{tr(lang, "Slug da rota HTTP", "HTTP Route Slug")}</label>
+            <input
+              value={String(cfg.slug ?? "")}
+              placeholder={props.workflowId}
+              onChange={(e) => setCfg({ slug: e.target.value.replace(/[^a-zA-Z0-9_-]/g, "-") })}
+            />
+          </div>
+          <div className="wf-field">
+            <label>{tr(lang, "Token secreto opcional (?token= / Bearer)", "Optional secret token (?token= / Bearer)")}</label>
+            <input
+              type="password"
+              value={String(cfg.secret ?? "")}
+              placeholder="meu-segredo-123"
+              onChange={(e) => setCfg({ secret: e.target.value })}
+            />
+          </div>
+          <div className="wf-field">
+            <label>{tr(lang, "URL Local do Webhook", "Local Webhook URL")}</label>
+            <div className="wf-webhook-box">
+              <code className="mono">{webhookUrl}</code>
+              <button
+                type="button"
+                className="btn btn-sm"
+                onClick={() => void navigator.clipboard?.writeText(webhookUrl)}
+              >
+                <Copy size={11} />
+                <span>{tr(lang, "Copiar", "Copy")}</span>
+              </button>
+            </div>
+            <p className="pn-hint" style={{ marginTop: 4 }}>
+              {`curl -X POST "${webhookUrl}" -d '{"alert":"host-down"}'`}
+            </p>
+          </div>
+        </>
+      ) : null}
+
+      {node.kind === "delay" ? (
+        <div className="wf-field">
+          <label>{tr(lang, "Aguardar (segundos, 1–300)", "Delay (seconds, 1–300)")}</label>
+          <input
+            type="number"
+            min={1}
+            max={300}
+            value={Number(cfg.seconds ?? 5)}
+            onChange={(e) =>
+              setCfg({ seconds: Math.max(1, Math.min(300, Number(e.target.value) || 5)) })
+            }
+          />
+        </div>
+      ) : null}
+
+      {node.kind === "loop" ? (
+        <>
+          <div className="wf-field">
+            <label>{tr(lang, "Ação por item", "Per-item action")}</label>
+            <select
+              value={String(cfg.mode ?? "template")}
+              onChange={(e) => setCfg({ mode: e.target.value })}
+            >
+              <option value="template">{tr(lang, "Formatar template ({{item}})", "Template ({{item}})")}</option>
+              <option value="shell">{tr(lang, "Executar comando Shell", "Run Shell command")}</option>
+              <option value="http">{tr(lang, "Chamada HTTP", "HTTP Request")}</option>
+            </select>
+          </div>
+          <div className="wf-field">
+            <label>{tr(lang, "Lista de itens (1/linha ou JSON; vazio = {{prev}})", "Items (lines or JSON array; empty = {{prev}})")}</label>
+            <textarea
+              value={String(cfg.items ?? "")}
+              placeholder={"192.168.1.1\n192.168.1.2"}
+              onChange={(e) => setCfg({ items: e.target.value })}
+            />
+          </div>
+          {String(cfg.mode ?? "template") === "shell" ? (
+            <div className="wf-field">
+              <label>{tr(lang, "Comando Shell (use {{item}})", "Shell command (use {{item}})")}</label>
+              <textarea
+                value={String(cfg.command ?? "echo {{item}}")}
+                onChange={(e) => setCfg({ command: e.target.value })}
+              />
+              {renderVarChips("command")}
+            </div>
+          ) : String(cfg.mode ?? "template") === "http" ? (
+            <div className="wf-field">
+              <label>{tr(lang, "URL HTTP (use {{item}})", "HTTP URL (use {{item}})")}</label>
+              <input
+                value={String(cfg.url ?? "")}
+                placeholder="https://api.exemplo.com/hosts/{{item}}"
+                onChange={(e) => setCfg({ url: e.target.value })}
+              />
+            </div>
+          ) : (
+            <div className="wf-field">
+              <label>{tr(lang, "Template (use {{item}} e {{index}})", "Template (use {{item}} & {{index}})")}</label>
+              <textarea
+                value={String(cfg.template ?? "{{item}}")}
+                onChange={(e) => setCfg({ template: e.target.value })}
+              />
+              {renderVarChips("template")}
+            </div>
+          )}
+          <div className="wf-field">
+            <label>{tr(lang, "Separador na saída", "Output separator")}</label>
+            <input
+              value={String(cfg.separator ?? "\n")}
+              onChange={(e) => setCfg({ separator: e.target.value })}
+            />
+          </div>
+        </>
       ) : null}
 
       {node.kind === "shell" ? (
@@ -1812,6 +2170,20 @@ function NodeInspector(props: {
       {node.kind === "ai_agent" ? (
         <>
           <div className="wf-field">
+            <label>{tr(lang, "Bot especialista (opcional)", "Specialist Bot (optional)")}</label>
+            <select
+              value={String(cfg.bot_name ?? "")}
+              onChange={(e) => setCfg({ bot_name: e.target.value })}
+            >
+              <option value="">{tr(lang, "Nenhum (usar prompt abaixo)", "None (use prompt below)")}</option>
+              {props.agents.map((a) => (
+                <option key={a.name} value={a.name}>
+                  @{a.name}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="wf-field">
             <label>{tr(lang, "Modelo", "Model")}</label>
             <select
               value={String(cfg.model ?? "")}
@@ -1902,6 +2274,63 @@ function NodeInspector(props: {
           </label>
         </>
       ) : null}
+
+      {supportsRetry ? (
+        <div className="wf-retry-row">
+          <div className="wf-field">
+            <label>{tr(lang, "Tentativas (0–5)", "Retries (0–5)")}</label>
+            <input
+              type="number"
+              min={0}
+              max={5}
+              value={Number(cfg.retry_count ?? 0)}
+              onChange={(e) =>
+                setCfg({ retry_count: Math.max(0, Math.min(5, Number(e.target.value) || 0)) })
+              }
+            />
+          </div>
+          <div className="wf-field">
+            <label>{tr(lang, "Espera (s)", "Delay (s)")}</label>
+            <input
+              type="number"
+              min={1}
+              max={60}
+              value={Number(cfg.retry_delay_secs ?? 2)}
+              onChange={(e) =>
+                setCfg({ retry_delay_secs: Math.max(1, Math.min(60, Number(e.target.value) || 2)) })
+              }
+            />
+          </div>
+        </div>
+      ) : null}
+
+      <div className="wf-pin-box">
+        <label className="pn-inline">
+          <input
+            type="checkbox"
+            checked={Boolean(cfg.pin_enabled)}
+            onChange={(e) => setCfg({ pin_enabled: e.target.checked })}
+          />
+          <span>{tr(lang, "Fixar saída mock (pular execução real)", "Pin mock output (skip real run)")}</span>
+        </label>
+        {Boolean(cfg.pin_enabled) || String(cfg.pinned_output ?? "") ? (
+          <textarea
+            rows={2}
+            value={String(cfg.pinned_output ?? "")}
+            placeholder={tr(lang, "Saída simulada para testar os próximos blocos...", "Mocked output for downstream testing...")}
+            onChange={(e) => setCfg({ pinned_output: e.target.value })}
+          />
+        ) : null}
+        {props.testOutput != null ? (
+          <button
+            type="button"
+            className="wf-var-chip"
+            onClick={() => setCfg({ pin_enabled: true, pinned_output: props.testOutput })}
+          >
+            {tr(lang, "Fixar último resultado de teste", "Pin latest test output")}
+          </button>
+        ) : null}
+      </div>
 
       <div style={{ borderTop: "1px solid var(--line-faint)", paddingTop: 10, display: "grid", gap: 8 }}>
         <div className="wf-field">

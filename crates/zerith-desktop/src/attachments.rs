@@ -13,6 +13,57 @@ use crate::state::AppState;
 
 /// Same ceiling `read_image` and the providers apply.
 const CAP: usize = 20 * 1024 * 1024;
+/// Ceiling for general file/video/log/config attachments.
+const FILE_CAP: usize = 50 * 1024 * 1024;
+
+fn sanitize_filename(raw: &str) -> String {
+    let base = raw.rsplit(['/', '\\']).next().unwrap_or("anexo").trim();
+    let clean: String = base
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = clean.trim_matches(['.', '_']);
+    if trimmed.is_empty() {
+        "anexo.bin".into()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Decodes `data` (bare base64 or a `data:` URL) for any file (configs, logs,
+/// videos, PDFs, captures, images) up to 50 MB and writes it under
+/// `<root>/attachments/<hash>-<safe_name>`.
+fn save_named(root: &Path, name: &str, data: &str) -> Result<PathBuf, String> {
+    let b64 = match data.strip_prefix("data:") {
+        Some(rest) => rest.split_once(',').ok_or("data URL sem conteúdo")?.1,
+        None => data,
+    };
+    if b64.len() > FILE_CAP / 3 * 4 + 4 {
+        return Err("arquivo maior que 50 MB".into());
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64.trim())
+        .map_err(|_| "anexo corrompido (base64 inválido)".to_string())?;
+    if bytes.len() > FILE_CAP {
+        return Err("arquivo maior que 50 MB".into());
+    }
+    let safe_name = sanitize_filename(name);
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    let dir = root.join("attachments");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let path = dir.join(format!("{:016x}-{safe_name}", h.finish()));
+    if !path.is_file() {
+        std::fs::write(&path, &bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    }
+    Ok(path)
+}
 
 /// Decodes `data` (bare base64 or a `data:` URL), checks it, writes it as
 /// `<root>/attachments/<hash>.<ext>` and returns that path.
@@ -61,6 +112,22 @@ pub async fn save_attachment(state: State<'_, AppState>, data: String) -> Result
     .map_err(|e| e.to_string())?
 }
 
+/// Saves any attached file (config, log, video, capture, PDF, archive); returns
+/// its normalized absolute path.
+#[tauri::command]
+pub async fn save_file_attachment(
+    state: State<'_, AppState>,
+    name: String,
+    data: String,
+) -> Result<String, String> {
+    let root = state.root().to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || {
+        save_named(&root, &name, &data).map(|p| p.to_string_lossy().replace('\\', "/"))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -85,5 +152,27 @@ mod tests {
             save(&root, &"A".repeat(CAP / 3 * 4 + 8)).is_err(),
             "too big"
         );
+    }
+
+    #[test]
+    fn named_file_attachments_save_configs_videos_and_logs_safely() {
+        let root =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-scratch/attach-file");
+        let _ = std::fs::remove_dir_all(&root);
+        let wg = b"[Interface]\nPrivateKey = abc\n";
+        let b64 = base64::engine::general_purpose::STANDARD.encode(wg);
+        let saved = save_named(
+            &root,
+            "../../wg-cliente (1).conf",
+            &format!("data:text/plain;base64,{b64}"),
+        )
+        .unwrap();
+        assert_eq!(saved.parent().unwrap(), root.join("attachments"));
+        assert!(saved
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with("-wg-cliente__1_.conf"));
+        assert_eq!(std::fs::read(&saved).unwrap(), wg);
     }
 }

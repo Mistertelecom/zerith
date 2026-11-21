@@ -35,11 +35,18 @@ import { api } from "../lib/api";
 import { tr, useLang } from "../lib/i18n";
 import { Logo } from "./ui";
 
-/// An image waiting to go with the next message: saved already, so `path` is
-/// what the prompt cites and `url` (data URL) is only the chip's thumbnail.
-type Attached = { name: string; path: string; url: string };
+/// An attachment waiting to go with the next message: images, videos, or any
+/// file (configs `.conf`/`.cfg`/`.rsc`, logs, PDFs, `.pcap`, code, archives).
+type Attached = {
+  name: string;
+  path: string;
+  url?: string;
+  kind: "image" | "video" | "file";
+};
 const IMAGE_CAP = 20 * 1024 * 1024;
+const FILE_CAP = 50 * 1024 * 1024;
 const isImagePath = (p: string) => /\.(png|jpe?g|webp|gif)$/i.test(p);
+const isVideoPath = (p: string) => /\.(mp4|m4v|webm|mov|mkv)$/i.test(p);
 
 /// What `/` offers. The names are the old window's, so muscle memory carries
 /// over; `run` is handled by App, which owns the state each one touches.
@@ -141,35 +148,72 @@ export function Composer(props: {
 
   // Saved on attach, not on send: a bad file is refused while the user is
   // still looking at it, and sending stays a plain text prompt.
-  const attach = (name: string, dataUrl: string) =>
+  const attachImage = (name: string, dataUrl: string) =>
     api.saveAttachment(dataUrl).then(
       (path) => {
         setNote(null);
         setImages((l) =>
-          l.some((i) => i.path === path) ? l : [...l, { name, path, url: dataUrl }],
+          l.some((i) => i.path === path)
+            ? l
+            : [...l, { name, path, url: dataUrl, kind: "image" }],
         );
       },
       (e) => setNote(String(e)),
     );
+  const attachFile = (name: string, dataUrl: string, isVideo: boolean) =>
+    api.saveFileAttachment(name, dataUrl).then(
+      (path) => {
+        setNote(null);
+        setImages((l) =>
+          l.some((i) => i.path === path)
+            ? l
+            : [
+                ...l,
+                {
+                  name,
+                  path,
+                  url: isVideo ? dataUrl : undefined,
+                  kind: isVideo ? "video" : "file",
+                },
+              ],
+        );
+      },
+      (e) => setNote(String(e)),
+    );
+  const attachExistingPath = (rawPath: string) => {
+    const norm = rawPath.replace(/\\/g, "/");
+    const name = norm.split("/").pop() ?? "arquivo";
+    const kind: Attached["kind"] = isImagePath(norm)
+      ? "image"
+      : isVideoPath(norm)
+        ? "video"
+        : "file";
+    setNote(null);
+    setImages((l) =>
+      l.some((i) => i.path === norm) ? l : [...l, { name, path: norm, kind }],
+    );
+  };
   const addFiles = (files: Iterable<File>) => {
     for (const f of files) {
-      if (!f.type.startsWith("image/")) continue;
-      if (f.size > IMAGE_CAP) {
-        setNote(`${f.name}: imagem maior que 20 MB`);
+      const isImg = f.type.startsWith("image/") || isImagePath(f.name);
+      const isVid = f.type.startsWith("video/") || isVideoPath(f.name);
+      const cap = isImg ? IMAGE_CAP : FILE_CAP;
+      if (f.size > cap) {
+        setNote(`${f.name}: maior que ${isImg ? "20 MB" : "50 MB"}`);
         continue;
       }
       const r = new FileReader();
-      r.onload = () => void attach(f.name || "imagem", String(r.result));
+      r.onload = () => {
+        const res = String(r.result);
+        if (isImg) void attachImage(f.name || "imagem", res);
+        else void attachFile(f.name || "arquivo", res, isVid);
+      };
       r.readAsDataURL(f);
     }
   };
-  /** Pasted files: images attach; anything else says why nothing happened. */
+  /** Pasted files: images, videos, configs, logs, PDFs — all attach cleanly. */
   const pasteFiles = (list: FileList) => {
-    const all = [...list];
-    const pics = all.filter((f) => f.type.startsWith("image/"));
-    addFiles(pics);
-    if (pics.length < all.length)
-      setNote("Aqui só entram texto e imagens; para outro arquivo, cite o caminho ou use @");
+    addFiles([...list]);
   };
 
   // Ctrl+V with the focus elsewhere (a conversation just picked in the list,
@@ -203,11 +247,17 @@ export function Composer(props: {
           if (p.type === "leave") return setDropping(false);
           if (p.type !== "drop") return setDropping(true);
           setDropping(false);
-          for (const path of p.paths.filter(isImagePath)) {
-            api
-              .readImage(path)
-              .then((url) => attach(path.split(/[\\/]/).pop() ?? "imagem", url))
-              .catch((e) => setNote(String(e)));
+          for (const path of p.paths) {
+            if (isImagePath(path)) {
+              api
+                .readImage(path)
+                .then((url) =>
+                  attachImage(path.split(/[\\/]/).pop() ?? "imagem", url),
+                )
+                .catch(() => attachExistingPath(path));
+            } else {
+              attachExistingPath(path);
+            }
           }
         })
         .then((u) => (live ? (off = u) : u()));
@@ -231,9 +281,13 @@ export function Composer(props: {
       return;
     }
     if (!images.length) return props.onSend();
-    const lines = images.map(
-      (i) => `![${i.name.replace(/[[\]\n]/g, "")}](<${i.path}>)`,
-    );
+    const lines = images.map((i) => {
+      const cleanName = i.name.replace(/[[\]\n]/g, "");
+      if (i.kind === "image" || i.kind === "video") {
+        return `![${cleanName}](<${i.path}>)`;
+      }
+      return `[Arquivo anexado: ${cleanName}](<${i.path}>)`;
+    });
     props.onDraft([props.draft.trim(), ...lines].filter(Boolean).join("\n"));
     setImages([]);
     setNote(null);
@@ -336,10 +390,17 @@ export function Composer(props: {
           }}
         >
           {images.length ? (
-            <div className="attach-row" aria-label="Imagens anexadas">
+            <div className="attach-row" aria-label="Anexos">
               {images.map((im, i) => (
-                <div className="attach-chip" key={im.path} title={im.name}>
-                  <img src={im.url} alt={im.name} />
+                <div className="attach-chip" key={im.path} title={`${im.name} (${im.path})`}>
+                  {im.kind === "image" && im.url ? (
+                    <img src={im.url} alt={im.name} />
+                  ) : (
+                    <span className="attach-file-label">
+                      <FileText size={14} strokeWidth={2} />
+                      <span>{im.name}</span>
+                    </span>
+                  )}
                   <button
                     type="button"
                     className="attach-x"
@@ -479,11 +540,11 @@ export function Composer(props: {
             <button
               type="button"
               className="icon-btn sm"
-              aria-label={tr(lang, "Anexar imagem", "Attach image")}
+              aria-label={tr(lang, "Anexar arquivo, imagem ou vídeo", "Attach file, image or video")}
               title={tr(
                 lang,
-                "Anexar imagem (ou cole / arraste)",
-                "Attach image (or paste / drag)",
+                "Anexar imagem, vídeo, config (.conf/.cfg/.rsc), log ou arquivo (ou cole / arraste)",
+                "Attach image, video, config, log or file (or paste / drag)",
               )}
               onClick={() => picker.current?.click()}
             >
@@ -492,7 +553,6 @@ export function Composer(props: {
             <input
               ref={picker}
               type="file"
-              accept="image/png,image/jpeg,image/webp,image/gif"
               multiple
               hidden
               onChange={(e) => {

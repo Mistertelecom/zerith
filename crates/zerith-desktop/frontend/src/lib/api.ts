@@ -671,6 +671,9 @@ export const api = {
   openUrl: (url: string) => invoke<void>("open_url", { url }),
   /** An attached image (data URL) saved under `<root>/attachments`; returns its path. */
   saveAttachment: (data: string) => invoke<string>("save_attachment", { data }),
+  /** Any attached file (video, config, log, PDF, archive) saved under `<root>/attachments`; returns its path. */
+  saveFileAttachment: (name: string, data: string) =>
+    invoke<string>("save_file_attachment", { name, data }),
   checkpoints: (sessionId: string) =>
     invoke<number[]>("checkpoints", { sessionId }),
   rewind: (sessionId: string) =>

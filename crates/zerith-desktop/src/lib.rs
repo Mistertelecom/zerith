@@ -286,6 +286,7 @@ pub fn run() {
             workspace::open_image,
             workspace::open_url,
             attachments::save_attachment,
+            attachments::save_file_attachment,
             changes::turn_changes,
             changes::turn_undo,
             learn::learning,

@@ -41,28 +41,7 @@ import {
 import { Card, EmptyState, Logo, ZerithMark, Field, ProbeResult } from "./ui";
 import { nameOf, host, domain, isOauth } from "./settingsFmt";
 import { GeneralTab, type GeneralProps } from "./General";
-import { tr, useLang } from "../lib/i18n";
-
-const TAB_EN: Record<string, string> = {
-  Geral: "General",
-  Contas: "Accounts",
-  Cotas: "Quotas",
-  "Delegação": "Routing",
-  "Memória": "Memory",
-  Skills: "Skills",
-  MCP: "MCP",
-  "Mídia": "Media",
-  Agentes: "Agents",
-  "Histórico": "History",
-  Uso: "Usage",
-};
-
-const GROUP_EN: Record<string, string> = {
-  Preferências: "Preferences",
-  Modelos: "Models",
-  Contexto: "Context",
-  Ferramentas: "Tools",
-};
+import { translateText, tr, useLang } from "../lib/i18n";
 
 const AgentsTab = lazy(() => import("./Agents").then((m) => ({ default: m.AgentsTab })));
 const HistoryTab = lazy(() => import("./History").then((m) => ({ default: m.HistoryTab })));
@@ -486,7 +465,7 @@ export function Settings({
           {NAV.map((g) => (
             <div key={g.group} className="nav-group">
               <div className="nav-group-label">
-                {lang === "en" ? (GROUP_EN[g.group] ?? g.group) : g.group}
+                {translateText(g.group, lang)}
               </div>
               {g.items.map(({ tab: t, icon: Icon }) => (
                 <button
@@ -499,7 +478,7 @@ export function Settings({
                   }}
                 >
                   <Icon size={16} strokeWidth={1.75} />
-                  <span>{lang === "en" ? (TAB_EN[t] ?? t) : t}</span>
+                  <span>{translateText(t, lang)}</span>
                 </button>
               ))}
             </div>
@@ -515,8 +494,8 @@ export function Settings({
               <MetaIcon size={18} strokeWidth={1.75} />
             </span>
             <div className="head-text">
-              <h2>{lang === "en" ? (TAB_EN[tab] ?? tab) : tab}</h2>
-              <p>{meta.hint}</p>
+              <h2>{translateText(tab, lang)}</h2>
+              <p>{translateText(meta.hint, lang)}</p>
             </div>
             <button
               className="icon-btn"

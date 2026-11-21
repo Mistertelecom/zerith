@@ -4,12 +4,7 @@ import { api, learnApi, type LongContextView, type ProfileView, type StorageView
 import { Card, Row, Segmented, Switch } from "./ui";
 import { UpdateRow } from "./Update";
 
-import { setLang, tr, useLang, type Lang } from "../lib/i18n";
-
-const LANGS: readonly (readonly [Lang, string])[] = [
-  ["pt-BR", "Português (BR)"],
-  ["en", "English"],
-] as const;
+import { LANG_OPTIONS, setLang, translateText, tr, useLang, type Lang } from "../lib/i18n";
 
 const THEMES = [
   ["dark", "Escuro"],
@@ -140,8 +135,8 @@ export function GeneralTab(props: GeneralProps) {
           <Segmented
             label={tr(lang, "Idioma", "Language")}
             value={lang}
-            options={LANGS}
-            onPick={(v) => setLang(v === "en" ? "en" : "pt-BR")}
+            options={LANG_OPTIONS}
+            onPick={(v) => setLang(v as Lang)}
           />
         </Row>
         <Row
@@ -155,7 +150,7 @@ export function GeneralTab(props: GeneralProps) {
           <Segmented
             label={tr(lang, "Tema", "Theme")}
             value={props.theme}
-            options={THEMES}
+            options={THEMES.map(([k, v]) => [k, translateText(v, lang)] as const)}
             onPick={props.onTheme}
           />
         </Row>

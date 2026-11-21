@@ -1,9 +1,9 @@
 import { useEffect, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { Copy, Minus, Square, X } from "lucide-react";
+import { Copy, Globe, Minus, Square, X } from "lucide-react";
 import { ZerithMark } from "./ui";
 import { UpdatePill } from "./Update";
-import { tr, useLang } from "../lib/i18n";
+import { LANG_OPTIONS, LANG_SHORT, setLang, tr, useLang, type Lang } from "../lib/i18n";
 
 /** The window's own title bar: the native one is off (decorations: false) so
  * the bar can sit on the app's black. Empty space drags the window (Tauri's
@@ -47,6 +47,27 @@ export function TitleBar({ title, brand = false }: { title?: string; brand?: boo
       <span className="titlebar-fill" data-tauri-drag-region />
       {/* boot screens (brand) have no app yet to update */}
       {brand ? null : <UpdatePill />}
+      {brand ? null : (
+        <button
+          type="button"
+          className="pill"
+          style={{ height: 22, padding: "0 8px", fontSize: 11, marginRight: 6 }}
+          title={tr(
+            lang,
+            "Trocar idioma (English, Português, Español, Français, Deutsch, 中文)",
+            "Switch language (English, Português, Español, Français, Deutsch, 中文)",
+          )}
+          aria-label={tr(lang, "Idioma", "Language")}
+          onClick={() => {
+            const idx = LANG_OPTIONS.findIndex(([code]) => code === lang);
+            const next = LANG_OPTIONS[(idx + 1) % LANG_OPTIONS.length][0] as Lang;
+            setLang(next);
+          }}
+        >
+          <Globe size={12} strokeWidth={2} />
+          <span>{LANG_SHORT[lang]}</span>
+        </button>
+      )}
       <div className="titlebar-ctrls">
         <button
           onClick={act((w) => w.minimize())}

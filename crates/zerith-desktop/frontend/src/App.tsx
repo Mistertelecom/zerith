@@ -57,7 +57,7 @@ import { AppVersion } from "./components/Update";
 import { FolderPill } from "./components/FolderPill";
 import { BackgroundJobs } from "./components/BackgroundJobs";
 import { ActiveTerminals } from "./components/ActiveTerminals";
-import { tr, useLang } from "./lib/i18n";
+import { translateText, tr, useDomTranslator, useLang } from "./lib/i18n";
 
 const Settings = lazy(() =>
   import("./components/Settings").then((m) => ({ default: m.Settings })),
@@ -127,6 +127,7 @@ export default function App() {
   // open keeps its stream, its Stop button and its approval card. `turn` below
   // is the open one.
   const lang = useLang();
+  useDomTranslator(lang);
   const [turns, setTurns] = useState<Record<string, TurnState>>({});
   const turnsRef = useRef<Record<string, TurnState>>(turns);
   turnsRef.current = turns;
@@ -1099,7 +1100,7 @@ export default function App() {
                 busy={turn.busy}
                 onCancel={() => selected && void api.cancelTurn(selected)}
                 mode={mode}
-                modes={MODES}
+                modes={MODES.map(([k, v]) => [k, translateText(v, lang)] as const)}
                 onMode={setMode}
                 effort={effort}
                 onEffort={setEffort}

@@ -9,12 +9,11 @@ import {
   SquarePen,
 } from "lucide-react";
 import type { Session } from "../lib/api";
-import { tr, useLang } from "../lib/i18n";
+import { translateText, tr, useLang } from "../lib/i18n";
 import { Logo, ZerithMark } from "./ui";
 
 const DAY = 86_400_000;
 const GROUPS_PT = ["Hoje", "Ontem", "Últimos 7 dias", "Mais antigas"] as const;
-const GROUPS_EN = ["Today", "Yesterday", "Last 7 days", "Older"] as const;
 
 /** Which date group a session falls in, counted from local midnight. */
 function group(ms: number, today: number): number {
@@ -76,7 +75,7 @@ export function Sidebar(props: {
     const q = props.query.trim().toLowerCase();
     const midnight = new Date();
     midnight.setHours(0, 0, 0, 0);
-    const labels = lang === "en" ? GROUPS_EN : GROUPS_PT;
+    const labels = GROUPS_PT.map((l) => translateText(l, lang));
     const out = labels.map((label) => ({
       label,
       rows: [] as { s: Session; time: string }[],

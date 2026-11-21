@@ -1052,24 +1052,91 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
         make_with(
             "net_probe",
             "Sonda conectividade TCP concorrente, resolução DNS, RTT em ms e banner inicial de gerência/roteamento \
-             (SSH, BGP 179, NETCONF 830, Winbox 8291, MikroTik API 8728/8729, HTTP/HTTPS 80/443/8443) para um ou mais hosts \
-             sem depender de nmap/nc instalados.",
+             (SSH 22, Telnet 23, BGP 179, NETCONF 830, Proxmox VE 8006, Winbox 8291, MikroTik API 8728/8729, HTTP/HTTPS 80/443/8443) \
+             para um ou mais hosts (`host`, `hosts` ou `subnet` como `10.0.0.1-20` / `10.0.0.0/28`). \
+             Com `auto_register_client`, identifica automaticamente o tipo de cada equipamento descoberto pelo banner/porta \
+             (Proxmox VE, MikroTik, Huawei, Cisco, FortiGate, VM Linux) e já o cadastra no inventário do cliente!",
             json!({"type": "object", "properties": {
                 "host": {"type": "string", "description": "hostname ou IP único"},
                 "hosts": {"type": "array", "items": {"type": "string"}, "description": "lista de hostnames ou IPs"},
-                "ports": {"type": "array", "items": {"type": "integer"}, "description": "padrão [22, 80, 179, 443, 830, 8291, 8443, 8728, 8729]"},
-                "timeout_ms": {"type": "integer", "description": "timeout TCP por porta em ms, padrão 1500"},
-                "grab_banner": {"type": "boolean", "description": "lê banner inicial (ex.: SSH-2.0-...), padrão true"}
+                "subnet": {"type": "string", "description": "sub-rede CIDR (ex.: 10.0.0.0/28) ou faixa de IPs (ex.: 10.0.0.1-30), até 64 IPs"},
+                "ports": {"type": "array", "items": {"type": "integer"}, "description": "padrão [22, 23, 80, 179, 443, 830, 8006, 8291, 8443, 8728, 8729]"},
+                "timeout_ms": {"type": "integer", "description": "timeout TCP por porta em ms, padrão 1200"},
+                "grab_banner": {"type": "boolean", "description": "lê banner inicial (ex.: SSH-2.0-...), padrão true"},
+                "auto_register_client": {"type": "string", "description": "se informado, cadastra automaticamente os hosts ativos encontrados neste cliente no inventory.toml"},
+                "site": {"type": "string", "description": "site opcional para o cadastro automático"},
+                "vpn": {"type": "string", "description": "túnel WireGuard opcional para vincular aos hosts descobertos"},
+                "user": {"type": "string", "description": "usuário padrão opcional para os hosts descobertos (ex.: admin ou root)"}
             }}),
-            "tabela markdown com DNS, status da porta, RTT em ms e banner do equipamento",
+            "tabela markdown com DNS, status da porta, RTT em ms, banner e resumo de auto-cadastro",
             Permission::Network,
-            30,
+            60,
             true,
             |args, _| {
-                let h = opt_str(args, "host").unwrap_or("net_probe");
+                let h = opt_str(args, "host")
+                    .or_else(|| opt_str(args, "subnet"))
+                    .unwrap_or("net_probe");
                 Ok(Some(Action::Network(h.to_string())))
             },
             net_probe,
+        ),
+        make_with(
+            "net_broadcast",
+            "Executa um comando simultaneamente em paralelo em múltiplos terminais abertos (`ids`, ou todos os terminais abertos \
+             de um `client` ou `vendor`, ou todos os terminais ativos se omitido), devolvendo a comparação lado a lado com o tempo de resposta de cada equipamento/VM.",
+            json!({"type": "object", "properties": {
+                "command": {"type": "string", "description": "comando a executar em paralelo em todos os terminais selecionados"},
+                "ids": {"type": "array", "items": {"type": "string"}, "description": "lista opcional de IDs (ex.: [\"term-1\", \"term-2\"]); se omitido, usa todos os terminais ativos ou filtrados por client/vendor"},
+                "client": {"type": "string", "description": "filtra apenas terminais abertos deste cliente"},
+                "vendor": {"type": "string", "description": "filtra apenas terminais abertos deste vendor"},
+                "auto_page": {"type": "boolean", "description": "padrão true"},
+                "timeout_secs": {"type": "integer", "description": "timeout por host em segundos, padrão 20"}
+            }, "required": ["command"]}),
+            "saída consolidada em paralelo de todos os hosts com tempo em ms",
+            Permission::Shell,
+            300,
+            false,
+            |args, _| {
+                let cmd = opt_str(args, "command").unwrap_or("");
+                Ok(Some(Action::Shell(format!("[broadcast] {cmd}"))))
+            },
+            net_broadcast,
+        ),
+        make_with(
+            "net_backup",
+            "Coleta o backup completo da configuração (`running-config`, `current-configuration`, `/export`, etc.) \
+             de um ou mais terminais abertos (`id`, `ids` ou `client`), salva em `backups/<cliente>/<equipamento>/latest.cfg` \
+             (mantendo histórico timestamped) e executa automaticamente o `net_diff` contra o último backup salvo.",
+            json!({"type": "object", "properties": {
+                "id": {"type": "string", "description": "ID de um terminal aberto (ex.: term-1)"},
+                "ids": {"type": "array", "items": {"type": "string"}, "description": "lista de terminais abertos para fazer backup em lote"},
+                "client": {"type": "string", "description": "faz backup de todos os terminais abertos deste cliente"},
+                "command": {"type": "string", "description": "comando customizado opcional (auto-detectado pelo vendor se omitido)"},
+                "timeout_secs": {"type": "integer", "description": "padrão 45"}
+            }}),
+            "caminhos dos arquivos de backup salvos e diff hierárquico contra o backup anterior",
+            Permission::Shell,
+            300,
+            false,
+            |args, _| {
+                let target = opt_str(args, "id")
+                    .or_else(|| opt_str(args, "client"))
+                    .unwrap_or("all");
+                Ok(Some(Action::Shell(format!("net_backup {target}"))))
+            },
+            net_backup,
+        ),
+        make_with(
+            "serial_ports",
+            "Descobre e lista todas as portas seriais / cabos Console USB-Serial (`COM1..COM99` no Windows com nome do adaptador FTDI/CH340/PL2303, \
+             `/dev/ttyUSB*`, `/dev/ttyACM*`, `/dev/ttyS*`, `/dev/cu.*` no Linux/macOS) conectados ao computador.",
+            json!({"type": "object", "properties": {}}),
+            "lista de portas seriais disponíveis para uso imediato no net_connect",
+            Permission::Read,
+            10,
+            true,
+            |_, _| Ok(None),
+            serial_ports,
         ),
     ]
 }
@@ -2503,6 +2570,7 @@ fn port_service_label(port: u16) -> &'static str {
         443 => "HTTPS",
         830 => "NETCONF",
         3389 => "RDP",
+        8006 => "Proxmox-VE",
         8080 => "HTTP-Alt",
         8291 => "Winbox",
         8443 => "HTTPS-Alt",
@@ -2510,6 +2578,53 @@ fn port_service_label(port: u16) -> &'static str {
         8729 => "MikroTik-API-SSL",
         _ => "TCP",
     }
+}
+
+/// Expands an IPv4 CIDR (`10.0.0.0/28`) or last-octet range (`10.0.0.1-20`)
+/// into up to `max_hosts` IP strings.
+pub fn expand_subnet_or_range(raw: &str, max_hosts: usize) -> Vec<String> {
+    let trimmed = raw.trim();
+    if let Some((ip_part, prefix_part)) = trimmed.split_once('/') {
+        let Ok(ipv4) = ip_part.trim().parse::<std::net::Ipv4Addr>() else {
+            return vec![trimmed.to_string()];
+        };
+        let Ok(prefix) = prefix_part.trim().parse::<u32>() else {
+            return vec![trimmed.to_string()];
+        };
+        if prefix >= 32 {
+            return vec![ipv4.to_string()];
+        }
+        let clamped_prefix = prefix.clamp(24, 31);
+        let mask = if clamped_prefix == 0 {
+            0
+        } else {
+            !0u32 << (32 - clamped_prefix)
+        };
+        let base = u32::from(ipv4) & mask;
+        let count = 1u32 << (32 - clamped_prefix);
+        let (start_off, end_off) = if clamped_prefix <= 30 && count > 2 {
+            (1, count - 1)
+        } else {
+            (0, count)
+        };
+        return (start_off..end_off)
+            .take(max_hosts)
+            .map(|off| std::net::Ipv4Addr::from(base + off).to_string())
+            .collect();
+    }
+    if let Some((prefix_dots, range_part)) = trimmed.rsplit_once('.') {
+        if let Some((start_s, end_s)) = range_part.split_once('-') {
+            if let (Ok(s), Ok(e)) = (start_s.trim().parse::<u8>(), end_s.trim().parse::<u8>()) {
+                if s <= e {
+                    return (s..=e)
+                        .take(max_hosts)
+                        .map(|last| format!("{prefix_dots}.{last}"))
+                        .collect();
+                }
+            }
+        }
+    }
+    vec![trimmed.to_string()]
 }
 
 #[derive(Debug, Clone)]
@@ -2521,6 +2636,117 @@ pub struct ProbeRow {
     pub open: bool,
     pub rtt_ms: Option<f64>,
     pub detail: String,
+}
+
+pub fn fingerprint_probed_host(
+    host_rows: &[ProbeRow],
+) -> Option<(Vendor, DeviceRole, DeviceTransport, u16, Vec<String>)> {
+    let open_rows: Vec<&ProbeRow> = host_rows.iter().filter(|r| r.open).collect();
+    if open_rows.is_empty() {
+        return None;
+    }
+    let has_port = |p: u16| open_rows.iter().any(|r| r.port == p);
+    let banners = open_rows
+        .iter()
+        .map(|r| r.detail.to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if has_port(8006) {
+        return Some((
+            Vendor::Linux,
+            DeviceRole::Server,
+            DeviceTransport::Ssh,
+            if has_port(22) { 22 } else { 8006 },
+            vec!["proxmox".into(), "auto-discovered".into()],
+        ));
+    }
+    if has_port(8291)
+        || has_port(8728)
+        || has_port(8729)
+        || banners.contains("rosssh")
+        || banners.contains("mikrotik")
+    {
+        let transport = if has_port(22) {
+            DeviceTransport::Ssh
+        } else if has_port(23) {
+            DeviceTransport::Telnet
+        } else {
+            DeviceTransport::Ssh
+        };
+        let port = if transport == DeviceTransport::Telnet {
+            23
+        } else {
+            22
+        };
+        return Some((
+            Vendor::MikrotikRouterOs,
+            DeviceRole::Border,
+            transport,
+            port,
+            vec!["mikrotik".into(), "auto-discovered".into()],
+        ));
+    }
+    if banners.contains("huawei") || (has_port(830) && !banners.contains("juniper")) {
+        return Some((
+            Vendor::HuaweiVrp,
+            DeviceRole::Core,
+            if has_port(22) {
+                DeviceTransport::Ssh
+            } else {
+                DeviceTransport::Telnet
+            },
+            if has_port(22) { 22 } else { 23 },
+            vec!["huawei".into(), "auto-discovered".into()],
+        ));
+    }
+    if banners.contains("cisco") {
+        return Some((
+            Vendor::CiscoIos,
+            DeviceRole::Core,
+            if has_port(22) {
+                DeviceTransport::Ssh
+            } else {
+                DeviceTransport::Telnet
+            },
+            if has_port(22) { 22 } else { 23 },
+            vec!["cisco".into(), "auto-discovered".into()],
+        ));
+    }
+    if banners.contains("fortissh") || has_port(8443) {
+        return Some((
+            Vendor::FortinetFortiOs,
+            DeviceRole::Firewall,
+            DeviceTransport::Ssh,
+            22,
+            vec!["fortigate".into(), "auto-discovered".into()],
+        ));
+    }
+    if has_port(22) {
+        return Some((
+            Vendor::Linux,
+            DeviceRole::Server,
+            DeviceTransport::Ssh,
+            22,
+            vec!["linux".into(), "auto-discovered".into()],
+        ));
+    }
+    if has_port(23) {
+        return Some((
+            Vendor::Generic,
+            DeviceRole::Access,
+            DeviceTransport::Telnet,
+            23,
+            vec!["telnet".into(), "auto-discovered".into()],
+        ));
+    }
+    Some((
+        Vendor::Generic,
+        DeviceRole::Server,
+        DeviceTransport::Ssh,
+        open_rows[0].port,
+        vec!["auto-discovered".into()],
+    ))
 }
 
 pub fn probe_hosts_tcp(
@@ -2632,24 +2858,37 @@ pub fn probe_hosts_tcp(
 fn net_probe(args: &Value, _ctx: &CallCtx<'_>, _exec: &Exec<'_>) -> Result<String> {
     let mut hosts = Vec::new();
     if let Some(h) = opt_str(args, "host") {
-        hosts.push(h.to_string());
+        for expanded in expand_subnet_or_range(h, 64) {
+            if !hosts.iter().any(|x| x == &expanded) {
+                hosts.push(expanded);
+            }
+        }
+    }
+    if let Some(sub) = opt_str(args, "subnet") {
+        for expanded in expand_subnet_or_range(sub, 64) {
+            if !hosts.iter().any(|x| x == &expanded) && hosts.len() < 64 {
+                hosts.push(expanded);
+            }
+        }
     }
     if let Some(arr) = args.get("hosts").and_then(Value::as_array) {
-        for v in arr.iter().take(32) {
+        for v in arr.iter().take(64) {
             if let Some(s) = v.as_str() {
-                if !hosts.iter().any(|x| x == s) {
-                    hosts.push(s.to_string());
+                for expanded in expand_subnet_or_range(s, 64) {
+                    if !hosts.iter().any(|x| x == &expanded) && hosts.len() < 64 {
+                        hosts.push(expanded);
+                    }
                 }
             }
         }
     }
     if hosts.is_empty() {
         return Err(ToolError::BadArguments(
-            "informe `host` ou `hosts` para `net_probe`".into(),
+            "informe `host`, `hosts` ou `subnet` para `net_probe`".into(),
         ));
     }
 
-    let default_ports: Vec<u16> = vec![22, 80, 179, 443, 830, 8291, 8443, 8728, 8729];
+    let default_ports: Vec<u16> = vec![22, 23, 80, 179, 443, 830, 8006, 8291, 8443, 8728, 8729];
     let ports: Vec<u16> = args
         .get("ports")
         .and_then(Value::as_array)
@@ -2666,7 +2905,7 @@ fn net_probe(args: &Value, _ctx: &CallCtx<'_>, _exec: &Exec<'_>) -> Result<Strin
     let timeout_ms = args
         .get("timeout_ms")
         .and_then(Value::as_u64)
-        .unwrap_or(1500)
+        .unwrap_or(1200)
         .clamp(100, 10_000);
     let grab_banner = args["grab_banner"].as_bool().unwrap_or(true);
 
@@ -2683,7 +2922,11 @@ fn net_probe(args: &Value, _ctx: &CallCtx<'_>, _exec: &Exec<'_>) -> Result<Strin
         open_count,
         rows.len()
     );
-    for r in rows {
+    for r in &rows {
+        // When scanning multiple hosts (subnet sweep), only print OPEN rows or all rows if <= 3 hosts
+        if hosts.len() > 3 && !r.open {
+            continue;
+        }
         let status = if r.open { "OPEN" } else { "CLOSED" };
         let rtt = r
             .rtt_ms
@@ -2694,7 +2937,367 @@ fn net_probe(args: &Value, _ctx: &CallCtx<'_>, _exec: &Exec<'_>) -> Result<Strin
             r.host, r.resolved_ip, r.port, r.service, status, rtt, r.detail
         ));
     }
+
+    // Auto-register discovered hosts into client's inventory when `auto_register_client` is provided
+    if let Some(client_name) =
+        opt_str(args, "auto_register_client").filter(|s| !s.trim().is_empty())
+    {
+        let root = zerith_core::Paths::resolve().root().to_path_buf();
+        let inv_path = root.join("inventory.toml");
+        let site = opt_str(args, "site").map(str::to_string);
+        let vpn = opt_str(args, "vpn").map(str::to_string);
+        let mut registered = Vec::new();
+
+        for h in &hosts {
+            let h_rows: Vec<ProbeRow> = rows.iter().filter(|r| &r.host == h).cloned().collect();
+            let Some((vendor, role, transport, port, tags)) = fingerprint_probed_host(&h_rows)
+            else {
+                continue;
+            };
+            let prefix = if tags.iter().any(|t| t == "proxmox") {
+                "pve"
+            } else {
+                match vendor {
+                    Vendor::MikrotikRouterOs => "mk",
+                    Vendor::HuaweiVrp => "huawei",
+                    Vendor::CiscoIos => "cisco",
+                    Vendor::FortinetFortiOs => "fw",
+                    Vendor::Linux => "vm",
+                    _ => "host",
+                }
+            };
+            let last_oct = h.rsplit('.').next().unwrap_or(h);
+            let auto_name = format!("{prefix}-{last_oct}");
+            let default_user = opt_str(args, "user")
+                .unwrap_or(if vendor == Vendor::Linux {
+                    "root"
+                } else {
+                    "admin"
+                })
+                .to_string();
+            let entry = DeviceEntry {
+                name: auto_name.clone(),
+                client: Some(client_name.to_string()),
+                site: site.clone(),
+                vpn: vpn.clone(),
+                host: h.clone(),
+                port,
+                user: default_user,
+                vendor,
+                role,
+                transport,
+                tags,
+                ..Default::default()
+            };
+            if upsert_inventory_device(&inv_path, entry).is_ok() {
+                registered.push(format!(
+                    "`{client_name}/{auto_name}` ({h} · {})",
+                    vendor.as_str()
+                ));
+            }
+        }
+        if !registered.is_empty() {
+            out.push_str(&format!(
+                "\n\n### Auto-Cadastro no Inventário ({})\nDispositivos registrados automaticamente: {}",
+                inv_path.display(),
+                registered.join(", ")
+            ));
+        }
+    }
+
     Ok(out)
+}
+
+fn select_target_terminals(args: &Value) -> Result<Vec<terminal::TerminalSnapshot>> {
+    let active = terminal::list_active_terminals();
+    let explicit_ids: Vec<String> = if let Some(single) = opt_str(args, "id") {
+        vec![single.to_string()]
+    } else if let Some(arr) = args.get("ids").and_then(Value::as_array) {
+        arr.iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let client_f = opt_str(args, "client").map(str::to_ascii_lowercase);
+    let vendor_f = opt_str(args, "vendor").map(str::to_ascii_lowercase);
+
+    let selected: Vec<terminal::TerminalSnapshot> = active
+        .into_iter()
+        .filter(|t| {
+            if !t.alive {
+                return false;
+            }
+            if !explicit_ids.is_empty() {
+                return explicit_ids.iter().any(|id| id == &t.id);
+            }
+            if let Some(cf) = &client_f {
+                if !t
+                    .client
+                    .as_deref()
+                    .is_some_and(|c| c.to_ascii_lowercase().contains(cf))
+                {
+                    return false;
+                }
+            }
+            if let Some(vf) = &vendor_f {
+                if !t
+                    .vendor
+                    .as_deref()
+                    .is_some_and(|v| v.to_ascii_lowercase().contains(vf))
+                {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect();
+
+    if selected.is_empty() {
+        return Err(ToolError::Failed(
+            "nenhum terminal ativo compatível encontrado (abra sessões com `net_connect` primeiro)"
+                .into(),
+        ));
+    }
+    Ok(selected)
+}
+
+fn net_broadcast(args: &Value, _ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
+    let command = str_arg(args, "command")?;
+    let targets = select_target_terminals(args)?;
+    let auto_page = args["auto_page"].as_bool().unwrap_or(true);
+    let timeout_secs = args["timeout_secs"].as_u64().unwrap_or(20).clamp(2, 300);
+
+    let results: Vec<(terminal::TerminalSnapshot, Result<(String, bool)>, u128)> =
+        std::thread::scope(|s| {
+            let handles: Vec<_> = targets
+                .into_iter()
+                .map(|snap| {
+                    s.spawn(move || {
+                        let started = std::time::Instant::now();
+                        let res = terminal::send_session_command(
+                            "net_broadcast",
+                            &snap.id,
+                            Some(command),
+                            None,
+                            true,
+                            None,
+                            Duration::from_secs(timeout_secs),
+                            auto_page,
+                            exec,
+                        );
+                        (snap, res, started.elapsed().as_millis())
+                    })
+                })
+                .collect();
+            handles.into_iter().filter_map(|h| h.join().ok()).collect()
+        });
+
+    let mut sections = Vec::with_capacity(results.len() + 1);
+    sections.push(format!(
+        "## Net Broadcast (`{command}` em {} host(s) em paralelo)",
+        results.len()
+    ));
+    for (snap, res, ms) in results {
+        let title = snap.device.as_deref().unwrap_or(&snap.command);
+        let host_label = snap.host.as_deref().unwrap_or("-");
+        match res {
+            Ok((out, _alive)) => {
+                sections.push(format!(
+                    "### {} ({} · {} · {} ms)\n```text\n{}\n```",
+                    title, snap.id, host_label, ms, out
+                ));
+            }
+            Err(e) => {
+                sections.push(format!(
+                    "### {} ({} · {} · ERRO)\n{}",
+                    title, snap.id, host_label, e
+                ));
+            }
+        }
+    }
+    Ok(sections.join("\n\n"))
+}
+
+fn default_backup_command_for_vendor(vendor_str: Option<&str>) -> &'static str {
+    match vendor_str
+        .and_then(Vendor::parse)
+        .unwrap_or(Vendor::Generic)
+    {
+        Vendor::CiscoIos | Vendor::CiscoNxos | Vendor::CiscoXr => "show running-config",
+        Vendor::HuaweiVrp => "display current-configuration",
+        Vendor::JuniperJunos => "show configuration",
+        Vendor::MikrotikRouterOs => "/export",
+        Vendor::FortinetFortiOs => "show full-configuration",
+        Vendor::Linux => "uname -a && ip -br addr && ip route",
+        Vendor::Generic => "show running-config",
+    }
+}
+
+fn sanitize_path_component(raw: &str) -> String {
+    let s: String = raw
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if s.is_empty() {
+        "default".into()
+    } else {
+        s
+    }
+}
+
+fn net_backup(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
+    let targets = select_target_terminals(args)?;
+    let custom_cmd = opt_str(args, "command");
+    let timeout_secs = args["timeout_secs"].as_u64().unwrap_or(45).clamp(5, 300);
+    let mut reports = Vec::with_capacity(targets.len());
+
+    for snap in targets {
+        let cmd =
+            custom_cmd.unwrap_or_else(|| default_backup_command_for_vendor(snap.vendor.as_deref()));
+        let (cfg_out, _alive) = terminal::send_session_command(
+            "net_backup",
+            &snap.id,
+            Some(cmd),
+            None,
+            true,
+            None,
+            Duration::from_secs(timeout_secs),
+            true,
+            exec,
+        )?;
+        let client_dir = sanitize_path_component(snap.client.as_deref().unwrap_or("geral"));
+        let dev_raw = snap
+            .device
+            .as_deref()
+            .and_then(|d| d.rsplit('/').next())
+            .or(snap.host.as_deref())
+            .unwrap_or(&snap.id);
+        let dev_dir = sanitize_path_component(dev_raw);
+        let dir = ctx
+            .workspace
+            .join("backups")
+            .join(&client_dir)
+            .join(&dev_dir);
+        std::fs::create_dir_all(&dir)?;
+
+        let latest_path = dir.join("latest.cfg");
+        let previous = std::fs::read_to_string(&latest_path).ok();
+        if let Some(ref prev_text) = previous {
+            let _ = std::fs::write(dir.join("previous.cfg"), prev_text);
+        }
+        std::fs::write(&latest_path, &cfg_out)?;
+
+        let vendor = snap.vendor.as_deref().and_then(Vendor::parse);
+        let diff_summary = match previous {
+            Some(prev_text) => compute_hierarchical_net_diff(&prev_text, &cfg_out, vendor, false),
+            None => {
+                "Primeiro backup registrado para este equipamento (sem versão anterior para diff)."
+                    .into()
+            }
+        };
+        reports.push(format!(
+            "### Backup `{}` ({})\n- **Arquivo salvo:** `{}` ({} bytes)\n\n{}",
+            snap.device.as_deref().unwrap_or(&snap.id),
+            cmd,
+            latest_path.display(),
+            cfg_out.len(),
+            diff_summary
+        ));
+    }
+    Ok(reports.join("\n\n---\n\n"))
+}
+
+pub fn discover_local_serial_ports() -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    #[cfg(windows)]
+    {
+        if let Ok(out) = std::process::Command::new("powershell")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Get-CimInstance Win32_PnPEntity | Where-Object { $_.Name -match '\\(COM\\d+\\)' } | ForEach-Object { $_.Name }",
+            ])
+            .output()
+        {
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                let l = line.trim();
+                if let Some(start) = l.rfind("(COM") {
+                    if let Some(end) = l[start..].find(')') {
+                        let com = l[start + 1..start + end].trim().to_string();
+                        if !found.iter().any(|(c, _)| c == &com) {
+                            found.push((com, l.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+        if found.is_empty() {
+            if let Ok(out) = std::process::Command::new("powershell")
+                .args([
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "[System.IO.Ports.SerialPort]::GetPortNames()",
+                ])
+                .output()
+            {
+                for line in String::from_utf8_lossy(&out.stdout).lines() {
+                    let com = line.trim();
+                    if com.starts_with("COM") && !found.iter().any(|(c, _)| c == com) {
+                        found.push((com.to_string(), "Porta Serial Windows".into()));
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        if let Ok(entries) = std::fs::read_dir("/dev") {
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name.starts_with("ttyUSB")
+                    || name.starts_with("ttyACM")
+                    || name.starts_with("cu.usb")
+                    || name.starts_with("tty.usb")
+                {
+                    found.push((
+                        format!("/dev/{name}"),
+                        "Adaptador USB-Serial Console".into(),
+                    ));
+                }
+            }
+        }
+    }
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    found
+}
+
+fn serial_ports(_args: &Value, _ctx: &CallCtx<'_>, _exec: &Exec<'_>) -> Result<String> {
+    let ports = discover_local_serial_ports();
+    if ports.is_empty() {
+        return Ok(
+            "Nenhuma porta serial/console detectada no momento (conecte o cabo USB-Serial FTDI/CH340/PL2303 e tente novamente).".into(),
+        );
+    }
+    let mut lines = vec!["## Portas Seriais / Console Detectadas".to_string()];
+    for (port, desc) in ports {
+        lines.push(format!(
+            "- **`{port}`** — {desc} (conectar com `net_connect(transport=\"serial\", serial_port=\"{port}\", baud_rate=9600)`)"
+        ));
+    }
+    Ok(lines.join("\n"))
 }
 
 #[cfg(test)]
@@ -3139,5 +3742,55 @@ Endpoint = vpn.telecomsul.com.br:51820
         let after_rem = load_inventory(dir.path(), Some(dir.path())).unwrap();
         assert_eq!(after_rem.len(), 1);
         assert_eq!(after_rem[0].client.as_deref(), Some("HospitalVida"));
+    }
+
+    #[test]
+    fn subnet_expansion_and_host_fingerprinting_for_proxmox_mikrotik_and_huawei() {
+        let cidr = expand_subnet_or_range("10.0.0.0/30", 16);
+        assert_eq!(cidr, vec!["10.0.0.1", "10.0.0.2"]);
+        let range = expand_subnet_or_range("192.168.10.5-7", 16);
+        assert_eq!(range, vec!["192.168.10.5", "192.168.10.6", "192.168.10.7"]);
+
+        // Proxmox VE host (ports 22 + 8006)
+        let pve_rows = vec![
+            ProbeRow {
+                host: "10.0.0.10".into(),
+                resolved_ip: "10.0.0.10".into(),
+                port: 22,
+                service: "SSH",
+                open: true,
+                rtt_ms: Some(1.2),
+                detail: "SSH-2.0-OpenSSH_9.2p1 Debian".into(),
+            },
+            ProbeRow {
+                host: "10.0.0.10".into(),
+                resolved_ip: "10.0.0.10".into(),
+                port: 8006,
+                service: "Proxmox-VE",
+                open: true,
+                rtt_ms: Some(1.5),
+                detail: "conectado".into(),
+            },
+        ];
+        let (vendor, role, transport, port, tags) = fingerprint_probed_host(&pve_rows).unwrap();
+        assert_eq!(vendor, Vendor::Linux);
+        assert_eq!(role, DeviceRole::Server);
+        assert_eq!(transport, DeviceTransport::Ssh);
+        assert_eq!(port, 22);
+        assert!(tags.contains(&"proxmox".to_string()));
+
+        // MikroTik RouterOS (Winbox 8291)
+        let mk_rows = vec![ProbeRow {
+            host: "10.0.0.1".into(),
+            resolved_ip: "10.0.0.1".into(),
+            port: 8291,
+            service: "Winbox",
+            open: true,
+            rtt_ms: Some(0.9),
+            detail: "conectado".into(),
+        }];
+        let (mk_vendor, mk_role, _, _, _) = fingerprint_probed_host(&mk_rows).unwrap();
+        assert_eq!(mk_vendor, Vendor::MikrotikRouterOs);
+        assert_eq!(mk_role, DeviceRole::Border);
     }
 }

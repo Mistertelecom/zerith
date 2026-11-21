@@ -127,6 +127,10 @@ export function Composer(props: {
   model: string;
   models: { value: string; label: string }[];
   onModel: (v: string) => void;
+  orchestrator?: boolean;
+  onToggleOrchestrator?: () => void;
+  executorModel?: string;
+  onExecutorModel?: (v: string) => void;
   hidden: string[];
   onToggleHidden: (v: string) => void;
   hint: string;
@@ -369,6 +373,15 @@ export function Composer(props: {
     props.modes.find(([v]) => v === props.mode)?.[1] ?? props.mode;
   const current = props.models.find((m) => m.value === props.model);
   const provider = current?.label.split(" · ")[0] ?? props.model;
+  const brainName =
+    current?.label.split(" · ")[1] ??
+    (props.model || tr(lang, "Escolha um modelo", "Choose a model"));
+  const execVal = props.executorModel || props.model;
+  const execCurrent = props.models.find((m) => m.value === execVal);
+  const execProvider = execCurrent?.label.split(" · ")[0] ?? execVal;
+  const execName =
+    execCurrent?.label.split(" · ")[1] ??
+    (execVal || tr(lang, "Escolha o executor", "Choose executor"));
   const canSend = !props.busy && (!!props.draft.trim() || images.length > 0);
 
   return (
@@ -596,8 +609,30 @@ export function Composer(props: {
                 onPick={props.onEffort}
               />
             ) : null}
+            {props.onToggleOrchestrator ? (
+              <button
+                type="button"
+                className={"pill" + (props.orchestrator ? " open" : "")}
+                aria-pressed={!!props.orchestrator}
+                title={tr(
+                  lang,
+                  "Modo Orquestrador 100%: o modelo de Pensamento planeja/coordena e o modelo de Execução roda todas as ferramentas",
+                  "100% Orchestrator Mode: Thinking model plans/coordinates and Execution model runs all tools",
+                )}
+                onClick={props.onToggleOrchestrator}
+              >
+                <Layers size={14} strokeWidth={2} />
+                <span className="pill-text">
+                  {tr(lang, "Orquestrador", "Orchestrator")}
+                </span>
+              </button>
+            ) : null}
             <PillMenu
-              label={tr(lang, "Modelo", "Model")}
+              label={
+                props.orchestrator
+                  ? tr(lang, "Modelo de Pensamento (Cérebro)", "Thinking Model (Brain)")
+                  : tr(lang, "Modelo", "Model")
+              }
               icon={
                 provider === "Perfil" ? (
                   <Layers size={16} strokeWidth={1.75} />
@@ -606,8 +641,9 @@ export function Composer(props: {
                 )
               }
               text={
-                current?.label.split(" · ")[1] ??
-                (props.model || tr(lang, "Escolha um modelo", "Choose a model"))
+                props.orchestrator
+                  ? `${tr(lang, "Pensamento", "Think")}: ${brainName}`
+                  : brainName
               }
               value={props.model}
               options={props.models}
@@ -617,6 +653,30 @@ export function Composer(props: {
               search
               wide
             />
+            {props.orchestrator && props.onExecutorModel ? (
+              <PillMenu
+                label={tr(
+                  lang,
+                  "Modelo de Execução (Subagentes / Ferramentas)",
+                  "Execution Model (Subagents / Tools)",
+                )}
+                icon={
+                  execProvider === "Perfil" ? (
+                    <Cpu size={16} strokeWidth={1.75} />
+                  ) : (
+                    <Logo id={execProvider || null} size={16} />
+                  )
+                }
+                text={`${tr(lang, "Execução", "Exec")}: ${execName}`}
+                value={execVal}
+                options={props.models}
+                onPick={props.onExecutorModel}
+                hidden={props.hidden}
+                onToggleHidden={props.onToggleHidden}
+                search
+                wide
+              />
+            ) : null}
             <span className="spacer" />
             {props.busy ? (
               <div className="send-busy-group">

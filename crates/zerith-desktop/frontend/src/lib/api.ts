@@ -735,6 +735,8 @@ export const api = {
     mode: string;
     agent?: string | null;
     reasoningEffort?: string | null;
+    orchestrator?: boolean;
+    executorModel?: string | null;
     history?: number;
   }) =>
     invoke<void>("send_turn", {
@@ -745,6 +747,8 @@ export const api = {
         mode: args.mode,
         agent: args.agent ?? null,
         reasoning_effort: args.reasoningEffort ?? null,
+        orchestrator: !!args.orchestrator,
+        executor_model: args.executorModel ?? null,
         // 0 = the profile's history window (the core decides).
         history: args.history ?? 0,
       },

@@ -70,6 +70,10 @@ pub struct SendArgs {
     pub agent: Option<String>,
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub orchestrator: bool,
+    #[serde(default)]
+    pub executor_model: Option<String>,
     // No `history`: the replay window is the execution profile's
     // (`history_window`), read by the turn. An old window still sending one
     // is fine, serde ignores the field.
@@ -99,6 +103,8 @@ pub fn send_turn(
         memory_paused: crate::wire::memory_paused(&state.db()),
         agent: args.agent.clone(),
         reasoning_effort: args.reasoning_effort.clone(),
+        orchestrator: args.orchestrator,
+        executor_model: args.executor_model.clone(),
         mcp_cache: Some(state.mcp_cache()),
     };
 

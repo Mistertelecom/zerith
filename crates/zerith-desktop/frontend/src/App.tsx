@@ -64,6 +64,8 @@ const Settings = lazy(() =>
 );
 
 const MODEL_KEY = "zerith.model";
+const EXECUTOR_MODEL_KEY = "zerith.executorModel";
+const ORCHESTRATOR_KEY = "zerith.orchestrator";
 const EFFORT_KEY = "zerith.effort";
 const MAX_CACHED_TURNS = 8;
 
@@ -184,6 +186,23 @@ export default function App() {
   const [model, setModel] = useState(
     () => localStorage.getItem(MODEL_KEY) ?? "",
   );
+  const [executorModel, setExecutorModel] = useState(
+    () => localStorage.getItem(EXECUTOR_MODEL_KEY) ?? "",
+  );
+  const [orchestrator, setOrchestrator] = useState(
+    () => localStorage.getItem(ORCHESTRATOR_KEY) === "1",
+  );
+  const toggleOrchestrator = useCallback(() => {
+    setOrchestrator((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem(ORCHESTRATOR_KEY, next ? "1" : "0");
+      } catch {
+        // ignore storage errors
+      }
+      return next;
+    });
+  }, []);
   const [accounts, setAccounts] = useState<Account[]>([]);
   // Live lists, for the accounts that publish one (Antigravity), by account id.
   const [liveModels, setLiveModels] = useState<
@@ -272,15 +291,26 @@ export default function App() {
         void api
           .routing()
           .then((r) => (loadProfiles(r), r))
-          .then((r) =>
+          .then((r) => {
             setModel(
               (prev) =>
                 prev || r.main_model || b.providers[0]?.default_model || "",
-            ),
-          )
-          .catch(() =>
-            setModel((prev) => prev || b.providers[0]?.default_model || ""),
-          );
+            );
+            setExecutorModel(
+              (prev) =>
+                prev ||
+                r.subagent_model ||
+                r.main_model ||
+                b.providers[0]?.default_model ||
+                "",
+            );
+          })
+          .catch(() => {
+            setModel((prev) => prev || b.providers[0]?.default_model || "");
+            setExecutorModel(
+              (prev) => prev || b.providers[0]?.default_model || "",
+            );
+          });
         void api
           .accounts()
           .then(setAccounts)
@@ -300,6 +330,10 @@ export default function App() {
   useEffect(() => {
     if (model) localStorage.setItem(MODEL_KEY, model);
   }, [model]);
+
+  useEffect(() => {
+    if (executorModel) localStorage.setItem(EXECUTOR_MODEL_KEY, executorModel);
+  }, [executorModel]);
 
   // The saved model left its account's live list: move to the account's
   // first model instead of failing every turn with a 404.
@@ -529,13 +563,26 @@ export default function App() {
         prompt,
         mode,
         reasoningEffort: effort === "off" ? null : effort,
+        orchestrator,
+        executorModel: orchestrator ? executorModel || model : null,
         history: 0,
       });
     } catch (e) {
       setError(String(e));
       if (id) updateTurn(id, (prev) => ({ ...prev, busy: false }));
     }
-  }, [draft, model, mode, effort, selected, turns, folder, updateTurn]);
+  }, [
+    draft,
+    model,
+    executorModel,
+    orchestrator,
+    mode,
+    effort,
+    selected,
+    turns,
+    folder,
+    updateTurn,
+  ]);
 
   const steer = useCallback(
     async (text: string) => {
@@ -1061,6 +1108,10 @@ export default function App() {
                 model={model}
                 models={models}
                 onModel={setModel}
+                orchestrator={orchestrator}
+                onToggleOrchestrator={toggleOrchestrator}
+                executorModel={executorModel || model}
+                onExecutorModel={setExecutorModel}
                 hidden={hidden}
                 onToggleHidden={toggleHidden}
                 hint={status || error || "/ comandos  ·  @ arquivos"}
@@ -1205,14 +1256,30 @@ export default function App() {
                     </span>
                   </header>
                   {route ? (
-                    <div className="insp-route">
-                      <Logo id={route.provider} size={28} />
-                      <div>
-                        <strong>{route.provider}</strong>
-                        {account ? <span>{account}</span> : null}
+                    <>
+                      <div className="insp-route">
+                        <Logo id={route.provider} size={28} />
+                        <div>
+                          <strong>
+                            {orchestrator
+                              ? `${tr(lang, "Pensamento", "Think")}: ${route.provider}`
+                              : route.provider}
+                          </strong>
+                          {account ? <span>{account}</span> : null}
+                        </div>
+                        <code>{route.model}</code>
                       </div>
-                      <code>{route.model}</code>
-                    </div>
+                      {orchestrator ? (
+                        <div className="insp-route" style={{ marginTop: 6 }}>
+                          <Bot size={20} strokeWidth={1.75} />
+                          <div>
+                            <strong>{tr(lang, "Executor", "Executor")}</strong>
+                            <span>{tr(lang, "Subagentes / Tools", "Subagents / Tools")}</span>
+                          </div>
+                          <code>{executorModel || model}</code>
+                        </div>
+                      ) : null}
+                    </>
                   ) : (
                     <p className="insp-empty">
                       {tr(lang, "Nenhum modelo escolhido.", "No model selected.")}

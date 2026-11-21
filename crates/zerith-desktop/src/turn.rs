@@ -28,6 +28,8 @@ pub struct Setup {
     pub memory_paused: bool,
     pub agent: Option<String>,
     pub reasoning_effort: Option<String>,
+    pub orchestrator: bool,
+    pub executor_model: Option<String>,
     pub mcp_cache: Option<Arc<crate::state::McpCache>>,
 }
 
@@ -250,6 +252,14 @@ pub fn run(
     if let Some(c) = &contrib {
         c.apply_hooks(&mut settings);
     }
+    if let Some(exec_m) = setup
+        .executor_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        settings.routing.subagent_model = Some(exec_m.to_string());
+    }
     let mut policy = Policy::from_settings(&settings, &setup.workspace)
         .map(|p| p.with_handle(zerith_security::ModeHandle::new(setup.mode)))
         .ok();
@@ -340,6 +350,8 @@ pub fn run(
             history,
             inbox,
             reasoning_effort: setup.reasoning_effort.clone(),
+            orchestrator: setup.orchestrator,
+            executor_model: setup.executor_model.clone(),
             ..AgentOptions::default()
         },
         session_id,

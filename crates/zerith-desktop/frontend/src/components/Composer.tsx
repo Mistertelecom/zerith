@@ -612,7 +612,7 @@ export function Composer(props: {
             {props.onToggleOrchestrator ? (
               <button
                 type="button"
-                className={"pill" + (props.orchestrator ? " open" : "")}
+                className={"pill" + (props.orchestrator ? " open orch-on" : "")}
                 aria-pressed={!!props.orchestrator}
                 title={tr(
                   lang,
@@ -627,50 +627,20 @@ export function Composer(props: {
                 </span>
               </button>
             ) : null}
-            <PillMenu
-              label={
-                props.orchestrator
-                  ? tr(lang, "Modelo de Pensamento (Cérebro)", "Thinking Model (Brain)")
-                  : tr(lang, "Modelo", "Model")
-              }
-              icon={
-                provider === "Perfil" ? (
-                  <Layers size={16} strokeWidth={1.75} />
-                ) : (
-                  <Logo id={provider || null} size={16} />
-                )
-              }
-              text={
-                props.orchestrator
-                  ? `${tr(lang, "Pensamento", "Think")}: ${brainName}`
-                  : brainName
-              }
-              value={props.model}
-              options={props.models}
-              onPick={props.onModel}
-              hidden={props.hidden}
-              onToggleHidden={props.onToggleHidden}
-              search
-              wide
-            />
-            {props.orchestrator && props.onExecutorModel ? (
+            {!props.orchestrator ? (
               <PillMenu
-                label={tr(
-                  lang,
-                  "Modelo de Execução (Subagentes / Ferramentas)",
-                  "Execution Model (Subagents / Tools)",
-                )}
+                label={tr(lang, "Modelo", "Model")}
                 icon={
-                  execProvider === "Perfil" ? (
-                    <Cpu size={16} strokeWidth={1.75} />
+                  provider === "Perfil" ? (
+                    <Layers size={16} strokeWidth={1.75} />
                   ) : (
-                    <Logo id={execProvider || null} size={16} />
+                    <Logo id={provider || null} size={16} />
                   )
                 }
-                text={`${tr(lang, "Execução", "Exec")}: ${execName}`}
-                value={execVal}
+                text={brainName}
+                value={props.model}
                 options={props.models}
-                onPick={props.onExecutorModel}
+                onPick={props.onModel}
                 hidden={props.hidden}
                 onToggleHidden={props.onToggleHidden}
                 search
@@ -711,6 +681,59 @@ export function Composer(props: {
               </button>
             )}
           </div>
+          {props.orchestrator && props.onExecutorModel ? (
+            <div className="orch-bar" role="group" aria-label={tr(lang, "Modelos do Orquestrador", "Orchestrator Models")}>
+              <span className="orch-tag">
+                <Brain size={13} strokeWidth={2} />
+                {tr(lang, "Pensamento:", "Thinking:")}
+              </span>
+              <PillMenu
+                label={tr(lang, "Modelo de Pensamento (Cérebro)", "Thinking Model (Brain)")}
+                icon={
+                  provider === "Perfil" ? (
+                    <Layers size={15} strokeWidth={1.75} />
+                  ) : (
+                    <Logo id={provider || null} size={15} />
+                  )
+                }
+                text={brainName}
+                value={props.model}
+                options={props.models}
+                onPick={props.onModel}
+                hidden={props.hidden}
+                onToggleHidden={props.onToggleHidden}
+                search
+                wide
+              />
+              <span className="orch-arrow" aria-hidden>→</span>
+              <span className="orch-tag">
+                <Cpu size={13} strokeWidth={2} />
+                {tr(lang, "Execução:", "Execution:")}
+              </span>
+              <PillMenu
+                label={tr(
+                  lang,
+                  "Modelo de Execução (Subagentes / Ferramentas)",
+                  "Execution Model (Subagents / Tools)",
+                )}
+                icon={
+                  execProvider === "Perfil" ? (
+                    <Cpu size={15} strokeWidth={1.75} />
+                  ) : (
+                    <Logo id={execProvider || null} size={15} />
+                  )
+                }
+                text={execName}
+                value={execVal}
+                options={props.models}
+                onPick={props.onExecutorModel}
+                hidden={props.hidden}
+                onToggleHidden={props.onToggleHidden}
+                search
+                wide
+              />
+            </div>
+          ) : null}
         </div>
         <div className="hint">
           <span className="hint-text">{note ?? props.hint}</span>

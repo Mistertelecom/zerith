@@ -1,9 +1,10 @@
 // What one answer did to the files: the bar under it, the diff per file and
 // the undo. Data comes lazily from `turn_changes` once the answer is stored.
 import { useEffect, useState } from "react";
-import { AlertTriangle, Check, ChevronRight, FileDiff, FilePen, Undo2 } from "lucide-react";
+import { AlertTriangle, Check, ChevronRight, FilePen, Undo2 } from "lucide-react";
 import { changesApi, type FileChange } from "../lib/api";
 import { tr, useLang } from "../lib/i18n";
+import { FileLangBadge } from "./Transcript";
 
 // Per answer, for the whole window session: a remount (switching
 // conversations, a new turn) never refetches or forgets an undo.
@@ -228,7 +229,7 @@ export function TurnChanges({ sessionId, messageId }: { sessionId: string; messa
                   aria-expanded={on}
                   title={f.path}
                 >
-                  <FileDiff size={14} strokeWidth={2} aria-hidden />
+                  <FileLangBadge path={f.rel} />
                   <span className="change-path">{f.rel}</span>
                   {f.changedSince ? (
                     <span

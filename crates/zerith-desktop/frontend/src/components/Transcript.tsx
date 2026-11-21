@@ -628,27 +628,191 @@ function Markdown({ text, streaming }: { text: string; streaming: boolean }) {
 
 const STATE_LABEL = { run: "executando", ok: "concluída", fail: "falhou" } as const;
 
+type LangMeta = { tag: string; cls: string; title: string };
+
+function fileLangMeta(path: string): LangMeta {
+  const base = path.split(/[\\/]/).pop() ?? path;
+  const lower = base.toLowerCase();
+  const ext = lower.includes(".") ? lower.split(".").pop() ?? "" : lower;
+  switch (ext) {
+    case "rs":
+      return { tag: "R", cls: "lang-rs", title: "Rust" };
+    case "ts":
+    case "tsx":
+      return { tag: "TS", cls: "lang-ts", title: "TypeScript" };
+    case "js":
+    case "jsx":
+    case "mjs":
+    case "cjs":
+      return { tag: "JS", cls: "lang-js", title: "JavaScript" };
+    case "py":
+      return { tag: "PY", cls: "lang-py", title: "Python" };
+    case "go":
+      return { tag: "GO", cls: "lang-go", title: "Go" };
+    case "json":
+    case "toml":
+    case "yaml":
+    case "yml":
+      return { tag: "{}", cls: "lang-cfg", title: ext.toUpperCase() };
+    case "css":
+    case "scss":
+      return { tag: "#", cls: "lang-css", title: "CSS" };
+    case "html":
+    case "htm":
+    case "svg":
+      return { tag: "<>", cls: "lang-html", title: ext.toUpperCase() };
+    case "md":
+    case "mdx":
+      return { tag: "M↓", cls: "lang-md", title: "Markdown" };
+    case "sh":
+    case "bash":
+    case "zsh":
+    case "ps1":
+    case "bat":
+    case "cmd":
+      return { tag: "$_", cls: "lang-sh", title: "Shell" };
+    case "rsc":
+    case "cfg":
+    case "conf":
+    case "ini":
+      return { tag: "⇄", cls: "lang-net", title: "Network Config" };
+    case "sql":
+      return { tag: "DB", cls: "lang-py", title: "SQL" };
+    default:
+      return { tag: (ext.slice(0, 2) || "F").toUpperCase(), cls: "lang-gen", title: base };
+  }
+}
+
+export function FileLangBadge({ path }: { path: string }) {
+  const meta = fileLangMeta(path);
+  return (
+    <span className={`lang-badge ${meta.cls}`} title={meta.title} aria-hidden>
+      {meta.tag}
+    </span>
+  );
+}
+
+const FILE_TOOLS = new Set([
+  "read_file",
+  "edit_file",
+  "multi_edit",
+  "write_file",
+  "diagnostics",
+  "lsp_definition",
+  "lsp_references",
+  "lsp_hover",
+  "lsp_symbols",
+]);
+
+function toolActionLabel(name: string): string {
+  switch (name) {
+    case "read_file":
+    case "diagnostics":
+    case "lsp_definition":
+    case "lsp_references":
+    case "lsp_hover":
+    case "lsp_symbols":
+      return "Analyzed";
+    case "edit_file":
+    case "multi_edit":
+      return "Edited";
+    case "write_file":
+      return "Created";
+    case "grep":
+    case "glob":
+    case "repo_map":
+    case "web_search":
+    case "skill_search":
+    case "session_search":
+      return "Searched";
+    case "list_dir":
+      return "Listed";
+    case "shell":
+      return "Ran";
+    case "net_connect":
+      return "Connected";
+    case "terminal_batch":
+    case "net_broadcast":
+      return "Executed";
+    case "agent":
+      return "Delegated";
+    case "skill_load":
+      return "Loaded skill";
+    case "memory_save":
+    case "memory_update":
+    case "memory_forget":
+    case "memory_recall":
+      return "Memory";
+    default:
+      return name;
+  }
+}
+
+function computeFileLineRange(name: string, argsObj: Record<string, unknown> | null, preview?: string): string | null {
+  if (name !== "read_file") return null;
+  const offset = typeof argsObj?.offset === "number" && argsObj.offset >= 1 ? Math.floor(argsObj.offset) : 1;
+  const limit = typeof argsObj?.limit === "number" && argsObj.limit >= 1 ? Math.floor(argsObj.limit) : null;
+  if (preview) {
+    const m = /\[linhas\s+(\d+)-(\d+)\s+de\s+\d+/i.exec(preview);
+    if (m) return `#L${m[1]}-${m[2]}`;
+    const nums = [...preview.matchAll(/^(\d+)\t/gm)].map((x) => Number(x[1]));
+    if (nums.length > 0) {
+      const first = nums[0];
+      const last = limit ? Math.max(nums[nums.length - 1], first + limit - 1) : nums[nums.length - 1];
+      return `#L${first}-${last}`;
+    }
+  }
+  if (limit) {
+    return `#L${offset}-${offset + limit - 1}`;
+  }
+  return `#L${offset}`;
+}
+
 function ToolLine({ row }: { row: ToolRow }) {
   const [open, setOpen] = useState(false);
   const Icon = toolIcon(row.name);
   const arg = argSummary(row.args);
-  const args = parseArgs(row.args);
-  const body = row.preview ?? row.progress ?? (args ? JSON.stringify(args, null, 2) : row.args);
+  const parsed = parseArgs(row.args);
+  const argsObj = parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : null;
+  const body = row.preview ?? row.progress ?? (parsed ? JSON.stringify(parsed, null, 2) : row.args);
   const state = row.ok === undefined ? "run" : row.ok ? "ok" : "fail";
   const liveTail =
     state === "run" && row.progress
       ? row.progress.split(/\r?\n/).slice(-8).join("\n")
       : null;
+  const rawPath =
+    typeof argsObj?.path === "string"
+      ? argsObj.path
+      : typeof argsObj?.file_path === "string"
+        ? argsObj.file_path
+        : typeof argsObj?.filePath === "string"
+          ? argsObj.filePath
+          : null;
+  const isFileTool = FILE_TOOLS.has(row.name) && Boolean(rawPath);
+  const fileBase = rawPath ? (rawPath.split(/[\\/]/).pop() ?? rawPath) : "";
+  const lineRange = isFileTool ? computeFileLineRange(row.name, argsObj, row.preview) : null;
+  const label = toolActionLabel(row.name);
   return (
     <div className={`tool ${state}` + (open ? " open" : "")}>
       <button className="tool-head" onClick={() => setOpen(!open)} aria-expanded={open} disabled={!body}>
-        <span className="tool-icon">
-          <Icon size={14} strokeWidth={2} />
-        </span>
-        <span className="tool-name">{row.name}</span>
-        <span className="tool-arg" title={arg}>
-          {arg}
-        </span>
+        {!isFileTool ? (
+          <span className="tool-icon">
+            <Icon size={14} strokeWidth={2} />
+          </span>
+        ) : null}
+        <span className="tool-name">{label}</span>
+        {isFileTool && rawPath ? (
+          <span className="tool-file" title={rawPath}>
+            <FileLangBadge path={rawPath} />
+            <span className="tool-file-name">{fileBase}</span>
+            {lineRange ? <span className="tool-range">{lineRange}</span> : null}
+          </span>
+        ) : (
+          <span className="tool-arg" title={arg}>
+            {arg}
+          </span>
+        )}
+        <span className="spacer" />
         <span className="tool-state" role="img" aria-label={STATE_LABEL[state]}>
           {state === "run" ? (
             <span className="spinner" />

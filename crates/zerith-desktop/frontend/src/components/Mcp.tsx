@@ -37,6 +37,98 @@ const HERMES: Record<HermesMcp["status"], [string, string]> = {
 
 const EMPTY = { name: "", command: "", url: "", env: "", headers: "" };
 
+const MCP_PRESETS: {
+  id: string;
+  label: string;
+  category: "Dev" | "NetOps";
+  hint: string;
+  kind: "stdio" | "http";
+  command: string;
+  url: string;
+  env: string;
+}[] = [
+  {
+    id: "context7",
+    label: "Context7 (Docs)",
+    category: "Dev",
+    hint: "Documentação oficial e atualizada de crates/pacotes em tempo real (Upstash)",
+    kind: "stdio",
+    command: "npx -y @upstash/context7-mcp",
+    url: "",
+    env: "",
+  },
+  {
+    id: "github",
+    label: "GitHub MCP",
+    category: "Dev",
+    hint: "PRs, issues, código, releases e logs do GitHub Actions",
+    kind: "stdio",
+    command: "npx -y @modelcontextprotocol/server-github",
+    url: "",
+    env: "GITHUB_PERSONAL_ACCESS_TOKEN=",
+  },
+  {
+    id: "ast_grep",
+    label: "ast-grep (AST)",
+    category: "Dev",
+    hint: "Busca e refatoração estrutural por árvore sintática em 25+ linguagens",
+    kind: "stdio",
+    command: "uvx --from git+https://github.com/ast-grep/ast-grep-mcp ast-grep-server",
+    url: "",
+    env: "",
+  },
+  {
+    id: "sequential_thinking",
+    label: "Sequential Thinking",
+    category: "Dev",
+    hint: "Decomposição e validação passo a passo para problemas complexos",
+    kind: "stdio",
+    command: "npx -y @modelcontextprotocol/server-sequential-thinking",
+    url: "",
+    env: "",
+  },
+  {
+    id: "netbox",
+    label: "NetBox (IPAM/DCIM)",
+    category: "NetOps",
+    hint: "Consulta prefixos IPv4/IPv6, VLANs, VRFs, ASNs, circuitos e ativos de rede",
+    kind: "stdio",
+    command: "uvx netbox-mcp-server",
+    url: "",
+    env: "NETBOX_URL=https://netbox.lan\nNETBOX_TOKEN=",
+  },
+  {
+    id: "grafana",
+    label: "Grafana NOC",
+    category: "NetOps",
+    hint: "Dashboards, alertas, Loki e métricas de NOC/infraestrutura",
+    kind: "stdio",
+    command: "npx -y mcp-grafana",
+    url: "",
+    env: "GRAFANA_URL=http://localhost:3000\nGRAFANA_API_KEY=",
+  },
+  {
+    id: "prometheus",
+    label: "Prometheus (PromQL)",
+    category: "NetOps",
+    hint: "Séries temporais de tráfego, CPU, erros ópticos e disponibilidade",
+    kind: "stdio",
+    command: "uvx prometheus-mcp-server",
+    url: "",
+    env: "PROMETHEUS_URL=http://localhost:9090",
+  },
+  {
+    id: "postgres",
+    label: "PostgreSQL",
+    category: "Dev",
+    hint: "Inspeção de schemas e consultas SQL somente-leitura",
+    kind: "stdio",
+    command: "npx -y @modelcontextprotocol/server-postgres postgresql://localhost/mydb",
+    url: "",
+    env: "",
+  },
+];
+
 export function McpTab() {
   const [servers, setServers] = useState<McpServer[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -178,8 +270,33 @@ export function McpTab() {
       ) : null}
 
       {adding ? (
-        <Card title="Novo servidor" icon={Plus} description="Gravado em mcp.toml do usuário. Nenhum shell envolvido.">
+        <Card title="Novo servidor" icon={Plus} description="Escolha um preset do GitHub com 1 clique ou preencha manualmente (gravado em mcp.toml do usuário).">
           <div className="pn-form">
+            <div className="field">
+              <span className="field-label">Presets rápidos (Dev &amp; NetOps)</span>
+              <div className="pn-inline wrap">
+                {MCP_PRESETS.map((p) => (
+                  <button
+                    key={p.id}
+                    type="button"
+                    className={"btn btn-sm" + (form.name === p.id ? " btn-primary" : "")}
+                    title={p.hint}
+                    onClick={() => {
+                      setKind(p.kind);
+                      setForm({
+                        name: p.id,
+                        command: p.command,
+                        url: p.url,
+                        env: p.env,
+                        headers: "",
+                      });
+                    }}
+                  >
+                    <span className="badge">{p.category}</span> {p.label}
+                  </button>
+                ))}
+              </div>
+            </div>
             <div className="pn-row2">
               <label className="field">
                 <span className="field-label">Nome</span>

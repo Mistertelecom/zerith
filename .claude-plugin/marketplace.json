@@ -5,10 +5,94 @@
     "url": "https://github.com/Mistertelecom"
   },
   "metadata": {
-    "description": "Loja de plugins do Zerith: pacotes no formato do Claude Code (skills, comandos, agentes e MCP) que a IA usa sozinha quando o assunto aparece.",
-    "version": "1"
+    "description": "Loja de plugins do Zerith: pacotes no formato do Claude Code (skills, comandos, agentes, hooks e MCP) que a IA usa sozinha quando o assunto aparece.",
+    "version": "2"
   },
   "plugins": [
+    {
+      "name": "zerith-netops",
+      "description": "Consultoria de redes, ISP/Telecom e engenharia de infraestrutura: troubleshooting BGP/OSPF/MPLS/EVPN/CGNAT/PPPoE multi-vendor (Cisco, Huawei, Juniper, MikroTik), janelas de mudança segura com rollback e auditoria de hardening de borda.",
+      "version": "0.2.3",
+      "category": "networking",
+      "license": "GPL-3.0-only",
+      "homepage": "https://github.com/Mistertelecom/zerith",
+      "source": "./plugins/zerith-netops"
+    },
+    {
+      "name": "superpowers",
+      "description": "Metodologia de engenharia de software para agentes (obra/superpowers): TDD estrito (Red/Green/Refactor), debugging sistemático de causa-raiz, planejamento antes de codar, code review e desenvolvimento guiado por subagentes.",
+      "version": "4.0.0",
+      "category": "development",
+      "license": "MIT",
+      "homepage": "https://github.com/obra/superpowers",
+      "source": {
+        "source": "github",
+        "repo": "obra/superpowers"
+      }
+    },
+    {
+      "name": "context7",
+      "description": "Documentação oficial em tempo real e exemplos de código da versão exata das bibliotecas (Rust, Tauri, React, Python, Go) via servidor MCP da Upstash, evitando alucinações de APIs.",
+      "version": "1.0.0",
+      "category": "development",
+      "license": "MIT",
+      "homepage": "https://github.com/upstash/context7",
+      "source": {
+        "source": "github",
+        "repo": "upstash/context7"
+      }
+    },
+    {
+      "name": "ast-grep",
+      "description": "Busca e refatoração estrutural de código por AST (Árvore Sintática) em mais de 25 linguagens (Rust, TypeScript, Python, Go, C/C++) usando o ast-grep (sg).",
+      "version": "1.0.0",
+      "category": "development",
+      "license": "MIT",
+      "homepage": "https://github.com/ast-grep/claude-skill",
+      "source": {
+        "source": "github",
+        "repo": "ast-grep/claude-skill"
+      }
+    },
+    {
+      "name": "pr-review-toolkit",
+      "description": "Kit oficial da Anthropic para revisão profunda de código e PRs: análise de bugs silenciosos, segurança, cobertura de testes, design de tipos e simplificação.",
+      "version": "1.0.0",
+      "category": "development",
+      "license": "MIT",
+      "homepage": "https://github.com/anthropics/claude-code",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/anthropics/claude-code.git",
+        "path": "plugins/pr-review-toolkit"
+      }
+    },
+    {
+      "name": "security-guidance",
+      "description": "Plugin oficial da Anthropic com hooks e diretrizes preventivas contra command injection, XSS, path traversal, desserialização insegura e vazamento de segredos.",
+      "version": "1.0.0",
+      "category": "security",
+      "license": "MIT",
+      "homepage": "https://github.com/anthropics/claude-code",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/anthropics/claude-code.git",
+        "path": "plugins/security-guidance"
+      }
+    },
+    {
+      "name": "commit-commands",
+      "description": "Comandos estruturados (/commit, /commit-push-pr, /clean_gone) para histórico Git limpo, mensagens semânticas e revisão de diff antes do commit.",
+      "version": "1.0.0",
+      "category": "productivity",
+      "license": "MIT",
+      "homepage": "https://github.com/anthropics/claude-code",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/anthropics/claude-code.git",
+        "path": "plugins/commit-commands"
+      }
+    },
     {
       "name": "claude-bughunter",
       "description": "Bug bounty e red team externo: 83 skills (hunt-* por classe de vulnerabilidade, recon/OSINT, M365/Entra, Okta, VPN, APK/iOS, relatório) e 15 comandos (/hunt, /recon, /chain...). Use só em alvos com autorização.",

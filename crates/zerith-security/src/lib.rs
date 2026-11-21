@@ -776,7 +776,7 @@ impl Policy {
             }
         };
         match tool {
-            "read_file" | "list_dir" | "glob" | "grep" => {
+            "read_file" | "list_dir" | "glob" | "grep" | "repo_map" => {
                 Some(Action::Read(path(s("path").unwrap_or("."))))
             }
             "write_file" | "edit_file" => Some(Action::Write(path(s("path")?))),

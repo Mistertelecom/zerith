@@ -400,6 +400,13 @@ mod tests {
             .filter_map(|p| p["name"].as_str())
             .collect();
         for want in [
+            "zerith-netops",
+            "superpowers",
+            "context7",
+            "ast-grep",
+            "pr-review-toolkit",
+            "security-guidance",
+            "commit-commands",
             "claude-bughunter",
             "cli-anything",
             "stitch-skills",

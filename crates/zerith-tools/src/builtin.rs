@@ -13,7 +13,7 @@ mod edit;
 mod search;
 
 use edit::{edit_file, multi_edit};
-use search::{glob, grep, list_dir};
+use search::{glob, grep, list_dir, repo_map};
 
 type RunFn = fn(&Value, &CallCtx<'_>, &Exec<'_>) -> Result<String>;
 type ActionFn = fn(&Value, &CallCtx<'_>) -> Result<Option<Action>>;
@@ -39,7 +39,13 @@ impl Tool for Builtin {
     fn concurrency_safe(&self, _: &Value) -> bool {
         matches!(
             self.spec.name.as_str(),
-            "read_file" | "list_dir" | "glob" | "grep" | "memory_recall" | "session_search"
+            "read_file"
+                | "list_dir"
+                | "glob"
+                | "grep"
+                | "repo_map"
+                | "memory_recall"
+                | "session_search"
         )
     }
     fn uses_memory(&self) -> bool {
@@ -181,6 +187,21 @@ pub(crate) fn all() -> Vec<Box<dyn crate::Tool>> {
             30,
             dir_action,
             grep,
+        ),
+        tool(
+            "repo_map",
+            "Mapeia a estrutura e assinaturas principais do repositório (funções, structs, traits, classes, interfaces e blocos de roteadores/switches em .cfg/.conf/.rsc) respeitando .gitignore e um orçamento de caracteres.",
+            json!({"type": "object", "properties": {
+                "path": {"type": "string", "description": "diretório ou arquivo base (padrão: workspace)"},
+                "glob": {"type": "string", "description": "filtro opcional de arquivos (ex.: *.rs, src/**/*.ts, *.cfg)"},
+                "max_chars": {"type": "integer", "description": "orçamento máximo de caracteres (padrão 6000, faixa 500..24000)"},
+                "max_symbols_per_file": {"type": "integer", "description": "máximo de símbolos por arquivo (padrão 25)"}
+            }}),
+            "árvore compacta de arquivos com linhas e assinaturas L<N>: <assinatura>",
+            Permission::Read,
+            30,
+            dir_action,
+            repo_map,
         ),
         tool(
             "shell",
@@ -853,5 +874,41 @@ mod ondav4_tests {
             std::fs::read(&latin_path).unwrap(),
             b"N\xfamero 1\nlinha B\n"
         );
+    }
+
+    #[test]
+    fn repo_map_extracts_code_and_network_config_symbols() {
+        let dir = scratch();
+        let root = dir.path();
+        std::fs::write(
+            root.join("lib.rs"),
+            "pub struct RouterConfig {\n    pub asn: u32,\n}\n\npub fn apply_bgp(cfg: &RouterConfig) -> bool {\n    true\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("core.cfg"),
+            "!\nhostname PE-CORE-01\ninterface GigabitEthernet0/0/0\n description Uplink\nrouter bgp 65001\n neighbor 10.0.0.1 remote-as 65002\n",
+        )
+        .unwrap();
+        let pol = Policy::new(preset("workspace-write").unwrap(), Mode::Bypass, root);
+        let ctx = CallCtx {
+            workspace: pol.workspace.as_path(),
+            policy: &pol,
+            memory: None,
+            scope: None,
+        };
+        let reg = Registry::new();
+
+        let out = reg.call("repo_map", &json!({}), &ctx).unwrap();
+        assert!(out.contains("lib.rs"), "{out}");
+        assert!(out.contains("pub struct RouterConfig"), "{out}");
+        assert!(
+            out.contains("pub fn apply_bgp(cfg: &RouterConfig) -> bool"),
+            "{out}"
+        );
+        assert!(out.contains("core.cfg"), "{out}");
+        assert!(out.contains("hostname PE-CORE-01"), "{out}");
+        assert!(out.contains("interface GigabitEthernet0/0/0"), "{out}");
+        assert!(out.contains("router bgp 65001"), "{out}");
     }
 }

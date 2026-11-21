@@ -566,3 +566,204 @@ fn scan_file(
     }
     (out, hits)
 }
+
+fn is_mappable_ext(rel: &str) -> bool {
+    let lower = rel.to_ascii_lowercase();
+    [
+        ".rs", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".go", ".c", ".h", ".cpp",
+        ".hpp", ".java", ".kt", ".rb", ".sh", ".sql", ".cfg", ".conf", ".rsc", ".ios", ".vrp",
+    ]
+    .iter()
+    .any(|ext| lower.ends_with(ext))
+}
+
+fn clean_signature(line: &str) -> String {
+    let mut s = line.trim();
+    if let Some(idx) = s.find(" {") {
+        s = s[..idx].trim_end();
+    } else if let Some(idx) = s.strip_suffix('{') {
+        s = idx.trim_end();
+    }
+    let cleaned: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if cleaned.chars().count() > 110 {
+        let mut trunc: String = cleaned.chars().take(107).collect();
+        trunc.push_str("...");
+        trunc
+    } else {
+        cleaned
+    }
+}
+
+fn is_symbol_line(rel: &str, trimmed: &str) -> bool {
+    if trimmed.is_empty()
+        || trimmed.starts_with("//")
+        || trimmed.starts_with('#')
+        || trimmed.starts_with("/*")
+        || trimmed.starts_with('*')
+        || trimmed.starts_with('!')
+    {
+        return false;
+    }
+    let lower_path = rel.to_ascii_lowercase();
+    if lower_path.ends_with(".cfg")
+        || lower_path.ends_with(".conf")
+        || lower_path.ends_with(".rsc")
+        || lower_path.ends_with(".ios")
+        || lower_path.ends_with(".vrp")
+    {
+        let low = trimmed.to_ascii_lowercase();
+        return [
+            "hostname ",
+            "sysname ",
+            "interface ",
+            "router bgp",
+            "router ospf",
+            "router isis",
+            "bgp ",
+            "ospf ",
+            "ip vrf ",
+            "ip vpn-instance ",
+            "vrf definition ",
+            "/interface",
+            "/routing",
+            "/ip firewall",
+        ]
+        .iter()
+        .any(|p| low.starts_with(p));
+    }
+
+    const CODE_PREFIXES: &[&str] = &[
+        "pub fn ",
+        "pub async fn ",
+        "pub const fn ",
+        "pub(crate) fn ",
+        "pub(super) fn ",
+        "fn ",
+        "async fn ",
+        "pub struct ",
+        "pub(crate) struct ",
+        "struct ",
+        "pub enum ",
+        "pub(crate) enum ",
+        "enum ",
+        "pub trait ",
+        "trait ",
+        "impl ",
+        "impl<",
+        "pub mod ",
+        "pub type ",
+        "export function ",
+        "export async function ",
+        "export default function ",
+        "function ",
+        "export class ",
+        "class ",
+        "export interface ",
+        "interface ",
+        "export type ",
+        "export const ",
+        "def ",
+        "async def ",
+        "func ",
+        "type ",
+        "CREATE TABLE ",
+        "create table ",
+    ];
+    CODE_PREFIXES.iter().any(|p| trimmed.starts_with(p))
+}
+
+pub(crate) fn extract_file_symbols(
+    rel: &str,
+    text: &str,
+    max_per_file: usize,
+) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    for (idx, raw) in text.lines().enumerate() {
+        let indent = raw.len() - raw.trim_start().len();
+        if indent > 4 {
+            continue;
+        }
+        let trimmed = raw.trim();
+        if is_symbol_line(rel, trimmed) {
+            out.push((idx + 1, clean_signature(trimmed)));
+            if out.len() >= max_per_file {
+                break;
+            }
+        }
+    }
+    out
+}
+
+pub(super) fn repo_map(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
+    let base = ctx.resolve(args["path"].as_str().unwrap_or("."));
+    let filter = args["glob"].as_str();
+    let max_chars = args["max_chars"]
+        .as_u64()
+        .map_or(6_000usize, |n| (n as usize).clamp(500, 24_000));
+    let max_per_file = args["max_symbols_per_file"]
+        .as_u64()
+        .map_or(25usize, |n| (n as usize).clamp(3, 100));
+
+    let mut files = Vec::new();
+    for item in walk(&base, exec) {
+        let (rel, entry) = item?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Some(f) = filter {
+            if !glob_match(f, &rel, true) && !glob_match(f, &name, true) {
+                continue;
+            }
+        } else if !is_mappable_ext(&rel) {
+            continue;
+        }
+        let shown = if base.is_file() { name } else { rel };
+        files.push((shown, entry.into_path()));
+    }
+
+    if files.is_empty() {
+        return Ok("nenhum arquivo de código ou configuração encontrado para mapear".into());
+    }
+
+    let mut out = String::new();
+    let mut mapped_files = 0usize;
+    let mut total_symbols = 0usize;
+    let mut truncated = false;
+
+    for (shown, path) in &files {
+        exec.check()?;
+        let Ok(meta) = std::fs::metadata(path) else {
+            continue;
+        };
+        if meta.len() > 1_048_576 {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let symbols = extract_file_symbols(shown, &text, max_per_file);
+        let mut block = String::new();
+        block.push_str(shown);
+        block.push('\n');
+        for (line_no, sig) in &symbols {
+            block.push_str(&format!("  L{line_no}: {sig}\n"));
+        }
+        if out.len() + block.len() > max_chars && !out.is_empty() {
+            truncated = true;
+            break;
+        }
+        out.push_str(&block);
+        mapped_files += 1;
+        total_symbols += symbols.len();
+    }
+
+    if truncated {
+        out.push_str(&format!(
+            "[repo_map truncado em {max_chars} caracteres: {mapped_files}/{} arquivos, {total_symbols} símbolos — use path ou glob para focar]",
+            files.len()
+        ));
+    } else {
+        out.push_str(&format!(
+            "[repo_map: {mapped_files} arquivo(s), {total_symbols} símbolo(s)]"
+        ));
+    }
+    Ok(out)
+}

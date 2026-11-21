@@ -1750,6 +1750,8 @@ pub(crate) fn is_orchestrator_root_tool(name: &str) -> bool {
             | "memory_delete"
             | "session_search"
             | "net_inventory"
+            | "workflow_list"
+            | "channel_list"
             | "enter_plan_mode"
             | "exit_plan_mode"
     )
@@ -1853,6 +1855,45 @@ pub(crate) fn should_include_tool_schema(name: &str, context_lower: &str) -> boo
             "novo agente",
             "create_agent",
             "delete_ai_item",
+        ]
+        .iter()
+        .any(|kw| context_lower.contains(kw));
+    }
+    if matches!(
+        name,
+        "workflow_list"
+            | "channel_list"
+            | "workflow_create_or_update"
+            | "workflow_toggle"
+            | "workflow_delete"
+            | "workflow_run"
+    ) {
+        return [
+            "workflow",
+            "automação",
+            "automacao",
+            "automatiz",
+            "automate",
+            "fluxo",
+            "rotina",
+            "routine",
+            "schedule",
+            "agend",
+            "cron",
+            "whatsapp",
+            "evolution",
+            "waha",
+            "telegram",
+            "discord",
+            "slack",
+            "webhook",
+            "alerta",
+            "notifica",
+            "relatório",
+            "relatorio",
+            "monitor",
+            "channel_list",
+            "workflow_",
         ]
         .iter()
         .any(|kw| context_lower.contains(kw));

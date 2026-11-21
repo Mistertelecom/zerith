@@ -27,6 +27,7 @@ mod skill_tool;
 mod tasks;
 mod terminal;
 mod web;
+mod workflows;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -50,6 +51,7 @@ pub use terminal::{
     TerminalSnapshot,
 };
 pub use web::SearchTool;
+pub use workflows::{set_workflow_ai_executor, set_workflow_change_hook};
 
 /// What a caller may be asked to allow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

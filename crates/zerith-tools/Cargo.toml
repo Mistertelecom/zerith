@@ -10,6 +10,7 @@ zerith-security = { path = "../zerith-security" }
 zerith-core = { path = "../zerith-core" }
 zerith-skills = { path = "../zerith-skills" }
 zerith-memory = { path = "../zerith-memory" }
+zerith-workflows = { path = "../zerith-workflows" }
 # Only for `Cancel`: the token a turn shares between the stream and its tools.
 zerith-providers = { path = "../zerith-providers" }
 serde = { workspace = true }

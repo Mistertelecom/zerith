@@ -1,0 +1,10 @@
+{
+  "name": "zerith-workflows",
+  "version": "0.3.0",
+  "description": "Arquiteto de automações e workflows globais do Zerith: cria, edita, conecta e valida fluxos visuais agendados (Cron), coleta NOC/SSH/HTTP, transformação sem tokens, IA e notificações em WhatsApp (Evolution API, WAHA, Cloud API), Telegram, Discord, Slack e Webhooks.",
+  "author": {
+    "name": "Joao Pedro Mota (Mistertelecom)"
+  },
+  "homepage": "https://github.com/Mistertelecom/zerith",
+  "license": "GPL-3.0-only"
+}

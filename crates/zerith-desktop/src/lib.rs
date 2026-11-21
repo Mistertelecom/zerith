@@ -78,8 +78,8 @@ fn seed_bundled_skills(root: &std::path::Path) {
 }
 
 /// Official Zerith plugins (`zerith-netops`, `zerith-proxmox`, `zerith-noc-observability`,
-/// `zerith-ftth-olt`, `zerith-linux-devops`, `zerith-workflows`) arrive installed and enabled by default
-/// so their skills and agents are immediately active without manual setup.
+/// `zerith-ftth-olt`, `zerith-linux-devops`, `zerith-workflows`, `zerith-finance`) arrive installed
+/// and enabled by default so their skills and agents are immediately active without manual setup.
 fn seed_bundled_plugins(root: &std::path::Path) {
     let bundle = zerith_core::Paths::with_root(root)
         .bundled_plugins()

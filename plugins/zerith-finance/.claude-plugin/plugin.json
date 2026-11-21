@@ -1,0 +1,10 @@
+{
+  "name": "zerith-finance",
+  "version": "0.3.0",
+  "description": "Analista pessoal de mercado financeiro e valuation (B3 e ações globais): triagem de ações descontadas / abaixo do preço justo (Graham, Bazin, DCF, P/L, P/VP, EV/EBITDA, DY), análise fundamentalista com cotações ao vivo e criação de briefings diários automáticos.",
+  "author": {
+    "name": "Joao Pedro Mota (Mistertelecom)"
+  },
+  "homepage": "https://github.com/Mistertelecom/zerith",
+  "license": "GPL-3.0-only"
+}

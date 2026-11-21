@@ -55,6 +55,62 @@
       "source": "./plugins/zerith-linux-devops"
     },
     {
+      "name": "zerith-workflows",
+      "description": "Arquiteto de automações e workflows globais do Zerith: cria, edita, conecta e valida fluxos visuais agendados (Cron), coleta NOC/SSH/HTTP, transformação sem tokens, IA e notificações em WhatsApp (Evolution API, WAHA, Cloud API), Telegram, Discord, Slack e Webhooks.",
+      "version": "0.3.0",
+      "category": "automation",
+      "license": "GPL-3.0-only",
+      "homepage": "https://github.com/Mistertelecom/zerith",
+      "source": "./plugins/zerith-workflows"
+    },
+    {
+      "name": "zerith-finance",
+      "description": "Analista pessoal de mercado financeiro e valuation (B3 e ações globais): triagem de ações descontadas / abaixo do preço justo (Graham, Bazin, P/L, P/VP, DY, DCF), cotações ao vivo e alertas automáticos.",
+      "version": "0.3.0",
+      "category": "finance",
+      "license": "GPL-3.0-only",
+      "homepage": "https://github.com/Mistertelecom/zerith",
+      "source": "./plugins/zerith-finance"
+    },
+    {
+      "name": "last30days",
+      "description": "Pesquisa profunda dos últimos 30 dias em Reddit, X, YouTube, TikTok, Hacker News, Polymarket, GitHub, patentes e web — ranqueada por engajamento real e sintetizada com fontes (mvanhorn/last30days-skill).",
+      "version": "4.5.0",
+      "category": "research",
+      "license": "MIT",
+      "homepage": "https://github.com/mvanhorn/last30days-skill",
+      "source": {
+        "source": "github",
+        "repo": "mvanhorn/last30days-skill"
+      }
+    },
+    {
+      "name": "finance-market-analysis",
+      "description": "Análise avançada de ações, balanços, correlações, ETFs, opções e valuation (DCF / SOTP) com yfinance (himself65/finance-skills).",
+      "version": "11.2.1",
+      "category": "finance",
+      "license": "MIT",
+      "homepage": "https://github.com/himself65/finance-skills",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/himself65/finance-skills.git",
+        "path": "plugins/market-analysis"
+      }
+    },
+    {
+      "name": "trading-ideas",
+      "description": "Pesquisa institucional de ações (equity research): análise fundamentalista, indicadores técnicos, atividade de insiders e relatórios com recomendação e preço-alvo (quant-sentiment-ai/claude-equity-research).",
+      "version": "1.0.1",
+      "category": "finance",
+      "license": "MIT",
+      "homepage": "https://github.com/quant-sentiment-ai/claude-equity-research",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/quant-sentiment-ai/claude-equity-research.git",
+        "path": "commands/trading-ideas"
+      }
+    },
+    {
       "name": "superpowers",
       "description": "Metodologia de engenharia de software para agentes (obra/superpowers): TDD estrito (Red/Green/Refactor), debugging sistemático de causa-raiz, planejamento antes de codar, code review e desenvolvimento guiado por subagentes.",
       "version": "4.0.0",

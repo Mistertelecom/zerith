@@ -1,276 +1,245 @@
-# Zerith
+<div align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="crates/zerith-desktop/icons/logo-white.svg" />
+    <source media="(prefers-color-scheme: light)" srcset="crates/zerith-desktop/icons/logo-black.svg" />
+    <img alt="Zerith logo" src="crates/zerith-desktop/icons/logo-black.svg" width="96" />
+  </picture>
 
-Harness de agentes de IA nativo, escrito em Rust: chat com ferramentas e
-aprovação humana, memória local, skills, MCP, planos com subagentes e uma
-janela desktop em Tauri 2 (`zerith-desktop`) sobre o núcleo Rust.
+  <h1>Zerith</h1>
+  <p>
+    <strong>Native Rust AI agent harness &amp; Tauri 2 desktop workbench</strong><br />
+    Built for heavy software engineering, multi-vendor network consulting, and autonomous CLI/daemon workflows.
+  </p>
 
-O Zerith é um projeto próprio. Estudou ideias de outros harnesses (OpenHuman,
-Claude Code, DeepSeek Harness, Hermes) e reimplementou em Rust o que fazia
-sentido; nenhum deles é dependência em tempo de execução. As referências e o
-que veio de cada uma estão em [UPSTREAMS.md](UPSTREAMS.md).
+  <p>
+    <a href="https://github.com/Mistertelecom/zerith/releases">
+      <img alt="Release v0.2.0" src="https://img.shields.io/badge/version-v0.2.0-111827?style=flat-square" />
+    </a>
+    <a href="https://github.com/Mistertelecom/zerith/actions/workflows/zerith.yml">
+      <img alt="CI Status" src="https://github.com/Mistertelecom/zerith/actions/workflows/zerith.yml/badge.svg" />
+    </a>
+    <img alt="Rust 2021" src="https://img.shields.io/badge/Rust-13_crates-b7410e?style=flat-square" />
+    <img alt="Tauri 2" src="https://img.shields.io/badge/Desktop-Tauri_2_+_React-24c8db?style=flat-square" />
+    <a href="LICENSE">
+      <img alt="License GPL-3.0" src="https://img.shields.io/badge/license-GPL--3.0-blue?style=flat-square" />
+    </a>
+  </p>
+</div>
 
-## Crates
+---
 
-| Crate | Papel |
+Zerith is an original, self-contained AI agent harness written in **Rust** across **13 workspace crates**, paired with a **Tauri 2 + React/TypeScript** desktop app (`zerith-desktop`) and a fast single-binary CLI (`zerith`).
+
+It combines human-in-the-loop tool governance, a native multi-account LLM gateway, semantic LSP & worktree coding tools, interactive SSH/PTY network device automation, cron scheduling, local FTS5 memory, and a fail-closed Telegram gateway—with zero external Node/Python runtime daemons required.
+
+---
+
+## Screenshots
+
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <strong>Workspace Chat, Active SSH Terminals &amp; Syntax Highlighting</strong><br />
+      <sub>Multi-vendor network CLI &amp; Rust highlighting, live PTY strips, tool previews, reasoning effort selector, and session context controls.</sub>
+      <br /><br />
+      <img src="docs/img/chat.png" alt="Zerith Desktop Chat, Active Terminals and Syntax Highlighting" />
+    </td>
+    <td width="50%" valign="top">
+      <strong>Multi-Model Delegation &amp; Routing Tree</strong><br />
+      <sub>Assign separate models/accounts for Main, Subagents, Explore, Plan, and Smart Compaction roles plus multi-model failover combos.</sub>
+      <br /><br />
+      <img src="docs/img/routing.png" alt="Zerith Multi-Model Routing Tree" />
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <strong>Skills, Plugins &amp; Hermes Importer</strong><br />
+      <sub>Review-before-run Agent Skills inspector with static security findings, toggle controls, GitHub catalog, and Hermes migration.</sub>
+      <br /><br />
+      <img src="docs/img/skills.png" alt="Zerith Skills Manager" />
+    </td>
+    <td width="50%" valign="top">
+      <strong>Scoped Persistent Memory (SQLite FTS5)</strong><br />
+      <sub>Project- and user-scoped instructions, preferences, decisions, and inferred facts ranked with BM25 + recency scoring.</sub>
+      <br /><br />
+      <img src="docs/img/memory.png" alt="Zerith Memory Panel" />
+    </td>
+  </tr>
+</table>
+
+---
+
+## What's Inside (v0.2.0)
+
+### 1. Speed, Prompt Caching & Native Gateway
+- **Native Multi-Account LLM Gateway (`zerith-providers`):** Direct support for OpenAI, Anthropic, Codex (OAuth), Antigravity (OAuth), DeepSeek, Gemini, OpenRouter, Ollama, LM Studio, and custom OpenAI/Anthropic endpoints—with per-account quotas, cooldowns, combos, and automatic failover.
+- **Prompt Caching & Token Saver (`zerith-runtime`):** Provider prompt-cache optimization, deterministic `Ponytail` / `Caveman` / `RTK` output filters, and dynamic `compact_model` routing with automatic 70% background pre-compaction.
+- **Zero Cold-Start Warm Caches:** Pre-warmed, generation-invalidated `McpCache` registries and SQLite schema caching.
+
+### 2. Desktop Workbench & Interactive CLI
+- **Desktop App (`zerith-desktop`):** Non-blocking background turn runner, Ed25519-signed auto-updater (`update.rs`), live command palette (`Ctrl+K` / `Cmd+K`), `Shift+Tab` mode cycling, `ArrowUp` prompt recall, context window gauge, and diff review with per-turn file `undo`.
+- **Live Turn Control:** Real-time mid-turn steering (`steer_turn`), throttled `ToolProgress` output streaming, end-to-end `reasoning_effort` (`off` / `low` / `medium` / `high`), and session-scoped approval grants with safe command-prefix matching.
+- **Zero-Dependency Syntax Highlighter:** Pure TypeScript tokenizer highlighting Rust, TypeScript/JavaScript, Python, Shell, JSON, TOML, YAML, SQL, and multi-vendor Network CLIs (Cisco IOS/XR/NX-OS, Huawei VRP, Juniper Junos, MikroTik RouterOS, Fortinet FortiOS, FRR) with IP/CIDR, interface, `permit`/`established`, and `deny`/`shutdown` color tokens.
+- **Interactive CLI REPL (`zerith repl`):** Multi-turn terminal session retaining warm HTTP clients, MCP tools, session grants, and slash commands (`/help`, `/model`, `/mode`, `/effort`, `/compact`, `/rewind`, `/sessions`, `/clear`, `/exit`).
+
+### 3. Heavy Software Engineering Toolkit
+- **Fast Search (`glob`, `grep`, `ripgrep` fast-path):** Root and nested `.gitignore` filtering, `-A`/`-B`/`-C` context lines, `case_insensitive` toggles, `rg --sort path` acceleration when present, and multi-threaded Rust fallback.
+- **Atomic Batch Editing (`multi_edit`):** All-or-nothing transactional multi-hunk edits with automatic rollback on failure, CRLF preservation, unique normalized-whitespace matching fallback, ambiguity refusal, and legacy Latin-1 round-trip support.
+- **Stdio LSP Bridge (`lsp.rs`):** Native `lsp_diagnostics`, `lsp_definition`, `lsp_references`, and `lsp_symbols` across Rust, TypeScript/JavaScript, Python, Go, and C/C++.
+- **Git Worktree Isolation & Rewind:** Subagents can run isolated via `WorktreeGuard` (`git worktree`), automatically cleaning up untouched worktrees or preserving dirty ones with a `git diff --stat` report; file + conversation checkpoints restore via `zerith rewind`.
+- **Remote Targets (`--remote` & `zerith remote`):** Run sessions and `remote_shell` against `ssh://` hosts or `docker://` containers with configured aliases in `[remote.targets]` and POSIX shell/flag-injection hardening.
+
+### 4. Network Consulting Suite
+- **Interactive PTY Terminals (`terminal.rs`):** ConPTY/PTY sessions with tail checks, automatic pager handling (`auto_page` for `--More--` / `---- More ----`), interruptible `Ctrl+C` (`0x03`), and the Desktop **Active Terminals** strip (`Tail`, `Ctrl+C`, `Close`).
+- **Device Inventory & Bastion SSH (`network.rs`):** Merge global and workspace `.zerith/inventory.toml` inventories with OS-keyring credentials, `net_inventory`, `net_connect` (auto disable-paging, `jump_host`, `legacy_ssh`), and multi-command `terminal_batch`.
+- **Risk Classification & Red-Flag Safety:** Automatic platform-aware classification (`ReadOnly` / `Mutation` / `Dangerous`) in `pipeline.rs` forcing explicit confirmation on destructive router/switch operations (`reload`, `write erase`, `reset bgp`, etc.) even under `Bypass` mode, alongside expanded `READ_ONLY` shell network diagnostics and RTK `network-config`/`network-table` compression.
+- **Bundled Skill:** Ships with [`bundled-skills/network-consulting/SKILL.md`](bundled-skills/network-consulting/SKILL.md).
+
+### 5. Autonomy, Memory & Messaging
+- **Unified SQLite Store (`zerith-sessions` & `zerith-memory`):** Single transactional SQLite file with `V1–V10` schema migrations, `session_search` across past chats, and FTS5 recall combining BM25 with PT/EN stopword stripping, project-scope affinity, and recency weighting.
+- **Cron Scheduler & Daemon (`zerith schedule` / `zerith daemon`):** UTC cron expressions persisted in SQLite supporting zero-LLM-token `--no-agent` shell checks or fail-closed autonomous agent runs, minute deduplication, and Telegram failure alerts.
+- **Telegram Bot Gateway (`zerith gateway telegram`):** OS-keyring token storage (`telegram_bot_token`), fail-closed `allowed_chats` allowlist, inline-keyboard tool approval (`Permitir 1x`, `Permitir sessão`, `Negar`), and UTF-8 safe 4096-char chunking.
+
+---
+
+## Architecture
+
+| Crate | Responsibility |
 | --- | --- |
-| `zerith-core` | Identidade, `Paths` (por SO), erros, configurações em camadas (`accounts`, `routing`, `token_saver`) |
-| `zerith-sessions` | SQLite, migrações versionadas (`V1`–`V7`), sessões, mensagens, eventos, checkpoints, rewind e rastreamento de uso/cotas/economia |
-| `zerith-memory` | `MemoryBackend` + `SqliteMemory` (FTS5) + extração determinística |
-| `zerith-providers` | Gateway nativo multi-conta com failover automático, presets nativos (`openai`, `anthropic`, `deepseek`, `gemini`, `openrouter`, `ollama`, `lmstudio`) e `ModelSpec` |
-| `zerith-runtime` | Um turno de agente, gateway + quota tracker, delegação multi-modelo de subagentes e Token Saver (`Ponytail`, `Caveman`, `RTK`) |
-| `zerith-importers` | Import read-only do Hermes (`~/.hermes/state.db`) |
-| `zerith-skills` | Formato Agent Skills, catálogo GitHub, instalação com rollback |
-| `zerith-mcp` | Cliente MCP (stdio e HTTP), configuração `[[mcp.servers]]`, ferramentas `mcp__<servidor>__<ferramenta>` no laço do agente |
-| `zerith-tools` | Registry de ferramentas com permissões, timeouts e política |
-| `zerith-plugins` | Manifestos de plugin (inclui pacotes de skills/agentes/hooks/MCP), ativação e revisão explícita |
-| `zerith-security` | Presets de sandbox, vereditos, redação de segredos |
-| `zerith-cli` | Binário `zerith` |
-| `zerith-desktop` | Janela desktop em Tauri 2 + React/TypeScript: chat, histórico, agentes, skills, memória, MCP, provedores, mídia, configurações e atualização automática assinada (Ed25519) |
+| `zerith-core` | Identity, OS `Paths`, layered TOML/env config (`accounts`, `routing`, `gateway`, `remote`, `token_saver`) with `tighten_only` project security, and OS keyring credential storage |
+| `zerith-sessions` | SQLite ownership, versioned `V1–V10` migrations, sessions, messages, checkpoints/`rewind`, usage/quota/savings telemetry, and cron `schedules` CRUD |
+| `zerith-memory` | `MemoryBackend` + `SqliteMemory` FTS5 store with PT/EN stopword filtering, scope/recency scoring, and explicit tombstone forgetting |
+| `zerith-providers` | Direct multi-account gateway (`openai`, `anthropic`, `deepseek`, `gemini`, `openrouter`, `ollama`, `lmstudio`, `codex`, `antigravity`), prompt cache & `reasoning_effort` mapping, media client |
+| `zerith-runtime` | Agent loop, policy & approval middleware, network risk gating, Token Saver (`Ponytail`/`Caveman`/`RTK`), smart compaction, subagent delegation & `git worktree` isolation |
+| `zerith-importers` | Read-only importer for Hermes (`~/.hermes/state.db` & JSONL) plus skills/MCP detection |
+| `zerith-skills` | `SKILL.md` parser/validator, static risk scanner, remote GitHub skill installer with rollback |
+| `zerith-mcp` | Stdio and HTTP MCP client with warm registry caching, resource expansion (`@server:res`), and per-project approval gating |
+| `zerith-tools` | Tool registry & built-ins (`read_file`, `write_file`, `edit_file`, `multi_edit`, `grep`, `glob`, `shell`, `terminal_*`, `net_*`, `lsp_*`, `remote_shell`, `session_search`, `web_*`) |
+| `zerith-plugins` | Directory plugin manifests (`plugin.json`), explicit trust workflow, hooks, bundled agents/skills/MCP |
+| `zerith-security` | Presets (`read-only`, `workspace-write`, `danger-full-access`), modes (`Default`, `AcceptEdits`, `Plan`, `DontAsk`, `Bypass`), compound shell parser & redaction |
+| `zerith-cli` | Single native `zerith` binary (chat, `-p` headless, `repl`, `schedule`, `daemon`, `gateway`, `remote`, admin) |
+| `zerith-desktop` | Tauri 2 + React 18/TypeScript UI with streaming turns, diff undo, active PTY strip, zero-dep highlighting, and Ed25519 self-updater |
 
-Um banco só: `zerith-sessions` é dono do schema; `zerith-memory` usa o mesmo
-arquivo e as mesmas migrações.
+More architectural details are available in [ARCHITECTURE.md](ARCHITECTURE.md) and [UPSTREAMS.md](UPSTREAMS.md).
 
-## Comandos
+---
+
+## Installation & Quick Start
+
+### Pre-built Binaries
+Download portable CLI archives (Windows, Linux, macOS) or the signed Windows NSIS desktop installer (`Zerith_<version>_x64-setup.exe` with `.sha256` + Ed25519 `.sig`) from [GitHub Releases](https://github.com/Mistertelecom/zerith/releases).
+
+### Build from Source
+Requirements: **Rust (stable)**, **Node.js 22+** (for `zerith-desktop`), and on Linux WebKitGTK/GTK (`libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev`).
 
 ```bash
-cargo test
-cargo clippy --all-targets -- -D warnings
-cargo fmt --all --check
-cargo run --bin zerith -- doctor
+# Run workspace tests & checks
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+
+# Run the CLI health check
+cargo run -p zerith-cli -- doctor
+
+# Build and launch the Desktop app (Tauri 2)
+cd crates/zerith-desktop/frontend && npm install && npm run build && cd ../../..
+cargo run -p zerith-desktop
 ```
 
-## Onde ficam os dados
+### Quick Usage Examples
 
-| SO | Raiz |
-| --- | --- |
-| Windows | `%APPDATA%\Zerith` |
-| macOS | `~/Library/Application Support/Zerith` |
-| Linux | `$XDG_DATA_HOME/zerith` (ou `~/.local/share/zerith`) |
+```bash
+# Interactive multi-turn REPL with high reasoning effort
+zerith repl --mode acceptEdits --effort high
 
-`ZERITH_HOME` sobrepõe tudo (testes, instalação portátil).
+# Remote execution over SSH or inside a Docker container
+zerith remote add core-lab ssh://ops@10.0.0.10:2222/srv/configs
+zerith repl --remote core-lab
 
-## CLI
+# Headless CI / automation turn with strict JSON output
+zerith -p "Audit open PR diff for race conditions" --output-format json --max-turns 8
+
+# Cron monitoring without spending LLM tokens (--no-agent), alerts via Telegram on failure
+zerith schedule add link-check --cron "*/5 * * * *" --command "ping -c 3 10.250.0.1" --no-agent
+zerith daemon
+
+# Configure & run the fail-closed Telegram Bot gateway (token stored in OS keyring)
+zerith gateway telegram setup --token - --chats 123456789
+zerith gateway telegram run
+```
+
+---
+
+## CLI Reference
 
 ```text
-zerith version | paths | policy | bench | backup | restore <file>
-zerith doctor [--offline]           # banco, configuração, sandbox, cofre, provider, MCP, plugins
+zerith version | paths | doctor [--offline] | policy [check <path>] | bench | backup | restore <file>
 zerith session list|new|show|rename
-zerith search <texto>               # busca de texto completo nas mensagens
-zerith export <sessão> [--format md|jsonl] [--out ARQ]
-zerith checkpoints <sessão>         # pontos de restauração
-zerith rewind <sessão> [--turn N] [--code|--conversation|--both] [--purge]
-zerith chat [--resume [id|nome]|--continue|--session id] [--fork] [--model id] <prompt>
-zerith -p <prompt> [--output-format text|json|stream-json] [--max-turns N]
-        [--max-budget-usd X --price-in P --price-out P] [--allowed-tools ...]
-        [--disallowed-tools ...] [--permission-mode MODO] [--json-schema ...]
-zerith agents list
-zerith skills list|install|update|remove|enable|disable|rollback|validate|catalog
+zerith search <query> [--limit N]
+zerith export <session> [--format md|jsonl] [--out FILE]
+zerith checkpoints <session>
+zerith rewind <session> [--turn N] [--code|--conversation|--both] [--purge]
+zerith repl [--session <id>|--resume [id|name]|--continue] [--model M] [--mode MODE] [--effort off|low|medium|high] [--remote <uri|alias>]
+zerith chat [--session <id>|--resume [id|name]|--continue] [--fork] [--model M] [--remote <uri|alias>] <prompt>
+zerith -p <prompt> [--output-format text|json|stream-json] [--model M] [--permission-mode MODE] [--max-turns N] [--remote <uri|alias>] ...
+zerith schedule add <name> --cron <expr> (--command <cmd> --no-agent | --prompt <p>) [--workspace dir] [--model M]
+zerith schedule list | remove <id|name> | toggle <id|name> <on|off> | run <id|name>
+zerith daemon [--once] [--poll-secs N]
+zerith gateway telegram setup --token <tok|-> --chats <id1,id2> [--model M] [--workspace dir]
+zerith gateway telegram run [--poll-secs N]
+zerith remote list | add <alias> <ssh://...|docker://...> | remove <alias> | exec <target> [--] <cmd...>
+zerith providers | accounts | routing | usage | quota | tokensaver | media | login | secret | config
 zerith memory list|recall|remember|edit|forget|export|import|pause|resume|status
-zerith mcp list|add|remove|approve|tools|call
-zerith plugin list|show|install|enable|disable|trust|untrust|remove|tools
-zerith providers [show|probe|models|chat <model> <prompt>]
-zerith accounts [list|add <id> <provider> ...|remove|enable|disable|reset-cooldown <id>]
-zerith routing [show|main|subagent|explore|plan <model>|role <agent> <model>|combo <name> <m1,m2,...>]
-zerith tokensaver [show|ponytail <nível>|caveman <nível>|rtk <on|off>]
-zerith usage [--hours N] | quota [--hours N]
-zerith import detect | hermes [--profile P] [--jsonl ARQUIVO]
+zerith skills list|installed|catalog|install|update|remove|enable|disable|rollback|validate
+zerith mcp list|add|remove|approve|tools|call | plugin list|show|install|enable|disable|trust|untrust|tools|remove
+zerith plan run <file|-> [--agents N] [--model M] | plan list | agents list | tools [list|call]
+zerith import detect | hermes | hermes-skills | mcp import-hermes
 ```
 
-`<sessão>` aceita o id, o título (sem diferenciar maiúsculas) ou um prefixo de
-id único com 4+ caracteres; título repetido é erro que lista os candidatos.
+---
 
-Códigos de saída: `0` sucesso; `1` erro, schema não atendido, orçamento ou limite
-de passos; `130` Ctrl+C e `143` SIGTERM/fechamento do console (um segundo sinal
-encerra na hora). O cancelamento só é visto entre pedaços do stream e entre
-chamadas de ferramenta.
+## Configuration & Environment Precedence
 
-## Providers e Gateway Local Nativo
-
-O Zerith conecta diretamente aos provedores via Gateway Local Nativo Multi-Conta
-(com suporte a combos, limites de cota, failover automático e delegação de
-subagentes entre modelos/contas). Não depende de 9Router externo. Quando
-variáveis de ambiente estiverem definidas, elas continuam no topo da precedência:
-
-| Variável | Efeito |
+| Variable | Effect |
 | --- | --- |
-| `ZERITH_PROVIDER` | `openai` (padrão), `anthropic`, `deepseek`, `gemini`, `openrouter`, `ollama`, `lmstudio`, `custom` |
-| `ZERITH_BASE_URL` | Sobrescreve a URL do endpoint |
-| `ZERITH_API_KEY` | Chave; exigida só no chat, não em `probe`/`models` |
-| `ZERITH_MODEL` | Modelo padrão do chat |
-| `ZERITH_ACCOUNT_ID` | ID explícito da conta no gateway |
-| `ZERITH_SUBAGENT_MODEL` | Sobrescreve `[routing] subagent_model` para subagentes |
-| `ZERITH_PONYTAIL` | Nível do protocolo Ponytail (`off`, `lite`, `full`, `ultra`) |
-| `ZERITH_CAVEMAN` | Nível do protocolo Caveman (`off`, `lite`, `full`, `ultra`, `wenyan`) |
-| `ZERITH_USER` | Dono do escopo de memória (padrão: usuário do SO) |
+| `ZERITH_HOME` | Overrides the entire data directory (useful for tests & portable installs) |
+| `ZERITH_PROVIDER` | Overrides active provider (`openai`, `anthropic`, `deepseek`, `gemini`, `openrouter`, `ollama`, `lmstudio`, `custom`) |
+| `ZERITH_BASE_URL` | Overrides the provider endpoint URL |
+| `ZERITH_API_KEY` | Explicit API key (otherwise resolved via OS keyring) |
+| `ZERITH_MODEL` | Overrides the default main model |
+| `ZERITH_ACCOUNT_ID` | Forces a specific gateway account ID |
+| `ZERITH_SUBAGENT_MODEL` | Overrides `[routing] subagent_model` |
+| `ZERITH_MODE` | Overrides default permission mode |
+| `ZERITH_PONYTAIL` / `ZERITH_CAVEMAN` | Overrides Token Saver protocol compression levels |
+| `ZERITH_USER` | Overrides the default `user:<id>` memory scope owner |
 
-`probe` e `models` funcionam sem chave de propósito: um servidor local
-(LM Studio, Ollama) que lista modelos não deve ser escondido por falta de
-credencial que ele nem pede. Detalhes do gateway, cotas e Token Saver estão em
-[docs/providers.md](docs/providers.md).
+**Default Data Locations:**
+- **Windows:** `%APPDATA%\Zerith`
+- **macOS:** `~/Library/Application Support/Zerith`
+- **Linux:** `$XDG_DATA_HOME/zerith` (fallback `~/.local/share/zerith`)
 
-## Permissões, segurança e benchmark
+---
 
-`zerith policy` mostra preset (`read-only`, `workspace-write`,
-`danger-full-access`), nível de enforcement e o veredito para um caminho
-(`zerith policy check <path>`). O enforcement é reportado como `partial`
-porque o host ainda não tem jail próprio: preset não é garantia. Erros são
-redigidos antes de ir para stderr (chaves, headers, hex longo).
+## Security & Governance
 
-`zerith bench` mede abertura+migração, 1000 appends, paginação de 50 e recall
-FTS5 sobre 200 fatos, num banco descartável. `zerith backup` usa a API de
-backup do SQLite (nunca cópia de arquivo WAL vivo) e `zerith restore` valida
-`integrity_check` e guarda o banco atual antes de substituir. O turno pode ser
-cancelado: a janela troca "enviar" por "parar" e o token chega ao loop de rede.
+- **No Plaintext Secrets:** API keys, OAuth tokens, device SSH passwords, and Telegram bot tokens live exclusively in the OS credential manager (`keyring` crate) and are redacted from logs/errors (`zerith-security::redact`).
+- **Project Layer Hardening (`tighten_only`):** Repository `.zerith/settings.toml` / `settings.local.toml` files can restrict permissions, **never** widen `allow` rules or hijack `providers`, `accounts`, `gateway`, `[remote.targets]`, `hooks`, or `media`.
+- **Fail-Closed Automation:** Headless runs (`-p`), cron agent jobs (`daemon`), Telegram `allowed_chats` checks, and dangerous network CLI commands require explicit configuration or interactive confirmation before executing.
 
-## Planos e subagentes
+See [SECURITY.md](SECURITY.md) and [docs/permissions.md](docs/permissions.md) for the complete model.
 
-Um plano é uma lista de tarefas (`título | prompt`, uma por linha) gravada em
-`agent_tasks` antes de rodar. Cada tarefa vira uma sessão própria, então o que
-um subagente fez é uma conversa legível. `zerith plan run <arquivo|-> --agents N`
-respeita dependências em cadeia, limita a concorrência a 8, marca `skipped`
-quando a dependência falhou e devolve tarefas `running` para `pending` no
-início (crash não trava o plano). `zerith plan list` mostra o que ficou pela
-metade; a janela tem o painel "Execução".
+---
 
-## Skills e MCP
+## Documentation Index
 
-### Skills
+- [Architecture](ARCHITECTURE.md) · [Agent Method](docs/agent-method.md) · [Upstream Attribution](UPSTREAMS.md)
+- [Providers & Gateway](docs/providers.md) · [Permissions](docs/permissions.md) · [Sandbox](docs/sandbox.md) · [Settings](docs/settings.md)
+- [Checkpoints & Rewind](docs/checkpoints.md) · [Memory](docs/memory.md) · [Skills](docs/skills.md) · [MCP](docs/mcp.md) · [Plugins](docs/plugins.md) · [Hooks](docs/hooks.md)
+- [Media Generation](docs/media.md) · [Hermes Import](docs/hermes-import.md)
+- [Build Guide](docs/build.md) · [Testing](docs/testing.md) · [Release & Verification](docs/release.md) · [Acceptance Spec](docs/aceite.md)
 
-Formato Agent Skills (`SKILL.md` com frontmatter YAML). O Zerith **lê e
-valida**, nunca executa nada na instalação: `zerith skills validate <dir>`
-mostra inventário, scripts encontrados e flags (`curl`, `| sh`, `rm -rf`,
-`Invoke-Expression`). A janela lista o que está em `<root>/skills`.
+<details>
+<summary>Windows MSVC dev-profile note</summary>
 
-### MCP
+`Cargo.toml` sets `[profile.dev] debug = false` because older MSVC toolsets reject `/Z7` (`cl.exe D8050`) when compiling bundled SQLite. Release builds and all functionality are unaffected; you can remove that setting if using a newer MSVC toolchain.
 
-Cliente stdio e HTTP, sem shell na linha de comando do servidor. Servidores de
-`[[mcp.servers]]` viram ferramentas `mcp__<servidor>__<ferramenta>` no laço do
-agente (hoje em `zerith -p`), com recursos `@servidor:recurso` e prompts como
-comandos. Servidor definido por um projeto só roda depois de
-`zerith mcp approve`. Detalhes e limites em [docs/mcp.md](docs/mcp.md).
-
-## Ferramentas e plugins
-
-O registry (`zerith-tools`) declara, por ferramenta, o que o spec exige:
-nome, descrição, schema de parâmetros, resultado esperado, permissão,
-timeout, se é cancelável, se é local e a origem. `zerith tools` imprime tudo
-isso — uma ferramenta que esconde o timeout fica visível na hora.
-
-| Ferramenta | Permissão | Timeout | Observação |
-| --- | --- | --- | --- |
-| `read_file` | read | 5 s | dentro do workspace |
-| `write_file` | write | 5 s | fora do workspace exige aprovação |
-| `list_dir` | read | 5 s | diretórios terminam em `/` |
-| `memory_recall` | read | 2 s | `[confirmed|inferred] texto` |
-| `shell` | shell | 30 s | **recusada**: o host não tem jail |
-| `mcp_call` | network | 60 s | recusada sem transporte conectado |
-
-`shell` é recusada mesmo em `danger-full-access`, e o motivo é o do spec: sem
-sandbox real, "permitido" seria uma promessa que o host não cumpre. O caminho
-para executar comando é MCP ou plugin, que rodam em outro processo.
-
-### Plugins
-
-Um plugin é um diretório com `plugin.json` (nome, versão, `command`, `args`).
-Descobrir plugin lê o manifesto e **nada mais**: instalar não executa e não
-confia. `plugins install` grava como `disabled` + `unreviewed`; habilitar não
-basta — `plugins trust` marca a revisão humana, e só então `plugins tools`
-abre o processo. Um plugin que falha morre no próprio processo, como um
-servidor MCP, e não derruba a aplicação.
-
-```bash
-zerith plugin install ./meu-plugin    # disabled, unreviewed
-zerith plugin show meu-plugin         # o que ele executa
-zerith plugin enable meu-plugin       # ainda não executa
-zerith plugin trust meu-plugin --yes  # revisão explícita
-zerith plugin tools meu-plugin        # agora inicia e lista ferramentas
-zerith plugin disable meu-plugin      # desativa sem apagar
-zerith plugin remove meu-plugin
-```
-
-Um plugin também pode ser um pacote de skills, agentes, hooks e servidores MCP
-([docs/plugins.md](docs/plugins.md)). Isso não é sandbox: o plugin roda com os
-privilégios do usuário. O manifesto também não é autorização — é metadado.
-
-## Rewind
-
-`zerith rewind` desfaz o que um turno fez nos arquivos e na conversa. Só vê
-edições feitas pelas ferramentas de arquivo, nunca as de comandos de shell, e
-sobrescreve o que está no disco. Limites e API em
-[docs/checkpoints.md](docs/checkpoints.md).
-
-## Método de agente
-
-O mapa entre o método do Claude Code, a arquitetura do DeepSeek Harness e o
-que o Zerith tem de fato (implementado x planejado) está em
-[docs/agent-method.md](docs/agent-method.md).
-
-## Capturas de tela
-
-Ainda não há capturas versionadas. Caminhos reservados:
-`docs/img/chat.png`, `docs/img/skills.png`, `docs/img/memoria.png`.
-## Memória
-
-Fatos vivem no mesmo banco das sessões, com escopo (`user:<id>`), tipo
-(`fact`, `preference`, `decision`, `instruction`, `entity`, `project`) e
-confiança (`confirmed` = o usuário disse; `inferred` = o sistema concluiu).
-Os dois nunca são exibidos como se fossem o mesmo.
-
-Captura: só o que o usuário pede explicitamente — `lembre que …`,
-`lembre-se que …`, `remember that …`. Sem marcador, nada é gravado; adivinhar
-seria transformar inferência em memória confirmada.
-
-Recall: uma vez por turno, contra o texto do usuário, com orçamento de
-`MEMORY_BUDGET_CHARS = 2000` caracteres e no máximo `MEMORY_HITS = 12` fatos. O
-bloco entra **depois** do prompt fixo do sistema, preservando o prefix cache do
-provider. Falha de recall não derruba o turno.
-
-Administração: `zerith memory list|recall|forget` no CLI e o painel **Memória**
-na janela, onde o botão `x` apaga o fato (tombstone: o texto é zerado e a chave
-de dedupe não o ressuscita).
-
-## Janela
-
-```bash
-cd crates/zerith-desktop/frontend && npm install && npm run build
-cd ../..
-cargo run -p zerith-desktop          # abre a janela Tauri 2
-```
-
-Para desenvolvimento com hot reload (Vite + Tauri 2):
-
-```bash
-cd crates/zerith-desktop && npx @tauri-apps/cli@2 dev
-```
-
-O turno roda em thread de trabalho e emite eventos ao frontend via Tauri, então
-um modelo lento nunca trava a interface.
-
-## Testes
-
-```bash
-cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-```
-
-O CI (`.github/workflows/zerith.yml`) roda fmt, clippy e `cargo test --workspace`
-em Linux e Windows, além do build/typecheck do frontend (`tsc --noEmit && vite build`).
-Uma tag `zerith-v*` dispara `.github/workflows/zerith-release.yml` (CLI portátil em
-Windows, Linux e macOS + instalador NSIS do `zerith-desktop` no Windows com `.sha256`
-e assinatura Ed25519 `.sig`).
-
-Detalhes de toolchain, memória e caminhos: [docs/build.md](docs/build.md).
-
-## Aceite e release
-
-`docs/aceite.md` traz cada critério da seção 21 do spec com o estado real e a
-evidência; `docs/release.md` cobre instalação, desinstalação, atualização,
-benchmarks e o que ainda falta (assinatura, instaladores, matriz executada).
-
-## Nota de build no Windows
-
-`[profile.dev] debug = false` está ligado. O toolset MSVC desta máquina falha
-com `cl.exe D8050` ao compilar o SQLite bundled com `/Z7`. Sem debug info o
-build passa; o custo é backtrace sem números de linha em dev. Remova a seção
-quando o toolset for atualizado.
+</details>

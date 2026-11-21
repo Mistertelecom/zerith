@@ -70,6 +70,9 @@ pub struct TerminalSnapshot {
     pub device: Option<String>,
     pub host: Option<String>,
     pub role: Option<String>,
+    pub client: Option<String>,
+    pub vpn: Option<String>,
+    pub transport: Option<String>,
     pub idle_secs: u64,
 }
 
@@ -81,6 +84,9 @@ struct TermMeta {
     device: Option<String>,
     host: Option<String>,
     role: Option<String>,
+    client: Option<String>,
+    vpn: Option<String>,
+    transport: Option<String>,
     buf: Arc<Mutex<VecDeque<u8>>>,
     input: Arc<Mutex<Box<dyn Write + Send>>>,
     last_used: Arc<Mutex<Instant>>,
@@ -163,6 +169,9 @@ pub fn list_active_terminals() -> Vec<TerminalSnapshot> {
                 device: m.device,
                 host: m.host,
                 role: m.role,
+                client: m.client,
+                vpn: m.vpn,
+                transport: m.transport,
                 idle_secs,
             }
         })
@@ -272,6 +281,36 @@ pub fn close_all_terminals() {
     if had_any {
         notify_changed();
     }
+}
+
+/// Closes open terminals belonging to a different client or different VPN
+/// before switching an exclusive WireGuard tunnel.
+pub fn close_other_vpn_terminals(active_vpn: &str) -> Vec<String> {
+    let ids_to_close: Vec<String> = meta_table()
+        .lock()
+        .map(|m| {
+            m.values()
+                .filter_map(|meta| {
+                    let other_vpn = meta
+                        .vpn
+                        .as_deref()
+                        .is_some_and(|v| !v.eq_ignore_ascii_case(active_vpn));
+                    if other_vpn {
+                        Some(meta.id.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut closed = Vec::new();
+    for id in ids_to_close {
+        if close_terminal(&id).is_ok() {
+            closed.push(id);
+        }
+    }
+    closed
 }
 
 fn open_list(t: &HashMap<String, Term>) -> String {
@@ -413,6 +452,9 @@ pub(crate) struct OpenSpec<'a> {
     pub device: Option<String>,
     pub host: Option<String>,
     pub role: Option<String>,
+    pub client: Option<String>,
+    pub vpn: Option<String>,
+    pub transport: Option<String>,
 }
 
 pub(crate) fn open_with_meta(
@@ -464,6 +506,9 @@ pub(crate) fn open_with_meta(
         device: spec.device,
         host: spec.host,
         role: spec.role,
+        client: spec.client,
+        vpn: spec.vpn,
+        transport: spec.transport,
         buf: buf.clone(),
         input: input.clone(),
         last_used,
@@ -519,6 +564,9 @@ fn open(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
             device: None,
             host: None,
             role: None,
+            client: None,
+            vpn: None,
+            transport: None,
         },
         exec,
     )?;

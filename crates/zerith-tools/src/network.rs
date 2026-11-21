@@ -160,6 +160,9 @@ fn default_baud_rate() -> u32 {
 #[serde(default)]
 pub struct DeviceEntry {
     pub name: String,
+    pub client: Option<String>,
+    pub site: Option<String>,
+    pub vpn: Option<String>,
     pub host: String,
     #[serde(default = "default_ssh_port")]
     pub port: u16,
@@ -181,6 +184,9 @@ impl Default for DeviceEntry {
     fn default() -> Self {
         Self {
             name: String::new(),
+            client: None,
+            site: None,
+            vpn: None,
             host: String::new(),
             port: 22,
             user: String::new(),
@@ -198,7 +204,32 @@ impl Default for DeviceEntry {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+impl DeviceEntry {
+    pub fn composite_key(&self) -> String {
+        let c = self
+            .client
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        let n = self.name.trim().to_ascii_lowercase();
+        format!("{c}::{n}")
+    }
+
+    pub fn display_qualified_name(&self) -> String {
+        match self
+            .client
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(c) => format!("{c}/{}", self.name),
+            None => self.name.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 struct InventoryFile {
     devices: Vec<DeviceEntry>,
@@ -221,12 +252,13 @@ pub fn parse_inventory(toml_str: &str) -> std::result::Result<Vec<DeviceEntry>, 
 }
 
 /// Loads devices from global `<root>/inventory.toml` and `<workspace>/.zerith/inventory.toml`.
-/// Workspace entries override global entries with the same `name`.
+/// Indexed by `(client, name)` so different clients can share device names (`core-01`, `pve-01`)
+/// and overlapping private IPs (`10.0.0.1`) without collision.
 pub fn load_inventory(
     workspace: &Path,
     global_root: Option<&Path>,
 ) -> std::result::Result<Vec<DeviceEntry>, String> {
-    let mut by_name: HashMap<String, DeviceEntry> = HashMap::new();
+    let mut by_key: HashMap<String, DeviceEntry> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
     let mut merge = |path: &Path| -> std::result::Result<(), String> {
         if !path.is_file() {
@@ -235,11 +267,11 @@ pub fn load_inventory(
         let raw = std::fs::read_to_string(path)
             .map_err(|e| format!("erro lendo {}: {e}", path.display()))?;
         for dev in parse_inventory(&raw)? {
-            let key = dev.name.trim().to_ascii_lowercase();
-            if !by_name.contains_key(&key) {
+            let key = dev.composite_key();
+            if !by_key.contains_key(&key) {
                 order.push(key.clone());
             }
-            by_name.insert(key, dev);
+            by_key.insert(key, dev);
         }
         Ok(())
     };
@@ -249,8 +281,237 @@ pub fn load_inventory(
     merge(&workspace.join(".zerith").join("inventory.toml"))?;
     Ok(order
         .into_iter()
-        .filter_map(|k| by_name.remove(&k))
+        .filter_map(|k| by_key.remove(&k))
         .collect())
+}
+
+pub fn derive_secret_ref_name(client: Option<&str>, name: &str) -> String {
+    let sanitize = |s: &str| -> String {
+        s.trim()
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_lowercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>()
+            .split('_')
+            .filter(|p| !p.is_empty())
+            .collect::<Vec<_>>()
+            .join("_")
+    };
+    let n = sanitize(name);
+    match client.map(sanitize).filter(|c| !c.is_empty()) {
+        Some(c) => format!("net_{c}_{n}"),
+        None => format!("net_{n}"),
+    }
+}
+
+/// Inserts or updates a [`DeviceEntry`] inside `inventory_path` (`inventory.toml`),
+/// matching by `(client, name)`.
+pub fn upsert_inventory_device(
+    inventory_path: &Path,
+    dev: DeviceEntry,
+) -> std::result::Result<(), String> {
+    if dev.name.trim().is_empty() {
+        return Err("name do dispositivo não pode ficar vazio".into());
+    }
+    let mut list = if inventory_path.is_file() {
+        let raw = std::fs::read_to_string(inventory_path)
+            .map_err(|e| format!("erro lendo {}: {e}", inventory_path.display()))?;
+        parse_inventory(&raw)?
+    } else {
+        Vec::new()
+    };
+    let target_key = dev.composite_key();
+    if let Some(existing) = list.iter_mut().find(|d| d.composite_key() == target_key) {
+        *existing = dev;
+    } else {
+        list.push(dev);
+    }
+    if let Some(parent) = inventory_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("erro criando pasta {}: {e}", parent.display()))?;
+    }
+    let serialized = toml::to_string_pretty(&InventoryFile { devices: list })
+        .map_err(|e| format!("erro serializando inventory.toml: {e}"))?;
+    std::fs::write(inventory_path, serialized)
+        .map_err(|e| format!("erro gravando {}: {e}", inventory_path.display()))
+}
+
+/// Removes a device matching `(client, name)` from `inventory_path`.
+pub fn remove_inventory_device(
+    inventory_path: &Path,
+    client: Option<&str>,
+    name: &str,
+) -> std::result::Result<bool, String> {
+    if !inventory_path.is_file() {
+        return Ok(false);
+    }
+    let raw = std::fs::read_to_string(inventory_path)
+        .map_err(|e| format!("erro lendo {}: {e}", inventory_path.display()))?;
+    let mut list = parse_inventory(&raw)?;
+    let before = list.len();
+    let c_norm = client.unwrap_or("").trim().to_ascii_lowercase();
+    let n_norm = name.trim().to_ascii_lowercase();
+    list.retain(|d| {
+        let dc = d
+            .client
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        let dn = d.name.trim().to_ascii_lowercase();
+        if client.is_some() {
+            !(dc == c_norm && dn == n_norm)
+        } else {
+            dn != n_norm
+        }
+    });
+    if list.len() == before {
+        return Ok(false);
+    }
+    let serialized = toml::to_string_pretty(&InventoryFile { devices: list })
+        .map_err(|e| format!("erro serializando inventory.toml: {e}"))?;
+    std::fs::write(inventory_path, serialized)
+        .map_err(|e| format!("erro gravando {}: {e}", inventory_path.display()))?;
+    Ok(true)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireGuardProfile {
+    pub name: String,
+    pub path: std::path::PathBuf,
+    pub address: Option<String>,
+    pub allowed_ips: Vec<String>,
+    pub endpoint: Option<String>,
+}
+
+pub fn parse_wireguard_conf_summary(
+    conf_text: &str,
+) -> (Option<String>, Vec<String>, Option<String>) {
+    let mut address = None;
+    let mut allowed_ips = Vec::new();
+    let mut endpoint = None;
+    for line in conf_text.lines() {
+        let trimmed = line.split('#').next().unwrap_or("").trim();
+        let Some((k, v)) = trimmed.split_once('=') else {
+            continue;
+        };
+        let key = k.trim().to_ascii_lowercase();
+        let val = v.trim();
+        match key.as_str() {
+            "address" => address = Some(val.to_string()),
+            "allowedips" => {
+                for cidr in val.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    if !allowed_ips.iter().any(|x| x == cidr) {
+                        allowed_ips.push(cidr.to_string());
+                    }
+                }
+            }
+            "endpoint" => endpoint = Some(val.to_string()),
+            _ => {}
+        }
+    }
+    (address, allowed_ips, endpoint)
+}
+
+fn validate_vpn_name(raw: &str) -> std::result::Result<String, String> {
+    let t = raw.trim().trim_end_matches(".conf");
+    if t.is_empty() {
+        return Err("nome do túnel VPN não pode ficar vazio".into());
+    }
+    if !t
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+    {
+        return Err(format!(
+            "nome de VPN inválido `{t}` (use apenas letras, números, `-` e `_`)"
+        ));
+    }
+    Ok(t.to_string())
+}
+
+pub fn save_wireguard_profile(
+    root: &Path,
+    vpn_name: &str,
+    conf_text_or_path: &str,
+    workspace: &Path,
+) -> std::result::Result<WireGuardProfile, String> {
+    let clean_name = validate_vpn_name(vpn_name)?;
+    let content = load_config_input(conf_text_or_path, workspace);
+    if !content.to_ascii_lowercase().contains("[interface]") {
+        return Err("configuração WireGuard inválida: precisa conter a seção `[Interface]`".into());
+    }
+    let dir = root.join("vpn");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("erro criando pasta de VPNs {}: {e}", dir.display()))?;
+    let path = dir.join(format!("{clean_name}.conf"));
+    std::fs::write(&path, &content)
+        .map_err(|e| format!("erro salvando VPN {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    let (address, allowed_ips, endpoint) = parse_wireguard_conf_summary(&content);
+    Ok(WireGuardProfile {
+        name: clean_name,
+        path,
+        address,
+        allowed_ips,
+        endpoint,
+    })
+}
+
+pub fn list_wireguard_profiles(
+    workspace: &Path,
+    global_root: Option<&Path>,
+) -> Vec<WireGuardProfile> {
+    let mut by_name: HashMap<String, WireGuardProfile> = HashMap::new();
+    let mut order = Vec::new();
+    let mut scan_dir = |dir: &Path| {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) != Some("conf") {
+                continue;
+            }
+            let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let Ok(text) = std::fs::read_to_string(&p) else {
+                continue;
+            };
+            let (address, allowed_ips, endpoint) = parse_wireguard_conf_summary(&text);
+            let key = stem.to_ascii_lowercase();
+            if !by_name.contains_key(&key) {
+                order.push(key.clone());
+            }
+            by_name.insert(
+                key,
+                WireGuardProfile {
+                    name: stem.to_string(),
+                    path: p,
+                    address,
+                    allowed_ips,
+                    endpoint,
+                },
+            );
+        }
+    };
+    if let Some(root) = global_root {
+        scan_dir(&root.join("vpn"));
+    }
+    scan_dir(&workspace.join(".zerith").join("vpn"));
+    order
+        .into_iter()
+        .filter_map(|k| by_name.remove(&k))
+        .collect()
 }
 
 fn validate_ssh_token(field: &str, value: &str) -> std::result::Result<(), String> {
@@ -646,29 +907,87 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
     vec![
         make_with(
             "net_inventory",
-            "Lista dispositivos do inventário de rede (`.zerith/inventory.toml` e global). \
-             Suporta filtros por `tag`, `vendor`, `role` ou `query`. Nunca expõe senhas ou segredos.",
+            "Gerencia e consulta o inventário multi-cliente de hosts, VMs Linux, servidores Proxmox e equipamentos de rede \
+             (`.zerith/inventory.toml` e global) sem o usuário precisar editar arquivos manualmente. \
+             `action`: `list` (padrão, filtra por `client`, `site`, `vpn`, `tag`, `vendor`, `role`, `query`), \
+             `upsert` (cadastra/atualiza dispositivo com `client`, `site`, `vpn`, `host`, `user`, `vendor`, `role` e grava `password` \
+             automaticamente no Cofre do Sistema), `remove` (remove dispositivo), ou `save_vpn` (salva arquivo `.conf` do WireGuard \
+             para um cliente em `~/.zerith/vpn/<vpn>.conf`).",
             json!({"type": "object", "properties": {
-                "tag": {"type": "string"},
+                "action": {"type": "string", "description": "list (padrão) | upsert | remove | save_vpn"},
+                "name": {"type": "string", "description": "nome do equipamento/VM (ex.: core-01, pve-01, olt-centro)"},
+                "client": {"type": "string", "description": "nome do cliente/empresa (ex.: TelecomSul, HospitalVida)"},
+                "site": {"type": "string", "description": "POP / Datacenter / Filial (ex.: DC-Curitiba, POP-Norte)"},
+                "vpn": {"type": "string", "description": "nome do túnel WireGuard associado ao cliente (ex.: wg-telecomsul)"},
+                "vpn_config": {"type": "string", "description": "conteúdo texto do .conf WireGuard ou caminho do arquivo para salvar automaticamente"},
+                "host": {"type": "string", "description": "IP/hostname ou porta serial"},
+                "port": {"type": "integer", "description": "porta SSH/Telnet (padrão 22 ou 23)"},
+                "user": {"type": "string"},
+                "password": {"type": "string", "description": "em upsert: grava automaticamente no Cofre do Sistema e vincula secret_ref"},
+                "secret_ref": {"type": "string"},
+                "transport": {"type": "string", "description": "ssh | telnet | serial"},
+                "serial_port": {"type": "string"},
+                "baud_rate": {"type": "integer"},
                 "vendor": {"type": "string"},
                 "role": {"type": "string"},
-                "query": {"type": "string"}
+                "jump_host": {"type": "string"},
+                "legacy_ssh": {"type": "boolean"},
+                "tags": {"type": "array", "items": {"type": "string"}},
+                "description": {"type": "string"},
+                "scope": {"type": "string", "description": "global (padrão) | workspace"},
+                "tag": {"type": "string", "description": "filtro por tag em action=list"},
+                "query": {"type": "string", "description": "filtro livre em action=list"}
             }}),
-            "lista de dispositivos com host, usuário, vendor, role e flags de conexão",
+            "lista ou confirmação de cadastro automático multi-cliente com cofre e VPN",
             Permission::Read,
-            5,
+            10,
             true,
-            |_, ctx| Ok(Some(Action::Read(ctx.workspace.join(".zerith")))),
+            |args, ctx| {
+                let act = opt_str(args, "action").unwrap_or("list");
+                if matches!(act, "upsert" | "remove" | "save_vpn") {
+                    Ok(Some(Action::Write(ctx.workspace.join(".zerith/inventory.toml"))))
+                } else {
+                    Ok(Some(Action::Read(ctx.workspace.join(".zerith"))))
+                }
+            },
             net_inventory,
+        ),
+        make_with(
+            "net_vpn",
+            "Orquestra túneis WireGuard multi-cliente (`status`, `list`, `switch`, `up`, `down`). \
+             Em `switch` (ou `up`), garante exclusividade quando clientes usam as mesmas faixas de IP privado (`10.0.0.0/24`, `192.168.1.0/24`): \
+             desliga automaticamente o túnel WireGuard do cliente anterior, fecha terminais daquele túnel e liga a VPN do cliente solicitado.",
+            json!({"type": "object", "properties": {
+                "action": {"type": "string", "description": "status (padrão) | list | switch | up | down"},
+                "vpn": {"type": "string", "description": "nome do perfil WireGuard (ex.: wg-telecomsul)"},
+                "client": {"type": "string", "description": "nome do cliente (descobre o túnel vinculado no inventário automaticamente)"},
+                "vpn_config": {"type": "string", "description": "opcional: texto ou caminho do .conf para salvar antes de subir"}
+            }}),
+            "status dos túneis WireGuard ativos, AllowedIPs e confirmação de chaveamento entre clientes",
+            Permission::Shell,
+            45,
+            false,
+            |args, _| {
+                let act = opt_str(args, "action").unwrap_or("status");
+                let v = opt_str(args, "vpn").or_else(|| opt_str(args, "client")).unwrap_or("");
+                Ok(Some(Action::Shell(format!("net_vpn {act} {v}").trim().to_string())))
+            },
+            net_vpn,
         ),
         make_with(
             "net_connect",
             "Abre uma sessão interativa de alta velocidade via SSH, Telnet nativo ou Porta Serial (Console COMx / /dev/ttyUSBx) \
-             em um roteador/switch/firewall/OLT do inventário (`device`) ou por parâmetros (`host`/`serial_port`, `transport`, `user`, `vendor`), \
-             fazendo login automático (`Username:`/`login:` + `Password:` via `secret_ref` ou `password`), acordando console serial se necessário \
-             e desativando a paginação do equipamento automaticamente.",
+             em uma VM Linux, servidor Proxmox ou roteador/switch/firewall/OLT do inventário (`device`, com suporte a `client` para desambiguar nomes repetidos como `core-01`) \
+             ou por parâmetros (`host`/`serial_port`, `client`, `vpn`, `transport`, `user`, `vendor`). \
+             Se o equipamento/cliente tiver `vpn` WireGuard configurada, chaveia a VPN automaticamente antes de conectar. \
+             Com `remember: true` (padrão quando `client` é informado), salva o equipamento e a senha no cofre automaticamente após conectar.",
             json!({"type": "object", "properties": {
-                "device": {"type": "string", "description": "nome no inventory.toml"},
+                "device": {"type": "string", "description": "nome no inventory.toml (ex.: core-01 ou TelecomSul/core-01)"},
+                "client": {"type": "string", "description": "cliente/empresa dono do equipamento (ex.: TelecomSul)"},
+                "site": {"type": "string", "description": "POP / Datacenter / Filial opcional"},
+                "vpn": {"type": "string", "description": "túnel WireGuard do cliente (chaveado automaticamente antes de conectar)"},
+                "auto_vpn": {"type": "boolean", "description": "liga/troca automaticamente a VPN WireGuard do cliente se necessário, padrão true"},
+                "remember": {"type": "boolean", "description": "salva/atualiza automaticamente o equipamento no inventário e a senha no cofre ao conectar (padrão true quando client é informado)"},
                 "transport": {"type": "string", "description": "ssh (padrão) | telnet | serial"},
                 "host": {"type": "string", "description": "IP/hostname (ou porta serial como COM3 / /dev/ttyUSB0)"},
                 "serial_port": {"type": "string", "description": "porta serial explícita (ex.: COM3, /dev/ttyUSB0, /dev/ttyS0)"},
@@ -678,13 +997,13 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
                 "vendor": {"type": "string", "description": "cisco_ios|cisco_nxos|cisco_xr|huawei_vrp|juniper_junos|mikrotik_router_os|fortinet_forti_os|linux|generic"},
                 "role": {"type": "string", "description": "core|border|distribution|access|firewall|lab|server"},
                 "secret_ref": {"type": "string", "description": "chave no cofre (zerith secret set <nome>)"},
-                "password": {"type": "string", "description": "senha direta opcional quando não estiver no cofre"},
+                "password": {"type": "string", "description": "senha direta (gravada automaticamente no cofre se remember=true)"},
                 "jump_host": {"type": "string"},
                 "legacy_ssh": {"type": "boolean"},
                 "disable_paging": {"type": "boolean", "description": "padrão true"},
                 "timeout_secs": {"type": "integer", "description": "padrão 25"}
             }}),
-            "id do terminal (`term-N`), transporte, banner inicial e confirmação de paginação",
+            "id do terminal (`term-N`), cliente, VPN, transporte, banner inicial e confirmação de paginação",
             Permission::Shell,
             130,
             false,
@@ -755,6 +1074,179 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
     ]
 }
 
+fn active_vpn_slot() -> &'static std::sync::Mutex<Option<String>> {
+    static V: std::sync::OnceLock<std::sync::Mutex<Option<String>>> = std::sync::OnceLock::new();
+    V.get_or_init(Default::default)
+}
+
+/// Queries the OS (`wg show interfaces`) and Zerith's tracked WireGuard state
+/// to list currently active WireGuard tunnel names.
+pub fn detect_active_wireguard_tunnels() -> Vec<String> {
+    let mut active = Vec::new();
+    if let Ok(out) = std::process::Command::new("wg")
+        .args(["show", "interfaces"])
+        .output()
+    {
+        if out.status.success() {
+            for tok in String::from_utf8_lossy(&out.stdout).split_whitespace() {
+                if !tok.is_empty() && !active.iter().any(|x: &String| x.eq_ignore_ascii_case(tok)) {
+                    active.push(tok.to_string());
+                }
+            }
+        }
+    }
+    if let Ok(g) = active_vpn_slot().lock() {
+        if let Some(tracked) = g.as_ref() {
+            if !active.iter().any(|x| x.eq_ignore_ascii_case(tracked)) {
+                active.push(tracked.clone());
+            }
+        }
+    }
+    active
+}
+
+fn run_wg_tunnel_down(
+    vpn_name: &str,
+    conf_path: Option<&Path>,
+) -> std::result::Result<String, String> {
+    let clean = validate_vpn_name(vpn_name)?;
+    let target_arg = conf_path
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| clean.clone());
+    let res = if cfg!(windows) {
+        std::process::Command::new("wireguard.exe")
+            .args(["/uninstalltunnelservice", &clean])
+            .output()
+    } else {
+        std::process::Command::new("wg-quick")
+            .args(["down", &target_arg])
+            .output()
+    };
+    if let Ok(mut g) = active_vpn_slot().lock() {
+        if g.as_deref().is_some_and(|v| v.eq_ignore_ascii_case(&clean)) {
+            *g = None;
+        }
+    }
+    match res {
+        Ok(out) if out.status.success() => Ok(format!("túnel `{clean}` desligado")),
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            Ok(format!(
+                "túnel `{clean}` marcado como desligado ({})",
+                if stderr.is_empty() {
+                    "serviço parado".into()
+                } else {
+                    stderr
+                }
+            ))
+        }
+        Err(e) => Ok(format!(
+            "túnel `{clean}` desativado no estado local (CLI wg ausente: {e})"
+        )),
+    }
+}
+
+fn run_wg_tunnel_up(profile: &WireGuardProfile) -> std::result::Result<String, String> {
+    let path_str = profile.path.to_string_lossy().into_owned();
+    let res = if cfg!(windows) {
+        std::process::Command::new("wireguard.exe")
+            .args(["/installtunnelservice", &path_str])
+            .output()
+    } else {
+        std::process::Command::new("wg-quick")
+            .args(["up", &path_str])
+            .output()
+    };
+    if let Ok(mut g) = active_vpn_slot().lock() {
+        *g = Some(profile.name.clone());
+    }
+    match res {
+        Ok(out) if out.status.success() => Ok(format!(
+            "túnel WireGuard `{}` ativado ({})",
+            profile.name,
+            if profile.allowed_ips.is_empty() {
+                "sem AllowedIPs".into()
+            } else {
+                format!("AllowedIPs: {}", profile.allowed_ips.join(", "))
+            }
+        )),
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            Ok(format!(
+                "túnel `{}` solicitado ({}) — detalhe CLI: {}",
+                profile.name,
+                profile.path.display(),
+                if stderr.is_empty() { "ok".into() } else { stderr }
+            ))
+        }
+        Err(e) => Ok(format!(
+            "perfil `{}` registrado como ativo ({}) — binário wireguard/wg-quick não encontrado no PATH ({e})",
+            profile.name,
+            profile.path.display()
+        )),
+    }
+}
+
+/// Switches exclusively to `vpn_name`: turns off any other active WireGuard tunnel,
+/// closes open terminals belonging to other VPNs, and brings up `vpn_name`.
+pub fn ensure_exclusive_wireguard_vpn(
+    vpn_name: &str,
+    workspace: &Path,
+    global_root: &Path,
+) -> std::result::Result<String, String> {
+    let clean = validate_vpn_name(vpn_name)?;
+    let profiles = list_wireguard_profiles(workspace, Some(global_root));
+    let active = detect_active_wireguard_tunnels();
+    let mut notes = Vec::new();
+
+    // 1. Close terminals attached to other VPNs and bring down any other active WireGuard tunnel
+    let closed_terms = terminal::close_other_vpn_terminals(&clean);
+    if !closed_terms.is_empty() {
+        notes.push(format!(
+            "terminais do cliente anterior encerrados: {}",
+            closed_terms.join(", ")
+        ));
+    }
+    for act in &active {
+        if !act.eq_ignore_ascii_case(&clean) {
+            let old_path = profiles
+                .iter()
+                .find(|p| p.name.eq_ignore_ascii_case(act))
+                .map(|p| p.path.as_path());
+            if let Ok(msg) = run_wg_tunnel_down(act, old_path) {
+                notes.push(msg);
+            }
+        }
+    }
+
+    // 2. If target tunnel is already active, keep it
+    if active.iter().any(|a| a.eq_ignore_ascii_case(&clean)) {
+        if let Ok(mut g) = active_vpn_slot().lock() {
+            *g = Some(clean.clone());
+        }
+        notes.push(format!("VPN `{clean}` já está ativa"));
+        return Ok(notes.join(" · "));
+    }
+
+    // 3. Bring up target tunnel if profile exists
+    if let Some(prof) = profiles
+        .iter()
+        .find(|p| p.name.eq_ignore_ascii_case(&clean))
+    {
+        let up_msg = run_wg_tunnel_up(prof)?;
+        notes.push(up_msg);
+    } else {
+        if let Ok(mut g) = active_vpn_slot().lock() {
+            *g = Some(clean.clone());
+        }
+        notes.push(format!(
+            "VPN `{clean}` selecionada (nenhum arquivo `{clean}.conf` em {}/vpn; envie o .conf com `net_inventory(action=\"save_vpn\")` para gerenciar o serviço do SO)",
+            global_root.display()
+        ));
+    }
+    Ok(notes.join(" · "))
+}
+
 fn infer_transport(
     explicit: Option<DeviceTransport>,
     host: &str,
@@ -780,23 +1272,95 @@ fn infer_transport(
     DeviceTransport::Ssh
 }
 
+pub fn find_inventory_device(
+    inv: &[DeviceEntry],
+    device_query: &str,
+    client_filter: Option<&str>,
+) -> std::result::Result<DeviceEntry, String> {
+    let (inline_client, target_name) = match device_query.trim().split_once('/') {
+        Some((c, n)) if !c.trim().is_empty() && !n.trim().is_empty() => (Some(c.trim()), n.trim()),
+        _ => (None, device_query.trim()),
+    };
+    let effective_client = client_filter
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or(inline_client);
+
+    let matches: Vec<&DeviceEntry> = inv
+        .iter()
+        .filter(|d| {
+            if !d.name.eq_ignore_ascii_case(target_name) {
+                return false;
+            }
+            if let Some(cf) = effective_client {
+                d.client
+                    .as_deref()
+                    .is_some_and(|dc| dc.trim().eq_ignore_ascii_case(cf))
+            } else {
+                true
+            }
+        })
+        .collect();
+
+    match matches.len() {
+        0 => Err(format!(
+            "dispositivo `{}` não encontrado no inventory.toml",
+            if let Some(c) = effective_client {
+                format!("{c}/{target_name}")
+            } else {
+                target_name.to_string()
+            }
+        )),
+        1 => Ok(matches[0].clone()),
+        n => {
+            let candidates: Vec<String> = matches
+                .iter()
+                .map(|d| {
+                    let qual = d.display_qualified_name();
+                    let site = d
+                        .site
+                        .as_deref()
+                        .map(|s| format!(" · site={s}"))
+                        .unwrap_or_default();
+                    let vpn = d
+                        .vpn
+                        .as_deref()
+                        .map(|v| format!(" · vpn={v}"))
+                        .unwrap_or_default();
+                    format!("`{qual}` ({}{site}{vpn})", d.host)
+                })
+                .collect();
+            Err(format!(
+                "o dispositivo `{target_name}` existe em {n} clientes diferentes: {}. Informe o parâmetro `client` (ou `device: \"Cliente/{target_name}\"`) para não conectar no cliente errado",
+                candidates.join(", ")
+            ))
+        }
+    }
+}
+
 fn resolve_connect_device(args: &Value, ctx: &CallCtx<'_>) -> Result<DeviceEntry> {
     let explicit_transport = opt_str(args, "transport").and_then(DeviceTransport::parse);
     let serial_override = opt_str(args, "serial_port").map(str::to_string);
     let baud_override = args["baud_rate"].as_u64().map(|b| b as u32);
     let port_override = args["port"].as_u64().map(|p| p.min(65535) as u16);
+    let client_arg = opt_str(args, "client").map(str::to_string);
+    let site_arg = opt_str(args, "site").map(str::to_string);
+    let vpn_arg = opt_str(args, "vpn").map(str::to_string);
 
     if let Some(name) = opt_str(args, "device") {
         let root = zerith_core::Paths::resolve().root().to_path_buf();
         let inv = load_inventory(ctx.workspace, Some(&root)).map_err(ToolError::Failed)?;
-        let mut dev = inv
-            .into_iter()
-            .find(|d| d.name.eq_ignore_ascii_case(name))
-            .ok_or_else(|| {
-                ToolError::Failed(format!(
-                    "dispositivo `{name}` não encontrado no inventory.toml"
-                ))
-            })?;
+        let mut dev =
+            find_inventory_device(&inv, name, client_arg.as_deref()).map_err(ToolError::Failed)?;
+        if let Some(c) = client_arg {
+            dev.client = Some(c);
+        }
+        if let Some(s) = site_arg {
+            dev.site = Some(s);
+        }
+        if let Some(v) = vpn_arg {
+            dev.vpn = Some(v);
+        }
         if let Some(t) = explicit_transport {
             dev.transport = t;
         }
@@ -849,8 +1413,12 @@ fn resolve_connect_device(args: &Value, ctx: &CallCtx<'_>) -> Result<DeviceEntry
     let role = opt_str(args, "role")
         .and_then(DeviceRole::parse)
         .unwrap_or(DeviceRole::Lab);
+    let name = opt_str(args, "name").unwrap_or(&host).to_string();
     Ok(DeviceEntry {
-        name: host.clone(),
+        name,
+        client: client_arg,
+        site: site_arg,
+        vpn: vpn_arg,
         host,
         port: port_override.unwrap_or(default_port),
         user,
@@ -897,9 +1465,182 @@ fn batch_action(args: &Value, _: &CallCtx<'_>) -> Result<Option<Action>> {
     ))))
 }
 
+fn inventory_target_path(args: &Value, workspace: &Path, global_root: &Path) -> std::path::PathBuf {
+    if opt_str(args, "scope").is_some_and(|s| s.eq_ignore_ascii_case("workspace")) {
+        workspace.join(".zerith").join("inventory.toml")
+    } else {
+        global_root.join("inventory.toml")
+    }
+}
+
 fn net_inventory(args: &Value, ctx: &CallCtx<'_>, _: &Exec<'_>) -> Result<String> {
     let root = zerith_core::Paths::resolve().root().to_path_buf();
+    let action = opt_str(args, "action")
+        .unwrap_or("list")
+        .trim()
+        .to_ascii_lowercase();
+
+    match action.as_str() {
+        "save_vpn" => {
+            let vpn_name = opt_str(args, "vpn")
+                .or_else(|| opt_str(args, "name"))
+                .or_else(|| opt_str(args, "client"))
+                .ok_or_else(|| {
+                    ToolError::BadArguments(
+                        "informe `vpn` (ou `client`) e `vpn_config` para `save_vpn`".into(),
+                    )
+                })?;
+            let vpn_cfg = str_arg(args, "vpn_config")?;
+            let prof = save_wireguard_profile(&root, vpn_name, vpn_cfg, ctx.workspace)
+                .map_err(ToolError::Failed)?;
+            return Ok(format!(
+                "VPN WireGuard `{}` salva automaticamente em `{}` (Address: {}, AllowedIPs: [{}], Endpoint: {})",
+                prof.name,
+                prof.path.display(),
+                prof.address.as_deref().unwrap_or("-"),
+                prof.allowed_ips.join(", "),
+                prof.endpoint.as_deref().unwrap_or("-")
+            ));
+        }
+        "upsert" => {
+            let name = opt_str(args, "name")
+                .or_else(|| opt_str(args, "device"))
+                .or_else(|| opt_str(args, "host"))
+                .ok_or_else(|| {
+                    ToolError::BadArguments(
+                        "informe `name` (e `host` ou `serial_port`) para `upsert`".into(),
+                    )
+                })?
+                .to_string();
+            let host = opt_str(args, "host")
+                .or_else(|| opt_str(args, "serial_port"))
+                .unwrap_or(&name)
+                .to_string();
+            let client = opt_str(args, "client").map(str::to_string);
+            let site = opt_str(args, "site").map(str::to_string);
+            let mut vpn = opt_str(args, "vpn").map(str::to_string);
+
+            // If vpn_config was passed inline during device onboarding, save the WireGuard profile automatically!
+            let mut vpn_note = String::new();
+            if let Some(vpn_cfg) = opt_str(args, "vpn_config") {
+                let v_name = vpn
+                    .clone()
+                    .or_else(|| {
+                        client
+                            .as_ref()
+                            .map(|c| format!("wg-{}", c.to_ascii_lowercase()))
+                    })
+                    .unwrap_or_else(|| format!("wg-{}", name.to_ascii_lowercase()));
+                let prof = save_wireguard_profile(&root, &v_name, vpn_cfg, ctx.workspace)
+                    .map_err(ToolError::Failed)?;
+                vpn = Some(prof.name.clone());
+                vpn_note = format!(
+                    " + VPN `{}` salva ({})",
+                    prof.name,
+                    prof.allowed_ips.join(", ")
+                );
+            }
+
+            // If password was provided, store it in the OS vault automatically and link secret_ref!
+            let mut secret_ref = opt_str(args, "secret_ref").map(str::to_string);
+            let mut vault_note = String::new();
+            if let Some(pw) = opt_str(args, "password") {
+                let s_name = secret_ref
+                    .clone()
+                    .unwrap_or_else(|| derive_secret_ref_name(client.as_deref(), &name));
+                match zerith_core::secrets::set_secret(&s_name, pw) {
+                    Ok(()) => {
+                        secret_ref = Some(s_name.clone());
+                        vault_note = format!(" + senha gravada no cofre (`{s_name}`)");
+                    }
+                    Err(e) => {
+                        vault_note = format!(" (aviso cofre: {e})");
+                    }
+                }
+            }
+
+            let explicit_transport = opt_str(args, "transport").and_then(DeviceTransport::parse);
+            let serial_port = opt_str(args, "serial_port").map(str::to_string);
+            let port_arg = args["port"].as_u64().map(|p| p.min(65535) as u16);
+            let transport =
+                infer_transport(explicit_transport, &host, serial_port.as_deref(), port_arg);
+            let default_port = if transport == DeviceTransport::Telnet {
+                23
+            } else {
+                22
+            };
+            let tags: Vec<String> = args
+                .get("tags")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let entry = DeviceEntry {
+                name: name.clone(),
+                client: client.clone(),
+                site,
+                vpn,
+                host,
+                port: port_arg.unwrap_or(default_port),
+                user: opt_str(args, "user").unwrap_or("admin").to_string(),
+                vendor: opt_str(args, "vendor")
+                    .and_then(Vendor::parse)
+                    .unwrap_or(Vendor::Generic),
+                role: opt_str(args, "role")
+                    .and_then(DeviceRole::parse)
+                    .unwrap_or(DeviceRole::Lab),
+                transport,
+                serial_port,
+                baud_rate: args["baud_rate"].as_u64().unwrap_or(9600) as u32,
+                secret_ref,
+                jump_host: opt_str(args, "jump_host").map(str::to_string),
+                legacy_ssh: args["legacy_ssh"].as_bool().unwrap_or(false),
+                tags,
+                description: opt_str(args, "description").map(str::to_string),
+            };
+            let inv_path = inventory_target_path(args, ctx.workspace, &root);
+            let qual = entry.display_qualified_name();
+            upsert_inventory_device(&inv_path, entry).map_err(ToolError::Failed)?;
+            return Ok(format!(
+                "dispositivo `{qual}` cadastrado/atualizado automaticamente em `{}`{vault_note}{vpn_note}",
+                inv_path.display()
+            ));
+        }
+        "remove" => {
+            let name = opt_str(args, "name")
+                .or_else(|| opt_str(args, "device"))
+                .ok_or_else(|| ToolError::BadArguments("informe `name` para `remove`".into()))?;
+            let client = opt_str(args, "client");
+            let inv_path = inventory_target_path(args, ctx.workspace, &root);
+            let removed =
+                remove_inventory_device(&inv_path, client, name).map_err(ToolError::Failed)?;
+            return if removed {
+                Ok(format!(
+                    "dispositivo `{}` removido de `{}`",
+                    client
+                        .map(|c| format!("{c}/{name}"))
+                        .unwrap_or_else(|| name.to_string()),
+                    inv_path.display()
+                ))
+            } else {
+                Ok(format!(
+                    "dispositivo `{name}` não encontrado em `{}`",
+                    inv_path.display()
+                ))
+            };
+        }
+        _ => {}
+    }
+
     let devices = load_inventory(ctx.workspace, Some(&root)).map_err(ToolError::Failed)?;
+    let client_f = opt_str(args, "client").map(str::to_ascii_lowercase);
+    let site_f = opt_str(args, "site").map(str::to_ascii_lowercase);
+    let vpn_f = opt_str(args, "vpn").map(str::to_ascii_lowercase);
     let tag_f = opt_str(args, "tag").map(str::to_ascii_lowercase);
     let vendor_f = opt_str(args, "vendor").and_then(Vendor::parse);
     let role_f = opt_str(args, "role").and_then(DeviceRole::parse);
@@ -908,6 +1649,33 @@ fn net_inventory(args: &Value, ctx: &CallCtx<'_>, _: &Exec<'_>) -> Result<String
     let filtered: Vec<&DeviceEntry> = devices
         .iter()
         .filter(|d| {
+            if let Some(cf) = &client_f {
+                if !d
+                    .client
+                    .as_deref()
+                    .is_some_and(|c| c.to_ascii_lowercase().contains(cf))
+                {
+                    return false;
+                }
+            }
+            if let Some(sf) = &site_f {
+                if !d
+                    .site
+                    .as_deref()
+                    .is_some_and(|s| s.to_ascii_lowercase().contains(sf))
+                {
+                    return false;
+                }
+            }
+            if let Some(vf) = &vpn_f {
+                if !d
+                    .vpn
+                    .as_deref()
+                    .is_some_and(|v| v.to_ascii_lowercase().contains(vf))
+                {
+                    return false;
+                }
+            }
             if let Some(t) = &tag_f {
                 if !d.tags.iter().any(|x| x.to_ascii_lowercase() == *t) {
                     return false;
@@ -926,6 +1694,21 @@ fn net_inventory(args: &Value, ctx: &CallCtx<'_>, _: &Exec<'_>) -> Result<String
             if let Some(q) = &query_f {
                 let hit = d.name.to_ascii_lowercase().contains(q)
                     || d.host.to_ascii_lowercase().contains(q)
+                    || d.client
+                        .as_deref()
+                        .unwrap_or("")
+                        .to_ascii_lowercase()
+                        .contains(q)
+                    || d.site
+                        .as_deref()
+                        .unwrap_or("")
+                        .to_ascii_lowercase()
+                        .contains(q)
+                    || d.vpn
+                        .as_deref()
+                        .unwrap_or("")
+                        .to_ascii_lowercase()
+                        .contains(q)
                     || d.serial_port
                         .as_deref()
                         .unwrap_or("")
@@ -945,7 +1728,7 @@ fn net_inventory(args: &Value, ctx: &CallCtx<'_>, _: &Exec<'_>) -> Result<String
         .collect();
 
     if filtered.is_empty() {
-        return Ok("nenhum dispositivo encontrado em .zerith/inventory.toml".into());
+        return Ok("nenhum dispositivo encontrado no inventário (use `net_inventory` com `action: \"upsert\"` para a IA cadastrar automaticamente)".into());
     }
     let mut out = Vec::with_capacity(filtered.len());
     for d in filtered {
@@ -958,12 +1741,22 @@ fn net_inventory(args: &Value, ctx: &CallCtx<'_>, _: &Exec<'_>) -> Result<String
             DeviceTransport::Telnet => format!("telnet={}:{}", d.host, d.port),
             DeviceTransport::Ssh => format!("ssh={}:{}", d.host, d.port),
         };
-        let mut meta = vec![
+        let mut meta = Vec::new();
+        if let Some(c) = &d.client {
+            meta.push(format!("client={c}"));
+        }
+        if let Some(s) = &d.site {
+            meta.push(format!("site={s}"));
+        }
+        if let Some(v) = &d.vpn {
+            meta.push(format!("vpn={v}"));
+        }
+        meta.extend([
             endpoint,
             format!("user={}", if d.user.is_empty() { "-" } else { &d.user }),
             format!("vendor={}", d.vendor.as_str()),
             format!("role={}", d.role.as_str()),
-        ];
+        ]);
         if let Some(j) = &d.jump_host {
             meta.push(format!("jump={j}"));
         }
@@ -976,9 +1769,115 @@ fn net_inventory(args: &Value, ctx: &CallCtx<'_>, _: &Exec<'_>) -> Result<String
         if !d.tags.is_empty() {
             meta.push(format!("tags=[{}]", d.tags.join(",")));
         }
-        out.push(format!("- **{}** ({})", d.name, meta.join(" · ")));
+        out.push(format!(
+            "- **{}** ({})",
+            d.display_qualified_name(),
+            meta.join(" · ")
+        ));
     }
     Ok(out.join("\n"))
+}
+
+fn net_vpn(args: &Value, ctx: &CallCtx<'_>, _: &Exec<'_>) -> Result<String> {
+    let root = zerith_core::Paths::resolve().root().to_path_buf();
+    let action = opt_str(args, "action")
+        .unwrap_or("status")
+        .trim()
+        .to_ascii_lowercase();
+
+    // Optionally save vpn_config before switching/activating
+    if let Some(vpn_cfg) = opt_str(args, "vpn_config") {
+        let v_name = opt_str(args, "vpn")
+            .or_else(|| opt_str(args, "client"))
+            .ok_or_else(|| {
+                ToolError::BadArguments("informe `vpn` ao passar `vpn_config`".into())
+            })?;
+        save_wireguard_profile(&root, v_name, vpn_cfg, ctx.workspace).map_err(ToolError::Failed)?;
+    }
+
+    let resolve_target_vpn = || -> Result<String> {
+        if let Some(v) = opt_str(args, "vpn") {
+            return Ok(v.to_string());
+        }
+        if let Some(client) = opt_str(args, "client") {
+            let inv = load_inventory(ctx.workspace, Some(&root)).unwrap_or_default();
+            if let Some(v) = inv
+                .iter()
+                .find(|d| {
+                    d.client
+                        .as_deref()
+                        .is_some_and(|c| c.eq_ignore_ascii_case(client))
+                        && d.vpn.is_some()
+                })
+                .and_then(|d| d.vpn.clone())
+            {
+                return Ok(v);
+            }
+            return Ok(format!("wg-{}", client.trim().to_ascii_lowercase()));
+        }
+        Err(ToolError::BadArguments(
+            "informe `vpn` ou `client` para a operação de VPN".into(),
+        ))
+    };
+
+    match action.as_str() {
+        "switch" | "up" => {
+            let target = resolve_target_vpn()?;
+            let msg = ensure_exclusive_wireguard_vpn(&target, ctx.workspace, &root)
+                .map_err(ToolError::Failed)?;
+            Ok(msg)
+        }
+        "down" => {
+            let profiles = list_wireguard_profiles(ctx.workspace, Some(&root));
+            let targets = if opt_str(args, "vpn").is_some() || opt_str(args, "client").is_some() {
+                vec![resolve_target_vpn()?]
+            } else {
+                detect_active_wireguard_tunnels()
+            };
+            if targets.is_empty() {
+                return Ok("nenhum túnel WireGuard ativo no momento".into());
+            }
+            let mut msgs = Vec::new();
+            for t in targets {
+                let p_path = profiles
+                    .iter()
+                    .find(|p| p.name.eq_ignore_ascii_case(&t))
+                    .map(|p| p.path.as_path());
+                msgs.push(run_wg_tunnel_down(&t, p_path).map_err(ToolError::Failed)?);
+            }
+            Ok(msgs.join(" · "))
+        }
+        _ => {
+            let active = detect_active_wireguard_tunnels();
+            let profiles = list_wireguard_profiles(ctx.workspace, Some(&root));
+            let mut lines = Vec::new();
+            lines.push(format!(
+                "## WireGuard VPN Status\n- **Túneis ativos agora:** {}",
+                if active.is_empty() {
+                    "nenhum".into()
+                } else {
+                    active.join(", ")
+                }
+            ));
+            if profiles.is_empty() {
+                lines.push("- **Perfis salvos:** nenhum (use `net_inventory(action=\"save_vpn\", vpn=\"wg-cliente\", vpn_config=\"...\")` para salvar)".into());
+            } else {
+                lines.push("- **Perfis salvos:**".into());
+                for p in profiles {
+                    let is_on = active.iter().any(|a| a.eq_ignore_ascii_case(&p.name));
+                    lines.push(format!(
+                        "  - **{}** [{}] — Address: `{}` · AllowedIPs: `[{}]` · Endpoint: `{}`",
+                        p.name,
+                        if is_on { "ATIVO" } else { "inativo" },
+                        p.address.as_deref().unwrap_or("-"),
+                        p.allowed_ips.join(", "),
+                        p.endpoint.as_deref().unwrap_or("-")
+                    ));
+                }
+            }
+            Ok(lines.join("\n"))
+        }
+    }
 }
 
 fn banner_requests_username(text: &str) -> bool {
@@ -1008,13 +1907,26 @@ fn banner_requests_password(text: &str) -> bool {
 }
 
 fn net_connect(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
-    let dev = resolve_connect_device(args, ctx)?;
+    let mut dev = resolve_connect_device(args, ctx)?;
+    let root = zerith_core::Paths::resolve().root().to_path_buf();
+
+    // Automatic exclusive WireGuard VPN switch before connecting if device has a VPN assigned
+    let auto_vpn = args["auto_vpn"].as_bool().unwrap_or(true);
+    let mut vpn_status_note = String::new();
+    if auto_vpn {
+        if let Some(vpn_name) = dev.vpn.as_deref().filter(|s| !s.trim().is_empty()) {
+            let msg = ensure_exclusive_wireguard_vpn(vpn_name, ctx.workspace, &root)
+                .map_err(ToolError::Failed)?;
+            vpn_status_note = format!("[VPN: {msg}]\n");
+        }
+    }
+
     let cmd = build_connect_command(&dev).map_err(ToolError::BadArguments)?;
     let mut secrets = Vec::new();
-    let password = if let Some(direct_pw) = opt_str(args, "password") {
-        let val = direct_pw.to_string();
-        secrets.push(val.clone());
-        Some(val)
+    let direct_password = opt_str(args, "password").map(str::to_string);
+    let password = if let Some(ref direct_pw) = direct_password {
+        secrets.push(direct_pw.clone());
+        Some(direct_pw.clone())
     } else if let Some(secret_name) = dev.secret_ref.as_deref() {
         let val = zerith_core::secrets::get_secret(secret_name).map_err(|e| {
             ToolError::Failed(format!(
@@ -1049,9 +1961,12 @@ fn net_connect(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<Strin
             auto_page: true,
             secrets,
             vendor: Some(dev.vendor.as_str().into()),
-            device: Some(dev.name.clone()),
+            device: Some(dev.display_qualified_name()),
             host: Some(dev.serial_port.clone().unwrap_or_else(|| dev.host.clone())),
             role: Some(dev.role.as_str().into()),
+            client: dev.client.clone(),
+            vpn: dev.vpn.clone(),
+            transport: Some(dev.transport.as_str().into()),
         },
         exec,
     )?;
@@ -1145,13 +2060,46 @@ fn net_connect(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<Strin
         }
     }
 
+    // 5. Auto-Learn: if `remember` is true (or `client` was specified on an ad-hoc connection),
+    // automatically save the device in inventory.toml and its password in the OS vault!
+    let remember = args["remember"]
+        .as_bool()
+        .unwrap_or_else(|| opt_str(args, "device").is_none() && dev.client.is_some());
+    if alive && remember {
+        if let Some(ref pw) = direct_password {
+            let s_name = dev
+                .secret_ref
+                .clone()
+                .unwrap_or_else(|| derive_secret_ref_name(dev.client.as_deref(), &dev.name));
+            if zerith_core::secrets::set_secret(&s_name, pw).is_ok() {
+                dev.secret_ref = Some(s_name);
+            }
+        }
+        let inv_path = root.join("inventory.toml");
+        if upsert_inventory_device(&inv_path, dev.clone()).is_ok() {
+            banner.push_str(&format!(
+                "\n[inventário: `{}` salvo automaticamente em {}]",
+                dev.display_qualified_name(),
+                inv_path.display()
+            ));
+        }
+    }
+
     Ok(format!(
-        "{id} conectado via {} a {} ({}, vendor={}, role={}){}\n{banner}",
+        "{vpn_status_note}{id} conectado via {} a {} ({}, vendor={}, role={}{}{}){}\n{banner}",
         dev.transport.as_str(),
-        dev.name,
+        dev.display_qualified_name(),
         dev.serial_port.as_deref().unwrap_or(&dev.host),
         dev.vendor.as_str(),
         dev.role.as_str(),
+        dev.site
+            .as_deref()
+            .map(|s| format!(", site={s}"))
+            .unwrap_or_default(),
+        dev.vpn
+            .as_deref()
+            .map(|v| format!(", vpn={v}"))
+            .unwrap_or_default(),
         if alive { "" } else { " — sessão encerrou" }
     ))
 }
@@ -2113,5 +3061,83 @@ router bgp 65001
         );
         let term_id = res.split_whitespace().next().unwrap();
         let _ = crate::terminal::close_terminal(term_id);
+    }
+
+    #[test]
+    fn multi_client_inventory_disambiguates_same_device_name_and_auto_onboards_with_vpn() {
+        let dir = tempfile::tempdir().unwrap();
+        let inv_path = dir.path().join("inventory.toml");
+
+        let dev_a = DeviceEntry {
+            name: "core-01".into(),
+            client: Some("TelecomSul".into()),
+            site: Some("DC-Curitiba".into()),
+            vpn: Some("wg-telecomsul".into()),
+            host: "10.0.0.1".into(),
+            user: "admin".into(),
+            vendor: Vendor::HuaweiVrp,
+            role: DeviceRole::Core,
+            ..Default::default()
+        };
+        let dev_b = DeviceEntry {
+            name: "core-01".into(),
+            client: Some("HospitalVida".into()),
+            site: Some("Matriz-SP".into()),
+            vpn: Some("wg-hospital".into()),
+            host: "10.0.0.1".into(),
+            user: "admin".into(),
+            vendor: Vendor::MikrotikRouterOs,
+            role: DeviceRole::Core,
+            ..Default::default()
+        };
+        upsert_inventory_device(&inv_path, dev_a).unwrap();
+        upsert_inventory_device(&inv_path, dev_b).unwrap();
+
+        let loaded = load_inventory(dir.path(), Some(dir.path())).unwrap();
+        assert_eq!(loaded.len(), 2);
+
+        // Requesting `core-01` without client must refuse to guess and list both clients
+        let err = find_inventory_device(&loaded, "core-01", None).unwrap_err();
+        assert!(err.contains("TelecomSul/core-01"), "{err}");
+        assert!(err.contains("HospitalVida/core-01"), "{err}");
+
+        // Requesting with explicit client or qualified `Client/device` resolves unambiguously
+        let hit_a = find_inventory_device(&loaded, "core-01", Some("TelecomSul")).unwrap();
+        assert_eq!(hit_a.vendor, Vendor::HuaweiVrp);
+        assert_eq!(hit_a.vpn.as_deref(), Some("wg-telecomsul"));
+
+        let hit_b = find_inventory_device(&loaded, "HospitalVida/core-01", None).unwrap();
+        assert_eq!(hit_b.vendor, Vendor::MikrotikRouterOs);
+        assert_eq!(hit_b.vpn.as_deref(), Some("wg-hospital"));
+
+        // WireGuard .conf parser & profile saver
+        let wg_conf = r#"
+[Interface]
+PrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+Address = 10.250.0.2/32
+
+[Peer]
+PublicKey = BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=
+AllowedIPs = 10.0.0.0/24, 172.16.50.0/24
+Endpoint = vpn.telecomsul.com.br:51820
+"#;
+        let prof =
+            save_wireguard_profile(dir.path(), "wg-telecomsul", wg_conf, dir.path()).unwrap();
+        assert_eq!(prof.name, "wg-telecomsul");
+        assert_eq!(prof.address.as_deref(), Some("10.250.0.2/32"));
+        assert_eq!(prof.allowed_ips, vec!["10.0.0.0/24", "172.16.50.0/24"]);
+        assert_eq!(
+            prof.endpoint.as_deref(),
+            Some("vpn.telecomsul.com.br:51820")
+        );
+
+        assert_eq!(
+            derive_secret_ref_name(Some("Telecom Sul"), "core-01"),
+            "net_telecom_sul_core_01"
+        );
+        assert!(remove_inventory_device(&inv_path, Some("TelecomSul"), "core-01").unwrap());
+        let after_rem = load_inventory(dir.path(), Some(dir.path())).unwrap();
+        assert_eq!(after_rem.len(), 1);
+        assert_eq!(after_rem[0].client.as_deref(), Some("HospitalVida"));
     }
 }

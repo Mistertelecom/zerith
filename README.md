@@ -13,7 +13,7 @@
 
   <p>
     <a href="https://github.com/Mistertelecom/zerith/releases">
-      <img alt="Release v0.3.1" src="https://img.shields.io/badge/version-v0.3.1-111827?style=flat-square" />
+      <img alt="Release v0.3.2" src="https://img.shields.io/badge/version-v0.3.2-111827?style=flat-square" />
     </a>
     <a href="https://github.com/Mistertelecom/zerith/actions/workflows/zerith.yml">
       <img alt="CI Status" src="https://github.com/Mistertelecom/zerith/actions/workflows/zerith.yml/badge.svg" />
@@ -69,7 +69,7 @@ It combines a **pure-SVG Visual Workflows Studio** (`zerith-workflows`), **Stric
 
 ---
 
-## What's Inside (v0.3.1)
+## What's Inside (v0.3.2)
 
 ### 1. Visual Workflows Studio & Global Channels (`zerith-workflows`)
 - **Ultra-Lightweight Pure-SVG Canvas (Tauri 2):** Lazy-loaded automation studio (`~10 kB` gzip JS + `~2.7 kB` gzip CSS, zero heavy graph dependencies) with dot-grid canvas, node drag-and-drop, zoom, 1-click **Arrange** (topological auto-layout), floating **`+` quick-add** node chaining, live dash-flow execution animations, and a side **Inspector + Runs** timeline drawer.

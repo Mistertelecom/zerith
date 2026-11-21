@@ -1138,6 +1138,60 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
             |_, _| Ok(None),
             serial_ports,
         ),
+        make_with(
+            "net_transfer",
+            "Transfere arquivos, backups, capturas `.pcap`, logs ou firmwares (`direction: \"upload\" | \"download\"`) \
+             via SCP/SFTP entre o computador local (`local_path`) e uma VM Linux, servidor Proxmox ou roteador (`remote_path`), \
+             usando o cadastro do inventário (`device`, `client`) ou `host`/`user`/`port` e chaveando a VPN WireGuard automaticamente.",
+            json!({"type": "object", "properties": {
+                "direction": {"type": "string", "description": "upload | download"},
+                "device": {"type": "string", "description": "nome no inventory.toml (ex.: pve-01 ou TelecomSul/pve-01)"},
+                "client": {"type": "string", "description": "nome do cliente"},
+                "host": {"type": "string"},
+                "port": {"type": "integer", "description": "padrão 22"},
+                "user": {"type": "string"},
+                "local_path": {"type": "string", "description": "caminho do arquivo/pasta no computador local"},
+                "remote_path": {"type": "string", "description": "caminho do arquivo/pasta no servidor/roteador remoto"},
+                "auto_vpn": {"type": "boolean", "description": "padrão true"}
+            }, "required": ["direction", "local_path", "remote_path"]}),
+            "confirmação da transferência com tamanho em bytes e tempo decorrido",
+            Permission::Shell,
+            300,
+            false,
+            |args, _| {
+                let dir = opt_str(args, "direction").unwrap_or("transfer");
+                let loc = opt_str(args, "local_path").unwrap_or("");
+                let rem = opt_str(args, "remote_path").unwrap_or("");
+                Ok(Some(Action::Shell(format!("net_transfer {dir} {loc} <-> {rem}"))))
+            },
+            net_transfer,
+        ),
+        make_with(
+            "net_path",
+            "Diagnostica qualidade de enlace, latência, perda de pacotes, Jitter (min/avg/max ms), \
+             Descoberta Automática de Path MTU sem fragmentação (`1500` Ethernet, `1492` PPPoE, `1472` VLAN, `1420` WireGuard, `1400` IPsec, `1360` GRE/MPLS) \
+             e Traceroute até um host ou equipamento (`host` ou `device` + `client`).",
+            json!({"type": "object", "properties": {
+                "host": {"type": "string", "description": "IP ou hostname de destino"},
+                "device": {"type": "string", "description": "opcional: nome do dispositivo no inventory.toml"},
+                "client": {"type": "string", "description": "opcional: cliente para resolver o dispositivo e chavear a VPN WireGuard"},
+                "count": {"type": "integer", "description": "quantidade de sondas de latência/jitter, padrão 4 (máx 10)"},
+                "discover_mtu": {"type": "boolean", "description": "testa Path MTU com bit Don't-Fragment, padrão true"},
+                "traceroute": {"type": "boolean", "description": "executa traceroute/tracert, padrão false"},
+                "port": {"type": "integer", "description": "porta TCP fallback para medir RTT/jitter se ICMP for bloqueado, padrão 22"}
+            }}),
+            "relatório completo de perda, jitter, Path MTU máximo sem fragmentação e saltos",
+            Permission::Network,
+            60,
+            true,
+            |args, _| {
+                let h = opt_str(args, "host")
+                    .or_else(|| opt_str(args, "device"))
+                    .unwrap_or("net_path");
+                Ok(Some(Action::Network(h.to_string())))
+            },
+            net_path,
+        ),
     ]
 }
 
@@ -3301,6 +3355,342 @@ fn serial_ports(_args: &Value, _ctx: &CallCtx<'_>, _exec: &Exec<'_>) -> Result<S
     Ok(lines.join("\n"))
 }
 
+pub fn build_scp_args(
+    dev: &DeviceEntry,
+    direction: &str,
+    local_path: &Path,
+    remote_path: &str,
+) -> std::result::Result<Vec<String>, String> {
+    validate_ssh_token("host", &dev.host)?;
+    let user = if dev.user.trim().is_empty() {
+        std::env::var("USER")
+            .or_else(|_| std::env::var("USERNAME"))
+            .unwrap_or_else(|_| "root".into())
+    } else {
+        dev.user.trim().to_string()
+    };
+    validate_ssh_token("user", &user)?;
+    let rem_trimmed = remote_path.trim();
+    if rem_trimmed.is_empty() || rem_trimmed.chars().any(|c| c.is_control()) {
+        return Err("remote_path inválido".into());
+    }
+
+    let mut args = vec![
+        "-r".to_string(),
+        "-o".to_string(),
+        "StrictHostKeyChecking=accept-new".to_string(),
+        "-o".to_string(),
+        "ConnectTimeout=15".to_string(),
+    ];
+    if dev.port != 22 && dev.port != 0 {
+        args.push("-P".to_string());
+        args.push(dev.port.to_string());
+    }
+    if let Some(jump) = dev
+        .jump_host
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        validate_ssh_token("jump_host", jump)?;
+        args.push("-J".to_string());
+        args.push(jump.to_string());
+    }
+    if dev.legacy_ssh {
+        args.extend([
+            "-o".to_string(),
+            "KexAlgorithms=+diffie-hellman-group14-sha1,diffie-hellman-group1-sha1".to_string(),
+            "-o".to_string(),
+            "HostKeyAlgorithms=+ssh-rsa".to_string(),
+            "-o".to_string(),
+            "PubkeyAcceptedAlgorithms=+ssh-rsa".to_string(),
+        ]);
+    }
+    let remote_spec = format!("{user}@{}:{rem_trimmed}", dev.host.trim());
+    let local_str = local_path.to_string_lossy().into_owned();
+    match direction.trim().to_ascii_lowercase().as_str() {
+        "upload" | "up" | "put" | "push" => {
+            args.push(local_str);
+            args.push(remote_spec);
+            Ok(args)
+        }
+        "download" | "down" | "get" | "pull" => {
+            args.push(remote_spec);
+            args.push(local_str);
+            Ok(args)
+        }
+        other => Err(format!(
+            "direction inválido `{other}` (use `upload` ou `download`)"
+        )),
+    }
+}
+
+fn net_transfer(args: &Value, ctx: &CallCtx<'_>, _exec: &Exec<'_>) -> Result<String> {
+    let direction = str_arg(args, "direction")?;
+    let local_raw = str_arg(args, "local_path")?;
+    let remote_raw = str_arg(args, "remote_path")?;
+    let local_path = ctx.resolve(local_raw);
+
+    let dev = resolve_connect_device(args, ctx)?;
+    let root = zerith_core::Paths::resolve().root().to_path_buf();
+    let auto_vpn = args["auto_vpn"].as_bool().unwrap_or(true);
+    let mut vpn_note = String::new();
+    if auto_vpn {
+        if let Some(vpn_name) = dev.vpn.as_deref().filter(|s| !s.trim().is_empty()) {
+            let msg = ensure_exclusive_wireguard_vpn(vpn_name, ctx.workspace, &root)
+                .map_err(ToolError::Failed)?;
+            vpn_note = format!("[VPN: {msg}]\n");
+        }
+    }
+
+    if matches!(
+        direction.trim().to_ascii_lowercase().as_str(),
+        "download" | "down" | "get" | "pull"
+    ) {
+        if let Some(parent) = local_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+    } else if !local_path.exists() {
+        return Err(ToolError::Failed(format!(
+            "local_path não existe para upload: {}",
+            local_path.display()
+        )));
+    }
+
+    let scp_args = build_scp_args(&dev, direction, &local_path, remote_raw)
+        .map_err(ToolError::BadArguments)?;
+    let started = std::time::Instant::now();
+    let out = std::process::Command::new("scp")
+        .args(&scp_args)
+        .output()
+        .map_err(|e| ToolError::Failed(format!("falha ao executar `scp`: {e}")))?;
+    let elapsed_ms = started.elapsed().as_millis();
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(ToolError::Failed(format!(
+            "scp falhou ({}): {}",
+            out.status,
+            if stderr.is_empty() {
+                "verifique chave SSH ou permissão no destino".into()
+            } else {
+                stderr
+            }
+        )));
+    }
+    let size_bytes = std::fs::metadata(&local_path).map(|m| m.len()).unwrap_or(0);
+    Ok(format!(
+        "{vpn_note}## Net Transfer ({})\n- **Dispositivo:** `{}` ({})\n- **Local:** `{}` ({} bytes)\n- **Remoto:** `{}`\n- **Tempo:** {} ms",
+        direction.to_ascii_uppercase(),
+        dev.display_qualified_name(),
+        dev.host,
+        local_path.display(),
+        size_bytes,
+        remote_raw,
+        elapsed_ms
+    ))
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RttStats {
+    pub sent: usize,
+    pub received: usize,
+    pub loss_pct: f64,
+    pub min_ms: f64,
+    pub avg_ms: f64,
+    pub max_ms: f64,
+    pub jitter_ms: f64,
+}
+
+pub fn compute_rtt_jitter_stats(sent: usize, samples_ms: &[f64]) -> RttStats {
+    let received = samples_ms.len();
+    let loss_pct = if sent == 0 {
+        0.0
+    } else {
+        ((sent.saturating_sub(received)) as f64 / sent as f64) * 100.0
+    };
+    if samples_ms.is_empty() {
+        return RttStats {
+            sent,
+            received: 0,
+            loss_pct,
+            min_ms: 0.0,
+            avg_ms: 0.0,
+            max_ms: 0.0,
+            jitter_ms: 0.0,
+        };
+    }
+    let mut min_ms = f64::MAX;
+    let mut max_ms = 0.0f64;
+    let mut sum = 0.0f64;
+    let mut diff_sum = 0.0f64;
+    for (i, &v) in samples_ms.iter().enumerate() {
+        if v < min_ms {
+            min_ms = v;
+        }
+        if v > max_ms {
+            max_ms = v;
+        }
+        sum += v;
+        if i > 0 {
+            diff_sum += (v - samples_ms[i - 1]).abs();
+        }
+    }
+    let avg_ms = sum / received as f64;
+    let jitter_ms = if received > 1 {
+        diff_sum / (received - 1) as f64
+    } else {
+        0.0
+    };
+    RttStats {
+        sent,
+        received,
+        loss_pct,
+        min_ms,
+        avg_ms,
+        max_ms,
+        jitter_ms,
+    }
+}
+
+fn ping_with_df_mtu(host: &str, total_ip_mtu: u16) -> bool {
+    let payload = total_ip_mtu.saturating_sub(28);
+    let payload_str = payload.to_string();
+    let out = if cfg!(windows) {
+        std::process::Command::new("ping")
+            .args(["-n", "1", "-w", "900", "-f", "-l", &payload_str, host])
+            .output()
+    } else if cfg!(target_os = "macos") {
+        std::process::Command::new("ping")
+            .args(["-c", "1", "-W", "900", "-D", "-s", &payload_str, host])
+            .output()
+    } else {
+        std::process::Command::new("ping")
+            .args(["-c", "1", "-W", "1", "-M", "do", "-s", &payload_str, host])
+            .output()
+    };
+    let Ok(res) = out else {
+        return false;
+    };
+    if !res.status.success() {
+        return false;
+    }
+    let stdout = String::from_utf8_lossy(&res.stdout).to_ascii_lowercase();
+    !stdout.contains("fragment")
+        && !stdout.contains("100% loss")
+        && !stdout.contains("100% packet loss")
+}
+
+fn discover_path_mtu(host: &str) -> Option<(u16, &'static str)> {
+    const CANDIDATES: &[(u16, &str)] = &[
+        (1500, "Ethernet Padrão (1500) — sem encapsulamento redutor"),
+        (1492, "PPPoE (1492) — overhead de 8 bytes PPPoE"),
+        (1472, "VLAN / MPLS / QinQ (1472)"),
+        (
+            1420,
+            "WireGuard VPN Padrão (1420) — overhead de 80 bytes WireGuard",
+        ),
+        (1400, "IPsec / L2TP / VXLAN (1400)"),
+        (1360, "GRE + IPsec / MPLS Duplo (1360)"),
+        (1280, "IPv6 Mínimo / Túnel Restrito (1280)"),
+    ];
+    for &(mtu, label) in CANDIDATES {
+        if ping_with_df_mtu(host, mtu) {
+            return Some((mtu, label));
+        }
+    }
+    None
+}
+
+fn net_path(args: &Value, ctx: &CallCtx<'_>, _exec: &Exec<'_>) -> Result<String> {
+    use std::net::{TcpStream, ToSocketAddrs};
+    use std::time::Instant;
+
+    let root = zerith_core::Paths::resolve().root().to_path_buf();
+    let (target_host, target_port, label_prefix) = if opt_str(args, "device").is_some() {
+        let dev = resolve_connect_device(args, ctx)?;
+        if let Some(vpn_name) = dev.vpn.as_deref().filter(|s| !s.trim().is_empty()) {
+            let _ = ensure_exclusive_wireguard_vpn(vpn_name, ctx.workspace, &root);
+        }
+        (
+            dev.host.clone(),
+            args["port"].as_u64().map(|p| p as u16).unwrap_or(dev.port),
+            format!("{} ({})", dev.display_qualified_name(), dev.host),
+        )
+    } else {
+        let h = str_arg(args, "host")?.trim().to_string();
+        let p = args["port"].as_u64().unwrap_or(22).min(65535) as u16;
+        (h.clone(), p, h)
+    };
+    validate_ssh_token("host", &target_host).map_err(ToolError::BadArguments)?;
+
+    let count = args["count"].as_u64().unwrap_or(4).clamp(1, 10) as usize;
+    let discover_mtu = args["discover_mtu"].as_bool().unwrap_or(true);
+    let run_trace = args["traceroute"].as_bool().unwrap_or(false);
+
+    // 1. Measure multi-sample RTT & Jitter via TCP connect probes
+    let mut samples_ms = Vec::with_capacity(count);
+    if let Some(addr) = (target_host.as_str(), target_port)
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut it| it.next())
+    {
+        for i in 0..count {
+            let started = Instant::now();
+            if TcpStream::connect_timeout(&addr, Duration::from_millis(1500)).is_ok() {
+                samples_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+            }
+            if i + 1 < count {
+                std::thread::sleep(Duration::from_millis(60));
+            }
+        }
+    }
+    let stats = compute_rtt_jitter_stats(count, &samples_ms);
+
+    let mut lines = vec![format!("## Net Path Diagnostics — `{label_prefix}`")];
+    lines.push(format!(
+        "- **Latência & Jitter (TCP/{target_port}):** enviados={}, recebidos={}, perda=`{:.0}%` · min=`{:.1} ms` · avg=`{:.1} ms` · max=`{:.1} ms` · **jitter=`{:.1} ms`**",
+        stats.sent, stats.received, stats.loss_pct, stats.min_ms, stats.avg_ms, stats.max_ms, stats.jitter_ms
+    ));
+
+    // 2. Automatic Path MTU Discovery (Don't-Fragment ICMP)
+    if discover_mtu {
+        match discover_path_mtu(&target_host) {
+            Some((mtu, profile)) => {
+                let mss = mtu.saturating_sub(40);
+                lines.push(format!(
+                    "- **Path MTU Descoberto (DF=1):** **`{mtu} bytes`** ({profile}) · TCP MSS recomendado: `ip tcp adjust-mss {mss}`"
+                ));
+            }
+            None => {
+                lines.push(
+                    "- **Path MTU (DF=1):** ICMP bloqueado ou indisponível no caminho (use TCP MSS clamping preventivo `1380` se houver suspeita de blackhole em túnel)".into(),
+                );
+            }
+        }
+    }
+
+    // 3. Optional Traceroute
+    if run_trace {
+        let trace_out = if cfg!(windows) {
+            std::process::Command::new("tracert")
+                .args(["-d", "-h", "15", "-w", "800", &target_host])
+                .output()
+        } else {
+            std::process::Command::new("traceroute")
+                .args(["-n", "-m", "15", "-w", "1", &target_host])
+                .output()
+        };
+        if let Ok(out) = trace_out {
+            let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !text.is_empty() {
+                lines.push(format!("\n### Traceroute\n```text\n{text}\n```"));
+            }
+        }
+    }
+
+    Ok(lines.join("\n"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3793,5 +4183,40 @@ Endpoint = vpn.telecomsul.com.br:51820
         let (mk_vendor, mk_role, _, _, _) = fingerprint_probed_host(&mk_rows).unwrap();
         assert_eq!(mk_vendor, Vendor::MikrotikRouterOs);
         assert_eq!(mk_role, DeviceRole::Border);
+    }
+
+    #[test]
+    fn scp_transfer_builder_and_rtt_jitter_stats_work() {
+        let dev = DeviceEntry {
+            name: "pve-01".into(),
+            client: Some("TelecomSul".into()),
+            host: "10.50.0.10".into(),
+            port: 2222,
+            user: "root".into(),
+            jump_host: Some("bastion@203.0.113.5".into()),
+            legacy_ssh: true,
+            ..Default::default()
+        };
+        let local = Path::new("/tmp/dump.pcap");
+        let up = build_scp_args(&dev, "upload", local, "/var/tmp/dump.pcap").unwrap();
+        assert!(up.contains(&"-P".to_string()));
+        assert!(up.contains(&"2222".to_string()));
+        assert!(up.contains(&"-J".to_string()));
+        assert!(up.contains(&"bastion@203.0.113.5".to_string()));
+        assert_eq!(up.last().unwrap(), "root@10.50.0.10:/var/tmp/dump.pcap");
+
+        let down = build_scp_args(&dev, "download", local, "/etc/pve/storage.cfg").unwrap();
+        assert_eq!(down[down.len() - 2], "root@10.50.0.10:/etc/pve/storage.cfg");
+        assert_eq!(down.last().unwrap(), "/tmp/dump.pcap");
+        assert!(build_scp_args(&dev, "invalid", local, "/tmp/x").is_err());
+
+        let stats = compute_rtt_jitter_stats(4, &[10.0, 14.0, 12.0]);
+        assert_eq!(stats.sent, 4);
+        assert_eq!(stats.received, 3);
+        assert!((stats.loss_pct - 25.0).abs() < 0.01);
+        assert!((stats.min_ms - 10.0).abs() < 0.01);
+        assert!((stats.max_ms - 14.0).abs() < 0.01);
+        assert!((stats.avg_ms - 12.0).abs() < 0.01);
+        assert!((stats.jitter_ms - 3.0).abs() < 0.01);
     }
 }

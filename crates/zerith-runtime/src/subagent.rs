@@ -237,6 +237,10 @@ fn builtin(name: &str) -> Option<(&'static str, Allow)> {
             "Você é um subagente de planejamento, somente leitura. Estude o código e devolva um plano de implementação passo a passo: arquivos a mudar, ordem e riscos. Não altere nada.",
             Allow::ReadOnly,
         ),
+        "executor" => (
+            "Você é o subagente Executor Técnico do Zerith. Execute diretamente todas as tarefas operacionais pedidas pelo Orquestrador usando as ferramentas disponíveis (`net_connect`, `terminal_batch`, `net_broadcast`, `net_vpn`, `net_probe`, `net_path`, `net_backup`, `net_transfer`, `net_diff`, `shell`, `read_file`, `edit_file`, `write_file`, `multi_edit`, `grep`, `glob`). Não responda apenas com teoria: execute os comandos/edições reais até concluir e devolva um relatório técnico conciso com o que foi executado, saídas relevantes e status final.",
+            Allow::All,
+        ),
         "general" | "default" => (
             "Você é um subagente de uso geral. Execute a tarefa por completo com as ferramentas disponíveis.",
             Allow::All,
@@ -276,7 +280,7 @@ pub fn resolve_agent(workspace: &Path, name: Option<&str>) -> Result<Resolved, S
             allow,
         });
     }
-    let mut known: Vec<String> = ["explore", "plan", "general"]
+    let mut known: Vec<String> = ["executor", "explore", "plan", "general"]
         .iter()
         .map(|s| s.to_string())
         .collect();
@@ -797,6 +801,7 @@ struct Runtime {
     base: Registry,
     skills_root: Option<zerith_skills::Library>,
     model: String,
+    executor_model: Option<String>,
     depth: usize,
     gate: Arc<Gate>,
     limit: Option<usize>,
@@ -817,6 +822,7 @@ pub(crate) fn bind(
     client: &Client,
     ctx: &TurnContext<'_>,
     model: &str,
+    executor_model: Option<&str>,
     session_id: &str,
     opts: &SubagentOptions,
     approvals: Option<&ApprovalGate>,
@@ -834,6 +840,10 @@ pub(crate) fn bind(
         base: tools.subset(|_| true),
         skills_root: ctx.skills.cloned(),
         model: model.to_string(),
+        executor_model: executor_model
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
         depth: opts.depth,
         gate: opts.gate.clone().unwrap_or_else(Gate::global),
         limit: opts.max_concurrent,
@@ -975,12 +985,20 @@ impl Services for Runtime {
             )
             .settings
         });
-        let raw_model = settings.routing.resolve_subagent_model(
-            &resolved.name,
-            req.model.as_deref(),
-            resolved.def.model.as_deref(),
-            &self.model,
-        );
+        let raw_model = self
+            .executor_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                settings.routing.resolve_subagent_model(
+                    &resolved.name,
+                    req.model.as_deref(),
+                    resolved.def.model.as_deref(),
+                    &self.model,
+                )
+            });
         let (cfg, model) = resolve_child_route(&db, &settings, &raw_model, &self.cfg);
         let steps = resolved
             .def

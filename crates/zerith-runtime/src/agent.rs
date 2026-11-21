@@ -256,6 +256,12 @@ pub struct AgentOptions<'a> {
     pub dynamic_context: Option<String>,
     /// Optional reasoning effort hint (`"low"`, `"medium"`, `"high"`).
     pub reasoning_effort: Option<String>,
+    /// Strict Orchestrator Mode: the root model thinks, plans, and coordinates
+    /// via `agent` (which runs on `executor_model` or `routing.subagent_model`),
+    /// while heavy execution tools are restricted to the subagents.
+    pub orchestrator: bool,
+    /// Explicit executor model selected for subagents in this turn.
+    pub executor_model: Option<String>,
     /// Depth and concurrency of the subagents this turn may start.
     pub subagents: SubagentOptions,
 }
@@ -280,6 +286,8 @@ impl Default for AgentOptions<'_> {
             questions: None,
             dynamic_context: None,
             reasoning_effort: None,
+            orchestrator: false,
+            executor_model: None,
             subagents: SubagentOptions::default(),
         }
     }
@@ -456,25 +464,6 @@ fn turn_body(
     }
     let prompt_row_id = store.append(session_id, &NewMessage::new(Role::User, prompt))?;
 
-    // The model has the skill tool exactly when the registry offers it.
-    let skill_tool = agent.tools.is_some_and(|r| r.get("skill").is_some());
-    let mut prompt_ctx = crate::build_prompt_context(title, ctx, skill_tool, session_id, prompt);
-    if let Some(r) = agent.tools {
-        prompt_ctx.static_system.push_str(&crate::tool_guidance(r));
-    }
-    let dynamic_reminder = match (
-        prompt_ctx.dynamic_reminder,
-        agent
-            .dynamic_context
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty()),
-    ) {
-        (Some(a), Some(b)) => Some(format!("{a}\n\n{b}")),
-        (a, None) => a,
-        (None, Some(b)) => Some(b.to_string()),
-    };
-    let system = vec![ChatMessage::system(prompt_ctx.static_system)];
     let kids_saved = if let (Some(r), Some(p)) = (agent.tools, agent.policy) {
         Some(subagent::bind(
             r,
@@ -483,6 +472,7 @@ fn turn_body(
             client,
             &ctx,
             model,
+            agent.executor_model.as_deref(),
             session_id,
             &agent.subagents,
             agent.approvals,
@@ -491,6 +481,58 @@ fn turn_body(
     } else {
         None
     };
+
+    // The model has the skill tool exactly when the registry offers it.
+    let skill_tool = agent.tools.is_some_and(|r| r.get("skill").is_some());
+    let mut prompt_ctx = crate::build_prompt_context(title, ctx, skill_tool, session_id, prompt);
+    if let Some(r) = agent.tools {
+        prompt_ctx.static_system.push_str(&crate::tool_guidance(r));
+    }
+    let is_root_orchestrator = agent.orchestrator
+        && agent.subagents.depth == 0
+        && agent.tools.is_some_and(|r| r.get("agent").is_some());
+    let exec_label = agent
+        .executor_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            ctx.settings
+                .and_then(|st| st.routing.subagent_model.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or(model);
+    let orch_block = is_root_orchestrator.then(|| {
+        format!(
+            "# Modo Orquestrador Ativo (Pensamento: `{model}` → Execução: `{exec_label}`)\n\
+             Você é o **Modelo de Pensamento (Arquiteto/Orquestrador)**. As ferramentas operacionais pesadas (`shell`, `edit_file`, `write_file`, `multi_edit`, `net_connect`, `terminal_batch`, `net_broadcast`, `net_vpn`, `net_probe`, `net_path`, `net_backup`, `net_transfer`, `read_file`, `grep`, `glob`) estão atribuídas exclusivamente aos subagentes executores, que rodam no modelo **`{exec_label}`**.\n\
+             Fluxo obrigatório para pedidos técnicos/operacionais:\n\
+             1. **Pense e Planeje:** Analise o pedido, consulte as skills pré-carregadas (e `net_inventory` se envolver clientes) e estruture os passos com `task_create`.\n\
+             2. **Delegue a Execução:** Chame a ferramenta `agent` (ex.: `agent=\"executor\"`, `\"netops-architect\"`, `\"proxmox-architect\"`, `\"noc-incident-commander\"`, `\"ftth-gpon-architect\"`, `\"linux-devops-architect\"`, `\"explore\"` ou `\"general\"`) passando um `prompt` completo e autossuficiente (com IPs/cliente, instruções da skill e o que verificar). Para tarefas independentes, chame vários `agent` em paralelo.\n\
+             3. **Audite e Conclua:** Revise o relatório técnico do Executor, atualize `task_update` e entregue a resposta final ao usuário.\n\
+             (Se o usuário fizer apenas uma pergunta conceitual simples que não exija executar ferramentas, responda diretamente.)"
+        )
+    });
+    let merged_dyn = match (
+        agent
+            .dynamic_context
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty()),
+        orch_block.as_deref(),
+    ) {
+        (Some(a), Some(b)) => Some(format!("{a}\n\n{b}")),
+        (Some(a), None) => Some(a.to_string()),
+        (None, Some(b)) => Some(b.to_string()),
+        (None, None) => None,
+    };
+    let dynamic_reminder = match (prompt_ctx.dynamic_reminder, merged_dyn.as_deref()) {
+        (Some(a), Some(b)) => Some(format!("{a}\n\n{b}")),
+        (a, None) => a,
+        (None, Some(b)) => Some(b.to_string()),
+    };
+    let system = vec![ChatMessage::system(prompt_ctx.static_system)];
     // Resolve Gateway once per turn (instead of hitting settings/keyring on
     // every tool step). Its first candidate sets the context window and folding.
     let mut gateway = match ctx.settings {
@@ -535,13 +577,41 @@ fn turn_body(
         hist.push(ChatMessage::user(text), cid);
     }
 
+    let context_probe = {
+        let mut s = prompt.to_lowercase();
+        if let Some(rem) = &dynamic_reminder {
+            s.push(' ');
+            s.push_str(&rem.to_lowercase());
+        }
+        for row in rows.iter().rev().take(6) {
+            s.push(' ');
+            s.push_str(&row.content.to_lowercase());
+            if let Some(tn) = &row.tool_name {
+                s.push(' ');
+                s.push_str(&tn.to_lowercase());
+            }
+        }
+        s
+    };
+
     let defs: Vec<ToolDef> = agent
         .tools
         .map(|r| {
-            r.specs()
+            let specs = r.specs();
+            let large_registry = specs.len() > 20;
+            specs
                 .into_iter()
                 // Deferred tools run through `mcp_call`: no schema per request.
                 .filter(|s| !s.source.starts_with(zerith_tools::DEFERRED_SOURCE))
+                .filter(|s| {
+                    if is_root_orchestrator {
+                        is_orchestrator_root_tool(&s.name)
+                    } else if large_registry {
+                        should_include_tool_schema(&s.name, &context_probe)
+                    } else {
+                        true
+                    }
+                })
                 .map(|s| ToolDef {
                     name: s.name.clone(),
                     description: s.description.clone(),
@@ -1654,6 +1724,139 @@ fn request(
     ))
 }
 
+/// Tools the root Thinking/Brain model retains in Strict Orchestrator Mode.
+/// All operational execution tools (`shell`, `edit_file`, `write_file`,
+/// `net_connect`, `terminal_batch`, `net_broadcast`, `read_file`, `grep`, etc.)
+/// remain bound in the subagent runtime (`rt.base`) so the Executor model gets
+/// 100% of them, while the Brain model is physically restricted to planning,
+/// inventory lookup, skill reading, and dispatching `agent`.
+pub(crate) fn is_orchestrator_root_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "agent"
+            | "agent_result"
+            | "task_create"
+            | "task_update"
+            | "task_list"
+            | "task_get"
+            | "ask_user"
+            | "skill"
+            | "skill_search"
+            | "memory_save"
+            | "memory_search"
+            | "memory_delete"
+            | "session_search"
+            | "net_inventory"
+            | "enter_plan_mode"
+            | "exit_plan_mode"
+    )
+}
+
+/// Contextual tool-schema filter for large built-in registries (> 20 tools).
+/// Keeps all core file, shell, task, subagent, skill, memory, diagnostics,
+/// terminal, and network tools on every turn, and only includes bulky niche
+/// schemas (`browser_*`, `lsp_*`, media generation, skill/agent authoring)
+/// when the prompt or recent conversation mentions them.
+pub(crate) fn should_include_tool_schema(name: &str, context_lower: &str) -> bool {
+    if name.starts_with("browser_") {
+        return [
+            "browser",
+            "navegador",
+            "site",
+            "página",
+            "pagina",
+            "web",
+            "http://",
+            "https://",
+            "click",
+            "clicar",
+            "clique",
+            "screenshot",
+            "chrome",
+            "kitesurf",
+            "playwright",
+            "painel",
+            "dashboard",
+            "grafana",
+            "browser_",
+        ]
+        .iter()
+        .any(|kw| context_lower.contains(kw));
+    }
+    if name.starts_with("lsp_") {
+        return [
+            "lsp",
+            "definição",
+            "definicao",
+            "definition",
+            "referência",
+            "referencia",
+            "references",
+            "símbolo",
+            "simbolo",
+            "symbol",
+            "hover",
+            ".rs",
+            ".ts",
+            ".tsx",
+            ".py",
+            ".go",
+            "struct ",
+            "trait ",
+            "impl ",
+            "fn ",
+            "class ",
+            "function",
+            "refator",
+            "compil",
+        ]
+        .iter()
+        .any(|kw| context_lower.contains(kw));
+    }
+    if matches!(name, "image_generate" | "tts_speak" | "audio_transcribe") {
+        return [
+            "gerar imagem",
+            "crie uma imagem",
+            "desenhe",
+            "ilustra",
+            "generate image",
+            "image_generate",
+            "tts",
+            "voz",
+            "falar",
+            "narrar",
+            "áudio",
+            "audio",
+            "transcrev",
+            "whisper",
+            ".mp3",
+            ".wav",
+            ".ogg",
+            ".m4a",
+            ".flac",
+        ]
+        .iter()
+        .any(|kw| context_lower.contains(kw));
+    }
+    if matches!(name, "create_skill" | "create_agent" | "delete_ai_item") {
+        return [
+            "criar skill",
+            "crie uma skill",
+            "nova skill",
+            "salvar skill",
+            "create_skill",
+            "criar agente",
+            "crie um agente",
+            "novo agente",
+            "create_agent",
+            "delete_ai_item",
+        ]
+        .iter()
+        .any(|kw| context_lower.contains(kw));
+    }
+    true
+}
+
 #[cfg(test)]
 mod shrink_tests {
     use super::shrink_at;
@@ -1709,5 +1912,36 @@ mod approval_grant_tests {
         let (_tx2, gate2) = approval_channel_with_grants(shared);
         assert!(gate2.granted("shell:prefix:git commit *"));
         assert!(!gate2.granted("shell:exact:git commit -m x && rm -rf ."));
+    }
+
+    #[test]
+    fn orchestrator_root_keeps_brain_tools_and_delegates_execution_tools() {
+        assert!(is_orchestrator_root_tool("agent"));
+        assert!(is_orchestrator_root_tool("task_create"));
+        assert!(is_orchestrator_root_tool("skill"));
+        assert!(is_orchestrator_root_tool("net_inventory"));
+        assert!(!is_orchestrator_root_tool("shell"));
+        assert!(!is_orchestrator_root_tool("edit_file"));
+        assert!(!is_orchestrator_root_tool("net_connect"));
+        assert!(!is_orchestrator_root_tool("terminal_batch"));
+    }
+
+    #[test]
+    fn contextual_schema_pruning_drops_unrelated_niche_tools_and_keeps_relevant_ones() {
+        let netops_ctx = "conecte por ssh na mikrotik do cliente acme e veja o bgp";
+        assert!(should_include_tool_schema("net_connect", netops_ctx));
+        assert!(should_include_tool_schema("terminal_batch", netops_ctx));
+        assert!(should_include_tool_schema("shell", netops_ctx));
+        assert!(!should_include_tool_schema("browser_click", netops_ctx));
+        assert!(!should_include_tool_schema("lsp_hover", netops_ctx));
+        assert!(!should_include_tool_schema("image_generate", netops_ctx));
+        assert!(!should_include_tool_schema("create_skill", netops_ctx));
+
+        let browser_ctx = "abra o navegador em https://10.0.0.1 e tire um screenshot";
+        assert!(should_include_tool_schema("browser_open", browser_ctx));
+        assert!(should_include_tool_schema(
+            "browser_screenshot",
+            browser_ctx
+        ));
     }
 }

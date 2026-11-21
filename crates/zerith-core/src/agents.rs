@@ -191,6 +191,30 @@ fn collect(
             }
         }
     }
+    if extra_files.is_empty() {
+        let idx = paths.root().join("plugins").join("plugins.json");
+        if let Ok(text) = std::fs::read_to_string(idx) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                for p in v["plugins"].as_array().into_iter().flatten() {
+                    if p["status"].as_str() != Some("enabled") {
+                        continue;
+                    }
+                    let Some(dir) = p["dir"].as_str().map(PathBuf::from) else {
+                        continue;
+                    };
+                    for rel in p["manifest"]["agents"].as_array().into_iter().flatten() {
+                        if let Some(rel_str) = rel.as_str() {
+                            if let Some(def) = load_file(&dir.join(rel_str), "plugin") {
+                                if !out.iter().any(|a| a.name == def.name) {
+                                    out.push(def);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     let mut layers = vec![(paths.agents(), "user")];
     if let Some(dir) = project_dir {
         layers.push((dir.join(".zerith").join("agents"), "project"));

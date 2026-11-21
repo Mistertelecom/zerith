@@ -42,6 +42,109 @@
   flex: 1;
   align-self: stretch;
 }
+.titlebar-tabs {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: 12px;
+  padding: 2px;
+  border-radius: var(--r-full);
+  background: var(--layer-1);
+  border: 1px solid var(--line);
+}
+.titlebar-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 22px;
+  padding: 0 10px;
+  border-radius: var(--r-full);
+  font-size: 11.5px;
+  font-weight: 550;
+  color: var(--label-tertiary);
+  transition: background var(--t-fast) var(--ease), color var(--t-fast) var(--ease);
+}
+.titlebar-tab:hover {
+  color: var(--label-primary);
+}
+.titlebar-tab.on {
+  background: var(--layer-3);
+  color: var(--label-primary);
+  box-shadow: inset 0 0 0 1px var(--line-strong);
+}
+
+/* ---- expressive bot emblems & Bots contact list --------------------- */
+.bot-emblem {
+  position: relative;
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.16), 0 3px 10px rgba(0, 0, 0, 0.35);
+}
+.bot-emblem-dot {
+  position: absolute;
+  right: -2px;
+  bottom: -2px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  border: 2px solid var(--bg-chrome);
+  background: var(--label-caption);
+}
+.bot-emblem-dot.on {
+  background: var(--ok);
+}
+.bot-emblem-dot.running {
+  background: #38bdf8;
+  animation: pulse-dot 1.1s ease-in-out infinite;
+}
+.bot-emblem-dot.error {
+  background: var(--danger);
+}
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.45; transform: scale(1.25); }
+}
+
+.bot-roster-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: var(--r-md);
+  border: 1px solid transparent;
+  text-align: left;
+  transition: background var(--t-fast) var(--ease), border-color var(--t-fast) var(--ease);
+}
+.bot-roster-row:hover {
+  background: var(--hover);
+}
+.bot-roster-row.on {
+  background: var(--layer-2);
+  border-color: var(--line-strong);
+}
+.bot-roster-info {
+  min-width: 0;
+  display: grid;
+  gap: 1px;
+}
+.bot-roster-name {
+  font-size: var(--fs-ui);
+  font-weight: 600;
+  color: var(--label-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.bot-roster-desc {
+  font-size: 11px;
+  color: var(--label-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 /* "Nova versão" pill: quiet hairline, the action is the only filled thing. */
 .update-pill {
   display: inline-flex;

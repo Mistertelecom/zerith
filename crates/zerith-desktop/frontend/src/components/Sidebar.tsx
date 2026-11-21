@@ -16,8 +16,10 @@ import {
   Workflow,
   X,
 } from "lucide-react";
-import type { Session } from "../lib/api";
+import type { AgentView, Session } from "../lib/api";
 import { translateText, tr, useLang } from "../lib/i18n";
+import { BotEmblem, emblemForAgent } from "./BotEmblem";
+import type { AppView } from "./TitleBar";
 import { Logo, ZerithMark } from "./ui";
 
 const DAY = 86_400_000;
@@ -55,6 +57,11 @@ export function Sidebar(props: {
   onSettings: () => void;
   onQuotas: () => void;
   onWorkflows?: () => void;
+  view?: AppView;
+  agents?: AgentView[];
+  activeBot?: string | null;
+  onSelectBot?: (bot: AgentView) => void;
+  onNewBotChat?: () => void;
   memoryPaused: boolean;
   onToggleMemory: () => void;
   pinned?: string[];
@@ -163,9 +170,16 @@ export function Sidebar(props: {
         <span>Zerith</span>
       </div>
 
-      <button className="btn side-new" onClick={props.onNew}>
+      <button
+        className="btn side-new"
+        onClick={props.view === "bots" ? (props.onNewBotChat ?? props.onNew) : props.onNew}
+      >
         <SquarePen size={16} strokeWidth={1.75} />
-        <span>{tr(lang, "Nova conversa", "New chat")}</span>
+        <span>
+          {props.view === "bots"
+            ? tr(lang, "Nova conversa com bot", "New bot chat")
+            : tr(lang, "Nova conversa", "New chat")}
+        </span>
         <span className="side-keys" aria-hidden>
           <kbd className="kbd">Ctrl</kbd>
           <kbd className="kbd">N</kbd>
@@ -176,12 +190,53 @@ export function Sidebar(props: {
         <Search size={14} strokeWidth={2} aria-hidden />
         <input
           value={props.query}
-          placeholder={tr(lang, "Buscar conversas", "Search chats")}
-          aria-label={tr(lang, "Buscar conversas", "Search chats")}
+          placeholder={
+            props.view === "bots"
+              ? tr(lang, "Buscar bots", "Search bots")
+              : tr(lang, "Buscar conversas", "Search chats")
+          }
+          aria-label={
+            props.view === "bots"
+              ? tr(lang, "Buscar bots", "Search bots")
+              : tr(lang, "Buscar conversas", "Search chats")
+          }
           onChange={(e) => props.onQuery(e.target.value)}
         />
       </label>
 
+      {props.view === "bots" ? (
+        <nav className="side-list" aria-label="Bots">
+          <section className="side-group">
+            <h2 className="side-group-label">{tr(lang, "Bots Especialistas", "Specialist Bots")}</h2>
+            {(props.agents ?? [])
+              .filter((b) => !b.disabled)
+              .filter((b) => {
+                const q = props.query.trim().toLowerCase();
+                return (
+                  !q ||
+                  b.name.toLowerCase().includes(q) ||
+                  b.description.toLowerCase().includes(q)
+                );
+              })
+              .map((bot) => (
+                <button
+                  key={bot.name}
+                  className={"bot-roster-row" + (props.activeBot === bot.name ? " on" : "")}
+                  onClick={() => props.onSelectBot?.(bot)}
+                  title={bot.description || bot.name}
+                >
+                  <BotEmblem icon={emblemForAgent(bot.name)} size={34} status="on" />
+                  <div className="bot-roster-info">
+                    <span className="bot-roster-name">{bot.name}</span>
+                    <span className="bot-roster-desc">
+                      {bot.description || bot.layer}
+                    </span>
+                  </div>
+                </button>
+              ))}
+          </section>
+        </nav>
+      ) : (
       <nav className="side-list" aria-label={tr(lang, "Conversas", "Chats")}>
         {groups.length === 0 ? (
           <div className="side-empty">
@@ -299,6 +354,7 @@ export function Sidebar(props: {
           ))
         )}
       </nav>
+      )}
 
       {menu ? (
         <div

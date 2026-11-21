@@ -1,14 +1,26 @@
 import { useEffect, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { Copy, Globe, Minus, Square, X } from "lucide-react";
+import { Bot, Copy, Globe, MessageSquare, Minus, Square, Workflow, X } from "lucide-react";
 import { ZerithMark } from "./ui";
 import { UpdatePill } from "./Update";
 import { LANG_OPTIONS, LANG_SHORT, setLang, tr, useLang, type Lang } from "../lib/i18n";
 
+export type AppView = "chat" | "bots" | "workflows";
+
 /** The window's own title bar: the native one is off (decorations: false) so
  * the bar can sit on the app's black. Empty space drags the window (Tauri's
  * data-tauri-drag-region), double click maximises. */
-export function TitleBar({ title, brand = false }: { title?: string; brand?: boolean }) {
+export function TitleBar({
+  title,
+  brand = false,
+  view,
+  onView,
+}: {
+  title?: string;
+  brand?: boolean;
+  view?: AppView;
+  onView?: (v: AppView) => void;
+}) {
   const [max, setMax] = useState(false);
   const lang = useLang();
   useEffect(() => {
@@ -43,6 +55,34 @@ export function TitleBar({ title, brand = false }: { title?: string; brand?: boo
         <span className="titlebar-title" data-tauri-drag-region>
           {title}
         </span>
+      ) : null}
+      {!brand && view && onView ? (
+        <nav className="titlebar-tabs" aria-label={tr(lang, "Modo do aplicativo", "App view")}>
+          <button
+            type="button"
+            className={"titlebar-tab" + (view === "chat" ? " on" : "")}
+            onClick={() => onView("chat")}
+          >
+            <MessageSquare size={12} strokeWidth={2.1} />
+            <span>{tr(lang, "Chat", "Chat")}</span>
+          </button>
+          <button
+            type="button"
+            className={"titlebar-tab" + (view === "bots" ? " on" : "")}
+            onClick={() => onView("bots")}
+          >
+            <Bot size={12} strokeWidth={2.1} />
+            <span>Bots</span>
+          </button>
+          <button
+            type="button"
+            className={"titlebar-tab" + (view === "workflows" ? " on" : "")}
+            onClick={() => onView("workflows")}
+          >
+            <Workflow size={12} strokeWidth={2.1} />
+            <span>{tr(lang, "Automações", "Workflows")}</span>
+          </button>
+        </nav>
       ) : null}
       <span className="titlebar-fill" data-tauri-drag-region />
       {/* boot screens (brand) have no app yet to update */}

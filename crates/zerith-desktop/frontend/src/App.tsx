@@ -29,6 +29,7 @@ import {
   onTurnEvent,
   onTurnLearned,
   type Account,
+  type AgentView,
   type Boot,
   type Routing,
   type Session,
@@ -52,7 +53,8 @@ import { Composer, type CommandName } from "./components/Composer";
 import { Logo, ZerithMark } from "./components/ui";
 import { catalogEntry, NOT_CHAT } from "./lib/catalog";
 import { titleOf } from "./lib/title";
-import { TitleBar } from "./components/TitleBar";
+import { TitleBar, type AppView } from "./components/TitleBar";
+import { BotEmblem, emblemForAgent } from "./components/BotEmblem";
 import { AppVersion } from "./components/Update";
 import { FolderPill } from "./components/FolderPill";
 import { BackgroundJobs } from "./components/BackgroundJobs";
@@ -254,7 +256,9 @@ export default function App() {
   const [paletteQuery, setPaletteQuery] = useState("");
   const [memoryPaused, setMemoryPaused] = useState(false);
   const [settings, setSettings] = useState<SettingsTab | null>(null);
-  const [workflowsOpen, setWorkflowsOpen] = useState(false);
+  const [activeView, setActiveView] = useState<AppView>("chat");
+  const [agents, setAgents] = useState<AgentView[]>([]);
+  const [activeAgent, setActiveAgent] = useState<string | null>(null);
   const [status, setStatus] = useState("");
   const [inspector, setInspector] = useState(true);
   // Folders used before (newest first, from the store) and the one picked for
@@ -324,6 +328,10 @@ export default function App() {
         void api
           .accounts()
           .then(setAccounts)
+          .catch(() => undefined);
+        void api
+          .agentsList()
+          .then(setAgents)
           .catch(() => undefined);
         document.documentElement.dataset.theme =
           b.theme === "light"
@@ -548,12 +556,25 @@ export default function App() {
     let id = selected;
     try {
       if (!id) {
-        const created = await api.createSession(titleOf(prompt), folder);
+        const sessionTitle = activeAgent
+          ? `@${activeAgent} · ${titleOf(prompt)}`
+          : titleOf(prompt);
+        const created = await api.createSession(sessionTitle, folder);
         setSessions((prev) => [created, ...prev]);
         id = created.id;
         fresh.current = id;
         setSelected(id);
         setMessages([]);
+        if (activeAgent) {
+          try {
+            const raw = localStorage.getItem("zerith.botSessions");
+            const map = raw ? (JSON.parse(raw) as Record<string, string>) : {};
+            map[activeAgent] = created.id;
+            localStorage.setItem("zerith.botSessions", JSON.stringify(map));
+          } catch {
+            // ignore storage errors
+          }
+        }
       }
       // The previous answer lives only in `turn` until the session is reloaded:
       // keep it in the transcript before the new turn resets that state.
@@ -572,6 +593,7 @@ export default function App() {
         model,
         prompt,
         mode,
+        agent: activeAgent,
         reasoningEffort: effort === "off" ? null : effort,
         orchestrator,
         executorModel: orchestrator ? executorModel || model : null,
@@ -589,6 +611,7 @@ export default function App() {
     mode,
     effort,
     selected,
+    activeAgent,
     turns,
     folder,
     updateTurn,
@@ -995,17 +1018,83 @@ export default function App() {
     null;
   const doneTasks = turn.tasks.filter((t) => t.status === "completed").length;
 
+  const activeBotSpec = useMemo(
+    () => (activeAgent ? agents.find((a) => a.name === activeAgent) ?? null : null),
+    [agents, activeAgent],
+  );
+
+  const selectBot = useCallback(
+    (bot: AgentView) => {
+      setActiveAgent(bot.name);
+      try {
+        const raw = localStorage.getItem("zerith.botSessions");
+        const map = raw ? (JSON.parse(raw) as Record<string, string>) : {};
+        const sid = map[bot.name];
+        if (sid && sessions.some((s) => s.id === sid && !s.archived)) {
+          setSelected(sid);
+          return;
+        }
+      } catch {
+        // ignore storage errors
+      }
+      setSelected(null);
+      setMessages([]);
+      draftRef.current?.focus();
+    },
+    [sessions],
+  );
+
+  const handleSwitchView = useCallback((v: AppView) => {
+    setActiveView(v);
+    if (v === "bots") {
+      void api.agentsList().then(setAgents).catch(() => undefined);
+    }
+  }, []);
+
   return (
     <div className="frame">
-      <TitleBar />
+      <TitleBar view={activeView} onView={handleSwitchView} />
       <div className="shell">
+        {activeView === "workflows" ? (
+          <Suspense fallback={null}>
+            <WorkflowsStudio
+              inline
+              models={models}
+              onClose={() => setActiveView("chat")}
+            />
+          </Suspense>
+        ) : (
+        <>
         <Sidebar
           sessions={sessions}
           selected={selected}
           query={query}
           onQuery={setQuery}
-          onSelect={setSelected}
+          view={activeView}
+          agents={agents}
+          activeBot={activeAgent}
+          onSelectBot={selectBot}
+          onNewBotChat={() => {
+            if (activeAgent) {
+              try {
+                const raw = localStorage.getItem("zerith.botSessions");
+                const map = raw ? (JSON.parse(raw) as Record<string, string>) : {};
+                delete map[activeAgent];
+                localStorage.setItem("zerith.botSessions", JSON.stringify(map));
+              } catch {
+                // ignore
+              }
+            }
+            setSelected(null);
+            setMessages([]);
+            draftRef.current?.focus();
+          }}
+          onSelect={(id) => {
+            setActiveAgent(null);
+            setSelected(id);
+          }}
           onNew={() => {
+            setActiveAgent(null);
             setSelected(null);
             setMessages([]);
             draftRef.current?.focus();
@@ -1059,7 +1148,7 @@ export default function App() {
           }}
           onSettings={() => setSettings("Geral")}
           onQuotas={() => setSettings("Cotas")}
-          onWorkflows={() => setWorkflowsOpen(true)}
+          onWorkflows={() => setActiveView("workflows")}
           memoryPaused={memoryPaused}
           onToggleMemory={() => {
             const next = !memoryPaused;
@@ -1069,8 +1158,14 @@ export default function App() {
         />
         <main className="main">
           <header className="topbar">
-            <h1 className="topbar-title">
-              {current?.title ?? "Nova conversa"}
+            <h1 className="topbar-title" style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              {activeAgent ? (
+                <BotEmblem icon={emblemForAgent(activeAgent)} size={22} status="on" />
+              ) : null}
+              <span>
+                {current?.title ??
+                  (activeAgent ? `@${activeAgent}` : tr(lang, "Nova conversa", "New chat"))}
+              </span>
             </h1>
             {turn.busy ? (
               <span className="top-pill busy" role="status">
@@ -1128,13 +1223,34 @@ export default function App() {
             <div className={"convo" + (hero ? " is-hero" : "")}>
               {hero ? (
                 <div className="hero-head">
-                  <ZerithMark size={40} />
-                  <h2>Como posso ajudar?</h2>
-                  <p>
-                    Peça código, revisão ou um plano. As ferramentas rodam no
-                    seu computador e pedem aprovação.
-                  </p>
-                  <AppVersion />
+                  {activeBotSpec ? (
+                    <>
+                      <BotEmblem
+                        icon={emblemForAgent(activeBotSpec.name)}
+                        size={48}
+                        status="on"
+                      />
+                      <h2>@{activeBotSpec.name}</h2>
+                      <p>
+                        {activeBotSpec.description ||
+                          tr(
+                            lang,
+                            "Bot especialista pronto para atuar no seu workspace.",
+                            "Specialist bot ready to act in your workspace.",
+                          )}
+                      </p>
+                    </>
+                  ) : (
+                    <>
+                      <ZerithMark size={40} />
+                      <h2>Como posso ajudar?</h2>
+                      <p>
+                        Peça código, revisão ou um plano. As ferramentas rodam no
+                        seu computador e pedem aprovação.
+                      </p>
+                      <AppVersion />
+                    </>
+                  )}
                 </div>
               ) : (
                 <Transcript
@@ -1412,6 +1528,8 @@ export default function App() {
             ) : null}
           </div>
         </main>
+        </>
+        )}
         {settings ? (
           <Suspense fallback={null}>
             <Settings
@@ -1431,14 +1549,6 @@ export default function App() {
                   void api.setMemoryPaused(paused);
                 },
               }}
-            />
-          </Suspense>
-        ) : null}
-        {workflowsOpen ? (
-          <Suspense fallback={null}>
-            <WorkflowsStudio
-              models={models}
-              onClose={() => setWorkflowsOpen(false)}
             />
           </Suspense>
         ) : null}
@@ -1483,7 +1593,7 @@ export default function App() {
               {
                 label: "Abrir Workflows & Automações",
                 hint: "Visual Studio",
-                run: () => setWorkflowsOpen(true),
+                run: () => setActiveView("workflows"),
               },
               {
                 label: "Abrir Delegação & Modelos",

@@ -1,13 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  Activity,
   Bell,
   Bot,
   Clock,
+  Copy,
   FileText,
   GitBranch,
   Globe,
   LayoutGrid,
+  Maximize2,
+  PanelRight,
   Play,
   Plus,
   RefreshCw,
@@ -41,39 +43,58 @@ import {
   type WorkflowRun,
 } from "../lib/api";
 import { tr, useLang, type Lang } from "../lib/i18n";
+import { BOT_EMBLEMS, BotEmblem } from "./BotEmblem";
 import "../styles/workflows.css";
 
+const NODE_W = 222;
 const NODE_META: Record<
   NodeKind,
-  { pt: string; en: string; icon: LucideIcon; defaultCfg: () => Record<string, unknown> }
+  {
+    pt: string;
+    en: string;
+    cat: "trigger" | "collect" | "logic" | "deliver";
+    color: string;
+    icon: LucideIcon;
+    defaultCfg: () => Record<string, unknown>;
+  }
 > = {
   trigger_cron: {
     pt: "Agenda (Cron)",
     en: "Schedule (Cron)",
+    cat: "trigger",
+    color: "#fbbf24",
     icon: Clock,
     defaultCfg: () => ({ cron: "0 8 * * *", tz_offset_minutes: -new Date().getTimezoneOffset() }),
   },
   trigger_manual: {
     pt: "Manual",
     en: "Manual Trigger",
+    cat: "trigger",
+    color: "#fbbf24",
     icon: Play,
     defaultCfg: () => ({}),
   },
   shell: {
     pt: "Shell / Script",
     en: "Shell / Script",
+    cat: "collect",
+    color: "#34d399",
     icon: Terminal,
     defaultCfg: () => ({ command: "echo ok", timeout_secs: 30 }),
   },
   ssh_command: {
     pt: "SSH / NOC",
     en: "SSH / Network",
+    cat: "collect",
+    color: "#22d3ee",
     icon: Server,
     defaultCfg: () => ({ host: "", user: "root", port: 22, command: "uptime", timeout_secs: 30 }),
   },
   http_request: {
     pt: "HTTP / API",
     en: "HTTP / API",
+    cat: "collect",
+    color: "#38bdf8",
     icon: Globe,
     defaultCfg: () => ({
       method: "GET",
@@ -86,18 +107,24 @@ const NODE_META: Record<
   transform: {
     pt: "Transformar",
     en: "Transform",
+    cat: "logic",
+    color: "#a5b4fc",
     icon: Sliders,
     defaultCfg: () => ({ mode: "template", pattern: "", template: "{{prev}}" }),
   },
   condition: {
     pt: "Condição (If)",
     en: "Condition (If)",
+    cat: "logic",
+    color: "#fdba74",
     icon: GitBranch,
     defaultCfg: () => ({ mode: "not_empty", pattern: "" }),
   },
   ai_agent: {
     pt: "Agente IA",
     en: "AI Agent",
+    cat: "logic",
+    color: "#c4b5fd",
     icon: Bot,
     defaultCfg: () => ({
       model: "",
@@ -108,16 +135,27 @@ const NODE_META: Record<
   notify_channel: {
     pt: "Notificar Canal",
     en: "Notify Channel",
+    cat: "deliver",
+    color: "#2dd4bf",
     icon: Bell,
     defaultCfg: () => ({ channel_id: "", target: "", message: "{{prev}}" }),
   },
   save_file: {
     pt: "Salvar Arquivo",
     en: "Save File",
+    cat: "deliver",
+    color: "#cbd5e1",
     icon: FileText,
     defaultCfg: () => ({ path: "reports/report-{{date}}.md", append: false }),
   },
 };
+
+const NODE_CATEGORIES: { cat: "trigger" | "collect" | "logic" | "deliver"; pt: string; en: string; kinds: NodeKind[] }[] = [
+  { cat: "trigger", pt: "Gatilhos", en: "Triggers", kinds: ["trigger_cron", "trigger_manual"] },
+  { cat: "collect", pt: "Coleta & Ação", en: "Collect & Act", kinds: ["shell", "ssh_command", "http_request"] },
+  { cat: "logic", pt: "IA & Lógica", en: "AI & Logic", kinds: ["ai_agent", "condition", "transform"] },
+  { cat: "deliver", pt: "Entrega", en: "Delivery", kinds: ["notify_channel", "save_file"] },
+];
 
 const NODE_KINDS: NodeKind[] = [
   "trigger_cron",
@@ -142,25 +180,6 @@ const CHANNEL_KINDS: { kind: ChannelKind; label: string }[] = [
   { kind: "generic_webhook", label: "Generic HTTP Webhook" },
   { kind: "desktop_notify", label: "Desktop Notification" },
 ];
-
-function rosterIcon(icon: string): LucideIcon {
-  switch (icon) {
-    case "activity":
-      return Activity;
-    case "globe":
-      return Globe;
-    case "bot":
-      return Bot;
-    case "bell":
-      return Bell;
-    case "terminal":
-      return Terminal;
-    case "file-text":
-      return FileText;
-    default:
-      return WorkflowIcon;
-  }
-}
 
 function workflowScheduleLabel(wf: Workflow, lang: Lang): string {
   const cronNode = wf.nodes.find((n) => n.kind === "trigger_cron");
@@ -207,7 +226,7 @@ function nodeSubPreview(n: WorkflowNode, channels: ChannelConfig[]): string {
 }
 
 function cubicPath(x1: number, y1: number, x2: number, y2: number): string {
-  const dx = Math.max(55, Math.abs(x2 - x1) * 0.45);
+  const dx = Math.max(58, Math.abs(x2 - x1) * 0.45);
   return `M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`;
 }
 
@@ -244,7 +263,7 @@ function autoArrange(wf: Workflow): Workflow {
     const col = depth.get(n.id) ?? 0;
     const row = colCounts.get(col) ?? 0;
     colCounts.set(col, row + 1);
-    return { ...n, x: 40 + col * 270, y: 120 + row * 145 };
+    return { ...n, x: 40 + col * 280, y: 120 + row * 150 };
   });
   return { ...wf, nodes };
 }
@@ -252,6 +271,7 @@ function autoArrange(wf: Workflow): Workflow {
 export function WorkflowsStudio(props: {
   models: { value: string; label: string }[];
   onClose: () => void;
+  inline?: boolean;
 }) {
   const lang = useLang();
   const [workflows, setWorkflows] = useState<Workflow[]>([]);
@@ -260,12 +280,26 @@ export function WorkflowsStudio(props: {
   const [draft, setDraft] = useState<Workflow | null>(null);
   const [dirty, setDirty] = useState(false);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [inspOpen, setInspOpen] = useState(true);
   const [inspTab, setInspTab] = useState<"insp" | "runs">("insp");
   const [runs, setRuns] = useState<WorkflowRun[]>([]);
   const [liveNodes, setLiveNodes] = useState<Record<string, NodeEvent>>({});
-  const [connectingFrom, setConnectingFrom] = useState<{ id: string; branch?: string } | null>(null);
+  const [connectingFrom, setConnectingFrom] = useState<{
+    id: string;
+    branch?: string;
+    x: number;
+    y: number;
+  } | null>(null);
+  const [mouseWorld, setMouseWorld] = useState<{ x: number; y: number } | null>(null);
   const [quickMenuNode, setQuickMenuNode] = useState<{ id: string; branch?: string } | null>(null);
-  const [zoom, setZoom] = useState(1);
+  const [addMenuOpen, setAddMenuOpen] = useState(false);
+  const [emblemMenuOpen, setEmblemMenuOpen] = useState(false);
+
+  const [zoom, setZoom] = useState(0.95);
+  const [pan, setPan] = useState<{ x: number; y: number }>({ x: 24, y: 24 });
+  const [isPanning, setIsPanning] = useState(false);
+  const viewportRef = useRef<HTMLDivElement>(null);
+
   const [aiPrompt, setAiPrompt] = useState("");
   const [aiBusy, setAiBusy] = useState(false);
   const [runningId, setRunningId] = useState<string | null>(null);
@@ -276,13 +310,53 @@ export function WorkflowsStudio(props: {
   const [nodeTestInput, setNodeTestInput] = useState("");
   const [nodeTestOutput, setNodeTestOutput] = useState<string | null>(null);
   const [nodeTestBusy, setNodeTestBusy] = useState(false);
-  const dragRef = useRef<{
+
+  const dragNodeRef = useRef<{
     id: string;
     startX: number;
     startY: number;
     origX: number;
     origY: number;
   } | null>(null);
+
+  const dragPanRef = useRef<{
+    startX: number;
+    startY: number;
+    origPanX: number;
+    origPanY: number;
+  } | null>(null);
+
+  const fitToView = useCallback((wf: Workflow | null) => {
+    const vp = viewportRef.current;
+    if (!wf || !wf.nodes.length || !vp) {
+      setZoom(0.95);
+      setPan({ x: 24, y: 24 });
+      return;
+    }
+    const rect = vp.getBoundingClientRect();
+    if (!rect.width || !rect.height) return;
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const n of wf.nodes) {
+      minX = Math.min(minX, n.x);
+      minY = Math.min(minY, n.y);
+      maxX = Math.max(maxX, n.x + NODE_W);
+      maxY = Math.max(maxY, n.y + 100);
+    }
+    const contentW = Math.max(300, maxX - minX);
+    const contentH = Math.max(200, maxY - minY);
+    const pad = 64;
+    const z = Math.max(
+      0.45,
+      Math.min(1.05, Math.min((rect.width - pad * 2) / contentW, (rect.height - pad * 2) / contentH)),
+    );
+    const cx = (rect.width - contentW * z) / 2 - minX * z;
+    const cy = (rect.height - contentH * z) / 2 - minY * z;
+    setZoom(Number(z.toFixed(2)));
+    setPan({ x: Math.round(cx), y: Math.round(cy) });
+  }, []);
 
   const loadAll = useCallback(async (keepSelection = true) => {
     try {
@@ -310,13 +384,15 @@ export function WorkflowsStudio(props: {
     }
     const found = workflows.find((w) => w.id === selectedId);
     if (found && !dirty) {
-      setDraft(structuredClone(found));
+      const cloned = structuredClone(found);
+      setDraft(cloned);
       setSelectedNodeId((prev) =>
         prev && found.nodes.some((n) => n.id === prev) ? prev : found.nodes[0]?.id ?? null,
       );
+      requestAnimationFrame(() => fitToView(cloned));
     }
     void workflowsApi.runs(selectedId, 25).then(setRuns).catch(() => undefined);
-  }, [selectedId, workflows, dirty]);
+  }, [selectedId, workflows, dirty, fitToView]);
 
   useEffect(() => {
     let offEv = () => {};
@@ -355,11 +431,16 @@ export function WorkflowsStudio(props: {
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && !channelsOpen && !templatesOpen) props.onClose();
+      if (e.key === "Escape") {
+        if (connectingFrom) setConnectingFrom(null);
+        else if (addMenuOpen) setAddMenuOpen(false);
+        else if (emblemMenuOpen) setEmblemMenuOpen(false);
+        else if (!props.inline && !channelsOpen && !templatesOpen) props.onClose();
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [props, channelsOpen, templatesOpen]);
+  }, [props, channelsOpen, templatesOpen, connectingFrom, addMenuOpen, emblemMenuOpen]);
 
   const selectedNode = useMemo(
     () => draft?.nodes.find((n) => n.id === selectedNodeId) ?? null,
@@ -407,7 +488,7 @@ export function WorkflowsStudio(props: {
       id: `wf-${now}`,
       name: tr(lang, "Nova Automação", "New Automation"),
       description: "",
-      icon: "workflow",
+      icon: "rocket",
       enabled: false,
       nodes: [
         {
@@ -422,7 +503,7 @@ export function WorkflowsStudio(props: {
           id: "n2",
           kind: "shell",
           label: tr(lang, "Coletar dados", "Collect data"),
-          x: 330,
+          x: 350,
           y: 140,
           config: NODE_META.shell.defaultCfg(),
         },
@@ -452,7 +533,11 @@ export function WorkflowsStudio(props: {
       await loadAll(false);
       setSelectedId(wf.id);
       setBanner({
-        text: tr(lang, "Workflow criado pela IA! Revise os blocos e ative.", "Workflow created by AI! Review blocks and activate."),
+        text: tr(
+          lang,
+          "Workflow criado pela IA! Revise os blocos e ative.",
+          "Workflow created by AI! Review blocks and activate.",
+        ),
         tone: "ok",
       });
     } catch (e) {
@@ -466,7 +551,7 @@ export function WorkflowsStudio(props: {
     if (!draft) return;
     const id = `n${Date.now().toString(36).slice(-4)}`;
     const tail = draft.nodes[draft.nodes.length - 1];
-    const x = tail ? tail.x + 260 : 80;
+    const x = tail ? tail.x + 280 : 80;
     const y = tail ? tail.y : 140;
     const meta = NODE_META[kind];
     const node: WorkflowNode = {
@@ -478,6 +563,21 @@ export function WorkflowsStudio(props: {
       config: meta.defaultCfg(),
     };
     patchDraft((w) => ({ ...w, nodes: [...w.nodes, node] }));
+    setSelectedNodeId(id);
+    setInspOpen(true);
+    setAddMenuOpen(false);
+  };
+
+  const duplicateNode = (src: WorkflowNode) => {
+    const id = `n${Date.now().toString(36).slice(-4)}`;
+    const clone: WorkflowNode = {
+      ...structuredClone(src),
+      id,
+      label: `${src.label} (cópia)`,
+      x: src.x + 40,
+      y: src.y + 125,
+    };
+    patchDraft((w) => ({ ...w, nodes: [...w.nodes, clone] }));
     setSelectedNodeId(id);
   };
 
@@ -492,8 +592,8 @@ export function WorkflowsStudio(props: {
       id,
       kind,
       label: lang === "pt-BR" ? meta.pt : meta.en,
-      x: parent.x + 268,
-      y: parent.y + (branch === "false" ? 130 : siblings * 110),
+      x: parent.x + 280,
+      y: parent.y + (branch === "false" ? 135 : siblings * 115),
       config: meta.defaultCfg(),
     };
     const edge: WorkflowEdge = {
@@ -508,6 +608,7 @@ export function WorkflowsStudio(props: {
       edges: [...w.edges, edge],
     }));
     setSelectedNodeId(id);
+    setInspOpen(true);
     setQuickMenuNode(null);
   };
 
@@ -571,12 +672,16 @@ export function WorkflowsStudio(props: {
     setSelectedId(saved.id);
   };
 
-  const runSingleNodeTest = async () => {
-    if (!selectedNode || nodeTestBusy) return;
+  const runSingleNodeTest = async (targetNode?: WorkflowNode) => {
+    const nodeToTest = targetNode ?? selectedNode;
+    if (!nodeToTest || nodeTestBusy) return;
+    setSelectedNodeId(nodeToTest.id);
+    setInspOpen(true);
+    setInspTab("insp");
     setNodeTestBusy(true);
     setNodeTestOutput(null);
     try {
-      const out = await workflowsApi.testNode(selectedNode, nodeTestInput);
+      const out = await workflowsApi.testNode(nodeToTest, nodeTestInput);
       setNodeTestOutput(out || "(sem saída)");
     } catch (e) {
       setNodeTestOutput(`Erro: ${String(e)}`);
@@ -585,162 +690,283 @@ export function WorkflowsStudio(props: {
     }
   };
 
-  return (
-    <div className="wf-backdrop" onMouseDown={props.onClose}>
-      <div
-        className="wf-studio"
-        role="dialog"
-        aria-label={tr(lang, "Estúdio de Workflows", "Workflows Studio")}
-        onMouseDown={(e) => e.stopPropagation()}
-      >
-        {/* Left Roster Rail (OpenMausBot style) */}
-        <aside className="wf-rail">
-          <div className="wf-rail-head">
-            <div className="wf-rail-title">
-              <WorkflowIcon size={16} strokeWidth={2} />
-              <span>{tr(lang, "Automações", "Workflows")}</span>
-            </div>
-            <button
-              type="button"
-              className="btn btn-sm"
-              onClick={() => void handleCreateNew()}
-              title={tr(lang, "Criar novo fluxo", "Create new workflow")}
-            >
-              <Plus size={14} strokeWidth={2} />
-            </button>
-          </div>
+  const handleWheelZoom = (e: React.WheelEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    const vp = viewportRef.current;
+    if (!vp) return;
+    const rect = vp.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+    const factor = e.deltaY < 0 ? 1.1 : 0.9;
+    const nextZoom = Math.max(0.35, Math.min(1.8, +(zoom * factor).toFixed(3)));
+    const scaleRatio = nextZoom / zoom;
+    setPan({
+      x: mx - (mx - pan.x) * scaleRatio,
+      y: my - (my - pan.y) * scaleRatio,
+    });
+    setZoom(nextZoom);
+  };
 
-          <div className="wf-rail-list">
-            {workflows.map((w) => {
-              const Icon = rosterIcon(w.icon);
-              const isRunning = runningId === w.id || w.last_status === "running";
-              const dotCls = isRunning
-                ? "running"
-                : w.last_status === "error"
-                  ? "error"
-                  : w.enabled
-                    ? "on"
-                    : "";
-              return (
-                <div
-                  key={w.id}
-                  className={"wf-roster-card" + (selectedId === w.id ? " on" : "")}
-                  onClick={() => {
-                    if (dirty && !window.confirm(tr(lang, "Descartar alterações não salvas?", "Discard unsaved changes?"))) {
-                      return;
-                    }
-                    setDirty(false);
-                    setLiveNodes({});
-                    setSelectedId(w.id);
-                  }}
-                >
-                  <span className="wf-roster-ava">
-                    <Icon size={15} strokeWidth={2} />
+  const zoomAtCenter = (nextZ: number) => {
+    const vp = viewportRef.current;
+    const clamped = Math.max(0.35, Math.min(1.8, +nextZ.toFixed(2)));
+    if (!vp) {
+      setZoom(clamped);
+      return;
+    }
+    const rect = vp.getBoundingClientRect();
+    const cx = rect.width / 2;
+    const cy = rect.height / 2;
+    const ratio = clamped / zoom;
+    setPan({
+      x: cx - (cx - pan.x) * ratio,
+      y: cy - (cy - pan.y) * ratio,
+    });
+    setZoom(clamped);
+  };
+
+  // Minimap bounds computation
+  const minimapData = useMemo(() => {
+    if (!draft?.nodes.length) return null;
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const n of draft.nodes) {
+      minX = Math.min(minX, n.x);
+      minY = Math.min(minY, n.y);
+      maxX = Math.max(maxX, n.x + NODE_W);
+      maxY = Math.max(maxY, n.y + 100);
+    }
+    minX -= 80;
+    minY -= 80;
+    maxX += 80;
+    maxY += 80;
+    const w = Math.max(400, maxX - minX);
+    const h = Math.max(250, maxY - minY);
+    const scale = Math.min(156 / w, 94 / h);
+    return { minX, minY, scale };
+  }, [draft]);
+
+  const studio = (
+    <div
+      className={
+        "wf-studio" +
+        (props.inline ? " inline" : "") +
+        (!inspOpen ? " no-insp" : "")
+      }
+      role="dialog"
+      aria-label={tr(lang, "Estúdio de Workflows", "Workflows Studio")}
+      onMouseDown={(e) => e.stopPropagation()}
+    >
+      {/* Left Roster Rail (OpenMausBot style) */}
+      <aside className="wf-rail">
+        <div className="wf-rail-head">
+          <div className="wf-rail-title">
+            <WorkflowIcon size={16} strokeWidth={2} />
+            <span>{tr(lang, "Automações", "Workflows")}</span>
+          </div>
+          <button
+            type="button"
+            className="btn btn-sm"
+            onClick={() => void handleCreateNew()}
+            title={tr(lang, "Criar novo fluxo", "Create new workflow")}
+          >
+            <Plus size={14} strokeWidth={2} />
+          </button>
+        </div>
+
+        <div className="wf-rail-list">
+          {workflows.map((w) => {
+            const isRunning = runningId === w.id || w.last_status === "running";
+            const status = isRunning
+              ? "running"
+              : w.last_status === "error"
+                ? "error"
+                : w.enabled
+                  ? "on"
+                  : "idle";
+            return (
+              <div
+                key={w.id}
+                className={"wf-roster-card" + (selectedId === w.id ? " on" : "")}
+                onClick={() => {
+                  if (
+                    dirty &&
+                    !window.confirm(
+                      tr(lang, "Descartar alterações não salvas?", "Discard unsaved changes?"),
+                    )
+                  ) {
+                    return;
+                  }
+                  setDirty(false);
+                  setLiveNodes({});
+                  setSelectedId(w.id);
+                }}
+              >
+                <BotEmblem icon={w.icon} size={34} status={status} />
+                <div className="wf-roster-meta">
+                  <span className="wf-roster-name">{w.name}</span>
+                  <span className="wf-roster-sub">
+                    <span>{workflowScheduleLabel(w, lang)}</span>
+                    <span>· {w.nodes.length} nós</span>
                   </span>
-                  <div className="wf-roster-meta">
-                    <span className="wf-roster-name">{w.name}</span>
-                    <span className="wf-roster-sub">
-                      <span className={`wf-status-dot ${dotCls}`} />
-                      <span>{workflowScheduleLabel(w, lang)}</span>
-                    </span>
-                  </div>
-                  <input
-                    type="checkbox"
-                    checked={w.enabled}
-                    aria-label={tr(lang, "Ativar workflow", "Enable workflow")}
-                    onClick={(e) => e.stopPropagation()}
-                    onChange={(e) => {
-                      const next = e.target.checked;
-                      void workflowsApi
-                        .toggle(w.id, next)
-                        .then(() => loadAll(true))
-                        .catch((err) => setBanner({ text: String(err), tone: "err" }));
-                    }}
-                  />
                 </div>
-              );
-            })}
-          </div>
+                <input
+                  type="checkbox"
+                  className="wf-switch"
+                  checked={w.enabled}
+                  aria-label={tr(lang, "Ativar workflow", "Enable workflow")}
+                  onClick={(e) => e.stopPropagation()}
+                  onChange={(e) => {
+                    const next = e.target.checked;
+                    void workflowsApi
+                      .toggle(w.id, next)
+                      .then(() => loadAll(true))
+                      .catch((err) => setBanner({ text: String(err), tone: "err" }));
+                  }}
+                />
+              </div>
+            );
+          })}
+        </div>
 
-          <div className="wf-rail-foot">
-            <button type="button" className="btn btn-sm" onClick={() => void openTemplates()}>
-              <LayoutGrid size={14} strokeWidth={2} />
-              <span>{tr(lang, "Galeria de Templates", "Template Gallery")}</span>
-            </button>
-            <button type="button" className="btn btn-sm" onClick={() => setChannelsOpen(true)}>
-              <Send size={14} strokeWidth={2} />
-              <span>
-                {tr(lang, "Canais", "Channels")} ({channels.length})
-              </span>
-            </button>
-          </div>
-        </aside>
+        <div className="wf-rail-foot">
+          <button type="button" className="btn btn-sm" onClick={() => void openTemplates()}>
+            <LayoutGrid size={14} strokeWidth={2} />
+            <span>{tr(lang, "Galeria de Templates", "Template Gallery")}</span>
+          </button>
+          <button type="button" className="btn btn-sm" onClick={() => setChannelsOpen(true)}>
+            <Send size={14} strokeWidth={2} />
+            <span>
+              {tr(lang, "Canais", "Channels")} ({channels.length})
+            </span>
+          </button>
+        </div>
+      </aside>
 
-        {/* Center Visual Studio */}
-        <section className="wf-main">
-          <div className="wf-topbar">
-            {draft ? (
+      {/* Center Visual Studio */}
+      <section className="wf-main">
+        <div className="wf-topbar">
+          {draft ? (
+            <>
+              <div style={{ position: "relative" }}>
+                <button
+                  type="button"
+                  className="wf-emblem-btn"
+                  title={tr(lang, "Trocar símbolo do workflow", "Change workflow emblem")}
+                  onClick={() => setEmblemMenuOpen((v) => !v)}
+                >
+                  <BotEmblem
+                    icon={draft.icon}
+                    size={30}
+                    status={runningId === draft.id ? "running" : draft.enabled ? "on" : "idle"}
+                  />
+                </button>
+                {emblemMenuOpen ? (
+                  <div className="wf-emblem-pop">
+                    {BOT_EMBLEMS.map((em) => (
+                      <button
+                        key={em.id}
+                        type="button"
+                        className={"wf-emblem-choice" + (draft.icon === em.id ? " on" : "")}
+                        title={em.label}
+                        onClick={() => {
+                          patchDraft((w) => ({ ...w, icon: em.id }));
+                          setEmblemMenuOpen(false);
+                        }}
+                      >
+                        <BotEmblem icon={em.id} size={34} />
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
               <input
                 className="wf-name-input"
                 value={draft.name}
                 onChange={(e) => patchDraft((w) => ({ ...w, name: e.target.value }))}
                 aria-label={tr(lang, "Nome do workflow", "Workflow name")}
               />
-            ) : (
-              <span className="wf-name-input">
-                {tr(lang, "Selecione ou crie um workflow", "Select or create a workflow")}
-              </span>
-            )}
-            {draft ? (
-              <>
+              <div className="wf-add-pop-wrap">
                 <button
                   type="button"
                   className="btn btn-sm"
-                  onClick={() => patchDraft(autoArrange)}
-                  title={tr(lang, "Auto-organizar nós", "Auto-arrange nodes")}
+                  onClick={() => setAddMenuOpen((v) => !v)}
                 >
-                  <Wand2 size={14} strokeWidth={2} />
-                  <span>{tr(lang, "Organizar", "Arrange")}</span>
+                  <Plus size={14} strokeWidth={2} />
+                  <span>{tr(lang, "Bloco", "Add Block")}</span>
                 </button>
-                <button
-                  type="button"
-                  className="btn btn-sm"
-                  onClick={() => void handleRunNow()}
-                  disabled={Boolean(runningId)}
-                >
-                  <Play size={14} strokeWidth={2} />
-                  <span>{tr(lang, "Executar", "Run Now")}</span>
-                </button>
-                <button
-                  type="button"
-                  className={"btn btn-sm" + (dirty ? " btn-primary" : "")}
-                  onClick={() => void handleSave()}
-                >
-                  <Save size={14} strokeWidth={2} />
-                  <span>{tr(lang, "Salvar", "Save")}</span>
-                </button>
-                <button
-                  type="button"
-                  className="icon-btn sm"
-                  title={tr(lang, "Excluir workflow", "Delete workflow")}
-                  onClick={() => {
-                    if (
-                      !window.confirm(
-                        tr(lang, `Excluir "${draft.name}"?`, `Delete "${draft.name}"?`),
-                      )
-                    ) {
-                      return;
-                    }
-                    void workflowsApi.delete(draft.id).then(() => {
-                      setDirty(false);
-                      void loadAll(false);
-                    });
-                  }}
-                >
-                  <Trash2 size={14} strokeWidth={2} />
-                </button>
-              </>
-            ) : null}
+                {addMenuOpen ? (
+                  <div className="wf-add-pop">
+                    {NODE_CATEGORIES.map((grp) => (
+                      <div key={grp.cat}>
+                        <div className="wf-add-cat">{lang === "pt-BR" ? grp.pt : grp.en}</div>
+                        {grp.kinds.map((k) => {
+                          const m = NODE_META[k];
+                          const KIcon = m.icon;
+                          return (
+                            <button
+                              key={k}
+                              type="button"
+                              className="wf-quick-item"
+                              style={{ width: "100%" }}
+                              onClick={() => addStandaloneNode(k)}
+                            >
+                              <KIcon size={14} style={{ color: m.color }} />
+                              <span>{lang === "pt-BR" ? m.pt : m.en}</span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+              <button
+                type="button"
+                className="btn btn-sm"
+                onClick={() => void handleRunNow()}
+                disabled={Boolean(runningId)}
+              >
+                <Play size={14} strokeWidth={2} />
+                <span>{tr(lang, "Executar", "Run Now")}</span>
+              </button>
+              <button
+                type="button"
+                className={"btn btn-sm" + (dirty ? " btn-primary" : "")}
+                onClick={() => void handleSave()}
+              >
+                <Save size={14} strokeWidth={2} />
+                <span>{tr(lang, "Salvar", "Save")}</span>
+              </button>
+              <button
+                type="button"
+                className="icon-btn sm"
+                title={tr(lang, "Excluir workflow", "Delete workflow")}
+                onClick={() => {
+                  if (
+                    !window.confirm(
+                      tr(lang, `Excluir "${draft.name}"?`, `Delete "${draft.name}"?`),
+                    )
+                  ) {
+                    return;
+                  }
+                  void workflowsApi.delete(draft.id).then(() => {
+                    setDirty(false);
+                    void loadAll(false);
+                  });
+                }}
+              >
+                <Trash2 size={14} strokeWidth={2} />
+              </button>
+            </>
+          ) : (
+            <span className="wf-name-input">
+              {tr(lang, "Selecione ou crie um workflow", "Select or create a workflow")}
+            </span>
+          )}
+          {!props.inline ? (
             <button
               type="button"
               className="icon-btn sm"
@@ -749,297 +975,460 @@ export function WorkflowsStudio(props: {
             >
               <X size={16} strokeWidth={2} />
             </button>
-          </div>
+          ) : null}
+        </div>
 
-          <div className="wf-ai-bar">
-            <Sparkles size={15} strokeWidth={2} style={{ color: "#c4b5fd", flexShrink: 0 }} />
-            <input
-              className="wf-ai-input"
-              value={aiPrompt}
-              onChange={(e) => setAiPrompt(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && void handleGenerateAi()}
-              placeholder={tr(
-                lang,
-                "Descreva em português ou inglês: ex. 'Verifique meu mikrotik via SSH às 08:00 e mande equipamentos offline no WhatsApp'",
-                "Describe your automation: e.g. 'Check offline devices daily at 08:00 and send a report to WhatsApp'",
-              )}
-            />
-            <button
-              type="button"
-              className="btn btn-sm"
-              onClick={() => void handleGenerateAi()}
-              disabled={aiBusy || !aiPrompt.trim()}
-            >
-              <Sparkles size={13} strokeWidth={2} />
-              <span>{aiBusy ? tr(lang, "Criando...", "Building...") : tr(lang, "Criar com IA", "Build with AI")}</span>
-            </button>
-          </div>
+        <div className="wf-ai-bar">
+          <Sparkles size={15} strokeWidth={2} style={{ color: "#c4b5fd", flexShrink: 0 }} />
+          <input
+            className="wf-ai-input"
+            value={aiPrompt}
+            onChange={(e) => setAiPrompt(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && void handleGenerateAi()}
+            placeholder={tr(
+              lang,
+              "Descreva sua automação: ex. 'Me mande relatório de equipamentos offline no WhatsApp todo dia às 08h'",
+              "Describe your automation: e.g. 'Check offline devices daily at 08:00 and send a report to WhatsApp'",
+            )}
+          />
+          <button
+            type="button"
+            className="btn btn-sm"
+            onClick={() => void handleGenerateAi()}
+            disabled={aiBusy || !aiPrompt.trim()}
+          >
+            <Sparkles size={13} strokeWidth={2} />
+            <span>
+              {aiBusy ? tr(lang, "Criando...", "Building...") : tr(lang, "Criar com IA", "Build with AI")}
+            </span>
+          </button>
+        </div>
 
+        {/* Interactive Infinite Canvas */}
+        <div
+          ref={viewportRef}
+          className={"wf-canvas-viewport" + (isPanning ? " panning" : "")}
+          style={{
+            backgroundPosition: `${pan.x}px ${pan.y}px`,
+            backgroundSize: `${22 * zoom}px ${22 * zoom}px`,
+          }}
+          onWheel={handleWheelZoom}
+          onClick={() => {
+            setConnectingFrom(null);
+            setQuickMenuNode(null);
+            setAddMenuOpen(false);
+            setEmblemMenuOpen(false);
+          }}
+          onPointerDown={(e) => {
+            if ((e.target as HTMLElement).closest(".wf-node, .wf-float-controls, .wf-minimap")) {
+              return;
+            }
+            e.currentTarget.setPointerCapture(e.pointerId);
+            setIsPanning(true);
+            dragPanRef.current = {
+              startX: e.clientX,
+              startY: e.clientY,
+              origPanX: pan.x,
+              origPanY: pan.y,
+            };
+          }}
+          onPointerMove={(e) => {
+            if (connectingFrom && viewportRef.current) {
+              const r = viewportRef.current.getBoundingClientRect();
+              setMouseWorld({
+                x: (e.clientX - r.left - pan.x) / zoom,
+                y: (e.clientY - r.top - pan.y) / zoom,
+              });
+            }
+            if (dragPanRef.current) {
+              const dp = dragPanRef.current;
+              setPan({
+                x: Math.round(dp.origPanX + (e.clientX - dp.startX)),
+                y: Math.round(dp.origPanY + (e.clientY - dp.startY)),
+              });
+              return;
+            }
+            const dn = dragNodeRef.current;
+            if (!dn) return;
+            const nx = Math.round(dn.origX + (e.clientX - dn.startX) / zoom);
+            const ny = Math.round(dn.origY + (e.clientY - dn.startY) / zoom);
+            patchDraft((w) => ({
+              ...w,
+              nodes: w.nodes.map((n) => (n.id === dn.id ? { ...n, x: nx, y: ny } : n)),
+            }));
+          }}
+          onPointerUp={() => {
+            dragNodeRef.current = null;
+            dragPanRef.current = null;
+            setIsPanning(false);
+          }}
+        >
           {draft ? (
-            <div className="wf-canvas-toolbar">
-              <div className="wf-add-strip">
-                {NODE_KINDS.map((k) => {
-                  const m = NODE_META[k];
-                  const Icon = m.icon;
+            <div
+              className="wf-canvas-world"
+              style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})` }}
+            >
+              <svg className="wf-svg-layer" aria-hidden>
+                {draft.edges.map((e) => {
+                  const from = draft.nodes.find((n) => n.id === e.from);
+                  const to = draft.nodes.find((n) => n.id === e.to);
+                  if (!from || !to) return null;
+                  const yOffset =
+                    from.kind === "condition" ? (e.branch === "false" ? 62 : 36) : 49;
+                  const x1 = from.x + NODE_W;
+                  const y1 = from.y + yOffset;
+                  const x2 = to.x;
+                  const y2 = to.y + 49;
+                  const d = cubicPath(x1, y1, x2, y2);
+                  const isActiveRun =
+                    liveNodes[from.id]?.status === "running" ||
+                    liveNodes[to.id]?.status === "running";
+                  const cls =
+                    "wf-edge-line" +
+                    (e.branch === "true"
+                      ? " branch-true"
+                      : e.branch === "false"
+                        ? " branch-false"
+                        : "") +
+                    (isActiveRun ? " running" : "");
+                  const mx = (x1 + x2) / 2;
+                  const my = (y1 + y2) / 2;
                   return (
-                    <button
-                      key={k}
-                      type="button"
-                      className="wf-chip-btn"
-                      onClick={() => addStandaloneNode(k)}
-                      title={tr(lang, "Adicionar bloco ao canvas", "Add block to canvas")}
+                    <g
+                      key={e.id}
+                      className="wf-edge-group"
+                      onClick={(ev) => {
+                        ev.stopPropagation();
+                        patchDraft((w) => ({
+                          ...w,
+                          edges: w.edges.filter((x) => x.id !== e.id),
+                        }));
+                      }}
                     >
-                      <Icon size={12} strokeWidth={2} />
-                      <span>{lang === "pt-BR" ? m.pt : m.en}</span>
-                    </button>
+                      <path className="wf-edge-hit" d={d}>
+                        <title>{tr(lang, "Clique para desconectar", "Click to disconnect")}</title>
+                      </path>
+                      <path className={cls} d={d} />
+                      {e.branch ? (
+                        <g transform={`translate(${mx - 18}, ${my - 10})`}>
+                          <rect className="wf-edge-badge-bg" width={36} height={18} rx={9} />
+                          <text
+                            className="wf-edge-badge-txt"
+                            x={18}
+                            y={12}
+                            textAnchor="middle"
+                          >
+                            {e.branch === "true" ? tr(lang, "Sim", "True") : tr(lang, "Não", "False")}
+                          </text>
+                        </g>
+                      ) : null}
+                    </g>
                   );
                 })}
-              </div>
-              <div className="wf-zoom-box">
-                <button
-                  type="button"
-                  className="icon-btn sm"
-                  onClick={() => setZoom((z) => Math.max(0.6, +(z - 0.1).toFixed(2)))}
-                  aria-label="Zoom out"
-                >
-                  <ZoomOut size={13} />
-                </button>
-                <span className="mono">{Math.round(zoom * 100)}%</span>
-                <button
-                  type="button"
-                  className="icon-btn sm"
-                  onClick={() => setZoom((z) => Math.min(1.4, +(z + 0.1).toFixed(2)))}
-                  aria-label="Zoom in"
-                >
-                  <ZoomIn size={13} />
-                </button>
-              </div>
-            </div>
-          ) : null}
+                {connectingFrom && mouseWorld ? (
+                  <path
+                    className="wf-edge-draft"
+                    d={cubicPath(connectingFrom.x, connectingFrom.y, mouseWorld.x, mouseWorld.y)}
+                  />
+                ) : null}
+              </svg>
 
-          <div
-            className="wf-canvas-scroll"
-            onClick={() => {
-              setConnectingFrom(null);
-              setQuickMenuNode(null);
-            }}
-            onPointerMove={(e) => {
-              const d = dragRef.current;
-              if (!d) return;
-              const nx = Math.max(10, Math.round(d.origX + (e.clientX - d.startX) / zoom));
-              const ny = Math.max(10, Math.round(d.origY + (e.clientY - d.startY) / zoom));
-              patchDraft((w) => ({
-                ...w,
-                nodes: w.nodes.map((n) => (n.id === d.id ? { ...n, x: nx, y: ny } : n)),
-              }));
-            }}
-            onPointerUp={() => {
-              dragRef.current = null;
-            }}
-          >
-            {draft ? (
-              <div
-                className="wf-canvas-stage"
-                style={{ transform: `scale(${zoom})`, transformOrigin: "0 0" }}
-              >
-                <svg className="wf-svg-layer" aria-hidden>
-                  {draft.edges.map((e) => {
-                    const from = draft.nodes.find((n) => n.id === e.from);
-                    const to = draft.nodes.find((n) => n.id === e.to);
-                    if (!from || !to) return null;
-                    const yOffset =
-                      from.kind === "condition"
-                        ? e.branch === "false"
-                          ? 62
-                          : 36
-                        : 48;
-                    const d = cubicPath(from.x + 214, from.y + yOffset, to.x, to.y + 48);
-                    const isActiveRun =
-                      liveNodes[from.id]?.status === "running" ||
-                      liveNodes[to.id]?.status === "running";
-                    const cls =
-                      "wf-edge-line" +
-                      (e.branch === "true"
-                        ? " branch-true"
-                        : e.branch === "false"
-                          ? " branch-false"
-                          : "") +
-                      (isActiveRun ? " running" : "");
-                    return (
-                      <g
-                        key={e.id}
-                        className="wf-edge-group"
-                        onClick={(ev) => {
-                          ev.stopPropagation();
-                          patchDraft((w) => ({
-                            ...w,
-                            edges: w.edges.filter((x) => x.id !== e.id),
-                          }));
-                        }}
-                      >
-                        <path className="wf-edge-hit" d={d}>
-                          <title>{tr(lang, "Clique para desconectar", "Click to disconnect")}</title>
-                        </path>
-                        <path className={cls} d={d} />
-                      </g>
-                    );
-                  })}
-                </svg>
+              {draft.nodes.map((n) => {
+                const meta = NODE_META[n.kind];
+                const Icon = meta.icon;
+                const ev = liveNodes[n.id];
+                const stateCls = ev ? ` state-${ev.status}` : "";
+                const latestLog = runs[0]?.node_logs.find((l) => l.node_id === n.id);
+                const quickOpen = quickMenuNode?.id === n.id;
+                const isSel = selectedNodeId === n.id;
 
-                {draft.nodes.map((n) => {
-                  const meta = NODE_META[n.kind];
-                  const Icon = meta.icon;
-                  const ev = liveNodes[n.id];
-                  const stateCls = ev ? ` state-${ev.status}` : "";
-                  const latestLog = runs[0]?.node_logs.find((l) => l.node_id === n.id);
-                  const quickOpen = quickMenuNode?.id === n.id;
-
-                  return (
-                    <div
-                      key={n.id}
-                      className={
-                        "wf-node" + (selectedNodeId === n.id ? " selected" : "") + stateCls
+                return (
+                  <div
+                    key={n.id}
+                    className={"wf-node" + (isSel ? " selected" : "") + stateCls}
+                    style={{ left: n.x, top: n.y }}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setSelectedNodeId(n.id);
+                      setInspOpen(true);
+                    }}
+                    onPointerDown={(e) => {
+                      if (
+                        (e.target as HTMLElement).closest(
+                          ".wf-port, .wf-quick-add, .wf-quick-menu, .wf-node-actions",
+                        )
+                      ) {
+                        return;
                       }
-                      style={{ left: n.x, top: n.y }}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setSelectedNodeId(n.id);
-                      }}
-                      onPointerDown={(e) => {
-                        if ((e.target as HTMLElement).closest(".wf-port, .wf-quick-add, .wf-quick-menu")) {
-                          return;
-                        }
-                        e.currentTarget.setPointerCapture(e.pointerId);
-                        dragRef.current = {
-                          id: n.id,
-                          startX: e.clientX,
-                          startY: e.clientY,
-                          origX: n.x,
-                          origY: n.y,
-                        };
-                      }}
-                    >
-                      {!n.kind.startsWith("trigger_") ? (
+                      e.currentTarget.setPointerCapture(e.pointerId);
+                      dragNodeRef.current = {
+                        id: n.id,
+                        startX: e.clientX,
+                        startY: e.clientY,
+                        origX: n.x,
+                        origY: n.y,
+                      };
+                    }}
+                  >
+                    {isSel ? (
+                      <div className="wf-node-actions" onClick={(e) => e.stopPropagation()}>
                         <button
                           type="button"
-                          className={"wf-port in" + (connectingFrom ? " connecting" : "")}
-                          title={tr(lang, "Conectar entrada aqui", "Connect input here")}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            connectEdge(n.id);
-                          }}
-                        />
+                          className="wf-node-act-btn"
+                          title={tr(lang, "Testar este bloco", "Test this block")}
+                          onClick={() => void runSingleNodeTest(n)}
+                        >
+                          <Play size={11} />
+                        </button>
+                        <button
+                          type="button"
+                          className="wf-node-act-btn"
+                          title={tr(lang, "Duplicar bloco", "Duplicate block")}
+                          onClick={() => duplicateNode(n)}
+                        >
+                          <Copy size={11} />
+                        </button>
+                        <button
+                          type="button"
+                          className="wf-node-act-btn"
+                          title={tr(lang, "Remover bloco", "Delete block")}
+                          onClick={() => deleteNode(n.id)}
+                        >
+                          <Trash2 size={11} />
+                        </button>
+                      </div>
+                    ) : null}
+
+                    {!n.kind.startsWith("trigger_") ? (
+                      <button
+                        type="button"
+                        className={"wf-port in" + (connectingFrom ? " connecting" : "")}
+                        title={tr(lang, "Conectar entrada aqui", "Connect input here")}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          connectEdge(n.id);
+                        }}
+                      />
+                    ) : null}
+
+                    <div className={`wf-node-head kind-${n.kind}`}>
+                      <Icon size={13} strokeWidth={2.2} />
+                      <span>{lang === "pt-BR" ? meta.pt : meta.en}</span>
+                      {latestLog ? (
+                        <span className="wf-node-dur">{latestLog.duration_ms}ms</span>
                       ) : null}
+                    </div>
 
-                      <div className={`wf-node-head kind-${n.kind}`}>
-                        <Icon size={13} strokeWidth={2.2} />
-                        <span>{lang === "pt-BR" ? meta.pt : meta.en}</span>
-                        {latestLog ? (
-                          <span className="wf-node-dur">{latestLog.duration_ms}ms</span>
-                        ) : null}
-                      </div>
+                    <div className="wf-node-body">
+                      <div className="wf-node-label">{n.label}</div>
+                      <div className="wf-node-sub">{nodeSubPreview(n, channels)}</div>
+                    </div>
 
-                      <div className="wf-node-body">
-                        <div className="wf-node-label">{n.label}</div>
-                        <div className="wf-node-sub">{nodeSubPreview(n, channels)}</div>
-                      </div>
-
-                      {n.kind === "condition" ? (
-                        <>
-                          <button
-                            type="button"
-                            className={
-                              "wf-port out-true" +
-                              (connectingFrom?.id === n.id && connectingFrom.branch === "true"
-                                ? " connecting"
-                                : "")
-                            }
-                            title={tr(lang, "Saída Verdadeira (Sim)", "True branch")}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setConnectingFrom({ id: n.id, branch: "true" });
-                            }}
-                          />
-                          <button
-                            type="button"
-                            className={
-                              "wf-port out-false" +
-                              (connectingFrom?.id === n.id && connectingFrom.branch === "false"
-                                ? " connecting"
-                                : "")
-                            }
-                            title={tr(lang, "Saída Falsa (Não)", "False branch")}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setConnectingFrom({ id: n.id, branch: "false" });
-                            }}
-                          />
-                        </>
-                      ) : (
+                    {n.kind === "condition" ? (
+                      <>
                         <button
                           type="button"
                           className={
-                            "wf-port out" + (connectingFrom?.id === n.id ? " connecting" : "")
+                            "wf-port out-true" +
+                            (connectingFrom?.id === n.id && connectingFrom.branch === "true"
+                              ? " connecting"
+                              : "")
                           }
-                          title={tr(lang, "Clique aqui e depois na entrada de outro bloco", "Click here then click target input")}
+                          title={tr(lang, "Saída Verdadeira (Sim)", "True branch")}
                           onClick={(e) => {
                             e.stopPropagation();
-                            setConnectingFrom({ id: n.id });
+                            setConnectingFrom({
+                              id: n.id,
+                              branch: "true",
+                              x: n.x + NODE_W,
+                              y: n.y + 36,
+                            });
                           }}
                         />
-                      )}
-
+                        <button
+                          type="button"
+                          className={
+                            "wf-port out-false" +
+                            (connectingFrom?.id === n.id && connectingFrom.branch === "false"
+                              ? " connecting"
+                              : "")
+                          }
+                          title={tr(lang, "Saída Falsa (Não)", "False branch")}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setConnectingFrom({
+                              id: n.id,
+                              branch: "false",
+                              x: n.x + NODE_W,
+                              y: n.y + 62,
+                            });
+                          }}
+                        />
+                      </>
+                    ) : (
                       <button
                         type="button"
-                        className={"wf-quick-add" + (quickOpen ? " open" : "")}
-                        title={tr(lang, "Encadear próximo bloco", "Append next block")}
+                        className={
+                          "wf-port out" + (connectingFrom?.id === n.id ? " connecting" : "")
+                        }
+                        title={tr(
+                          lang,
+                          "Clique para puxar fio até outro bloco",
+                          "Click to wire to target block",
+                        )}
                         onClick={(e) => {
                           e.stopPropagation();
-                          setQuickMenuNode(
-                            quickOpen
-                              ? null
-                              : {
-                                  id: n.id,
-                                  branch: n.kind === "condition" ? "true" : undefined,
-                                },
-                          );
+                          setConnectingFrom({
+                            id: n.id,
+                            x: n.x + NODE_W,
+                            y: n.y + 49,
+                          });
                         }}
-                      >
-                        <Plus size={12} strokeWidth={2.5} />
-                      </button>
+                      />
+                    )}
 
-                      {quickOpen ? (
-                        <div className="wf-quick-menu" onClick={(e) => e.stopPropagation()}>
-                          {NODE_KINDS.filter((k) => !k.startsWith("trigger_")).map((k) => {
-                            const m = NODE_META[k];
-                            const KIcon = m.icon;
-                            return (
-                              <button
-                                key={k}
-                                type="button"
-                                className="wf-quick-item"
-                                onClick={() => quickAddChild(n.id, k, quickMenuNode?.branch)}
-                              >
-                                <KIcon size={13} />
-                                <span>{lang === "pt-BR" ? m.pt : m.en}</span>
-                              </button>
-                            );
-                          })}
-                        </div>
-                      ) : null}
-                    </div>
-                  );
-                })}
-              </div>
-            ) : null}
-          </div>
+                    <button
+                      type="button"
+                      className={"wf-quick-add" + (quickOpen ? " open" : "")}
+                      title={tr(lang, "Encadear próximo bloco", "Append next block")}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setQuickMenuNode(
+                          quickOpen
+                            ? null
+                            : {
+                                id: n.id,
+                                branch: n.kind === "condition" ? "true" : undefined,
+                              },
+                        );
+                      }}
+                    >
+                      <Plus size={12} strokeWidth={2.5} />
+                    </button>
 
-          {banner ? (
-            <div className={"wf-banner-msg " + banner.tone}>{banner.text}</div>
+                    {quickOpen ? (
+                      <div className="wf-quick-menu" onClick={(e) => e.stopPropagation()}>
+                        {NODE_KINDS.filter((k) => !k.startsWith("trigger_")).map((k) => {
+                          const m = NODE_META[k];
+                          const KIcon = m.icon;
+                          return (
+                            <button
+                              key={k}
+                              type="button"
+                              className="wf-quick-item"
+                              onClick={() => quickAddChild(n.id, k, quickMenuNode?.branch)}
+                            >
+                              <KIcon size={13} style={{ color: m.color }} />
+                              <span>{lang === "pt-BR" ? m.pt : m.en}</span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    ) : null}
+                  </div>
+                );
+              })}
+            </div>
           ) : null}
-        </section>
 
-        {/* Right Inspector & Run History */}
+          {/* Floating Glass HUD */}
+          {draft ? (
+            <div className="wf-float-controls" onClick={(e) => e.stopPropagation()}>
+              <button
+                type="button"
+                className="wf-hud-btn"
+                onClick={() => zoomAtCenter(zoom - 0.15)}
+                aria-label="Zoom out"
+              >
+                <ZoomOut size={13} />
+              </button>
+              <span className="mono" style={{ minWidth: 40, textAlign: "center" }}>
+                {Math.round(zoom * 100)}%
+              </span>
+              <button
+                type="button"
+                className="wf-hud-btn"
+                onClick={() => zoomAtCenter(zoom + 0.15)}
+                aria-label="Zoom in"
+              >
+                <ZoomIn size={13} />
+              </button>
+              <span className="wf-hud-sep" />
+              <button
+                type="button"
+                className="wf-hud-btn"
+                onClick={() => fitToView(draft)}
+                title={tr(lang, "Ajustar todos os blocos na tela", "Fit to view")}
+              >
+                <Maximize2 size={12} />
+                <span>{tr(lang, "Ajustar", "Fit")}</span>
+              </button>
+              <button
+                type="button"
+                className="wf-hud-btn"
+                onClick={() => {
+                  const arranged = autoArrange(draft);
+                  setDraft(arranged);
+                  setDirty(true);
+                  requestAnimationFrame(() => fitToView(arranged));
+                }}
+                title={tr(lang, "Auto-organizar blocos", "Auto-arrange blocks")}
+              >
+                <Wand2 size={12} />
+                <span>{tr(lang, "Organizar", "Arrange")}</span>
+              </button>
+              <span className="wf-hud-sep" />
+              <button
+                type="button"
+                className="wf-hud-btn"
+                onClick={() => setInspOpen((v) => !v)}
+                title={tr(lang, "Mostrar / ocultar inspetor", "Toggle inspector")}
+              >
+                <PanelRight size={13} />
+              </button>
+            </div>
+          ) : null}
+
+          {/* Pure-SVG Minimap */}
+          {draft && minimapData ? (
+            <svg className="wf-minimap" viewBox="0 0 168 106" aria-hidden>
+              {draft.edges.map((e) => {
+                const from = draft.nodes.find((n) => n.id === e.from);
+                const to = draft.nodes.find((n) => n.id === e.to);
+                if (!from || !to) return null;
+                return (
+                  <line
+                    key={e.id}
+                    x1={6 + (from.x + NODE_W / 2 - minimapData.minX) * minimapData.scale}
+                    y1={6 + (from.y + 45 - minimapData.minY) * minimapData.scale}
+                    x2={6 + (to.x + NODE_W / 2 - minimapData.minX) * minimapData.scale}
+                    y2={6 + (to.y + 45 - minimapData.minY) * minimapData.scale}
+                    stroke="rgba(255,255,255,0.28)"
+                    strokeWidth={1.2}
+                  />
+                );
+              })}
+              {draft.nodes.map((n) => (
+                <rect
+                  key={n.id}
+                  x={6 + (n.x - minimapData.minX) * minimapData.scale}
+                  y={6 + (n.y - minimapData.minY) * minimapData.scale}
+                  width={Math.max(8, NODE_W * minimapData.scale)}
+                  height={Math.max(5, 86 * minimapData.scale)}
+                  rx={2}
+                  fill={NODE_META[n.kind].color}
+                  opacity={n.id === selectedNodeId ? 1 : 0.65}
+                />
+              ))}
+            </svg>
+          ) : null}
+        </div>
+
+        {banner ? <div className={"wf-banner-msg " + banner.tone}>{banner.text}</div> : null}
+      </section>
+
+      {/* Right Collapsible Inspector & Run History */}
+      {inspOpen ? (
         <aside className="wf-inspector">
           <div className="wf-insp-tabs">
             <button
@@ -1083,7 +1472,11 @@ export function WorkflowsStudio(props: {
                 />
               ) : (
                 <p className="pn-hint">
-                  {tr(lang, "Clique em qualquer bloco no canvas para configurá-lo.", "Click any block on the canvas to edit its settings.")}
+                  {tr(
+                    lang,
+                    "Clique em qualquer bloco no canvas para configurá-lo.",
+                    "Click any block on the canvas to edit its settings.",
+                  )}
                 </p>
               )}
             </div>
@@ -1092,9 +1485,7 @@ export function WorkflowsStudio(props: {
               <button
                 type="button"
                 className="btn btn-sm"
-                onClick={() =>
-                  selectedId && void workflowsApi.runs(selectedId, 25).then(setRuns)
-                }
+                onClick={() => selectedId && void workflowsApi.runs(selectedId, 25).then(setRuns)}
               >
                 <RefreshCw size={13} />
                 <span>{tr(lang, "Atualizar histórico", "Refresh history")}</span>
@@ -1102,7 +1493,11 @@ export function WorkflowsStudio(props: {
               {runs.map((r) => (
                 <div key={r.id} className="wf-run-card">
                   <div className="pn-inline">
-                    <span className={"badge " + (r.status === "ok" ? "ok" : r.status === "error" ? "danger" : "")}>
+                    <span
+                      className={
+                        "badge " + (r.status === "ok" ? "ok" : r.status === "error" ? "danger" : "")
+                      }
+                    >
                       {r.status}
                     </span>
                     <span className="badge">{r.trigger_source}</span>
@@ -1119,7 +1514,19 @@ export function WorkflowsStudio(props: {
             </div>
           )}
         </aside>
-      </div>
+      ) : null}
+    </div>
+  );
+
+  return (
+    <>
+      {props.inline ? (
+        studio
+      ) : (
+        <div className="wf-backdrop" onMouseDown={props.onClose}>
+          {studio}
+        </div>
+      )}
 
       {channelsOpen ? (
         <ChannelsModal
@@ -1153,7 +1560,10 @@ export function WorkflowsStudio(props: {
               <div className="wf-tpl-grid">
                 {templates.map((t) => (
                   <div key={t.id} className="wf-tpl-card">
-                    <strong>{t.name}</strong>
+                    <div className="pn-inline">
+                      <BotEmblem icon={t.icon} size={30} />
+                      <strong>{t.name}</strong>
+                    </div>
                     <p className="pn-hint">{t.description}</p>
                     <button
                       type="button"
@@ -1170,7 +1580,7 @@ export function WorkflowsStudio(props: {
           </div>
         </div>
       ) : null}
-    </div>
+    </>
   );
 }
 
@@ -1196,7 +1606,11 @@ function NodeInspector(props: {
 
   const insertVar = (field: string, token: string) => {
     const cur = String(cfg[field] ?? "");
-    setCfg({ [field]: cur ? `${cur}${cur.endsWith(" ") || cur.endsWith("\n") ? "" : " "}${token}` : token });
+    setCfg({
+      [field]: cur
+        ? `${cur}${cur.endsWith(" ") || cur.endsWith("\n") ? "" : " "}${token}`
+        : token,
+    });
   };
 
   const renderVarChips = (field: string) => (
@@ -1652,9 +2066,7 @@ function ChannelsModal(props: {
                 className={"wf-roster-card" + (selectedId === c.id ? " on" : "")}
                 onClick={() => selectChannel(c)}
               >
-                <span className="wf-roster-ava">
-                  <Send size={14} />
-                </span>
+                <BotEmblem icon="bell" size={30} />
                 <div className="wf-roster-meta">
                   <span className="wf-roster-name">{c.name}</span>
                   <span className="wf-roster-sub">{c.kind}</span>

@@ -88,6 +88,16 @@ const MCP_PRESETS: {
     env: "",
   },
   {
+    id: "proxmox",
+    label: "Proxmox VE MCP",
+    category: "NetOps",
+    hint: "Gerencia nós Proxmox VE, VMs KVM/QEMU, containers LXC, ZFS/Ceph e snapshots via API",
+    kind: "stdio",
+    command: "uvx --from git+https://github.com/canvrno/ProxmoxMCP proxmox-mcp",
+    url: "",
+    env: "PROXMOX_HOST=10.0.0.10\nPROXMOX_USER=root@pam\nPROXMOX_TOKEN_NAME=zerith\nPROXMOX_TOKEN_VALUE=",
+  },
+  {
     id: "netbox",
     label: "NetBox (IPAM/DCIM)",
     category: "NetOps",

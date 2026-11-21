@@ -3063,36 +3063,37 @@ fn select_target_terminals(args: &Value) -> Result<Vec<terminal::TerminalSnapsho
     Ok(selected)
 }
 
+type BroadcastRow = (terminal::TerminalSnapshot, Result<(String, bool)>, u128);
+
 fn net_broadcast(args: &Value, _ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
     let command = str_arg(args, "command")?;
     let targets = select_target_terminals(args)?;
     let auto_page = args["auto_page"].as_bool().unwrap_or(true);
     let timeout_secs = args["timeout_secs"].as_u64().unwrap_or(20).clamp(2, 300);
 
-    let results: Vec<(terminal::TerminalSnapshot, Result<(String, bool)>, u128)> =
-        std::thread::scope(|s| {
-            let handles: Vec<_> = targets
-                .into_iter()
-                .map(|snap| {
-                    s.spawn(move || {
-                        let started = std::time::Instant::now();
-                        let res = terminal::send_session_command(
-                            "net_broadcast",
-                            &snap.id,
-                            Some(command),
-                            None,
-                            true,
-                            None,
-                            Duration::from_secs(timeout_secs),
-                            auto_page,
-                            exec,
-                        );
-                        (snap, res, started.elapsed().as_millis())
-                    })
+    let results: Vec<BroadcastRow> = std::thread::scope(|s| {
+        let handles: Vec<_> = targets
+            .into_iter()
+            .map(|snap| {
+                s.spawn(move || {
+                    let started = std::time::Instant::now();
+                    let res = terminal::send_session_command(
+                        "net_broadcast",
+                        &snap.id,
+                        Some(command),
+                        None,
+                        true,
+                        None,
+                        Duration::from_secs(timeout_secs),
+                        auto_page,
+                        exec,
+                    );
+                    (snap, res, started.elapsed().as_millis())
                 })
-                .collect();
-            handles.into_iter().filter_map(|h| h.join().ok()).collect()
-        });
+            })
+            .collect();
+        handles.into_iter().filter_map(|h| h.join().ok()).collect()
+    });
 
     let mut sections = Vec::with_capacity(results.len() + 1);
     sections.push(format!(

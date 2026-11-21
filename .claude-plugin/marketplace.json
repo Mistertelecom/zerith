@@ -11,12 +11,21 @@
   "plugins": [
     {
       "name": "zerith-netops",
-      "description": "Consultoria de redes, ISP/Telecom e engenharia de infraestrutura: troubleshooting BGP/OSPF/MPLS/EVPN/CGNAT/PPPoE multi-vendor (Cisco, Huawei, Juniper, MikroTik), janelas de mudança segura com rollback e auditoria de hardening de borda.",
-      "version": "0.2.4",
+      "description": "Consultoria de redes, ISP/Telecom e engenharia de infraestrutura: troubleshooting BGP/OSPF/MPLS/EVPN/CGNAT/PPPoE multi-vendor (Cisco, Huawei, Juniper, MikroTik), VPNs WireGuard multi-cliente, janelas de mudança segura com rollback e auditoria de hardening de borda.",
+      "version": "0.2.5",
       "category": "networking",
       "license": "GPL-3.0-only",
       "homepage": "https://github.com/Mistertelecom/zerith",
       "source": "./plugins/zerith-netops"
+    },
+    {
+      "name": "zerith-proxmox",
+      "description": "Administração avançada de Proxmox VE (KVM/QEMU, LXC, Cluster Corosync, HA), Storage (ZFS, Ceph, LVM-Thin), Proxmox Backup Server (PBS), SDN/Linux Bridges VLAN-aware e VMs Linux corporativas.",
+      "version": "0.2.5",
+      "category": "infrastructure",
+      "license": "GPL-3.0-only",
+      "homepage": "https://github.com/Mistertelecom/zerith",
+      "source": "./plugins/zerith-proxmox"
     },
     {
       "name": "superpowers",

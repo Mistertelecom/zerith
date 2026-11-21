@@ -1,0 +1,10 @@
+{
+  "name": "zerith-proxmox",
+  "version": "0.2.5",
+  "description": "Administração avançada de Proxmox VE (KVM/QEMU, LXC, Cluster Corosync, HA), Storage (ZFS, Ceph, LVM-Thin), Proxmox Backup Server (PBS), SDN/Linux Bridges VLAN-aware e VMs Linux corporativas.",
+  "author": {
+    "name": "Joao Pedro Mota (Mistertelecom)"
+  },
+  "homepage": "https://github.com/Mistertelecom/zerith",
+  "license": "GPL-3.0-only"
+}

@@ -12,6 +12,7 @@ import {
   Bug,
   CheckCircle2,
   CircleDashed,
+  Download,
   FolderTree,
   Gauge,
   GitPullRequest,
@@ -815,6 +816,53 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [paletteOpen, settings, mode]);
 
+  const exportCurrentReport = useCallback(() => {
+    if (!selected) {
+      setStatus(tr(lang, "Abra uma conversa para exportar", "Open a conversation to export"));
+      return;
+    }
+    const title = current?.title ?? "Relatório Zerith";
+    const mdLines: string[] = [`# ${title}\n`];
+    for (const b of surface) {
+      if (b.kind === "user") {
+        mdLines.push(`## Solicitação\n\n${b.text}\n`);
+      } else if (b.kind === "assistant") {
+        if (b.tools.length > 0) {
+          mdLines.push(
+            `### Ferramentas Executadas\n` +
+              b.tools.map((t) => `- **\`${t.name}\`**: ${t.preview || "ok"}`).join("\n") +
+              "\n",
+          );
+        }
+        if (b.text.trim()) {
+          mdLines.push(`## Análise & Resposta\n\n${b.text}\n`);
+        }
+      }
+    }
+    const reportMd = mdLines.join("\n");
+    void navigator.clipboard?.writeText(reportMd).catch(() => undefined);
+    api
+      .exportSession(selected)
+      .then((path) => {
+        setStatus(
+          tr(
+            lang,
+            `Relatório exportado em ${path} (e copiado em Markdown)`,
+            `Report exported to ${path} (and copied as Markdown)`,
+          ),
+        );
+      })
+      .catch(() => {
+        setStatus(
+          tr(
+            lang,
+            "Relatório Markdown copiado para a área de transferência",
+            "Markdown report copied to clipboard",
+          ),
+        );
+      });
+  }, [selected, current?.title, surface, lang]);
+
   const tail = (
     <>
       {turn.approval ? (
@@ -927,23 +975,41 @@ export default function App() {
               </span>
             ) : null}
             {selected ? (
-              <button
-                className={"icon-btn" + (inspector ? " on" : "")}
-                onClick={() => setInspector((v) => !v)}
-                aria-pressed={inspector}
-                aria-label={
-                  inspector
-                    ? "Ocultar painel lateral"
-                    : "Mostrar painel lateral"
-                }
-                title={
-                  inspector
-                    ? "Ocultar painel lateral"
-                    : "Mostrar painel lateral"
-                }
-              >
-                <PanelRight size={18} strokeWidth={1.75} />
-              </button>
+              <>
+                <button
+                  className="icon-btn"
+                  onClick={exportCurrentReport}
+                  aria-label={tr(
+                    lang,
+                    "Exportar relatório / conversa em Markdown (.md)",
+                    "Export report / conversation as Markdown (.md)",
+                  )}
+                  title={tr(
+                    lang,
+                    "Exportar relatório / conversa em Markdown (.md)",
+                    "Export report / conversation as Markdown (.md)",
+                  )}
+                >
+                  <Download size={17} strokeWidth={1.75} />
+                </button>
+                <button
+                  className={"icon-btn" + (inspector ? " on" : "")}
+                  onClick={() => setInspector((v) => !v)}
+                  aria-pressed={inspector}
+                  aria-label={
+                    inspector
+                      ? "Ocultar painel lateral"
+                      : "Mostrar painel lateral"
+                  }
+                  title={
+                    inspector
+                      ? "Ocultar painel lateral"
+                      : "Mostrar painel lateral"
+                  }
+                >
+                  <PanelRight size={18} strokeWidth={1.75} />
+                </button>
+              </>
             ) : null}
           </header>
           <BackgroundJobs
@@ -1271,6 +1337,11 @@ export default function App() {
                 label: "Compactar conversa atual",
                 hint: "/compact",
                 run: () => runCommand("compact"),
+              },
+              {
+                label: "Exportar relatório / conversa (.md)",
+                hint: "Markdown + Clipboard",
+                run: exportCurrentReport,
               },
               {
                 label: inspector ? "Ocultar painel lateral" : "Mostrar painel lateral",

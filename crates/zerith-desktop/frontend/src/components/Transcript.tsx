@@ -271,6 +271,268 @@ const HighlightedCode = memo(function HighlightedCode({
   );
 });
 
+type GraphNode = { id: string; label: string; layer: number; row: number };
+type GraphEdge = { from: string; to: string; label: string };
+
+function parseMermaidGraph(src: string): { nodes: GraphNode[]; edges: GraphEdge[] } | null {
+  const nodesMap = new Map<string, string>();
+  const edges: GraphEdge[] = [];
+  const cleanLabel = (raw: string) =>
+    raw
+      .trim()
+      .replace(/^["'[(]+|["'\])]+$/g, "")
+      .replace(/\\n/g, " · ");
+
+  const parseEndpoint = (token: string): string => {
+    const t = token.trim();
+    const m = /^([A-Za-z0-9_.-]+)\s*(?:\[([^\]]+)\]|"([^"]+)"|\(([^)]+)\)|\{([^}]+)\})?/.exec(t);
+    if (!m) return t;
+    const id = m[1];
+    const lbl = m[2] || m[3] || m[4] || m[5];
+    if (lbl && !nodesMap.has(id)) {
+      nodesMap.set(id, cleanLabel(lbl));
+    } else if (!nodesMap.has(id)) {
+      nodesMap.set(id, id);
+    }
+    return id;
+  };
+
+  for (const rawLine of src.split("\n")) {
+    const line = rawLine.trim();
+    if (
+      !line ||
+      line.startsWith("%%") ||
+      /^(graph|flowchart|subgraph|end|style|classDef|class|direction)\b/i.test(line)
+    ) {
+      continue;
+    }
+    const edgeMatch =
+      /^(.+?)\s*(?:-->|---|==>|-\.->)\s*(?:\|([^|]+)\|\s*)?(.+)$/.exec(line) ||
+      /^(.+?)\s*--\s*([^-|>]+?)\s*-->\s*(.+)$/.exec(line);
+    if (edgeMatch) {
+      const from = parseEndpoint(edgeMatch[1]);
+      const edgeLabel = (edgeMatch[2] ?? "").trim();
+      const to = parseEndpoint(edgeMatch[3]);
+      if (from && to) {
+        edges.push({ from, to, label: edgeLabel });
+      }
+    }
+  }
+
+  if (nodesMap.size < 2 || edges.length === 0) return null;
+
+  const inDegree = new Map<string, number>();
+  const adj = new Map<string, string[]>();
+  for (const id of nodesMap.keys()) {
+    inDegree.set(id, 0);
+    adj.set(id, []);
+  }
+  for (const e of edges) {
+    inDegree.set(e.to, (inDegree.get(e.to) ?? 0) + 1);
+    adj.get(e.from)?.push(e.to);
+  }
+
+  const layerMap = new Map<string, number>();
+  const queue: string[] = [];
+  for (const [id, deg] of inDegree.entries()) {
+    if (deg === 0) {
+      layerMap.set(id, 0);
+      queue.push(id);
+    }
+  }
+  if (queue.length === 0) {
+    const first = nodesMap.keys().next().value;
+    if (first) {
+      layerMap.set(first, 0);
+      queue.push(first);
+    }
+  }
+  while (queue.length > 0) {
+    const cur = queue.shift()!;
+    const curLayer = layerMap.get(cur) ?? 0;
+    for (const nxt of adj.get(cur) ?? []) {
+      if (!layerMap.has(nxt)) {
+        layerMap.set(nxt, Math.min(curLayer + 1, 8));
+        queue.push(nxt);
+      }
+    }
+  }
+  for (const id of nodesMap.keys()) {
+    if (!layerMap.has(id)) layerMap.set(id, 0);
+  }
+
+  const byLayer = new Map<number, string[]>();
+  for (const [id, l] of layerMap.entries()) {
+    const arr = byLayer.get(l) ?? [];
+    arr.push(id);
+    byLayer.set(l, arr);
+  }
+
+  const nodes: GraphNode[] = [];
+  for (const [layer, ids] of byLayer.entries()) {
+    ids.forEach((id, row) => {
+      nodes.push({
+        id,
+        label: nodesMap.get(id) ?? id,
+        layer,
+        row,
+      });
+    });
+  }
+  return { nodes, edges };
+}
+
+function MermaidDiagramBlock({ lang, text }: { lang: string; text: string }) {
+  const graph = useMemo(() => parseMermaidGraph(text), [text]);
+  const [view, setView] = useState<"diagram" | "code">(graph ? "diagram" : "code");
+
+  if (!graph) {
+    return (
+      <div className="md-code">
+        <div className="md-code-bar">
+          <span>{lang || "mermaid"}</span>
+          <CopyButton text={text} label="Copiar" />
+        </div>
+        <pre>
+          <code>
+            <HighlightedCode lang={lang} text={text} />
+          </code>
+        </pre>
+      </div>
+    );
+  }
+
+  const maxLayer = Math.max(...graph.nodes.map((n) => n.layer), 0);
+  const maxRow = Math.max(...graph.nodes.map((n) => n.row), 0);
+  const colW = 210;
+  const rowH = 74;
+  const nodeW = 164;
+  const nodeH = 42;
+  const padX = 28;
+  const padY = 24;
+  const width = Math.max(420, (maxLayer + 1) * colW + padX * 2);
+  const height = Math.max(130, (maxRow + 1) * rowH + padY * 2);
+  const pos = new Map<string, { x: number; y: number }>();
+  for (const n of graph.nodes) {
+    pos.set(n.id, {
+      x: padX + n.layer * colW,
+      y: padY + n.row * rowH,
+    });
+  }
+
+  return (
+    <div className="md-code">
+      <div className="md-code-bar">
+        <span>{lang} · topologia</span>
+        <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+          <button
+            type="button"
+            className="copy-btn"
+            onClick={() => setView(view === "diagram" ? "code" : "diagram")}
+          >
+            <span>{view === "diagram" ? "Ver código" : "Ver diagrama"}</span>
+          </button>
+          <CopyButton text={text} label="Copiar" />
+        </div>
+      </div>
+      {view === "diagram" ? (
+        <div style={{ overflowX: "auto", padding: "12px 8px" }}>
+          <svg
+            width={width}
+            height={height}
+            viewBox={`0 0 ${width} ${height}`}
+            role="img"
+            aria-label="Diagrama de topologia Mermaid"
+          >
+            <defs>
+              <marker
+                id="mermaid-arrow"
+                viewBox="0 0 10 10"
+                refX="9"
+                refY="5"
+                markerWidth="6"
+                markerHeight="6"
+                orient="auto-start-reverse"
+              >
+                <path d="M 0 1 L 10 5 L 0 9 z" fill="currentColor" opacity="0.65" />
+              </marker>
+            </defs>
+            {graph.edges.map((e, idx) => {
+              const p1 = pos.get(e.from);
+              const p2 = pos.get(e.to);
+              if (!p1 || !p2) return null;
+              const x1 = p1.x + nodeW;
+              const y1 = p1.y + nodeH / 2;
+              const x2 = p2.x;
+              const y2 = p2.y + nodeH / 2;
+              const mx = (x1 + x2) / 2;
+              const my = (y1 + y2) / 2 - 6;
+              return (
+                <g key={idx}>
+                  <line
+                    x1={x1}
+                    y1={y1}
+                    x2={x2}
+                    y2={y2}
+                    stroke="currentColor"
+                    strokeOpacity="0.45"
+                    strokeWidth="1.5"
+                    markerEnd="url(#mermaid-arrow)"
+                  />
+                  {e.label ? (
+                    <text
+                      x={mx}
+                      y={my}
+                      textAnchor="middle"
+                      fontSize="10"
+                      fill="currentColor"
+                      opacity="0.8"
+                    >
+                      {e.label.slice(0, 22)}
+                    </text>
+                  ) : null}
+                </g>
+              );
+            })}
+            {graph.nodes.map((n) => {
+              const p = pos.get(n.id)!;
+              return (
+                <g key={n.id} transform={`translate(${p.x},${p.y})`}>
+                  <rect
+                    width={nodeW}
+                    height={nodeH}
+                    rx="8"
+                    fill="var(--bg-elevated, rgba(127,127,127,0.12))"
+                    stroke="currentColor"
+                    strokeOpacity="0.35"
+                    strokeWidth="1.25"
+                  />
+                  <text
+                    x={nodeW / 2}
+                    y={nodeH / 2 + 4}
+                    textAnchor="middle"
+                    fontSize="11.5"
+                    fontWeight="600"
+                    fill="currentColor"
+                  >
+                    {n.label.length > 22 ? n.label.slice(0, 20) + "…" : n.label}
+                  </text>
+                </g>
+              );
+            })}
+          </svg>
+        </div>
+      ) : (
+        <pre>
+          <code>
+            <HighlightedCode lang={lang} text={text} />
+          </code>
+        </pre>
+      )}
+    </div>
+  );
+}
+
 function blocks(list: MdBlock[]): ReactNode[] {
   return list.map((b, i) => {
     switch (b.t) {
@@ -291,6 +553,9 @@ function blocks(list: MdBlock[]): ReactNode[] {
         );
       }
       case "code":
+        if (/^(mermaid|topology)$/i.test(b.lang.trim())) {
+          return <MermaidDiagramBlock key={i} lang={b.lang} text={b.text} />;
+        }
         return (
           <div key={i} className="md-code">
             <div className="md-code-bar">

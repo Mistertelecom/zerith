@@ -125,6 +125,19 @@ pub struct UsageSummary {
     pub active_model: Option<String>,
 }
 
+/// Aggregated token usage and prompt cache metrics for one conversation session.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionUsageTotals {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub saved_tokens: u64,
+    pub saved_rtk_tokens: u64,
+    pub requests: u64,
+}
+
 fn window_since_ms(window_hours: u32) -> i64 {
     if window_hours == 0 {
         0
@@ -348,6 +361,36 @@ impl Store {
             last_model,
             last_used_at,
         })
+    }
+
+    /// Aggregates all recorded usage rows belonging to `session_id`.
+    pub fn session_usage(&self, session_id: &str) -> Result<SessionUsageTotals> {
+        self.conn()
+            .query_row(
+                "SELECT
+                     COALESCE(SUM(prompt_tokens), 0),
+                     COALESCE(SUM(completion_tokens), 0),
+                     COALESCE(SUM(cache_read_tokens), 0),
+                     COALESCE(SUM(cache_write_tokens), 0),
+                     COALESCE(SUM(saved_tokens), 0),
+                     COALESCE(SUM(saved_rtk_tokens), 0),
+                     COUNT(*)
+                 FROM usage_records
+                 WHERE session_id = ?1",
+                [session_id],
+                |r| {
+                    Ok(SessionUsageTotals {
+                        prompt_tokens: from_sql_u64(r.get::<_, i64>(0)?),
+                        completion_tokens: from_sql_u64(r.get::<_, i64>(1)?),
+                        cache_read_tokens: from_sql_u64(r.get::<_, i64>(2)?),
+                        cache_write_tokens: from_sql_u64(r.get::<_, i64>(3)?),
+                        saved_tokens: from_sql_u64(r.get::<_, i64>(4)?),
+                        saved_rtk_tokens: from_sql_u64(r.get::<_, i64>(5)?),
+                        requests: from_sql_u64(r.get::<_, i64>(6)?),
+                    })
+                },
+            )
+            .map_err(Into::into)
     }
 
     /// Returns `true` when `account_id` is neither in an active cooldown nor at/above
@@ -886,5 +929,62 @@ mod tests {
         let stats = s.account_window_stats("acct-c", 24).unwrap();
         assert_eq!(stats.cooldown_until, 0);
         assert_eq!(stats.last_error, None);
+    }
+
+    #[test]
+    fn session_usage_aggregates_per_session_and_defaults_to_zero() {
+        let s = Store::open_in_memory().unwrap();
+        let empty = s.session_usage("missing").unwrap();
+        assert_eq!(empty, SessionUsageTotals::default());
+
+        let sess = s
+            .create_session("usage-test", crate::SessionSource::Native)
+            .unwrap();
+        let other = s
+            .create_session("other-test", crate::SessionSource::Native)
+            .unwrap();
+        s.record_usage(&NewUsageRecord {
+            session_id: Some(sess.id.clone()),
+            account_id: "acct".into(),
+            provider: "openai".into(),
+            model: "gpt-5".into(),
+            role_kind: "main".into(),
+            prompt_tokens: 1000,
+            completion_tokens: 250,
+            cache_read_tokens: 600,
+            cache_write_tokens: 100,
+            saved_rtk_tokens: 120,
+            saved_tokens: 150,
+            ..Default::default()
+        })
+        .unwrap();
+        s.record_usage(&NewUsageRecord {
+            session_id: Some(sess.id.clone()),
+            provider: "openai".into(),
+            model: "gpt-5".into(),
+            prompt_tokens: 500,
+            completion_tokens: 100,
+            cache_read_tokens: 200,
+            saved_tokens: 50,
+            ..Default::default()
+        })
+        .unwrap();
+        s.record_usage(&NewUsageRecord {
+            session_id: Some(other.id.clone()),
+            provider: "openai".into(),
+            model: "gpt-5".into(),
+            prompt_tokens: 9999,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let totals = s.session_usage(&sess.id).unwrap();
+        assert_eq!(totals.prompt_tokens, 1500);
+        assert_eq!(totals.completion_tokens, 350);
+        assert_eq!(totals.cache_read_tokens, 800);
+        assert_eq!(totals.cache_write_tokens, 100);
+        assert_eq!(totals.saved_tokens, 200);
+        assert_eq!(totals.saved_rtk_tokens, 170);
+        assert_eq!(totals.requests, 2);
     }
 }

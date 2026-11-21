@@ -576,6 +576,21 @@
   border-style: dotted;
 }
 
+/* ---- medium column (e.g. inside modal): 2x2 comfortable cards --------- */
+
+@container (max-width: 920px) {
+  .dg-fan {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 16px;
+    padding-top: 12px;
+  }
+  .dg-fan::before,
+  .dg-fan > .dg-node::before,
+  .dg-fan > .dg-node::after {
+    display: none;
+  }
+}
+
 /* ---- narrow column: stack the fan, drop the bus --------------------- */
 
 @container (max-width: 600px) {

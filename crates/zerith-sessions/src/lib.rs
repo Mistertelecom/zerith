@@ -24,4 +24,6 @@ pub use schedules::{CronExpr, NewSchedule, Schedule};
 pub use store::Store;
 pub use tasks::{Todo, TodoPatch, TodoStatus};
 pub use types::{Message, NewMessage, Role, Session, SessionSource};
-pub use usage::{AccountWindowStats, ModelUsageStats, NewUsageRecord, UsageSummary};
+pub use usage::{
+    AccountWindowStats, ModelUsageStats, NewUsageRecord, SessionUsageTotals, UsageSummary,
+};

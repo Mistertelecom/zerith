@@ -130,6 +130,11 @@ pub fn run() {
     tauri::Builder::default()
         .setup(move |app| {
             learn::bind(app.handle());
+            let term_handle = app.handle().clone();
+            zerith_tools::set_terminal_change_hook(std::sync::Arc::new(move || {
+                use tauri::Emitter;
+                let _ = term_handle.emit("terminals:changed", ());
+            }));
             // The window is built here, not by the config, so a WebView2
             // failure surfaces as a message instead of a panic.
             let cfg = app
@@ -193,6 +198,8 @@ pub fn run() {
             commands::terminal_tail,
             commands::terminal_interrupt,
             commands::terminal_close,
+            commands::terminal_send,
+            commands::session_usage,
             commands::create_session,
             commands::session_messages,
             commands::session_fork,
@@ -294,8 +301,12 @@ pub fn run() {
             // window stops whatever is still running.
             if matches!(event, tauri::RunEvent::Exit) {
                 zerith_tools::kill_all_jobs();
+                zerith_tools::close_all_terminals();
+                zerith_tools::lsp::shutdown_all();
                 use tauri::Manager;
-                app.state::<state::AppState>().invalidate_mcp_cache();
+                let state = app.state::<state::AppState>();
+                state.invalidate_mcp_cache();
+                state.reset_store();
             }
         });
 }

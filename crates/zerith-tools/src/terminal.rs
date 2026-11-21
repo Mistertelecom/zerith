@@ -7,7 +7,7 @@
 //! Windows, `script` elsewhere), a thread buffers its output, and each call
 //! sends one input and returns what came back since the last read.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -24,10 +24,40 @@ use crate::{CallCtx, Exec, Permission, Result, Tool, ToolError};
 const MAX_OPEN: usize = 6;
 const MAX_AUTO_PAGES: usize = 64;
 const LOOP_TAIL_BYTES: usize = 4096;
-// ponytail: a forgotten session dies on the next terminal call after 30 min
-// idle; a reaper thread if sessions must die exactly on time.
-const IDLE_REAP: Duration = Duration::from_secs(30 * 60);
-const BUF_CAP: usize = 16 * 1024 * 1024;
+const IDLE_REAP: Duration = Duration::from_secs(20 * 60);
+const BUF_CAP: usize = 4 * 1024 * 1024;
+const BUF_SHRINK_THRESHOLD: usize = 64 * 1024;
+
+type TermHook = Arc<dyn Fn() + Send + Sync>;
+
+fn change_hook_slot() -> &'static Mutex<Option<TermHook>> {
+    static H: OnceLock<Mutex<Option<TermHook>>> = OnceLock::new();
+    H.get_or_init(Default::default)
+}
+
+/// Registers a callback fired whenever terminal liveness, busy state, or list changes.
+pub fn set_terminal_change_hook(cb: TermHook) {
+    if let Ok(mut guard) = change_hook_slot().lock() {
+        *guard = Some(cb);
+    }
+}
+
+fn notify_changed() {
+    let cb = change_hook_slot().lock().ok().and_then(|g| g.clone());
+    if let Some(f) = cb {
+        f();
+    }
+}
+
+fn ensure_reaper() {
+    static REAPER: OnceLock<()> = OnceLock::new();
+    REAPER.get_or_init(|| {
+        std::thread::spawn(|| loop {
+            std::thread::sleep(Duration::from_secs(60));
+            reap();
+        });
+    });
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -51,7 +81,7 @@ struct TermMeta {
     device: Option<String>,
     host: Option<String>,
     role: Option<String>,
-    buf: Arc<Mutex<Vec<u8>>>,
+    buf: Arc<Mutex<VecDeque<u8>>>,
     input: Arc<Mutex<Box<dyn Write + Send>>>,
     last_used: Arc<Mutex<Instant>>,
     alive: Arc<AtomicBool>,
@@ -61,7 +91,7 @@ struct TermMeta {
 pub(crate) struct Term {
     meta: TermMeta,
     /// Output not yet handed to the model.
-    buf: Arc<Mutex<Vec<u8>>>,
+    buf: Arc<Mutex<VecDeque<u8>>>,
     input: Arc<Mutex<Box<dyn Write + Send>>>,
     proc: Proc,
     owner: Option<String>,
@@ -148,15 +178,46 @@ pub fn terminal_tail(id: &str, max_bytes: usize) -> std::result::Result<String, 
         .ok()
         .and_then(|m| m.get(id).map(|t| t.buf.clone()))
         .ok_or_else(|| format!("terminal {id} não encontrado"))?;
-    let bytes = buf
+    let bytes: Vec<u8> = buf
         .lock()
         .map(|b| {
             let cap = max_bytes.clamp(64, 65536);
             let start = b.len().saturating_sub(cap);
-            b[start..].to_vec()
+            b.range(start..).copied().collect()
         })
         .unwrap_or_default();
     Ok(clean(&bytes))
+}
+
+/// Sends a single manual command line directly from the Desktop Active Terminals
+/// drawer to an open session `id`.
+pub fn send_terminal_input(id: &str, input: &str) -> std::result::Result<(), String> {
+    let meta = meta_table()
+        .lock()
+        .ok()
+        .and_then(|m| m.get(id).cloned())
+        .ok_or_else(|| format!("terminal {id} não encontrado"))?;
+    if !meta.alive.load(Ordering::SeqCst) {
+        return Err(format!("terminal {id} já encerrou"));
+    }
+    let mut payload = input.to_string();
+    if !payload.ends_with('\r') && !payload.ends_with('\n') {
+        payload.push('\r');
+    }
+    {
+        let mut w = meta
+            .input
+            .lock()
+            .map_err(|e| format!("falha ao travar stdin: {e}"))?;
+        w.write_all(payload.as_bytes())
+            .and_then(|_| w.flush())
+            .map_err(|e| format!("falha ao enviar comando para {id}: {e}"))?;
+    }
+    if let Ok(mut lu) = meta.last_used.lock() {
+        *lu = Instant::now();
+    }
+    notify_changed();
+    Ok(())
 }
 
 /// Sends `Ctrl+C` (`0x03`) to `id`, even if a command is currently running.
@@ -171,7 +232,9 @@ pub fn interrupt_terminal(id: &str) -> std::result::Result<(), String> {
         .map_err(|e| format!("falha ao travar stdin: {e}"))?;
     w.write_all(b"\x03")
         .and_then(|_| w.flush())
-        .map_err(|e| format!("falha ao enviar Ctrl+C para {id}: {e}"))
+        .map_err(|e| format!("falha ao enviar Ctrl+C para {id}: {e}"))?;
+    notify_changed();
+    Ok(())
 }
 
 /// Closes terminal session `id` and terminates its child process.
@@ -179,6 +242,7 @@ pub fn close_terminal(id: &str) -> std::result::Result<(), String> {
     let removed = lock().remove(id);
     if let Some(term) = removed {
         drop(term);
+        notify_changed();
         return Ok(());
     }
     // If currently in flight inside send/batch, mark dead so it drops on return.
@@ -189,10 +253,25 @@ pub fn close_terminal(id: &str) -> std::result::Result<(), String> {
                 let _ = w.write_all(b"\x03\nexit\n");
                 let _ = w.flush();
             }
+            drop(m);
+            notify_changed();
             return Ok(());
         }
     }
     Err(format!("terminal {id} não existe"))
+}
+
+/// Closes all open interactive PTY/ConPTY sessions (used on app exit).
+pub fn close_all_terminals() {
+    let drained: Vec<Term> = {
+        let mut t = lock();
+        t.drain().map(|(_, term)| term).collect()
+    };
+    let had_any = !drained.is_empty();
+    drop(drained);
+    if had_any {
+        notify_changed();
+    }
 }
 
 fn open_list(t: &HashMap<String, Term>) -> String {
@@ -316,7 +395,11 @@ fn reap() {
             }
         }
     }
+    let removed = !dropped.is_empty();
     drop(dropped);
+    if removed {
+        notify_changed();
+    }
 }
 
 pub(crate) struct OpenSpec<'a> {
@@ -336,6 +419,7 @@ pub(crate) fn open_with_meta(
     spec: OpenSpec<'_>,
     exec: &Exec<'_>,
 ) -> Result<(String, String, bool)> {
+    ensure_reaper();
     reap();
     {
         let t = lock();
@@ -348,7 +432,7 @@ pub(crate) fn open_with_meta(
     }
     let (proc, input_w, mut out) = spawn(spec.command, spec.cwd)
         .map_err(|e| ToolError::Failed(format!("não abriu `{}`: {e}", spec.command)))?;
-    let buf = Arc::new(Mutex::new(Vec::new()));
+    let buf = Arc::new(Mutex::new(VecDeque::new()));
     let fill = buf.clone();
     let alive = Arc::new(AtomicBool::new(true));
     let alive_reader = alive.clone();
@@ -359,11 +443,14 @@ pub(crate) fn open_with_meta(
                 break;
             }
             let mut v = fill.lock().unwrap_or_else(|e| e.into_inner());
-            if v.len() < BUF_CAP {
-                v.extend_from_slice(&chunk[..n]);
+            v.extend(&chunk[..n]);
+            let overflow = v.len().saturating_sub(BUF_CAP);
+            if overflow > 0 {
+                v.drain(..overflow);
             }
         }
         alive_reader.store(false, Ordering::SeqCst);
+        notify_changed();
     });
     static NEXT: AtomicU64 = AtomicU64::new(1);
     let id = format!("term-{}", NEXT.fetch_add(1, Ordering::Relaxed));
@@ -386,6 +473,7 @@ pub(crate) fn open_with_meta(
     if let Ok(mut m) = meta_table().lock() {
         m.insert(id.clone(), meta.clone());
     }
+    notify_changed();
     let term = Term {
         meta: meta.clone(),
         owner: exec.host.session(),
@@ -411,6 +499,7 @@ pub(crate) fn open_with_meta(
     if still_alive {
         lock().insert(id.clone(), term);
     }
+    notify_changed();
     Ok((id, text, still_alive))
 }
 
@@ -471,6 +560,7 @@ pub(crate) fn send_session_command(
         t
     };
     t.meta.busy.store(true, Ordering::SeqCst);
+    notify_changed();
     let mut data = String::new();
     if let Some(v) = secret_val {
         data.push_str(&v);
@@ -504,6 +594,7 @@ pub(crate) fn send_session_command(
     if alive {
         lock().insert(id.to_string(), t);
     }
+    notify_changed();
     Ok((text, alive))
 }
 
@@ -576,13 +667,13 @@ fn collect(
             if now.saturating_sub(progress_at) > LOOP_TAIL_BYTES {
                 progress_at = now - LOOP_TAIL_BYTES;
             }
-            let chunk_bytes = t
+            let chunk_bytes: Vec<u8> = t
                 .buf
                 .lock()
                 .map(|b| {
                     let start = progress_at.min(b.len());
                     let end = b.len().min(start + 1024);
-                    b[start..end].to_vec()
+                    b.range(start..end).copied().collect()
                 })
                 .unwrap_or_default();
             if !chunk_bytes.is_empty() {
@@ -601,10 +692,13 @@ fn collect(
             last_emit = Instant::now();
         }
         let quiet = changed.elapsed();
-        let tail_bytes = t
+        let tail_bytes: Vec<u8> = t
             .buf
             .lock()
-            .map(|b| b[b.len().saturating_sub(LOOP_TAIL_BYTES)..].to_vec())
+            .map(|b| {
+                let start = b.len().saturating_sub(LOOP_TAIL_BYTES);
+                b.range(start..).copied().collect()
+            })
             .unwrap_or_default();
         let tail_clean = clean(&tail_bytes);
         if auto_page && pages < MAX_AUTO_PAGES && now > page_at && looks_like_pager(&tail_clean) {
@@ -653,7 +747,14 @@ fn collect(
             });
         }
     };
-    let raw = std::mem::take(&mut *t.buf.lock().unwrap_or_else(|e| e.into_inner()));
+    let raw: Vec<u8> = {
+        let mut guard = t.buf.lock().unwrap_or_else(|e| e.into_inner());
+        let drained: Vec<u8> = guard.drain(..).collect();
+        if guard.capacity() > BUF_SHRINK_THRESHOLD {
+            guard.shrink_to(BUF_SHRINK_THRESHOLD);
+        }
+        drained
+    };
     let mut text = clean(&raw);
     for s in &t.secrets {
         text = text.replace(s.as_str(), "[segredo]");

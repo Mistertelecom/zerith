@@ -275,12 +275,10 @@ fn fetch_latest() -> Result<LatestRelease, String> {
         ..Default::default()
     };
     let url = update_endpoint();
-    let agent = ureq::AgentBuilder::new()
-        .user_agent(UA)
-        .timeout(Duration::from_secs(20))
-        .build();
+    let agent = zerith_providers::shared_http_agent(20_000);
     let release: Value = match agent
         .get(&url)
+        .set("User-Agent", UA)
         .set("Accept", "application/vnd.github+json")
         .call()
     {

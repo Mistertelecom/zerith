@@ -33,10 +33,7 @@ fn with_workspaces(st: &Store, list: Vec<Session>) -> Vec<SessionView> {
         .collect()
 }
 
-/// The sidebar list: archived conversations and subagent children stay out
-/// (Histórico lists those through `sessions_history`).
-fn list(db: &Path, limit: usize) -> Cmd<Vec<SessionView>> {
-    let st = Store::open(db).map_err(|e| e.to_string())?;
+fn list_with_store(st: &Store, limit: usize) -> Cmd<Vec<SessionView>> {
     let v = st
         .list_sessions_filtered(&SessionFilter {
             archived: Some(false),
@@ -45,7 +42,7 @@ fn list(db: &Path, limit: usize) -> Cmd<Vec<SessionView>> {
             ..SessionFilter::default()
         })
         .map_err(|e| e.to_string())?;
-    Ok(with_workspaces(&st, v))
+    Ok(with_workspaces(st, v))
 }
 
 /// Everything the window needs to draw its first frame.
@@ -67,7 +64,7 @@ pub async fn boot(state: tauri::State<'_, AppState>) -> Cmd<Boot> {
     let db = state.db();
     state.ensure().map_err(|e| e.to_string())?;
     let prefs = wire::load_prefs(&root);
-    let sessions = list(&db, 200)?;
+    let sessions = state.with_store(|st| list_with_store(st, 200))?;
     Ok(Boot {
         root: root.display().to_string(),
         db: db.display().to_string(),
@@ -88,7 +85,7 @@ pub async fn list_sessions(
     state: tauri::State<'_, AppState>,
     limit: Option<usize>,
 ) -> Cmd<Vec<SessionView>> {
-    list(&state.db(), limit.unwrap_or(200))
+    state.with_store(|st| list_with_store(st, limit.unwrap_or(200)))
 }
 
 /// A folder the window sent, checked: it must be an existing directory.
@@ -113,22 +110,24 @@ pub async fn create_session(
         Some(w) if !w.trim().is_empty() => folder(w)?,
         _ => crate::turn::last_workspace(&db),
     };
-    let st = Store::open(&db).map_err(|e| e.to_string())?;
-    let s = st
-        .create_session(
-            if title.is_empty() {
-                "Nova conversa"
-            } else {
-                &title
-            },
-            SessionSource::Native,
-        )
-        .map_err(|e| e.to_string())?;
-    let dir = dir.display().to_string();
-    st.set_workspace(&s.id, &dir).map_err(|e| e.to_string())?;
-    Ok(SessionView {
-        session: s,
-        workspace: Some(dir),
+    let dir_str = dir.display().to_string();
+    state.with_store(|st| {
+        let s = st
+            .create_session(
+                if title.is_empty() {
+                    "Nova conversa"
+                } else {
+                    &title
+                },
+                SessionSource::Native,
+            )
+            .map_err(|e| e.to_string())?;
+        st.set_workspace(&s.id, &dir_str)
+            .map_err(|e| e.to_string())?;
+        Ok(SessionView {
+            session: s,
+            workspace: Some(dir_str),
+        })
     })
 }
 
@@ -140,9 +139,10 @@ pub async fn set_session_workspace(
     workspace: String,
 ) -> Cmd<()> {
     let dir = folder(&workspace)?;
-    Store::open(state.db())
-        .and_then(|st| st.set_workspace(&id, &dir.display().to_string()))
-        .map_err(|e| e.to_string())
+    state.with_store(|st| {
+        st.set_workspace(&id, &dir.display().to_string())
+            .map_err(|e| e.to_string())
+    })
 }
 
 /// Folders used before, newest first, only those still on disk. Never empty:
@@ -150,8 +150,8 @@ pub async fn set_session_workspace(
 #[tauri::command]
 pub async fn recent_workspaces(state: tauri::State<'_, AppState>) -> Cmd<Vec<String>> {
     let db = state.db();
-    let mut out: Vec<String> = Store::open(&db)
-        .and_then(|st| st.recent_workspaces(8))
+    let mut out: Vec<String> = state
+        .with_store(|st| st.recent_workspaces(8).map_err(|e| e.to_string()))
         .unwrap_or_default()
         .into_iter()
         .filter(|p| Path::new(p).is_dir())
@@ -186,9 +186,11 @@ pub async fn session_messages(
     id: String,
     limit: Option<usize>,
 ) -> Cmd<Vec<ChatMessage>> {
-    let db = state.db();
-    Store::open(&db)
-        .and_then(|st| st.recent_messages(&id, limit.unwrap_or(400)))
+    state
+        .with_store(|st| {
+            st.recent_messages(&id, limit.unwrap_or(400))
+                .map_err(|e| e.to_string())
+        })
         .map(|v| {
             v.into_iter()
                 .map(|m| ChatMessage {
@@ -201,7 +203,6 @@ pub async fn session_messages(
                 })
                 .collect()
         })
-        .map_err(|e| e.to_string())
 }
 
 /// A background shell job (`shell run_in_background`) still running.
@@ -248,12 +249,13 @@ pub async fn session_fork(
     upto_message_id: Option<i64>,
     title: String,
 ) -> Cmd<SessionView> {
-    let st = Store::open(state.db()).map_err(|e| e.to_string())?;
-    let session = st
-        .fork_session(&session_id, upto_message_id, title.trim())
-        .map_err(|e| e.to_string())?;
-    let workspace = st.workspace(&session.id).map_err(|e| e.to_string())?;
-    Ok(SessionView { session, workspace })
+    state.with_store(|st| {
+        let session = st
+            .fork_session(&session_id, upto_message_id, title.trim())
+            .map_err(|e| e.to_string())?;
+        let workspace = st.workspace(&session.id).map_err(|e| e.to_string())?;
+        Ok(SessionView { session, workspace })
+    })
 }
 
 #[tauri::command]
@@ -348,4 +350,17 @@ pub async fn terminal_interrupt(id: String) -> Cmd<()> {
 #[tauri::command]
 pub async fn terminal_close(id: String) -> Cmd<()> {
     zerith_tools::close_terminal(&id)
+}
+
+#[tauri::command]
+pub async fn terminal_send(id: String, input: String) -> Cmd<()> {
+    zerith_tools::send_terminal_input(&id, &input)
+}
+
+#[tauri::command]
+pub async fn session_usage(
+    state: tauri::State<'_, crate::state::AppState>,
+    session_id: String,
+) -> Cmd<zerith_sessions::usage::SessionUsageTotals> {
+    state.with_store(|s| s.session_usage(&session_id).map_err(|e| e.to_string()))
 }

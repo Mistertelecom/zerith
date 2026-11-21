@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { AlertTriangle, Check, ChevronRight, FileDiff, FilePen, Undo2 } from "lucide-react";
 import { changesApi, type FileChange } from "../lib/api";
+import { tr, useLang } from "../lib/i18n";
 
 // Per answer, for the whole window session: a remount (switching
 // conversations, a new turn) never refetches or forgets an undo.
@@ -37,28 +38,98 @@ const UNDO_EFFECT = {
   apagado: "será recriado",
 } as const;
 
-function Diff({ file }: { file: FileChange }) {
+type SplitCell = { text: string; ln?: number; kind: "add" | "del" | "ctx" | "empty" };
+type SplitRow = { hunk: string } | { left: SplitCell; right: SplitCell };
+
+/** Unified rows paired side by side: a run of deletions sits next to the
+ * additions that follow it; context shows on both sides. */
+export function splitRows(list: Row[]): SplitRow[] {
+  const out: SplitRow[] = [];
+  const empty: SplitCell = { text: "", kind: "empty" };
+  let i = 0;
+  while (i < list.length) {
+    const r = list[i];
+    if (r.kind === "hunk") {
+      out.push({ hunk: r.text });
+      i++;
+    } else if (r.kind === "ctx") {
+      out.push({
+        left: { text: r.text, ln: r.old, kind: "ctx" },
+        right: { text: r.text, ln: r.now, kind: "ctx" },
+      });
+      i++;
+    } else {
+      const dels: Row[] = [];
+      const adds: Row[] = [];
+      while (i < list.length && list[i].kind === "del") dels.push(list[i++]);
+      while (i < list.length && list[i].kind === "add") adds.push(list[i++]);
+      const n = Math.max(dels.length, adds.length);
+      for (let k = 0; k < n; k++) {
+        const d = dels[k];
+        const a = adds[k];
+        out.push({
+          left: d ? { text: d.text, ln: d.old, kind: "del" } : empty,
+          right: a ? { text: a.text, ln: a.now, kind: "add" } : empty,
+        });
+      }
+    }
+  }
+  return out;
+}
+
+type DiffMode = "unified" | "split";
+const DIFF_MODE_KEY = "zerith.diffMode";
+const readMode = (): DiffMode => {
+  try {
+    return localStorage.getItem(DIFF_MODE_KEY) === "split" ? "split" : "unified";
+  } catch {
+    return "unified";
+  }
+};
+
+function Diff({ file, mode }: { file: FileChange; mode: DiffMode }) {
   if (file.diff == null) return <p className="changes-diff-note">{file.note ?? "Sem diff"}</p>;
+  const list = rows(file.diff);
   return (
     <div className="changes-diff" role="region" aria-label={"Diff de " + file.rel}>
       {file.truncated ? (
         <p className="changes-diff-note">Arquivo grande demais para comparar linha a linha: trecho alterado inteiro.</p>
       ) : null}
-      <div className="diff-lines">
-        {rows(file.diff).map((r, i) => (
-          <div key={i} className={"diff-line " + r.kind}>
-            <span className="diff-ln">{r.old ?? ""}</span>
-            <span className="diff-ln">{r.now ?? ""}</span>
-            <span className="diff-sign">{r.kind === "add" ? "+" : r.kind === "del" ? "-" : ""}</span>
-            <span className="diff-text">{r.text}</span>
-          </div>
-        ))}
-      </div>
+      {mode === "split" ? (
+        <div className="diff-split">
+          {splitRows(list).map((r, i) =>
+            "hunk" in r ? (
+              <div key={i} className="diff-split-hunk">
+                {r.hunk}
+              </div>
+            ) : (
+              <div key={i} className="diff-split-row">
+                <span className="diff-ln">{r.left.ln ?? ""}</span>
+                <span className={"diff-split-cell " + r.left.kind}>{r.left.text}</span>
+                <span className="diff-ln">{r.right.ln ?? ""}</span>
+                <span className={"diff-split-cell " + r.right.kind}>{r.right.text}</span>
+              </div>
+            ),
+          )}
+        </div>
+      ) : (
+        <div className="diff-lines">
+          {list.map((r, i) => (
+            <div key={i} className={"diff-line " + r.kind}>
+              <span className="diff-ln">{r.old ?? ""}</span>
+              <span className="diff-ln">{r.now ?? ""}</span>
+              <span className="diff-sign">{r.kind === "add" ? "+" : r.kind === "del" ? "-" : ""}</span>
+              <span className="diff-text">{r.text}</span>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
 
 export function TurnChanges({ sessionId, messageId }: { sessionId: string; messageId: number }) {
+  const lang = useLang();
   const key = sessionId + ":" + messageId;
   const [files, setFiles] = useState<FileChange[] | null>(null);
   const [open, setOpen] = useState(false);
@@ -66,6 +137,15 @@ export function TurnChanges({ sessionId, messageId }: { sessionId: string; messa
   const [busy, setBusy] = useState(false);
   const [done, setDone] = useState<string | null>(undone.get(key) ?? null);
   const [error, setError] = useState<string | null>(null);
+  const [mode, setModeState] = useState<DiffMode>(readMode);
+  const setMode = (m: DiffMode) => {
+    setModeState(m);
+    try {
+      localStorage.setItem(DIFF_MODE_KEY, m);
+    } catch {
+      /* private mode: keep it for this session only */
+    }
+  };
 
   useEffect(() => {
     let live = true;
@@ -125,11 +205,14 @@ export function TurnChanges({ sessionId, messageId }: { sessionId: string; messa
       <button type="button" className="changes-head" onClick={() => setOpen(!open)} aria-expanded={open}>
         <FilePen size={14} strokeWidth={2} aria-hidden />
         <span className="changes-title">
-          {files.length} {files.length === 1 ? "arquivo alterado" : "arquivos alterados"}
+          {files.length}{" "}
+          {files.length === 1
+            ? tr(lang, "arquivo alterado", "file changed")
+            : tr(lang, "arquivos alterados", "files changed")}
         </span>
         <span className={"changes-count add" + (added ? "" : " zero")}>+{added}</span>
         <span className={"changes-count del" + (removed ? "" : " zero")}>−{removed}</span>
-        {done ? <span className="badge">desfeito</span> : null}
+        {done ? <span className="badge">{tr(lang, "desfeito", "undone")}</span> : null}
         <ChevronRight size={14} strokeWidth={2} className="chev" />
       </button>
       {open ? (
@@ -148,12 +231,15 @@ export function TurnChanges({ sessionId, messageId }: { sessionId: string; messa
                   <FileDiff size={14} strokeWidth={2} aria-hidden />
                   <span className="change-path">{f.rel}</span>
                   {f.changedSince ? (
-                    <span className="badge warn" title="O arquivo mudou depois desta resposta">
-                      mudou depois
+                    <span
+                      className="badge warn"
+                      title={tr(lang, "O arquivo mudou depois desta resposta", "File changed after this turn")}
+                    >
+                      {tr(lang, "mudou depois", "changed later")}
                     </span>
                   ) : null}
                   {f.diff == null ? (
-                    <span className="changes-count bin">binário</span>
+                    <span className="changes-count bin">{tr(lang, "binário", "binary")}</span>
                   ) : (
                     <>
                       <span className={"changes-count add" + (f.added ? "" : " zero")}>+{f.added}</span>
@@ -162,7 +248,31 @@ export function TurnChanges({ sessionId, messageId }: { sessionId: string; messa
                   )}
                   <span className={"badge change-status " + STATUS_TONE[f.status]}>{f.status}</span>
                 </button>
-                {on ? <Diff file={f} /> : null}
+                {on ? (
+                  <>
+                    {f.diff != null ? (
+                      <div className="diff-mode" role="group" aria-label={tr(lang, "Modo do diff", "Diff view mode")}>
+                        <button
+                          type="button"
+                          className={"diff-mode-btn" + (mode === "unified" ? " on" : "")}
+                          aria-pressed={mode === "unified"}
+                          onClick={() => setMode("unified")}
+                        >
+                          {tr(lang, "Unificado", "Unified")}
+                        </button>
+                        <button
+                          type="button"
+                          className={"diff-mode-btn" + (mode === "split" ? " on" : "")}
+                          aria-pressed={mode === "split"}
+                          onClick={() => setMode("split")}
+                        >
+                          {tr(lang, "Lado a lado", "Side by side")}
+                        </button>
+                      </div>
+                    ) : null}
+                    <Diff file={f} mode={mode} />
+                  </>
+                ) : null}
               </div>
             );
           })}
@@ -175,7 +285,7 @@ export function TurnChanges({ sessionId, messageId }: { sessionId: string; messa
             ) : (
               <button type="button" className="btn btn-sm" onClick={() => void undo()} disabled={busy}>
                 {busy ? <span className="spinner" /> : <Undo2 size={14} strokeWidth={2} aria-hidden />}
-                Desfazer alterações
+                {tr(lang, "Desfazer alterações", "Undo changes")}
               </button>
             )}
           </div>

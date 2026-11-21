@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   Bot,
   Bug,
@@ -23,6 +31,7 @@ import {
   type Boot,
   type Routing,
   type Session,
+  type SessionUsageTotals,
 } from "./lib/api";
 import {
   applyEvent,
@@ -37,7 +46,7 @@ import {
 import { Sidebar } from "./components/Sidebar";
 import { Transcript } from "./components/Transcript";
 import { ApprovalCard, QuestionCard } from "./components/Cards";
-import { Settings, type SettingsTab } from "./components/Settings";
+import type { SettingsTab } from "./components/Settings";
 import { Composer, type CommandName } from "./components/Composer";
 import { Logo, ZerithMark } from "./components/ui";
 import { catalogEntry, NOT_CHAT } from "./lib/catalog";
@@ -47,9 +56,15 @@ import { AppVersion } from "./components/Update";
 import { FolderPill } from "./components/FolderPill";
 import { BackgroundJobs } from "./components/BackgroundJobs";
 import { ActiveTerminals } from "./components/ActiveTerminals";
+import { tr, useLang } from "./lib/i18n";
+
+const Settings = lazy(() =>
+  import("./components/Settings").then((m) => ({ default: m.Settings })),
+);
 
 const MODEL_KEY = "zerith.model";
 const EFFORT_KEY = "zerith.effort";
+const MAX_CACHED_TURNS = 8;
 
 function estimateContextWindow(model: string): number {
   const m = model.toLowerCase();
@@ -108,15 +123,50 @@ export default function App() {
   // One live turn per conversation, keyed by session id: a chat that is not
   // open keeps its stream, its Stop button and its approval card. `turn` below
   // is the open one.
+  const lang = useLang();
   const [turns, setTurns] = useState<Record<string, TurnState>>({});
   const turnsRef = useRef<Record<string, TurnState>>(turns);
   turnsRef.current = turns;
   const selectedRef = useRef<string | null>(null);
   selectedRef.current = selected;
+  const [sessionUsage, setSessionUsage] = useState<SessionUsageTotals | null>(
+    null,
+  );
+  const [pendingUsage, setPendingUsage] = useState<Record<string, boolean>>({});
+  const turnTouchedRef = useRef<Map<string, number>>(new Map());
+  const pruneTurns = useCallback(
+    (all: Record<string, TurnState>, keepId: string): Record<string, TurnState> => {
+      turnTouchedRef.current.set(keepId, Date.now());
+      const inactive = Object.entries(all).filter(
+        ([k, v]) =>
+          k !== selectedRef.current &&
+          k !== keepId &&
+          !v.busy &&
+          !v.approval &&
+          !v.question,
+      );
+      if (inactive.length <= MAX_CACHED_TURNS) return all;
+      inactive.sort(
+        (a, b) =>
+          (turnTouchedRef.current.get(a[0]) ?? 0) -
+          (turnTouchedRef.current.get(b[0]) ?? 0),
+      );
+      const next = { ...all };
+      const drop = inactive.length - MAX_CACHED_TURNS;
+      for (let i = 0; i < drop; i++) {
+        delete next[inactive[i][0]];
+        turnTouchedRef.current.delete(inactive[i][0]);
+      }
+      return next;
+    },
+    [],
+  );
   const updateTurn = useCallback(
     (id: string, fn: (prev: TurnState) => TurnState) =>
-      setTurns((all) => ({ ...all, [id]: fn(all[id] ?? emptyTurn) })),
-    [],
+      setTurns((all) =>
+        pruneTurns({ ...all, [id]: fn(all[id] ?? emptyTurn) }, id),
+      ),
+    [pruneTurns],
   );
   const turn: TurnState = (selected && turns[selected]) || emptyTurn;
   const setTurn = useCallback(
@@ -305,6 +355,23 @@ export default function App() {
     };
   }, [selected, setTurn]);
 
+  useEffect(() => {
+    if (!selected) {
+      setSessionUsage(null);
+      return;
+    }
+    turnTouchedRef.current.set(selected, Date.now());
+    setSessionUsage(null);
+    let live = true;
+    api
+      .sessionUsage(selected)
+      .then((u) => live && setSessionUsage(u))
+      .catch(() => live && setSessionUsage(null));
+    return () => {
+      live = false;
+    };
+  }, [selected]);
+
   const pendingDeltasRef = useRef<Map<string, { text: string; reasoning: string }>>(new Map());
   const rafRef = useRef<number | null>(null);
 
@@ -318,16 +385,19 @@ export default function App() {
     const snapshot = Array.from(pending.entries());
     pending.clear();
     setTurns((all) => {
-      const next = { ...all };
+      let next = { ...all };
+      let lastId = "";
       for (const [sid, buf] of snapshot) {
         let s = next[sid] ?? emptyTurn;
         if (buf.reasoning) s = applyEvent(s, { type: "reasoning", text: buf.reasoning });
         if (buf.text) s = applyEvent(s, { type: "delta", text: buf.text });
         next[sid] = s;
+        turnTouchedRef.current.set(sid, Date.now());
+        lastId = sid;
       }
-      return next;
+      return lastId ? pruneTurns(next, lastId) : next;
     });
-  }, []);
+  }, [pruneTurns]);
 
   // Turn events, for every conversation at once. The state of a chat that is
   // not open is kept here, so switching away and back shows the same stream,
@@ -360,10 +430,14 @@ export default function App() {
     });
     const done = onTurnDone((id) => {
       flushDeltas();
+      const isSelected = id === selectedRef.current;
+      if (isSelected) {
+        setPendingUsage((m) => ({ ...m, [id]: true }));
+      }
       updateTurn(id, finishTurn);
       // The open conversation gets its stored rows back (with their ids, which
       // "Editar" needs); a closed one rereads them when it is opened.
-      if (id !== selectedRef.current) return;
+      if (!isSelected) return;
       void api
         .sessionMessages(id)
         .then((list) => {
@@ -375,6 +449,20 @@ export default function App() {
           });
         })
         .catch(() => undefined);
+      void api
+        .sessionUsage(id)
+        .then((u) => {
+          if (id === selectedRef.current) setSessionUsage(u);
+        })
+        .catch(() => undefined)
+        .finally(() => {
+          setPendingUsage((m) => {
+            if (!m[id]) return m;
+            const n = { ...m };
+            delete n[id];
+            return n;
+          });
+        });
     });
     const learned = onTurnLearned((id, items) => {
       if (!items.length) return;
@@ -999,19 +1087,17 @@ export default function App() {
                   </section>
                 ) : null}
 
-                <section className="insp-card">
-                  <header className="insp-head">
-                    <span className="insp-icon">
-                      <ListChecks size={14} strokeWidth={2} />
-                    </span>
-                    <h3>Tarefas</h3>
-                    {turn.tasks.length ? (
+                {turn.tasks.length > 0 ? (
+                  <section className="insp-card">
+                    <header className="insp-head">
+                      <span className="insp-icon">
+                        <ListChecks size={14} strokeWidth={2} />
+                      </span>
+                      <h3>{tr(lang, "Tarefas", "Tasks")}</h3>
                       <span className="insp-meta">
                         {doneTasks}/{turn.tasks.length}
                       </span>
-                    ) : null}
-                  </header>
-                  {turn.tasks.length ? (
+                    </header>
                     <div className="insp-bar" aria-hidden>
                       <span
                         style={{
@@ -1019,8 +1105,6 @@ export default function App() {
                         }}
                       />
                     </div>
-                  ) : null}
-                  {turn.tasks.length ? (
                     <ul className="insp-tasks">
                       {turn.tasks.map((t) => (
                         <li key={t.id} className={"insp-task " + t.status}>
@@ -1039,21 +1123,19 @@ export default function App() {
                         </li>
                       ))}
                     </ul>
-                  ) : (
-                    <p className="insp-empty">
-                      O agente lista aqui os passos do turno.
-                    </p>
-                  )}
-                </section>
+                  </section>
+                ) : null}
 
                 <section className="insp-card">
                   <header className="insp-head">
                     <span className="insp-icon">
                       <Route size={14} strokeWidth={2} />
                     </span>
-                    <h3>Rota</h3>
+                    <h3>{tr(lang, "Rota", "Route")}</h3>
                     <span className="insp-meta">
-                      {turn.route ? "em uso" : "próximo turno"}
+                      {turn.route
+                        ? tr(lang, "em uso", "in use")
+                        : tr(lang, "próximo turno", "next turn")}
                     </span>
                   </header>
                   {route ? (
@@ -1066,73 +1148,101 @@ export default function App() {
                       <code>{route.model}</code>
                     </div>
                   ) : (
-                    <p className="insp-empty">Nenhum modelo escolhido.</p>
+                    <p className="insp-empty">
+                      {tr(lang, "Nenhum modelo escolhido.", "No model selected.")}
+                    </p>
                   )}
                 </section>
 
-                <section className="insp-card">
-                  <header className="insp-head">
-                    <span className="insp-icon">
-                      <Gauge size={14} strokeWidth={2} />
-                    </span>
-                    <h3>Uso</h3>
-                    <span className="insp-meta">tokens</span>
-                  </header>
-                  <dl className="insp-usage">
-                    <div>
-                      <dt>Entrada</dt>
-                      <dd>{num(turn.usage?.input ?? 0)}</dd>
-                    </div>
-                    <div>
-                      <dt>Saída</dt>
-                      <dd>{num(turn.usage?.output ?? 0)}</dd>
-                    </div>
-                    {(turn.usage?.cacheRead ?? 0) > 0 ? (
-                      <div className="saved">
-                        <dt>Cache hit</dt>
-                        <dd>
-                          {num(turn.usage!.cacheRead!)}
-                          {turn.usage!.input > 0
-                            ? ` (${Math.round((100 * turn.usage!.cacheRead!) / turn.usage!.input)}%)`
-                            : ""}
-                        </dd>
-                      </div>
-                    ) : null}
-                    {(turn.usage?.ttftMs ?? 0) > 0 ? (
-                      <div>
-                        <dt>TTFT</dt>
-                        <dd>{turn.usage!.ttftMs} ms</dd>
-                      </div>
-                    ) : null}
-                    <div className={turn.saved > 0 ? "saved" : undefined}>
-                      <dt>Economizados</dt>
-                      <dd>{num(turn.saved)}</dd>
-                    </div>
-                  </dl>
-                </section>
+                {(() => {
+                  const includeLive =
+                    turn.busy || Boolean(selected && pendingUsage[selected]);
+                  const persistedIn = sessionUsage?.promptTokens ?? 0;
+                  const persistedOut = sessionUsage?.completionTokens ?? 0;
+                  const persistedCache = sessionUsage?.cacheReadTokens ?? 0;
+                  const persistedSaved = sessionUsage?.savedTokens ?? 0;
+                  const liveIn = turn.usage?.input ?? 0;
+                  const liveOut = turn.usage?.output ?? 0;
+                  const liveCache = turn.usage?.cacheRead ?? 0;
+                  const liveSaved = turn.saved;
+                  const useLive =
+                    includeLive ||
+                    ((sessionUsage?.requests ?? 0) === 0 &&
+                      (liveIn > 0 || liveOut > 0));
+                  const totalIn = persistedIn + (useLive ? liveIn : 0);
+                  const totalOut = persistedOut + (useLive ? liveOut : 0);
+                  const totalCache =
+                    persistedCache + (useLive ? liveCache : 0);
+                  const totalSaved =
+                    persistedSaved + (useLive ? liveSaved : 0);
+                  const cacheDenom = totalIn + totalCache;
+                  const cachePct =
+                    totalCache > 0 && cacheDenom > 0
+                      ? `${num(totalCache)} (${Math.round((100 * totalCache) / cacheDenom)}%)`
+                      : "—";
+                  return (
+                    <section className="insp-card">
+                      <header className="insp-head">
+                        <span className="insp-icon">
+                          <Gauge size={14} strokeWidth={2} />
+                        </span>
+                        <h3>{tr(lang, "Uso", "Usage")}</h3>
+                        <span className="insp-meta">tokens</span>
+                      </header>
+                      <dl className="insp-usage">
+                        <div>
+                          <dt>{tr(lang, "Entrada", "Input")}</dt>
+                          <dd>{num(totalIn)}</dd>
+                        </div>
+                        <div>
+                          <dt>{tr(lang, "Saída", "Output")}</dt>
+                          <dd>{num(totalOut)}</dd>
+                        </div>
+                        <div className={totalCache > 0 ? "saved" : undefined}>
+                          <dt>Cache hit</dt>
+                          <dd>{cachePct}</dd>
+                        </div>
+                        {(turn.usage?.ttftMs ?? 0) > 0 ? (
+                          <div>
+                            <dt>TTFT</dt>
+                            <dd>{turn.usage!.ttftMs} ms</dd>
+                          </div>
+                        ) : null}
+                        {totalSaved > 0 ? (
+                          <div className="saved">
+                            <dt>{tr(lang, "Economizados", "Saved")}</dt>
+                            <dd>{num(totalSaved)}</dd>
+                          </div>
+                        ) : null}
+                      </dl>
+                    </section>
+                  );
+                })()}
               </aside>
             ) : null}
           </div>
         </main>
         {settings ? (
-          <Settings
-            onClose={closeSettings}
-            open={settings}
-            general={{
-              theme: boot.theme,
-              reduceMotion: boot.reduce_motion,
-              profile: boot.profile,
-              memoryPaused,
-              models,
-              onTheme: setTheme,
-              onReduceMotion: setReduceMotion,
-              onProfile: setProfile,
-              onMemory: (paused) => {
-                setMemoryPaused(paused);
-                void api.setMemoryPaused(paused);
-              },
-            }}
-          />
+          <Suspense fallback={null}>
+            <Settings
+              onClose={closeSettings}
+              open={settings}
+              general={{
+                theme: boot.theme,
+                reduceMotion: boot.reduce_motion,
+                profile: boot.profile,
+                memoryPaused,
+                models,
+                onTheme: setTheme,
+                onReduceMotion: setReduceMotion,
+                onProfile: setProfile,
+                onMemory: (paused) => {
+                  setMemoryPaused(paused);
+                  void api.setMemoryPaused(paused);
+                },
+              }}
+            />
+          </Suspense>
         ) : null}
         {paletteOpen ? (
           <CommandPalette

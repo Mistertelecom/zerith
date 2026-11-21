@@ -44,22 +44,34 @@ impl Store {
         conn.busy_timeout(std::time::Duration::from_secs(10))?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        // Switching to WAL needs the write lock and, on a brand new file, can
-        // lose a race to another connection doing the same. The busy timeout
-        // covers the wait; a retry covers the rare "locked" that a pragma
-        // returns without waiting.
-        let mut tries = 0;
-        loop {
-            match conn.pragma_update(None, "journal_mode", "WAL") {
-                Ok(()) => break,
-                Err(e) if is_locked(&e) && tries < 20 => {
-                    tries += 1;
-                    std::thread::sleep(std::time::Duration::from_millis(25));
+        conn.pragma_update(None, "cache_size", -16000)?;
+        conn.pragma_update(None, "temp_store", "MEMORY")?;
+        let current_mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap_or_default();
+        if !current_mode.eq_ignore_ascii_case("wal") {
+            let mut tries = 0;
+            loop {
+                match conn.pragma_update(None, "journal_mode", "WAL") {
+                    Ok(()) => break,
+                    Err(e) if is_locked(&e) && tries < 20 => {
+                        tries += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    }
+                    Err(e) => return Err(e.into()),
                 }
-                Err(e) => return Err(e.into()),
             }
         }
-        migrations::run(&mut conn)?;
+        let applied: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version BETWEEN 1 AND ?1",
+                [migrations::CURRENT_VERSION],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if applied < migrations::CURRENT_VERSION {
+            migrations::run(&mut conn)?;
+        }
         Ok(Self { conn })
     }
 

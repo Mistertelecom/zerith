@@ -223,6 +223,16 @@ export interface AccountStats {
   last_used_at: number | null;
 }
 
+export interface SessionUsageTotals {
+  promptTokens: number;
+  completionTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  savedTokens: number;
+  savedRtkTokens: number;
+  requests: number;
+}
+
 export interface UsageSummary {
   accounts: AccountStats[];
   models: {
@@ -562,6 +572,8 @@ export const api = {
   revealWorkspace: (path: string) => invoke<void>("reveal_workspace", { path }),
   sessionMessages: (id: string, limit = 400) =>
     invoke<ChatMessage[]>("session_messages", { id, limit }),
+  sessionUsage: (sessionId: string) =>
+    invoke<SessionUsageTotals>("session_usage", { sessionId }),
   /** A copy up to `uptoMessageId` (all when null), same folder. */
   forkSession: (sessionId: string, uptoMessageId: number | null, title: string) =>
     invoke<Session>("session_fork", { sessionId, uptoMessageId, title }),
@@ -885,9 +897,17 @@ export const terminalsApi = {
   list: () => invoke<TerminalSnapshot[]>("terminals_list"),
   tail: (id: string, maxBytes = 4096) =>
     invoke<string>("terminal_tail", { id, maxBytes }),
+  send: (id: string, input: string) =>
+    invoke<void>("terminal_send", { id, input }),
   interrupt: (id: string) => invoke<void>("terminal_interrupt", { id }),
   close: (id: string) => invoke<void>("terminal_close", { id }),
 };
+
+export function onTerminalsChanged(handler: () => void): Promise<UnlistenFn> {
+  return listen<void>("terminals:changed", () => handler()).catch(
+    () => () => undefined,
+  );
+}
 
 export const updateApi = {
   check: () => invoke<UpdateInfo>("update_check"),

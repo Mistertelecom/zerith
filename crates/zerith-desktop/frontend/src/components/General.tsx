@@ -4,6 +4,13 @@ import { api, learnApi, type LongContextView, type ProfileView, type StorageView
 import { Card, Row, Segmented, Switch } from "./ui";
 import { UpdateRow } from "./Update";
 
+import { setLang, tr, useLang, type Lang } from "../lib/i18n";
+
+const LANGS: readonly (readonly [Lang, string])[] = [
+  ["pt-BR", "Português (BR)"],
+  ["en", "English"],
+] as const;
+
 const THEMES = [
   ["dark", "Escuro"],
   ["light", "Claro"],
@@ -95,6 +102,7 @@ export function GeneralTab(props: GeneralProps) {
   }, []);
 
   const limit = limits.find((l) => l.name === props.profile);
+  const lang = useLang();
 
   const copy = useCallback(() => {
     setBusy(true);
@@ -116,23 +124,54 @@ export function GeneralTab(props: GeneralProps) {
           <span>{error}</span>
         </div>
       ) : null}
-      <Card title="Aparência" icon={Palette} description="Como a janela se apresenta.">
+      <Card
+        title={tr(lang, "Aparência", "Appearance")}
+        icon={Palette}
+        description={tr(lang, "Como a janela se apresenta.", "How the window looks and feels.")}
+      >
         <Row
-          label="Tema"
-          hint="“Sistema” acompanha o modo claro ou escuro do computador."
+          label={tr(lang, "Idioma", "Language")}
+          hint={tr(
+            lang,
+            "Idioma da interface do aplicativo.",
+            "Display language for the desktop interface.",
+          )}
         >
           <Segmented
-            label="Tema"
+            label={tr(lang, "Idioma", "Language")}
+            value={lang}
+            options={LANGS}
+            onPick={(v) => setLang(v === "en" ? "en" : "pt-BR")}
+          />
+        </Row>
+        <Row
+          label={tr(lang, "Tema", "Theme")}
+          hint={tr(
+            lang,
+            "“Sistema” acompanha o modo claro ou escuro do computador.",
+            "“System” follows your OS light or dark mode.",
+          )}
+        >
+          <Segmented
+            label={tr(lang, "Tema", "Theme")}
             value={props.theme}
             options={THEMES}
             onPick={props.onTheme}
           />
         </Row>
         <Row
-          label="Movimento reduzido"
-          hint="Troca animações por cortes e fades curtos."
+          label={tr(lang, "Movimento reduzido", "Reduced motion")}
+          hint={tr(
+            lang,
+            "Troca animações por cortes e fades curtos.",
+            "Replaces animations with quick cuts and fades.",
+          )}
         >
-          <Switch label="Movimento reduzido" checked={props.reduceMotion} onChange={props.onReduceMotion} />
+          <Switch
+            label={tr(lang, "Movimento reduzido", "Reduced motion")}
+            checked={props.reduceMotion}
+            onChange={props.onReduceMotion}
+          />
         </Row>
       </Card>
 

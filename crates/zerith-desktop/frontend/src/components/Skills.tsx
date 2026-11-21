@@ -62,6 +62,13 @@ const sourceOf = (repo: string, path: string) => `github:${repo}${path ? "/" + p
 
 const matches = (q: string, ...fields: string[]) => fields.some((f) => f.toLowerCase().includes(q));
 
+const middleTruncate = (value: string, max = 42) => {
+  if (value.length <= max) return value;
+  const keepStart = Math.max(8, Math.floor((max - 1) * 0.38));
+  const keepEnd = Math.max(10, max - 1 - keepStart);
+  return `${value.slice(0, keepStart)}…${value.slice(value.length - keepEnd)}`;
+};
+
 // The body opens with the name as a heading and often the description as its
 // first paragraph; the panel header already shows both.
 const preview = (body: string, description: string) => {
@@ -1056,13 +1063,13 @@ function SkillDetail(props: {
         <dt>Origem</dt>
         <dd>
           <span className="mono-path" title={s.installed.source}>
-            {s.installed.source}
+            {middleTruncate(s.installed.source, 42)}
           </span>
         </dd>
         <dt>Pasta</dt>
         <dd>
           <span className="mono-path" title={s.installed.dir}>
-            {s.installed.dir}
+            {middleTruncate(s.installed.dir, 42)}
           </span>
         </dd>
         <dt>Licença</dt>

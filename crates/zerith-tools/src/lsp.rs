@@ -108,16 +108,39 @@ pub fn read_lsp_frame(r: &mut impl BufRead) -> io::Result<Value> {
     serde_json::from_slice(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
+const MAX_LSP_SESSIONS: usize = 3;
+const LSP_IDLE_TTL: Duration = Duration::from_secs(10 * 60);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DocSyncKind {
+    Open(i32),
+    Change(i32),
+}
+
+fn next_doc_sync(docs: &mut HashMap<String, i32>, uri: &str) -> DocSyncKind {
+    if let Some(ver) = docs.get_mut(uri) {
+        *ver += 1;
+        DocSyncKind::Change(*ver)
+    } else {
+        docs.insert(uri.to_string(), 1);
+        DocSyncKind::Open(1)
+    }
+}
+
 struct LspSession {
     stdin: Arc<Mutex<ChildStdin>>,
     pending: Arc<Mutex<HashMap<u64, mpsc::Sender<Value>>>>,
     diagnostics: Arc<Mutex<HashMap<String, Vec<Value>>>>,
+    open_docs: Mutex<HashMap<String, i32>>,
+    last_used: Mutex<std::time::Instant>,
     next_id: AtomicU64,
     _child: Mutex<Child>,
 }
 
 impl Drop for LspSession {
     fn drop(&mut self) {
+        let _ = self.notify("shutdown", Value::Null);
+        let _ = self.notify("exit", Value::Null);
         if let Ok(mut c) = self._child.lock() {
             let _ = c.kill();
             let _ = c.wait();
@@ -126,6 +149,27 @@ impl Drop for LspSession {
 }
 
 impl LspSession {
+    fn is_alive(&self) -> bool {
+        self._child
+            .lock()
+            .ok()
+            .and_then(|mut c| c.try_wait().ok())
+            .is_some_and(|st| st.is_none())
+    }
+
+    fn touch(&self) {
+        if let Ok(mut t) = self.last_used.lock() {
+            *t = std::time::Instant::now();
+        }
+    }
+
+    fn last_used_at(&self) -> std::time::Instant {
+        self.last_used
+            .lock()
+            .map(|t| *t)
+            .unwrap_or_else(|_| std::time::Instant::now())
+    }
+
     fn spawn(workspace: &Path, lang: Language) -> std::result::Result<Arc<Self>, String> {
         let mut spawned: Option<(Child, &str)> = None;
         for &(bin, args) in lang.server_candidates() {
@@ -186,6 +230,8 @@ impl LspSession {
             stdin: Arc::new(Mutex::new(stdin)),
             pending,
             diagnostics,
+            open_docs: Mutex::new(HashMap::new()),
+            last_used: Mutex::new(std::time::Instant::now()),
             next_id: AtomicU64::new(1),
             _child: Mutex::new(child),
         });
@@ -225,6 +271,7 @@ impl LspSession {
         params: Value,
         wait: Duration,
     ) -> std::result::Result<Value, String> {
+        self.touch();
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = mpsc::channel();
         if let Ok(mut m) = self.pending.lock() {
@@ -252,20 +299,44 @@ impl LspSession {
     }
 
     fn open_doc(&self, path: &Path, lang: Language) -> std::result::Result<String, String> {
+        self.touch();
         let uri = file_uri(path);
         let text = std::fs::read_to_string(path)
             .map_err(|e| format!("erro lendo {}: {e}", path.display()))?;
-        self.notify(
-            "textDocument/didOpen",
-            json!({
-                "textDocument": {
-                    "uri": uri,
-                    "languageId": lang.language_id(),
-                    "version": 1,
-                    "text": text,
-                }
-            }),
-        )?;
+        let sync = {
+            let mut docs = self
+                .open_docs
+                .lock()
+                .map_err(|e| format!("LSP docs lock: {e}"))?;
+            next_doc_sync(&mut docs, &uri)
+        };
+        match sync {
+            DocSyncKind::Open(version) => {
+                self.notify(
+                    "textDocument/didOpen",
+                    json!({
+                        "textDocument": {
+                            "uri": uri,
+                            "languageId": lang.language_id(),
+                            "version": version,
+                            "text": text,
+                        }
+                    }),
+                )?;
+            }
+            DocSyncKind::Change(version) => {
+                self.notify(
+                    "textDocument/didChange",
+                    json!({
+                        "textDocument": {
+                            "uri": uri,
+                            "version": version,
+                        },
+                        "contentChanges": [{ "text": text }],
+                    }),
+                )?;
+            }
+        }
         Ok(uri)
     }
 }
@@ -277,20 +348,77 @@ fn pool() -> &'static LspPool {
     P.get_or_init(Default::default)
 }
 
+/// Closes all pooled Language Server child processes.
+pub fn shutdown_all() {
+    let drained: Vec<Arc<LspSession>> = pool()
+        .lock()
+        .map(|mut m| m.drain().map(|(_, s)| s).collect())
+        .unwrap_or_default();
+    drop(drained);
+}
+
 fn session_for(workspace: &Path, path: &Path) -> Result<(Arc<LspSession>, Language, String)> {
     let lang = Language::detect(path).ok_or_else(|| {
         ToolError::BadArguments(format!("extensão sem suporte LSP: {}", path.display()))
     })?;
     let ws = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
     let key = (ws.clone(), lang);
-    let existing = pool().lock().ok().and_then(|m| m.get(&key).cloned());
+
+    let (existing, evicted_stale) = {
+        let mut stale = Vec::new();
+        let mut reuse = None;
+        if let Ok(mut m) = pool().lock() {
+            let now = std::time::Instant::now();
+            let dead_keys: Vec<(PathBuf, Language)> = m
+                .iter()
+                .filter_map(|(k, s)| {
+                    let expired = now.duration_since(s.last_used_at()) > LSP_IDLE_TTL;
+                    if !s.is_alive() || expired {
+                        Some(k.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for dk in dead_keys {
+                if let Some(old) = m.remove(&dk) {
+                    stale.push(old);
+                }
+            }
+            if let Some(s) = m.get(&key).cloned() {
+                s.touch();
+                reuse = Some(s);
+            }
+        }
+        (reuse, stale)
+    };
+    drop(evicted_stale);
+
     let sess = match existing {
         Some(s) => s,
         None => {
             let s = LspSession::spawn(&ws, lang).map_err(ToolError::Failed)?;
-            if let Ok(mut m) = pool().lock() {
+            let evicted_lru: Vec<Arc<LspSession>> = if let Ok(mut m) = pool().lock() {
+                let mut lru = Vec::new();
+                while m.len() >= MAX_LSP_SESSIONS {
+                    if let Some(oldest_key) = m
+                        .iter()
+                        .min_by_key(|(_, sess)| sess.last_used_at())
+                        .map(|(k, _)| k.clone())
+                    {
+                        if let Some(old) = m.remove(&oldest_key) {
+                            lru.push(old);
+                        }
+                    } else {
+                        break;
+                    }
+                }
                 m.insert(key, s.clone());
-            }
+                lru
+            } else {
+                Vec::new()
+            };
+            drop(evicted_lru);
             s
         }
     };
@@ -563,5 +691,26 @@ mod tests {
             "range": {"start": {"line": 14, "character": 2}}
         }]));
         assert_eq!(loc, "file:///repo/src/lib.rs:15:3");
+    }
+
+    #[test]
+    fn doc_sync_tracks_did_open_then_increments_for_did_change() {
+        let mut docs = HashMap::new();
+        assert_eq!(
+            next_doc_sync(&mut docs, "file:///a.rs"),
+            DocSyncKind::Open(1)
+        );
+        assert_eq!(
+            next_doc_sync(&mut docs, "file:///a.rs"),
+            DocSyncKind::Change(2)
+        );
+        assert_eq!(
+            next_doc_sync(&mut docs, "file:///a.rs"),
+            DocSyncKind::Change(3)
+        );
+        assert_eq!(
+            next_doc_sync(&mut docs, "file:///b.rs"),
+            DocSyncKind::Open(1)
+        );
     }
 }

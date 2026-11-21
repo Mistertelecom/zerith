@@ -68,7 +68,7 @@ pub struct Completion {
 }
 
 /// Reuses HTTP/TLS connection pools across turns and steps for each timeout bucket.
-fn pooled_agent(timeout_ms: u64) -> ureq::Agent {
+pub fn pooled_agent(timeout_ms: u64) -> ureq::Agent {
     static POOL: OnceLock<Mutex<HashMap<u64, ureq::Agent>>> = OnceLock::new();
     let pool = POOL.get_or_init(Default::default);
     let mut guard = pool.lock().unwrap_or_else(|e| e.into_inner());

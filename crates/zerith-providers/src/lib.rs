@@ -28,7 +28,7 @@ pub use gateway::{
     infer_provider, is_failover_error, suggested_cooldown_ms, Gateway, GatewayOutcome, ModelSpec,
     RouteCandidate,
 };
-pub use openai::{Client, Completion, Probe, Usage};
+pub use openai::{pooled_agent as shared_http_agent, Client, Completion, Probe, Usage};
 pub use retry::RetryPolicy;
 
 use serde::{Deserialize, Serialize};

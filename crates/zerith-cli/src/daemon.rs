@@ -6,9 +6,11 @@
 //! Failed jobs or agent responses starting with `"ALERTA:"` dispatch Telegram
 //! notifications when `gateway.telegram` is configured.
 
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use zerith_core::{Paths, Settings};
 use zerith_mcp::McpRegistry;
@@ -25,6 +27,85 @@ use zerith_tools::Registry;
 
 use crate::headless::{provider_config, resolve_model};
 use crate::{signals, telegram};
+
+/// Single-instance PID lock file used by long-running daemons (`daemon`, `gateway`).
+pub(crate) struct PidLock {
+    path: PathBuf,
+}
+
+impl PidLock {
+    pub fn acquire(path: PathBuf) -> Result<Self, String> {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let pid = std::process::id();
+        for _ in 0..2 {
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(mut f) => {
+                    let _ = writeln!(f, "{pid}");
+                    return Ok(Self { path });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let old_pid = std::fs::read_to_string(&path)
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u32>().ok());
+                    if let Some(p) = old_pid.filter(|&p| pid_alive(p)) {
+                        return Err(format!(
+                            "outra instância já está ativa (PID {p}, lock em {})",
+                            path.display()
+                        ));
+                    }
+                    // Stale/dead lock file: clear and retry once.
+                    let _ = std::fs::remove_file(&path);
+                }
+                Err(e) => return Err(format!("falha ao criar lock {}: {e}", path.display())),
+            }
+        }
+        Err(format!("não consegui adquirir lock em {}", path.display()))
+    }
+}
+
+impl Drop for PidLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    if pid == std::process::id() {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Path::new(&format!("/proc/{pid}")).exists()
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+    #[cfg(windows)]
+    {
+        std::process::Command::new("tasklist")
+            .args(["/FO", "CSV", "/NH", "/FI", &format!("PID eq {pid}")])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+            .map(|o| {
+                let txt = String::from_utf8_lossy(&o.stdout);
+                txt.contains(&format!(",{pid},")) || txt.contains(&format!("\"{pid}\""))
+            })
+            .unwrap_or(false)
+    }
+}
 
 /// Returns `true` when `schedule` is enabled, its cron matches the current
 /// UTC minute (`now_secs`), and it has not already executed in that minute.
@@ -84,12 +165,13 @@ pub fn schedule_cmd(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::e
         }
         Some("run") => {
             let target = args.get(2).ok_or("uso: zerith schedule run <id|nome>")?;
+            let timeout_secs = parse_timeout_flag(&args[3..])?;
             let s = store
                 .schedule_get(target)?
                 .ok_or_else(|| format!("tarefa não encontrada: {target}"))?;
             let cancel = Cancel::default();
             signals::install(cancel.clone());
-            let (status, out) = run_one_schedule(paths, &store, &s, &cancel);
+            let (status, out) = run_one_schedule(paths, &store, &s, &cancel, timeout_secs);
             println!("[{status}] {}\n{out}", s.name);
             if status == "ok" {
                 Ok(())
@@ -224,9 +306,33 @@ fn schedule_list(store: &Store) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+const DEFAULT_CMD_TIMEOUT_SECS: u64 = 120;
+
+fn parse_timeout_flag(args: &[String]) -> Result<u64, Box<dyn std::error::Error>> {
+    let mut timeout_secs = DEFAULT_CMD_TIMEOUT_SECS;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--timeout-secs" => {
+                let v = args
+                    .get(i + 1)
+                    .ok_or("--timeout-secs precisa de um número")?;
+                timeout_secs = v
+                    .parse::<u64>()
+                    .map_err(|_| format!("--timeout-secs inválido: {v}"))?
+                    .clamp(10, 3600);
+                i += 2;
+            }
+            other => return Err(format!("opção desconhecida em schedule run: {other}").into()),
+        }
+    }
+    Ok(timeout_secs)
+}
+
 pub fn daemon_cmd(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut once = false;
     let mut poll_secs: u64 = 20;
+    let mut timeout_secs: u64 = DEFAULT_CMD_TIMEOUT_SECS;
 
     let mut i = 1;
     while i < args.len() {
@@ -243,19 +349,34 @@ pub fn daemon_cmd(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::err
                     .clamp(5, 60);
                 i += 2;
             }
+            "--timeout-secs" => {
+                let v = args
+                    .get(i + 1)
+                    .ok_or("--timeout-secs precisa de um número")?;
+                timeout_secs = v
+                    .parse::<u64>()
+                    .map_err(|_| format!("--timeout-secs inválido: {v}"))?
+                    .clamp(10, 3600);
+                i += 2;
+            }
             other => return Err(format!("opção desconhecida em daemon: {other}").into()),
         }
     }
 
     paths.ensure()?;
+    let _instance_lock = if !once {
+        Some(PidLock::acquire(paths.root().join("daemon.lock"))?)
+    } else {
+        None
+    };
     let store = Store::open(paths.db())?;
     let cancel = Cancel::default();
     signals::install(cancel.clone());
 
     if !once {
         eprintln!(
-            "zerith: daemon de agendamentos iniciado (poll={}s)",
-            poll_secs
+            "zerith: daemon de agendamentos iniciado (poll={}s, timeout={}s)",
+            poll_secs, timeout_secs
         );
     }
 
@@ -276,7 +397,8 @@ pub fn daemon_cmd(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::err
                             "zerith: executando agendamento `{}` ({})",
                             s.name, s.cron_expr
                         );
-                        let (status, _) = run_one_schedule(paths, &store, &s, &cancel);
+                        let (status, _) =
+                            run_one_schedule(paths, &store, &s, &cancel, timeout_secs);
                         eprintln!("zerith: agendamento `{}` finalizado: {status}", s.name);
                     }
                 }
@@ -309,11 +431,95 @@ fn maybe_alert_telegram(settings: &Settings, schedule_name: &str, status: &str, 
     }
 }
 
+fn run_command_with_timeout(
+    mut proc: std::process::Command,
+    timeout: Duration,
+    cancel: &Cancel,
+) -> std::result::Result<(bool, String), String> {
+    proc.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = proc
+        .spawn()
+        .map_err(|e| format!("falha ao iniciar comando: {e}"))?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let out_t = std::thread::spawn(move || -> Vec<u8> {
+        let mut buf = Vec::new();
+        if let Some(mut s) = stdout {
+            let _ = s.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let err_t = std::thread::spawn(move || -> Vec<u8> {
+        let mut buf = Vec::new();
+        if let Some(mut s) = stderr {
+            let _ = s.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break Ok(st),
+            Ok(None) => {
+                if cancel.is_cancelled() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break Err("execução cancelada".to_string());
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break Err(format!("timeout após {}s", timeout.as_secs()));
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err(format!("falha aguardando processo: {e}"));
+            }
+        }
+    };
+
+    let out_bytes = out_t.join().unwrap_or_default();
+    let err_bytes = err_t.join().unwrap_or_default();
+    let mut combined = String::from_utf8_lossy(&out_bytes).into_owned();
+    let err_txt = String::from_utf8_lossy(&err_bytes);
+    if !err_txt.trim().is_empty() {
+        if !combined.is_empty() && !combined.ends_with('\n') {
+            combined.push('\n');
+        }
+        combined.push_str(&err_txt);
+    }
+
+    match status {
+        Ok(st) => {
+            if st.success() {
+                Ok((true, combined))
+            } else {
+                let code = st
+                    .code()
+                    .map_or_else(|| "sinal".to_string(), |c| c.to_string());
+                Ok((false, format!("exit {code}\n{combined}")))
+            }
+        }
+        Err(why) => Err(if combined.trim().is_empty() {
+            why
+        } else {
+            format!("{why}\n{combined}")
+        }),
+    }
+}
+
 fn run_one_schedule(
     paths: &Paths,
     store: &Store,
     s: &Schedule,
     cancel: &Cancel,
+    timeout_secs: u64,
 ) -> (&'static str, String) {
     let ws = if s.workspace.trim().is_empty() {
         std::env::current_dir().unwrap_or_else(|_| paths.root().to_path_buf())
@@ -336,29 +542,10 @@ fn run_one_schedule(
             return ("error", msg);
         };
         let mut proc = zerith_tools::shell_command(cmd);
-        proc.current_dir(&ws).stdin(Stdio::null());
-        match proc.output() {
-            Ok(out) => {
-                let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
-                let err_txt = String::from_utf8_lossy(&out.stderr);
-                if !err_txt.trim().is_empty() {
-                    if !combined.is_empty() && !combined.ends_with('\n') {
-                        combined.push('\n');
-                    }
-                    combined.push_str(&err_txt);
-                }
-                if out.status.success() {
-                    ("ok", combined, false)
-                } else {
-                    let code = out
-                        .status
-                        .code()
-                        .map_or_else(|| "sinal".to_string(), |c| c.to_string());
-                    let msg = format!("exit {code}\n{combined}");
-                    ("error", msg, true)
-                }
-            }
-            Err(e) => ("error", format!("falha ao iniciar comando: {e}"), true),
+        proc.current_dir(&ws);
+        match run_command_with_timeout(proc, Duration::from_secs(timeout_secs), cancel) {
+            Ok((true, combined)) => ("ok", combined, false),
+            Ok((false, msg)) | Err(msg) => ("error", msg, true),
         }
     } else {
         match run_agent_schedule(paths, store, &settings, contrib.as_ref(), s, &ws, cancel) {
@@ -505,5 +692,43 @@ mod tests {
             &mk_schedule("*/5 * * * *", true, None),
             ts + 60
         ));
+    }
+
+    #[test]
+    fn pid_lock_blocks_duplicate_recovers_stale_and_cleans_on_drop() {
+        let dir = std::env::temp_dir().join(format!(
+            "zerith-pidlock-{}",
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock_path = dir.join("daemon.lock");
+
+        // Stale non-numeric lock recovers transparently.
+        std::fs::write(&lock_path, "stale-garbage").unwrap();
+        {
+            let _guard = PidLock::acquire(lock_path.clone()).unwrap();
+            assert!(lock_path.exists());
+            // Active lock in same process must fail.
+            assert!(PidLock::acquire(lock_path.clone()).is_err());
+        }
+        // Dropped -> removed cleanly.
+        assert!(!lock_path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn command_timeout_kills_slow_process() {
+        let cmd = if cfg!(windows) {
+            "ping -n 6 127.0.0.1"
+        } else {
+            "sleep 5"
+        };
+        let proc = zerith_tools::shell_command(cmd);
+        let cancel = Cancel::default();
+        let err = run_command_with_timeout(proc, Duration::from_millis(200), &cancel).unwrap_err();
+        assert!(err.contains("timeout"), "{err}");
     }
 }

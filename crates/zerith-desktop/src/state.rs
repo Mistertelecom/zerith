@@ -10,6 +10,7 @@ use std::time::UNIX_EPOCH;
 
 use zerith_core::Paths;
 use zerith_mcp::McpRegistry;
+use zerith_sessions::Store;
 
 type McpCacheEntry = ((PathBuf, u64), Arc<McpRegistry>);
 
@@ -98,11 +99,14 @@ pub fn mcp_config_fingerprint(root: &Path, workspace: &Path) -> u64 {
     h.finish()
 }
 
+type StoredConn = Mutex<Option<(PathBuf, Store)>>;
+
 /// Process-wide state handed to every command.
 #[derive(Clone)]
 pub struct AppState {
     root: PathBuf,
     mcp_cache: Arc<McpCache>,
+    store: Arc<StoredConn>,
 }
 
 impl AppState {
@@ -110,6 +114,7 @@ impl AppState {
         Self {
             root: root.into(),
             mcp_cache: Arc::new(McpCache::default()),
+            store: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -128,6 +133,32 @@ impl AppState {
 
     pub fn invalidate_mcp_cache(&self) {
         self.mcp_cache.invalidate();
+    }
+
+    /// Runs `f` against a cached SQLite [`Store`] connection for this `AppState`,
+    /// reopening transparently only if the DB path changed or no handle exists.
+    pub fn with_store<T>(&self, f: impl FnOnce(&Store) -> Result<T, String>) -> Result<T, String> {
+        let db = self.db();
+        let mut guard = self
+            .store
+            .lock()
+            .map_err(|_| "banco em estado inconsistente".to_string())?;
+        let needs_open = match guard.as_ref() {
+            Some((p, _)) => *p != db,
+            None => true,
+        };
+        if needs_open {
+            let st = Store::open(&db).map_err(|e| e.to_string())?;
+            *guard = Some((db, st));
+        }
+        let (_, store) = guard.as_ref().expect("store populated above");
+        f(store)
+    }
+
+    pub fn reset_store(&self) {
+        if let Ok(mut guard) = self.store.lock() {
+            *guard = None;
+        }
     }
 
     /// `<root>/zerith.db`: sessions, memory and usage in one file, as the CLI

@@ -397,10 +397,7 @@ fn respond(stream: &mut TcpStream, status: u16, body: &str) {
 }
 
 fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(15))
-        .timeout_read(Duration::from_secs(30))
-        .build()
+    crate::shared_http_agent(30_000)
 }
 
 fn post_form(url: &str, fields: &[(&str, &str)]) -> Result<String> {

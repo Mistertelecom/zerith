@@ -358,11 +358,7 @@ impl OpenRouter {
             self.agent.clone()
         } else {
             // A signed URL may redirect to a CDN; no key travels there.
-            ureq::AgentBuilder::new()
-                .timeout_connect(Duration::from_secs(15))
-                .timeout_read(Duration::from_secs(120))
-                .user_agent("zerith")
-                .build()
+            crate::shared_http_agent(120_000)
         };
         let scrub = key.clone();
         let limit = total.unwrap_or(Duration::from_secs(150)) + Duration::from_secs(5);

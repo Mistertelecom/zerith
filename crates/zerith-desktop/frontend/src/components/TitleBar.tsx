@@ -3,12 +3,14 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Copy, Minus, Square, X } from "lucide-react";
 import { ZerithMark } from "./ui";
 import { UpdatePill } from "./Update";
+import { tr, useLang } from "../lib/i18n";
 
 /** The window's own title bar: the native one is off (decorations: false) so
  * the bar can sit on the app's black. Empty space drags the window (Tauri's
  * data-tauri-drag-region), double click maximises. */
 export function TitleBar({ title, brand = false }: { title?: string; brand?: boolean }) {
   const [max, setMax] = useState(false);
+  const lang = useLang();
   useEffect(() => {
     let win: ReturnType<typeof getCurrentWindow> | null = null;
     try {
@@ -46,13 +48,34 @@ export function TitleBar({ title, brand = false }: { title?: string; brand?: boo
       {/* boot screens (brand) have no app yet to update */}
       {brand ? null : <UpdatePill />}
       <div className="titlebar-ctrls">
-        <button onClick={act((w) => w.minimize())} aria-label="Minimizar" title="Minimizar">
+        <button
+          onClick={act((w) => w.minimize())}
+          aria-label={tr(lang, "Minimizar", "Minimize")}
+          title={tr(lang, "Minimizar", "Minimize")}
+        >
           <Minus size={16} strokeWidth={1.5} />
         </button>
-        <button onClick={act((w) => w.toggleMaximize())} aria-label={max ? "Restaurar" : "Maximizar"} title={max ? "Restaurar" : "Maximizar"}>
+        <button
+          onClick={act((w) => w.toggleMaximize())}
+          aria-label={
+            max
+              ? tr(lang, "Restaurar", "Restore")
+              : tr(lang, "Maximizar", "Maximize")
+          }
+          title={
+            max
+              ? tr(lang, "Restaurar", "Restore")
+              : tr(lang, "Maximizar", "Maximize")
+          }
+        >
           {max ? <Copy size={13} strokeWidth={1.5} /> : <Square size={13} strokeWidth={1.5} />}
         </button>
-        <button className="close" onClick={act((w) => w.close())} aria-label="Fechar" title="Fechar">
+        <button
+          className="close"
+          onClick={act((w) => w.close())}
+          aria-label={tr(lang, "Fechar", "Close")}
+          title={tr(lang, "Fechar", "Close")}
+        >
           <X size={17} strokeWidth={1.5} />
         </button>
       </div>

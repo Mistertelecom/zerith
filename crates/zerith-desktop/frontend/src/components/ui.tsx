@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
-import type { LucideIcon } from "lucide-react";
+import { CircleAlert, CircleCheck, type LucideIcon } from "lucide-react";
+import type { ProbeView } from "../lib/api";
 
 // Provider marks. First choice: LobeHub's monochrome SVGs (assets/brand, MIT),
 // drawn in currentColor so they read on black and on white at any size.
@@ -223,6 +224,58 @@ export function EmptyState(props: { icon: LucideIcon; title: string; text?: stri
       <strong>{props.title}</strong>
       {props.text ? <p>{props.text}</p> : null}
       {props.children}
+    </div>
+  );
+}
+
+export function Field(props: {
+  label: string;
+  value: string;
+  onChange: (v: string) => void;
+  type?: string;
+  placeholder?: string;
+  hint?: string;
+}) {
+  return (
+    <label className="field">
+      <span className="field-label">{props.label}</span>
+      <input
+        type={props.type ?? "text"}
+        value={props.value}
+        placeholder={props.placeholder}
+        onChange={(e) => props.onChange(e.target.value)}
+      />
+      {props.hint ? <span className="field-hint">{props.hint}</span> : null}
+    </label>
+  );
+}
+
+export function ProbeResult({ probe }: { probe: ProbeView | null }) {
+  if (!probe) return null;
+  return (
+    <div className={"probe" + (probe.ok ? " ok" : " bad")} role="status">
+      {probe.ok ? (
+        <CircleCheck size={16} strokeWidth={1.75} />
+      ) : (
+        <CircleAlert size={16} strokeWidth={1.75} />
+      )}
+      <div>
+        <strong>
+          {probe.ok
+            ? "Conectado em " + probe.latency_ms + " ms"
+            : probe.status === 0
+              ? "Sem resposta (" + probe.latency_ms + " ms)"
+              : "HTTP " + probe.status + " em " + probe.latency_ms + " ms"}
+        </strong>
+        {probe.models.length ? (
+          <span className="probe-detail">
+            {probe.models.length} modelos disponíveis
+          </span>
+        ) : null}
+        {probe.detail ? (
+          <span className="probe-detail">{probe.detail}</span>
+        ) : null}
+      </div>
     </div>
   );
 }

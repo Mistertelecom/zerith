@@ -32,6 +32,7 @@ import {
 } from "lucide-react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { api } from "../lib/api";
+import { tr, useLang } from "../lib/i18n";
 import { Logo } from "./ui";
 
 /// An image waiting to go with the next message: saved already, so `path` is
@@ -126,6 +127,7 @@ export function Composer(props: {
   /** Extra pill at the head of the toolbar (the conversation's folder). */
   folder?: ReactNode;
 }) {
+  const lang = useLang();
   const box = useRef<HTMLTextAreaElement>(null);
   const [caret, setCaret] = useState(0);
   const [list, setList] = useState<string[] | null>(null);
@@ -414,8 +416,8 @@ export function Composer(props: {
             ref={box}
             rows={1}
             value={props.draft}
-            aria-label="Mensagem"
-            placeholder="Pergunte algo ao Zerith…"
+            aria-label={tr(lang, "Mensagem", "Message")}
+            placeholder={tr(lang, "Pergunte algo ao Zerith…", "Ask Zerith anything…")}
             onChange={(e) => {
               props.onDraft(e.target.value);
               setCaret(e.target.selectionStart ?? e.target.value.length);
@@ -477,8 +479,12 @@ export function Composer(props: {
             <button
               type="button"
               className="icon-btn sm"
-              aria-label="Anexar imagem"
-              title="Anexar imagem (ou cole / arraste)"
+              aria-label={tr(lang, "Anexar imagem", "Attach image")}
+              title={tr(
+                lang,
+                "Anexar imagem (ou cole / arraste)",
+                "Attach image (or paste / drag)",
+              )}
               onClick={() => picker.current?.click()}
             >
               <Paperclip size={16} strokeWidth={2} />
@@ -500,7 +506,7 @@ export function Composer(props: {
                 white OS window that spills out of the frame (and down). */}
             {props.folder}
             <PillMenu
-              label="Permissões"
+              label={tr(lang, "Permissões", "Permissions")}
               icon={<ShieldCheck size={14} strokeWidth={2} />}
               text={modeLabel}
               value={props.mode}
@@ -509,29 +515,29 @@ export function Composer(props: {
             />
             {props.onEffort ? (
               <PillMenu
-                label="Esforço"
+                label={tr(lang, "Esforço", "Effort")}
                 icon={<Brain size={14} strokeWidth={2} />}
                 text={
                   props.effort === "low"
-                    ? "Baixo"
+                    ? tr(lang, "Baixo", "Low")
                     : props.effort === "medium"
-                      ? "Médio"
+                      ? tr(lang, "Médio", "Medium")
                       : props.effort === "high"
-                        ? "Alto"
+                        ? tr(lang, "Alto", "High")
                         : "Off"
                 }
                 value={props.effort ?? "off"}
                 options={[
-                  { value: "off", label: "Off (padrão)" },
-                  { value: "low", label: "Baixo" },
-                  { value: "medium", label: "Médio" },
-                  { value: "high", label: "Alto" },
+                  { value: "off", label: tr(lang, "Off (padrão)", "Off (default)") },
+                  { value: "low", label: tr(lang, "Baixo", "Low") },
+                  { value: "medium", label: tr(lang, "Médio", "Medium") },
+                  { value: "high", label: tr(lang, "Alto", "High") },
                 ]}
                 onPick={props.onEffort}
               />
             ) : null}
             <PillMenu
-              label="Modelo"
+              label={tr(lang, "Modelo", "Model")}
               icon={
                 provider === "Perfil" ? (
                   <Layers size={16} strokeWidth={1.75} />
@@ -541,7 +547,7 @@ export function Composer(props: {
               }
               text={
                 current?.label.split(" · ")[1] ??
-                (props.model || "Escolha um modelo")
+                (props.model || tr(lang, "Escolha um modelo", "Choose a model"))
               }
               value={props.model}
               options={props.models}
@@ -558,8 +564,8 @@ export function Composer(props: {
                   <button
                     className="btn btn-primary send ready steer"
                     onClick={send}
-                    aria-label="Direcionar"
-                    title="Direcionar o turno atual"
+                    aria-label={tr(lang, "Direcionar", "Steer")}
+                    title={tr(lang, "Direcionar o turno atual", "Steer current turn")}
                   >
                     <ArrowUp size={16} strokeWidth={2.25} />
                   </button>
@@ -567,8 +573,8 @@ export function Composer(props: {
                 <button
                   className="send stop"
                   onClick={props.onCancel}
-                  aria-label="Parar"
-                  title="Parar"
+                  aria-label={tr(lang, "Parar", "Stop")}
+                  title={tr(lang, "Parar", "Stop")}
                 >
                   <Square size={12} strokeWidth={2} fill="currentColor" />
                 </button>
@@ -578,8 +584,8 @@ export function Composer(props: {
                 className={"btn btn-primary send" + (canSend ? " ready" : "")}
                 disabled={!canSend}
                 onClick={send}
-                aria-label="Enviar"
-                title="Enviar"
+                aria-label={tr(lang, "Enviar", "Send")}
+                title={tr(lang, "Enviar", "Send")}
               >
                 <ArrowUp size={16} strokeWidth={2.25} />
               </button>
@@ -607,10 +613,10 @@ export function Composer(props: {
           })() : null}
           <span className="hint-keys">
             <kbd className="kbd">Shift</kbd>
-            <kbd className="kbd">Tab</kbd> modo
+            <kbd className="kbd">Tab</kbd> {tr(lang, "modo", "mode")}
             <span className="hint-sep" />
             <kbd className="kbd">Ctrl</kbd>
-            <kbd className="kbd">K</kbd> comandos
+            <kbd className="kbd">K</kbd> {tr(lang, "comandos", "commands")}
           </span>
         </div>
       </div>

@@ -9,10 +9,12 @@ import {
   SquarePen,
 } from "lucide-react";
 import type { Session } from "../lib/api";
+import { tr, useLang } from "../lib/i18n";
 import { Logo, ZerithMark } from "./ui";
 
 const DAY = 86_400_000;
-const GROUPS = ["Hoje", "Ontem", "Últimos 7 dias", "Mais antigas"] as const;
+const GROUPS_PT = ["Hoje", "Ontem", "Últimos 7 dias", "Mais antigas"] as const;
+const GROUPS_EN = ["Today", "Yesterday", "Last 7 days", "Older"] as const;
 
 /** Which date group a session falls in, counted from local midnight. */
 function group(ms: number, today: number): number {
@@ -51,6 +53,7 @@ export function Sidebar(props: {
   status?: (id: string) => "busy" | "waiting" | null;
 }) {
   const { onNew } = props;
+  const lang = useLang();
 
   // Ctrl/⌘ N opens a new conversation, as the button's key hint promises.
   useEffect(() => {
@@ -73,7 +76,8 @@ export function Sidebar(props: {
     const q = props.query.trim().toLowerCase();
     const midnight = new Date();
     midnight.setHours(0, 0, 0, 0);
-    const out = GROUPS.map((label) => ({
+    const labels = lang === "en" ? GROUPS_EN : GROUPS_PT;
+    const out = labels.map((label) => ({
       label,
       rows: [] as { s: Session; time: string }[],
     }));
@@ -86,7 +90,7 @@ export function Sidebar(props: {
       out[g].rows.push({ s, time: when(ts, g) });
     }
     return out.filter((g) => g.rows.length > 0);
-  }, [props.sessions, props.query]);
+  }, [props.sessions, props.query, lang]);
 
   return (
     <aside className="sidebar">
@@ -97,7 +101,7 @@ export function Sidebar(props: {
 
       <button className="btn side-new" onClick={props.onNew}>
         <SquarePen size={16} strokeWidth={1.75} />
-        <span>Nova conversa</span>
+        <span>{tr(lang, "Nova conversa", "New chat")}</span>
         <span className="side-keys" aria-hidden>
           <kbd className="kbd">Ctrl</kbd>
           <kbd className="kbd">N</kbd>
@@ -108,20 +112,20 @@ export function Sidebar(props: {
         <Search size={14} strokeWidth={2} aria-hidden />
         <input
           value={props.query}
-          placeholder="Buscar conversas"
-          aria-label="Buscar conversas"
+          placeholder={tr(lang, "Buscar conversas", "Search chats")}
+          aria-label={tr(lang, "Buscar conversas", "Search chats")}
           onChange={(e) => props.onQuery(e.target.value)}
         />
       </label>
 
-      <nav className="side-list" aria-label="Conversas">
+      <nav className="side-list" aria-label={tr(lang, "Conversas", "Chats")}>
         {groups.length === 0 ? (
           <div className="side-empty">
             <MessageSquare size={18} strokeWidth={1.75} aria-hidden />
             <span>
               {props.query.trim()
-                ? "Nada encontrado"
-                : "Nenhuma conversa ainda"}
+                ? tr(lang, "Nada encontrado", "Nothing found")
+                : tr(lang, "Nenhuma conversa ainda", "No chats yet")}
             </span>
           </div>
         ) : (
@@ -143,11 +147,15 @@ export function Sidebar(props: {
                   {(() => {
                     const state = props.status?.(s.id);
                     if (!state) return null;
+                    const label =
+                      state === "waiting"
+                        ? tr(lang, "Esperando você", "Waiting for you")
+                        : tr(lang, "Respondendo", "Responding");
                     return (
                       <span
                         className={"side-row-state " + state}
-                        title={state === "waiting" ? "Esperando você" : "Respondendo"}
-                        aria-label={state === "waiting" ? "Esperando você" : "Respondendo"}
+                        title={label}
+                        aria-label={label}
                       >
                         {state === "waiting" ? "!" : <Loader size={11} strokeWidth={2.5} />}
                       </span>
@@ -165,22 +173,28 @@ export function Sidebar(props: {
         <button
           className="list-row side-foot-row"
           onClick={props.onToggleMemory}
-          title={props.memoryPaused ? "Retomar memória" : "Pausar memória"}
+          title={
+            props.memoryPaused
+              ? tr(lang, "Retomar memória", "Resume memory")
+              : tr(lang, "Pausar memória", "Pause memory")
+          }
         >
           <Brain size={16} strokeWidth={1.75} />
-          <span className="side-row-title">Memória</span>
+          <span className="side-row-title">{tr(lang, "Memória", "Memory")}</span>
           <span className="side-state">
             <span className={"dot" + (props.memoryPaused ? " warn" : " ok")} />
-            {props.memoryPaused ? "pausada" : "ativa"}
+            {props.memoryPaused
+              ? tr(lang, "pausada", "paused")
+              : tr(lang, "ativa", "active")}
           </span>
         </button>
         <button className="list-row side-foot-row" onClick={props.onQuotas}>
           <Gauge size={16} strokeWidth={1.75} />
-          <span className="side-row-title">Cotas</span>
+          <span className="side-row-title">{tr(lang, "Cotas", "Quotas")}</span>
         </button>
         <button className="list-row side-foot-row" onClick={props.onSettings}>
           <Settings size={16} strokeWidth={1.75} />
-          <span className="side-row-title">Ajustes</span>
+          <span className="side-row-title">{tr(lang, "Ajustes", "Settings")}</span>
         </button>
       </div>
     </aside>

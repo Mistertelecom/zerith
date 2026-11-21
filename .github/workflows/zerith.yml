@@ -61,6 +61,7 @@ jobs:
           node --experimental-strip-types scripts/markdown.check.ts
           node --experimental-strip-types scripts/title.check.ts
           node --experimental-strip-types scripts/turn.check.ts
+          node --experimental-strip-types scripts/highlight.check.ts
       - name: Smoke-test update signing script
         run: |
           set -euo pipefail

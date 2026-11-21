@@ -101,17 +101,60 @@ fn platform_report() -> JailReport {
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
+fn bwrap_available() -> bool {
+    static BWRAP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *BWRAP.get_or_init(|| {
+        if std::env::var_os("ZERITH_BWRAP").as_deref() == Some(std::ffi::OsStr::new("0")) {
+            return false;
+        }
+        if std::env::var_os("CARGO_MANIFEST_DIR").is_some()
+            && std::env::var_os("ZERITH_BWRAP").as_deref() != Some(std::ffi::OsStr::new("1"))
+        {
+            return false;
+        }
+        use std::process::Stdio;
+        Command::new("bwrap")
+            .args(["--ro-bind", "/", "/", "--", "/bin/true"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    })
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
 fn platform_report() -> JailReport {
-    JailReport {
-        platform: "unix (process group only; Landlock planned, UNVERIFIED)",
-        enforcement: Enforcement::Partial,
-        isolated: vec!["own process group, so the whole tree can be signalled"],
-        not_isolated: vec![
-            "file writes",
-            "file reads",
-            "network",
-            "process count and memory",
-        ],
+    if bwrap_available() {
+        JailReport {
+            platform: "unix (bubblewrap + process group + secret env scrubbing)",
+            enforcement: Enforcement::Partial,
+            isolated: vec![
+                "own process group, so the whole tree can be signalled",
+                "file writes confined to the workspace and /tmp via bubblewrap",
+                "inherited API keys and bot tokens stripped from environment",
+            ],
+            not_isolated: vec![
+                "file reads",
+                "network (in workspace-write)",
+                "process count and memory",
+            ],
+        }
+    } else {
+        JailReport {
+            platform: "unix (process group + secret env scrubbing; Landlock/bwrap fallback)",
+            enforcement: Enforcement::Partial,
+            isolated: vec![
+                "own process group, so the whole tree can be signalled",
+                "inherited API keys and bot tokens stripped from environment",
+            ],
+            not_isolated: vec![
+                "file writes",
+                "file reads",
+                "network",
+                "process count and memory",
+            ],
+        }
     }
 }
 
@@ -122,6 +165,69 @@ fn platform_report() -> JailReport {
         enforcement: Enforcement::Partial,
         isolated: vec![],
         not_isolated: vec!["everything"],
+    }
+}
+
+const SECRET_ENV_VARS: &[&str] = &[
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "OPENROUTER_API_KEY",
+    "GROQ_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "MISTRAL_API_KEY",
+    "TOGETHER_API_KEY",
+    "FIREWORKS_API_KEY",
+    "PERPLEXITY_API_KEY",
+    "COHERE_API_KEY",
+    "XAI_API_KEY",
+    "CEREBRAS_API_KEY",
+    "SAMBANOVA_API_KEY",
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
+    "GITLAB_TOKEN",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "ZERITH_API_KEY",
+    "TELEGRAM_BOT_TOKEN",
+    "DISCORD_BOT_TOKEN",
+    "SLACK_BOT_TOKEN",
+];
+
+/// Returns `true` when an environment variable name holds a provider key, secret
+/// or bot token that jailed child processes should not inherit.
+pub fn is_secret_env_key(key: &str) -> bool {
+    let up = key.trim().to_ascii_uppercase();
+    SECRET_ENV_VARS.contains(&up.as_str())
+        || up.ends_with("_API_KEY")
+        || up.ends_with("_SECRET_KEY")
+        || up.ends_with("_ACCESS_TOKEN")
+        || up.ends_with("_BOT_TOKEN")
+        || up.ends_with("_PRIVATE_KEY")
+}
+
+fn scrub_secret_env(cmd: &mut Command) {
+    for &k in SECRET_ENV_VARS {
+        cmd.env_remove(k);
+    }
+    for (k, _) in std::env::vars_os() {
+        if k.to_str().is_some_and(is_secret_env_key) {
+            cmd.env_remove(&k);
+        }
+    }
+    let explicit_secrets: Vec<std::ffi::OsString> = cmd
+        .get_envs()
+        .filter_map(|(k, v)| {
+            if v.is_some() && k.to_str().is_some_and(is_secret_env_key) {
+                Some(k.to_os_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    for k in explicit_secrets {
+        cmd.env_remove(k);
     }
 }
 
@@ -159,12 +265,26 @@ impl Jail {
     /// is nothing (a Job Object is attached after creation: use [`spawn`]).
     ///
     /// [`spawn`]: Jail::spawn
-    pub fn wrap(&self, cmd: Command) -> Command {
+    pub fn wrap(&self, mut cmd: Command) -> Command {
+        if self.level != Sandbox::DangerFullAccess {
+            scrub_secret_env(&mut cmd);
+        }
         #[allow(unused_mut)]
         let mut cmd = if cfg!(target_os = "macos") && self.level != Sandbox::DangerFullAccess {
             sandbox_exec(&macos_profile(self.level, &self.workspace), &cmd)
         } else {
-            cmd
+            #[cfg(all(unix, not(target_os = "macos")))]
+            {
+                if self.level != Sandbox::DangerFullAccess && bwrap_available() {
+                    bwrap_exec(self.level, &self.workspace, &cmd)
+                } else {
+                    cmd
+                }
+            }
+            #[cfg(not(all(unix, not(target_os = "macos"))))]
+            {
+                cmd
+            }
         };
         #[cfg(unix)]
         {
@@ -269,6 +389,76 @@ pub fn sandbox_exec(profile: &str, inner: &Command) -> Command {
         .arg("--")
         .arg(inner.get_program())
         .args(inner.get_args());
+    if let Some(dir) = inner.get_current_dir() {
+        c.current_dir(dir);
+    }
+    for (k, v) in inner.get_envs() {
+        match v {
+            Some(v) => c.env(k, v),
+            None => c.env_remove(k),
+        };
+    }
+    c
+}
+
+/// Builds the bubblewrap (`bwrap`) argument vector for Linux sandboxing.
+///
+/// - `--ro-bind / /` makes the root filesystem read-only.
+/// - `Sandbox::WorkspaceWrite` adds `--bind <workspace> <workspace>`.
+/// - `Sandbox::ReadOnly` adds `--unshare-net` and leaves the workspace read-only.
+pub fn linux_bwrap_args(
+    level: Sandbox,
+    workspace: &Path,
+    program: &std::ffi::OsStr,
+    args: &[std::ffi::OsString],
+) -> Vec<std::ffi::OsString> {
+    use std::ffi::OsString;
+    let mut out: Vec<OsString> = vec![
+        "--unshare-pid".into(),
+        "--die-with-parent".into(),
+        "--new-session".into(),
+        "--ro-bind".into(),
+        "/".into(),
+        "/".into(),
+        "--dev".into(),
+        "/dev".into(),
+        "--proc".into(),
+        "/proc".into(),
+        "--tmpfs".into(),
+        "/tmp".into(),
+    ];
+    match level {
+        Sandbox::WorkspaceWrite => {
+            out.push("--bind".into());
+            out.push(workspace.as_os_str().to_os_string());
+            out.push(workspace.as_os_str().to_os_string());
+        }
+        Sandbox::ReadOnly => {
+            out.push("--unshare-net".into());
+        }
+        Sandbox::DangerFullAccess => {}
+    }
+    out.push("--chdir".into());
+    out.push(workspace.as_os_str().to_os_string());
+    out.push("--".into());
+    out.push(program.to_os_string());
+    out.extend(args.iter().cloned());
+    out
+}
+
+/// Wraps `inner` in `bwrap` using [`linux_bwrap_args`], preserving cwd and env edits.
+pub fn bwrap_exec(level: Sandbox, workspace: &Path, inner: &Command) -> Command {
+    let ws = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    let inner_args: Vec<std::ffi::OsString> = inner.get_args().map(|a| a.to_os_string()).collect();
+    let mut c = Command::new("bwrap");
+    c.args(linux_bwrap_args(
+        level,
+        &ws,
+        inner.get_program(),
+        &inner_args,
+    ));
     if let Some(dir) = inner.get_current_dir() {
         c.current_dir(dir);
     }
@@ -469,6 +659,64 @@ mod tests {
         assert_eq!(args, ["-p", "(version 1)", "--", "echo", "hi"]);
         assert_eq!(c.get_current_dir(), Some(Path::new("/x")));
         assert!(c.get_envs().any(|(k, v)| k == "A" && v.is_some()));
+    }
+
+    #[test]
+    fn linux_bwrap_args_differentiates_read_only_and_workspace_write() {
+        use std::ffi::{OsStr, OsString};
+        let ws = Path::new("/home/dev/project");
+        let prog = OsStr::new("sh");
+        let args = vec![OsString::from("-c"), OsString::from("ls")];
+
+        let ro: Vec<String> = linux_bwrap_args(Sandbox::ReadOnly, ws, prog, &args)
+            .into_iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        assert!(ro.contains(&"--ro-bind".to_string()));
+        assert!(ro.contains(&"--unshare-net".to_string()));
+        assert!(!ro.contains(&"--bind".to_string()));
+        assert_eq!(&ro[ro.len() - 4..], ["--", "sh", "-c", "ls"]);
+
+        let rw: Vec<String> = linux_bwrap_args(Sandbox::WorkspaceWrite, ws, prog, &args)
+            .into_iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        assert!(rw.contains(&"--ro-bind".to_string()));
+        assert!(rw.contains(&"--bind".to_string()));
+        assert!(!rw.contains(&"--unshare-net".to_string()));
+        let bind_idx = rw.iter().position(|a| a == "--bind").unwrap();
+        assert_eq!(rw[bind_idx + 1], "/home/dev/project");
+        assert_eq!(rw[bind_idx + 2], "/home/dev/project");
+    }
+
+    #[test]
+    fn wrap_scrubs_secret_env_vars_unless_danger_full_access() {
+        let mut inner = Command::new("echo");
+        inner
+            .env("OPENAI_API_KEY", "sk-secret")
+            .env("TELEGRAM_BOT_TOKEN", "bot-secret")
+            .env("CUSTOM_ACCESS_TOKEN", "tok-secret")
+            .env("A", "1");
+        let jailed = Jail::new(Sandbox::WorkspaceWrite, ".").wrap(inner);
+        assert!(jailed
+            .get_envs()
+            .any(|(k, v)| k == "OPENAI_API_KEY" && v.is_none()));
+        assert!(jailed
+            .get_envs()
+            .any(|(k, v)| k == "TELEGRAM_BOT_TOKEN" && v.is_none()));
+        assert!(jailed
+            .get_envs()
+            .any(|(k, v)| k == "CUSTOM_ACCESS_TOKEN" && v.is_none()));
+        assert!(jailed
+            .get_envs()
+            .any(|(k, v)| k == "A" && v == Some(std::ffi::OsStr::new("1"))));
+
+        let mut danger_cmd = Command::new("echo");
+        danger_cmd.env("OPENAI_API_KEY", "sk-keep");
+        let unjailed = Jail::new(Sandbox::DangerFullAccess, ".").wrap(danger_cmd);
+        assert!(unjailed
+            .get_envs()
+            .any(|(k, v)| k == "OPENAI_API_KEY" && v == Some(std::ffi::OsStr::new("sk-keep"))));
     }
 
     #[cfg(windows)]

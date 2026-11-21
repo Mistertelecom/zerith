@@ -386,6 +386,7 @@ fn run_cmd(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Err
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| paths.root().to_path_buf()));
 
     paths.ensure()?;
+    let _instance_lock = crate::daemon::PidLock::acquire(paths.root().join("telegram.lock"))?;
     let main_store = Store::open(paths.db())?;
 
     let cancel = Cancel::default();
@@ -411,7 +412,7 @@ fn run_cmd(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Err
         allowed.len()
     );
 
-    let mut offset: i64 = 0;
+    let mut offset: i64 = load_offset(&main_store);
     while !cancel.is_cancelled() {
         let updates = match post_json(
             &poll_agent,
@@ -435,6 +436,7 @@ fn run_cmd(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Err
             continue;
         };
 
+        let prev_offset = offset;
         for upd in items {
             if let Some(uid) = upd["update_id"].as_i64() {
                 offset = offset.max(uid + 1);
@@ -568,9 +570,28 @@ fn run_cmd(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Err
                 }
             });
         }
+        if offset > prev_offset {
+            save_offset(&main_store, offset);
+        }
     }
 
     Ok(())
+}
+
+const TELEGRAM_OFFSET_KEY: &str = "telegram.offset";
+
+fn load_offset(store: &Store) -> i64 {
+    store
+        .setting(TELEGRAM_OFFSET_KEY)
+        .ok()
+        .flatten()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|&n| n >= 0)
+        .unwrap_or(0)
+}
+
+fn save_offset(store: &Store, offset: i64) {
+    let _ = store.set_setting(TELEGRAM_OFFSET_KEY, &offset.to_string());
 }
 
 fn handle_callback(
@@ -791,5 +812,15 @@ mod tests {
         );
         assert!(!cleaned.contains("ABC-SecretToken"), "{cleaned}");
         assert!(cleaned.contains("<redacted>"), "{cleaned}");
+    }
+
+    #[test]
+    fn telegram_offset_persists_in_store() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(load_offset(&store), 0);
+        save_offset(&store, 4219);
+        assert_eq!(load_offset(&store), 4219);
+        save_offset(&store, 9900);
+        assert_eq!(load_offset(&store), 9900);
     }
 }

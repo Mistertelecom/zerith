@@ -12,7 +12,7 @@
     {
       "name": "zerith-netops",
       "description": "Consultoria de redes, ISP/Telecom e engenharia de infraestrutura: troubleshooting BGP/OSPF/MPLS/EVPN/CGNAT/PPPoE multi-vendor (Cisco, Huawei, Juniper, MikroTik), VPNs WireGuard multi-cliente, janelas de mudança segura com rollback e auditoria de hardening de borda.",
-      "version": "0.2.6",
+      "version": "0.2.7",
       "category": "networking",
       "license": "GPL-3.0-only",
       "homepage": "https://github.com/Mistertelecom/zerith",
@@ -21,11 +21,38 @@
     {
       "name": "zerith-proxmox",
       "description": "Administração avançada de Proxmox VE (KVM/QEMU, LXC, Cluster Corosync, HA), Storage (ZFS, Ceph, LVM-Thin), Proxmox Backup Server (PBS), SDN/Linux Bridges VLAN-aware e VMs Linux corporativas.",
-      "version": "0.2.6",
+      "version": "0.2.7",
       "category": "infrastructure",
       "license": "GPL-3.0-only",
       "homepage": "https://github.com/Mistertelecom/zerith",
       "source": "./plugins/zerith-proxmox"
+    },
+    {
+      "name": "zerith-noc-observability",
+      "description": "Observabilidade e NOC para provedores e empresas: Zabbix API (JSON-RPC), LibreNMS, Grafana, Prometheus (PromQL), SNMPv2/v3 (IF-MIB 64-bit, sensores ópticos DOM/dBm), NetFlow/sFlow/IPFIX e correlação de incidentes.",
+      "version": "0.2.7",
+      "category": "observability",
+      "license": "GPL-3.0-only",
+      "homepage": "https://github.com/Mistertelecom/zerith",
+      "source": "./plugins/zerith-noc-observability"
+    },
+    {
+      "name": "zerith-ftth-olt",
+      "description": "Engenharia e operação de redes ópticas FTTH GPON/XGS-PON: OLTs Huawei SmartAX (MA5800/MA5600T), ZTE (C300/C320/C600/C620), FiberHome, Datacom DmOS e Nokia, diagnóstico de sinal dBm, Rogue ONU e integração BNG/PPPoE.",
+      "version": "0.2.7",
+      "category": "networking",
+      "license": "GPL-3.0-only",
+      "homepage": "https://github.com/Mistertelecom/zerith",
+      "source": "./plugins/zerith-ftth-olt"
+    },
+    {
+      "name": "zerith-linux-devops",
+      "description": "Engenharia de sistemas Linux, DevOps e serviços críticos de provedores/empresas: DNS (Unbound/Bind9), FreeRADIUS + SQL, Accel-PPP, Docker/K3s, Nginx/Traefik/HAProxy, PostgreSQL/MariaDB tuning e otimização de kernel sysctl.",
+      "version": "0.2.7",
+      "category": "infrastructure",
+      "license": "GPL-3.0-only",
+      "homepage": "https://github.com/Mistertelecom/zerith",
+      "source": "./plugins/zerith-linux-devops"
     },
     {
       "name": "superpowers",

@@ -1,6 +1,6 @@
 {
   "name": "zerith-netops",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "description": "Consultoria de redes, ISP/Telecom e infraestrutura: troubleshooting BGP/OSPF/MPLS/EVPN/CGNAT/PPPoE (Cisco, Huawei, Juniper, MikroTik), janelas de manutenção segura com rollback e auditoria de hardening de borda.",
   "author": {
     "name": "Joao Pedro Mota (Mistertelecom)"

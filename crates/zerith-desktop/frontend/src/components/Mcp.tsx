@@ -98,6 +98,16 @@ const MCP_PRESETS: {
     env: "PROXMOX_HOST=10.0.0.10\nPROXMOX_USER=root@pam\nPROXMOX_TOKEN_NAME=zerith\nPROXMOX_TOKEN_VALUE=",
   },
   {
+    id: "zabbix",
+    label: "Zabbix NOC MCP",
+    category: "NetOps",
+    hint: "Consulta incidentes, hosts, triggers, histórico SNMP/óptico e templates na API do Zabbix",
+    kind: "stdio",
+    command: "uvx zabbix-mcp-server",
+    url: "",
+    env: "ZABBIX_URL=https://zabbix.lan/api_jsonrpc.php\nZABBIX_TOKEN=",
+  },
+  {
     id: "netbox",
     label: "NetBox (IPAM/DCIM)",
     category: "NetOps",

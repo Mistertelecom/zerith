@@ -1,0 +1,10 @@
+{
+  "name": "zerith-linux-devops",
+  "version": "0.2.7",
+  "description": "Engenharia de sistemas Linux, DevOps e serviços críticos de provedores/empresas: DNS (Unbound/Bind9), FreeRADIUS + SQL, Accel-PPP, Docker/K3s, Nginx/Traefik/HAProxy, PostgreSQL/MariaDB tuning e otimização de kernel sysctl.",
+  "author": {
+    "name": "Joao Pedro Mota (Mistertelecom)"
+  },
+  "homepage": "https://github.com/Mistertelecom/zerith",
+  "license": "GPL-3.0-only"
+}

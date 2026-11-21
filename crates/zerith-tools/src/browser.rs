@@ -1,23 +1,29 @@
-//! `browser`: drives a real Chromium (Edge/Chrome) over the DevTools protocol.
+//! `browser`: drives a browser over the Chrome DevTools Protocol (CDP),
+//! supporting both **Cloudflare Kitesurf** (lightweight stateless Rust/Wasm
+//! agent browser via `workerd` / CDP WebSocket) and a local **Chromium**
+//! (Edge/Chrome) instance with a persistent `<data>/browser-profile`.
 //!
-//! One browser per data folder, started on first use with its own profile
-//! (`<data>/browser-profile`) and left running: every call, and every process
-//! (each `zerith tools call` is one), reattaches through the
-//! `DevToolsActivePort` file Chromium writes in that profile. The protocol is
-//! spoken over a minimal WebSocket client on `std::net` (localhost only, no
-//! TLS), one request at a time under a global lock.
+//! Routing rules (`BrowserEngine::Auto`, default):
+//! - Local, LAN (RFC1918), ISP CGNAT (`100.64.0.0/10`) and `.local`/`.lan`
+//!   addresses always route to the local Chromium browser so device WebGUIs
+//!   (MikroTik WebFig, FortiGate, Huawei, Unifi, Zabbix, Proxmox) and local
+//!   dev servers have full SPA/WebGL support and persistent login cookies.
+//! - Public web URLs route to Kitesurf when a Kitesurf CDP endpoint is
+//!   configured (`[browser] kitesurf_url` in `settings.toml`,
+//!   `ZERITH_KITESURF_URL`, or `ZERITH_BROWSER_CDP_URL`), falling back
+//!   automatically to local Chromium if Kitesurf is unreachable or fails.
 
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
+use std::net::{Ipv4Addr, Ipv6Addr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
-use zerith_core::Paths;
+use zerith_core::{BrowserEngine, Paths, Settings};
 use zerith_providers::media::{b64_decode, b64_encode};
 use zerith_security::Action;
 
@@ -29,16 +35,18 @@ const TEXT_CAP: usize = 15_000;
 /// Socket poll interval: how often a blocked read looks at cancel/deadline.
 const POLL: Duration = Duration::from_millis(200);
 const MAX_MESSAGE: usize = 64 << 20;
+const DEFAULT_KITESURF_URL: &str = "ws://127.0.0.1:8787/cdp";
 
 pub(crate) fn all() -> Vec<Box<dyn Tool>> {
     vec![make_with(
         "browser",
-        "Controla um navegador real (Edge/Chrome) pelo DevTools: abre páginas, lê o conteúdo, clica, digita, roda JavaScript e tira prints. \
+        "Controla um navegador via Chrome DevTools Protocol (CDP): abre páginas, lê o conteúdo, clica, digita, roda JavaScript e tira prints. \
+Suporta motor híbrido (`engine`): `auto` (padrão: usa Cloudflare Kitesurf para páginas públicas quando configurado e Chromium local para IPs de LAN/CGNAT/localhost ou como fallback automático), `kitesurf` (motor leve Wasm/Blitz) ou `chromium` (Edge/Chrome local com perfil persistente). \
 Fluxo: navigate {url} → snapshot (título, texto visível e lista numerada de elementos [n]) → click/type com ref=n → snapshot de novo para ver o resultado. \
-O navegador fica aberto entre chamadas, com perfil próprio do Zerith (logins feitos nele continuam valendo). \
 screenshot devolve uma linha Markdown ![screenshot](caminho) para mostrar ao usuário.",
         json!({"type": "object", "properties": {
             "action": {"type": "string", "enum": ["navigate", "snapshot", "click", "type", "press", "eval", "screenshot", "back", "close"]},
+            "engine": {"type": "string", "enum": ["auto", "kitesurf", "chromium"], "description": "motor CDP: auto (Kitesurf na web pública com fallback Chromium; Chromium direto em LAN/CGNAT/localhost), kitesurf ou chromium"},
             "url": {"type": "string", "description": "navigate: endereço http(s)"},
             "ref": {"type": "integer", "description": "click/type: número [n] do elemento no último snapshot"},
             "selector": {"type": "string", "description": "click/type: seletor CSS, alternativa ao ref"},
@@ -47,7 +55,7 @@ screenshot devolve uma linha Markdown ![screenshot](caminho) para mostrar ao usu
             "key": {"type": "string", "description": "press: Enter, Tab, Escape, Backspace, Delete, ArrowUp/Down/Left/Right, PageUp, PageDown, Home, End, Space ou um caractere"},
             "expression": {"type": "string", "description": "eval: expressão JavaScript; o valor volta como JSON (promises são aguardadas)"}
         }, "required": ["action"]}),
-        "navigate/click/type/press/back: título e URL da página; snapshot: texto visível e elementos numerados; eval: o valor; screenshot: caminho do PNG e linha Markdown",
+        "navigate/click/type/press/back: título, motor ativo e URL da página; snapshot: texto visível e elementos numerados; eval: o valor; screenshot: caminho do PNG e linha Markdown",
         Permission::Network,
         60,
         false,
@@ -82,16 +90,270 @@ fn bad_action(a: &str) -> ToolError {
 
 static SESSION: Mutex<Option<Cdp>> = Mutex::new(None);
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BackendKind {
+    Chromium { port: u16 },
+    Kitesurf { endpoint: String },
+}
+
+impl BackendKind {
+    fn badge(&self) -> &'static str {
+        match self {
+            Self::Chromium { .. } => "Chromium",
+            Self::Kitesurf { .. } => "Kitesurf",
+        }
+    }
+}
+
+/// Extracts the hostname from an `http(s)://` URL (or bare `host/path`),
+/// stripping port and IPv6 brackets.
+fn extract_url_host(url: &str) -> Option<String> {
+    let trimmed = url.trim();
+    let after_scheme = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .or_else(|| trimmed.strip_prefix("ws://"))
+        .or_else(|| trimmed.strip_prefix("wss://"))
+        .unwrap_or(trimmed);
+    let authority = after_scheme.split(['/', '?', '#']).next()?;
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, hp)| hp)
+        .trim();
+    if host_port.is_empty() {
+        return None;
+    }
+    if let Some(rest) = host_port.strip_prefix('[') {
+        let end = rest.find(']')?;
+        return Some(rest[..end].to_ascii_lowercase());
+    }
+    let host = host_port
+        .split_once(':')
+        .map_or(host_port, |(h, _)| h)
+        .trim();
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_ascii_lowercase())
+    }
+}
+
+/// Returns `true` when `url` targets `localhost`, RFC1918 private LANs,
+/// ISP CGNAT (`100.64.0.0/10`), link-local addresses, or `.local`/`.lan`
+/// mDNS/internal hostnames that require the local Chromium instance.
+pub fn is_private_or_local_url(url: &str) -> bool {
+    let Some(host) = extract_url_host(url) else {
+        return false;
+    };
+    if host == "localhost"
+        || host.ends_with(".localhost")
+        || host.ends_with(".local")
+        || host.ends_with(".lan")
+        || host.ends_with(".internal")
+        || host.ends_with(".home.arpa")
+        || host.ends_with(".corp")
+        || host.ends_with(".intranet")
+        || (!host.contains('.') && !host.contains(':'))
+    {
+        return true;
+    }
+    if let Ok(ip) = host.parse::<Ipv4Addr>() {
+        let oct = ip.octets();
+        let is_cgnat = oct[0] == 100 && (oct[1] & 0b1100_0000) == 64;
+        return ip.is_loopback()
+            || ip.is_private()
+            || ip.is_link_local()
+            || ip.is_unspecified()
+            || is_cgnat;
+    }
+    if let Ok(ip) = host.parse::<Ipv6Addr>() {
+        let seg0 = ip.segments()[0];
+        let is_ula = (seg0 & 0xfe00) == 0xfc00;
+        let is_ll = (seg0 & 0xffc0) == 0xfe80;
+        return ip.is_loopback() || ip.is_unspecified() || is_ula || is_ll;
+    }
+    false
+}
+
+/// Parses a Kitesurf/CDP endpoint (`ws://host:port/path`, `http://host:port`,
+/// or `host:port/path`) into `(host, port, path)`.
+pub fn parse_cdp_endpoint(raw: &str) -> Result<(String, u16, String)> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return Err(ToolError::BadArguments(
+            "endpoint CDP do Kitesurf vazio".into(),
+        ));
+    }
+    if s.starts_with("wss://") || s.starts_with("https://") {
+        return Err(ToolError::BadArguments(
+            "endpoint CDP local deve usar ws:// ou http:// (ou aponte para o túnel local workerd)"
+                .into(),
+        ));
+    }
+    let without_scheme = s
+        .strip_prefix("ws://")
+        .or_else(|| s.strip_prefix("http://"))
+        .unwrap_or(s);
+    let (host_port, raw_path) = match without_scheme.find('/') {
+        Some(idx) => (&without_scheme[..idx], &without_scheme[idx..]),
+        None => (without_scheme, ""),
+    };
+    let (host, port) = if let Some(rest) = host_port.strip_prefix('[') {
+        let end = rest
+            .find(']')
+            .ok_or_else(|| ToolError::BadArguments(format!("endpoint CDP inválido: {s}")))?;
+        let h = &rest[..end];
+        let after = &rest[end + 1..];
+        let p = if let Some(p_str) = after.strip_prefix(':') {
+            p_str
+                .parse::<u16>()
+                .map_err(|_| ToolError::BadArguments(format!("porta CDP inválida em {s}")))?
+        } else {
+            8787
+        };
+        (h.to_string(), p)
+    } else if let Some((h, p_str)) = host_port.rsplit_once(':') {
+        let p = p_str
+            .parse::<u16>()
+            .map_err(|_| ToolError::BadArguments(format!("porta CDP inválida em {s}")))?;
+        (h.trim().to_string(), p)
+    } else {
+        (host_port.trim().to_string(), 8787)
+    };
+    if host.is_empty() {
+        return Err(ToolError::BadArguments(format!(
+            "host ausente no endpoint CDP: {s}"
+        )));
+    }
+    let path = if raw_path.is_empty() || raw_path == "/" {
+        "/cdp".to_string()
+    } else {
+        raw_path.to_string()
+    };
+    Ok((host, port, path))
+}
+
+/// Decides which engine to use and whether automatic fallback to local Chromium
+/// is enabled.
+pub fn select_target_engine(
+    requested: BrowserEngine,
+    kitesurf_url: Option<&str>,
+    target_url: Option<&str>,
+) -> (BrowserEngine, bool) {
+    match requested {
+        BrowserEngine::Chromium => (BrowserEngine::Chromium, false),
+        BrowserEngine::Kitesurf => (BrowserEngine::Kitesurf, false),
+        BrowserEngine::Auto => {
+            if target_url.is_some_and(is_private_or_local_url) {
+                (BrowserEngine::Chromium, false)
+            } else if kitesurf_url.is_some_and(|u| !u.trim().is_empty()) {
+                (BrowserEngine::Kitesurf, true)
+            } else {
+                (BrowserEngine::Chromium, false)
+            }
+        }
+    }
+}
+
+fn resolve_browser_config(args: &Value) -> Result<(BrowserEngine, Option<String>, bool)> {
+    let paths = Paths::resolve();
+    let settings = Settings::load(&paths, None).settings;
+    let mut engine = settings.browser.engine;
+    if let Ok(env_eng) = std::env::var("ZERITH_BROWSER_ENGINE") {
+        if !env_eng.trim().is_empty() {
+            engine = BrowserEngine::parse(&env_eng).ok_or_else(|| {
+                ToolError::BadArguments(format!(
+                    "ZERITH_BROWSER_ENGINE inválido: {env_eng} (use auto, kitesurf ou chromium)"
+                ))
+            })?;
+        }
+    }
+    if let Some(arg_eng) = opt_str(args, "engine") {
+        engine = BrowserEngine::parse(arg_eng).ok_or_else(|| {
+            ToolError::BadArguments(format!(
+                "engine inválido: {arg_eng} (use auto, kitesurf ou chromium)"
+            ))
+        })?;
+    }
+    let kitesurf_url = std::env::var("ZERITH_KITESURF_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            std::env::var("ZERITH_BROWSER_CDP_URL")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        })
+        .or_else(|| {
+            settings
+                .browser
+                .kitesurf_url
+                .filter(|s| !s.trim().is_empty())
+        });
+    let headless = settings.browser.headless
+        || std::env::var("ZERITH_BROWSER_HEADLESS").is_ok_and(|v| v == "1");
+    Ok((engine, kitesurf_url, headless))
+}
+
 fn run(args: &Value, _: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
     let action = str_arg(args, "action")?;
     let root = Paths::resolve().root;
     let profile = root.join("browser-profile");
     let mut slot = SESSION.lock().unwrap_or_else(|e| e.into_inner());
     if action == "close" {
+        let was_kitesurf = slot
+            .as_ref()
+            .is_some_and(|c| matches!(c.backend, BackendKind::Kitesurf { .. }));
         *slot = None;
+        if was_kitesurf && live_port(&profile).is_none() {
+            return Ok("Sessão Kitesurf encerrada.".into());
+        }
         return close(&profile, exec);
     }
-    let c = attach(&mut slot, &profile, exec)?;
+
+    let (requested_engine, kitesurf_url, headless) = resolve_browser_config(args)?;
+    let nav_target = if action == "navigate" {
+        Some(nav_url(str_arg(args, "url")?)?)
+    } else {
+        None
+    };
+
+    // For non-navigate actions without an explicit `engine` override, stay on
+    // whichever engine currently holds the active page session.
+    let (primary, allow_fallback) =
+        if action != "navigate" && opt_str(args, "engine").is_none() && slot.is_some() {
+            let current = match slot.as_ref().unwrap().backend {
+                BackendKind::Kitesurf { .. } => BrowserEngine::Kitesurf,
+                BackendKind::Chromium { .. } => BrowserEngine::Chromium,
+            };
+            (current, false)
+        } else {
+            select_target_engine(
+                requested_engine,
+                kitesurf_url.as_deref(),
+                nav_target.as_deref(),
+            )
+        };
+
+    if primary == BrowserEngine::Kitesurf {
+        let endpoint = kitesurf_url.as_deref().unwrap_or(DEFAULT_KITESURF_URL);
+        match attach_kitesurf(&mut slot, endpoint, exec)
+            .and_then(|c| act(c, action, args, &root, exec))
+        {
+            Ok(out) => return Ok(out),
+            Err(err) => {
+                *slot = None;
+                if !allow_fallback
+                    || matches!(err, ToolError::Cancelled | ToolError::BadArguments(_))
+                {
+                    return Err(err);
+                }
+                // Automatic fallback to local Chromium when Kitesurf is
+                // unavailable or fails to render a public page in Auto mode.
+            }
+        }
+    }
+
+    let c = attach_chromium(&mut slot, &profile, headless, exec)?;
     let r = act(c, action, args, &root, exec);
     // A broken socket (or a frame cut by cancel/timeout) is not reusable.
     if matches!(
@@ -407,14 +669,23 @@ fn browser_exe() -> Option<PathBuf> {
     candidates.iter().map(PathBuf::from).find(|p| p.exists())
 }
 
-fn http(port: u16, method: &str, path: &str) -> io::Result<Value> {
+fn http_host(host: &str, port: u16, method: &str, path: &str) -> io::Result<Value> {
+    let authority = if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
     ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(3))
         .build()
-        .request(method, &format!("http://127.0.0.1:{port}{path}"))
+        .request(method, &format!("http://{authority}{path}"))
         .call()
         .map_err(|e| io::Error::other(e.to_string()))?
         .into_json()
+}
+
+fn http(port: u16, method: &str, path: &str) -> io::Result<Value> {
+    http_host("127.0.0.1", port, method, path)
 }
 
 fn file_port(profile: &Path) -> Option<u16> {
@@ -443,7 +714,7 @@ fn pages(port: u16) -> io::Result<Vec<String>> {
         .collect())
 }
 
-fn launch(profile: &Path, exec: &Exec<'_>) -> Result<u16> {
+fn launch(profile: &Path, headless: bool, exec: &Exec<'_>) -> Result<u16> {
     let exe = browser_exe().ok_or_else(|| {
         ToolError::Failed(
             "nenhum Edge/Chrome/Chromium encontrado; defina ZERITH_BROWSER com o caminho do executável"
@@ -456,7 +727,7 @@ fn launch(profile: &Path, exec: &Exec<'_>) -> Result<u16> {
     cmd.arg("--remote-debugging-port=0")
         .arg(format!("--user-data-dir={}", profile.display()))
         .args(["--no-first-run", "--no-default-browser-check"]);
-    if std::env::var("ZERITH_BROWSER_HEADLESS").is_ok_and(|v| v == "1") {
+    if headless {
         cmd.arg("--headless=new");
     }
     // ponytail: never killed here; it outlives this process so the next call
@@ -480,20 +751,95 @@ fn launch(profile: &Path, exec: &Exec<'_>) -> Result<u16> {
     ))
 }
 
+fn discover_kitesurf_path(host: &str, port: u16, default_path: &str) -> String {
+    if let Ok(list) = http_host(host, port, "GET", "/json/list") {
+        if let Some(arr) = list.as_array() {
+            for item in arr {
+                if let Some(ws_url) = item["webSocketDebuggerUrl"].as_str() {
+                    if let Ok((_, _, p)) = parse_cdp_endpoint(ws_url) {
+                        return p;
+                    }
+                }
+                if let Some(id) = item["id"].as_str() {
+                    return format!("/devtools/page/{id}");
+                }
+            }
+        }
+    }
+    if let Ok(ver) = http_host(host, port, "GET", "/json/version") {
+        if let Some(ws_url) = ver["webSocketDebuggerUrl"].as_str() {
+            if let Ok((_, _, p)) = parse_cdp_endpoint(ws_url) {
+                return p;
+            }
+        }
+    }
+    default_path.to_string()
+}
+
+/// Attaches to a Cloudflare Kitesurf CDP endpoint (`workerd` / WebSocket),
+/// reusing the existing socket when already connected to the same endpoint.
+fn attach_kitesurf<'a>(
+    slot: &'a mut Option<Cdp>,
+    raw_endpoint: &str,
+    exec: &Exec<'_>,
+) -> Result<&'a mut Cdp> {
+    let (host, port, raw_path) = parse_cdp_endpoint(raw_endpoint)?;
+    let key = format!("{host}:{port}{raw_path}");
+    if slot.as_ref().is_some_and(
+        |c| !matches!(&c.backend, BackendKind::Kitesurf { endpoint } if endpoint == &key),
+    ) {
+        *slot = None;
+    }
+    if slot.is_none() {
+        let ws_path = if raw_endpoint.trim().starts_with("http://") {
+            discover_kitesurf_path(&host, port, &raw_path)
+        } else {
+            raw_path
+        };
+        let ws = Ws::connect_host(&host, port, &ws_path).map_err(|e| fail(exec, e))?;
+        let mut c = Cdp {
+            ws,
+            backend: BackendKind::Kitesurf {
+                endpoint: key.clone(),
+            },
+            target: ws_path,
+            frame: String::new(),
+            id: 0,
+            seen: Vec::new(),
+        };
+        // Kitesurf implements a streamlined CDP subset; tolerate missing
+        // frame-tree metadata on stateless isolates.
+        let _ = c.call("Page.enable", json!({}), exec);
+        if let Ok(tree) = c.call("Page.getFrameTree", json!({}), exec) {
+            c.frame = tree["frameTree"]["frame"]["id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+        }
+        *slot = Some(c);
+    }
+    Ok(slot.as_mut().expect("kitesurf session set above"))
+}
+
 /// The session for the current page: reused while its tab exists, else a
 /// fresh connection to the first tab (launching the browser if none runs).
-fn attach<'a>(slot: &'a mut Option<Cdp>, profile: &Path, exec: &Exec<'_>) -> Result<&'a mut Cdp> {
+fn attach_chromium<'a>(
+    slot: &'a mut Option<Cdp>,
+    profile: &Path,
+    headless: bool,
+    exec: &Exec<'_>,
+) -> Result<&'a mut Cdp> {
     let (port, list) = match file_port(profile).and_then(|p| pages(p).ok().map(|l| (p, l))) {
         Some(x) => x,
         None => {
-            let p = launch(profile, exec)?;
+            let p = launch(profile, headless, exec)?;
             (p, pages(p).map_err(|e| fail(exec, e))?)
         }
     };
-    if slot
-        .as_ref()
-        .is_some_and(|c| c.port != port || !list.contains(&c.target))
-    {
+    if slot.as_ref().is_some_and(|c| {
+        !matches!(c.backend, BackendKind::Chromium { port: cp } if cp == port)
+            || !list.contains(&c.target)
+    }) {
         *slot = None;
     }
     if slot.is_none() {
@@ -508,7 +854,7 @@ fn attach<'a>(slot: &'a mut Option<Cdp>, profile: &Path, exec: &Exec<'_>) -> Res
             Ws::connect(port, &format!("/devtools/page/{target}")).map_err(|e| fail(exec, e))?;
         let mut c = Cdp {
             ws,
-            port,
+            backend: BackendKind::Chromium { port },
             target,
             frame: String::new(),
             id: 0,
@@ -552,7 +898,7 @@ fn fail(exec: &Exec<'_>, e: io::Error) -> ToolError {
 
 struct Cdp {
     ws: Ws,
-    port: u16,
+    backend: BackendKind,
     target: String,
     /// Main frame id: events of other frames do not count as navigation.
     frame: String,
@@ -584,10 +930,11 @@ impl Cdp {
         let v: Value = serde_json::from_str(&text)?;
         if let Some(m) = v["method"].as_str() {
             let p = &v["params"];
-            if p["frameId"]
-                .as_str()
-                .or(p["frame"]["id"].as_str())
-                .is_none_or(|f| f == self.frame)
+            if self.frame.is_empty()
+                || p["frameId"]
+                    .as_str()
+                    .or(p["frame"]["id"].as_str())
+                    .is_none_or(|f| f == self.frame)
             {
                 self.seen.push(m.to_string());
                 if self.seen.len() > 64 {
@@ -636,7 +983,8 @@ impl Cdp {
     fn page(&mut self, exec: &Exec<'_>) -> Result<String> {
         let v = self.eval("[document.title, location.href]", exec)?;
         Ok(format!(
-            "Página: {} — {}",
+            "Página [{}]: {} — {}",
+            self.backend.badge(),
             v["value"][0].as_str().unwrap_or(""),
             v["value"][1].as_str().unwrap_or("")
         ))
@@ -701,16 +1049,29 @@ struct Ws {
 
 impl Ws {
     fn connect(port: u16, path: &str) -> io::Result<Ws> {
-        let s = TcpStream::connect(("127.0.0.1", port))?;
+        Self::connect_host("127.0.0.1", port, path)
+    }
+
+    fn connect_host(host: &str, port: u16, path: &str) -> io::Result<Ws> {
+        let addr = (host, port)
+            .to_socket_addrs()?
+            .next()
+            .ok_or_else(|| io::Error::other(format!("não resolveu {host}:{port}")))?;
+        let s = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
         s.set_read_timeout(Some(Duration::from_secs(5)))?;
         s.set_write_timeout(Some(Duration::from_secs(10)))?;
         let mut w = s.try_clone()?;
         let key = b64_encode(&random::<16>());
+        let host_hdr = if host.contains(':') {
+            format!("[{host}]:{port}")
+        } else {
+            format!("{host}:{port}")
+        };
         // No Origin header: Chromium refuses DevTools sockets with an
         // unlisted Origin, and accepts them without one.
         write!(
             w,
-            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+            "GET {path} HTTP/1.1\r\nHost: {host_hdr}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
              Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
         )?;
         let mut r = BufReader::new(s);
@@ -937,5 +1298,98 @@ mod tests {
             label(&json!({"action": "navigate", "url": "https://a.b"})).unwrap(),
             "navegador navigate https://a.b"
         );
+    }
+
+    #[test]
+    fn lan_cgnat_and_localhost_urls_route_to_local_chromium() {
+        for local_url in [
+            "http://localhost:5183",
+            "https://127.0.0.1:8443/login",
+            "http://[::1]:3000",
+            "https://192.168.1.1/webfig/",
+            "https://10.20.30.1:4443",
+            "http://172.16.0.1",
+            "http://172.31.255.254",
+            "http://100.64.10.1:8080",
+            "http://100.127.255.1",
+            "https://olt01.core.lan",
+            "http://mikrotik.local",
+            "http://router",
+        ] {
+            assert!(
+                is_private_or_local_url(local_url),
+                "expected local/private classification for {local_url}"
+            );
+            assert_eq!(
+                select_target_engine(
+                    BrowserEngine::Auto,
+                    Some("ws://127.0.0.1:8787/cdp"),
+                    Some(local_url)
+                ),
+                (BrowserEngine::Chromium, false),
+                "Auto must route {local_url} directly to local Chromium"
+            );
+        }
+
+        for public_url in [
+            "https://cloudflare.com",
+            "https://docs.rs/tokio/latest",
+            "https://1.1.1.1",
+            "http://172.32.0.1",
+            "http://100.128.0.1",
+        ] {
+            assert!(
+                !is_private_or_local_url(public_url),
+                "expected public classification for {public_url}"
+            );
+            assert_eq!(
+                select_target_engine(
+                    BrowserEngine::Auto,
+                    Some("ws://127.0.0.1:8787/cdp"),
+                    Some(public_url)
+                ),
+                (BrowserEngine::Kitesurf, true),
+                "Auto with Kitesurf URL must route {public_url} to Kitesurf with Chromium fallback"
+            );
+            assert_eq!(
+                select_target_engine(BrowserEngine::Auto, None, Some(public_url)),
+                (BrowserEngine::Chromium, false),
+                "Auto without Kitesurf URL defaults to Chromium"
+            );
+        }
+
+        assert_eq!(
+            select_target_engine(BrowserEngine::Kitesurf, None, Some("https://192.168.1.1")),
+            (BrowserEngine::Kitesurf, false)
+        );
+        assert_eq!(
+            select_target_engine(
+                BrowserEngine::Chromium,
+                Some("ws://127.0.0.1:8787/cdp"),
+                Some("https://cloudflare.com")
+            ),
+            (BrowserEngine::Chromium, false)
+        );
+    }
+
+    #[test]
+    fn kitesurf_cdp_endpoints_parse_cleanly() {
+        assert_eq!(
+            parse_cdp_endpoint("ws://127.0.0.1:8787/cdp").unwrap(),
+            ("127.0.0.1".into(), 8787, "/cdp".into())
+        );
+        assert_eq!(
+            parse_cdp_endpoint("http://localhost:8787").unwrap(),
+            ("localhost".into(), 8787, "/cdp".into())
+        );
+        assert_eq!(
+            parse_cdp_endpoint("127.0.0.1:9222/devtools/page/abc").unwrap(),
+            ("127.0.0.1".into(), 9222, "/devtools/page/abc".into())
+        );
+        assert_eq!(
+            parse_cdp_endpoint("ws://[::1]:8787/cdp").unwrap(),
+            ("::1".into(), 8787, "/cdp".into())
+        );
+        assert!(parse_cdp_endpoint("").is_err());
     }
 }

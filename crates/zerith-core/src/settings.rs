@@ -58,6 +58,57 @@ pub struct Settings {
     pub gateway: GatewaySettings,
     #[serde(default, skip_serializing_if = "RemoteSettings::is_empty")]
     pub remote: RemoteSettings,
+    #[serde(default, skip_serializing_if = "BrowserSettings::is_default")]
+    pub browser: BrowserSettings,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BrowserEngine {
+    /// Uses Kitesurf for public web pages when configured or reachable,
+    /// and local Chromium for LAN/CGNAT/localhost URLs or as automatic fallback.
+    #[default]
+    Auto,
+    /// Forces Cloudflare Kitesurf CDP engine.
+    Kitesurf,
+    /// Forces local Chromium (Edge/Chrome) with persistent `<root>/browser-profile`.
+    Chromium,
+}
+
+impl BrowserEngine {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "kitesurf" => Some(Self::Kitesurf),
+            "chromium" | "chrome" | "edge" => Some(Self::Chromium),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Kitesurf => "kitesurf",
+            Self::Chromium => "chromium",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BrowserSettings {
+    pub engine: BrowserEngine,
+    /// Kitesurf CDP endpoint (`ws://127.0.0.1:8787/cdp` or `http://127.0.0.1:8787`).
+    /// Env override: `ZERITH_KITESURF_URL` or `ZERITH_BROWSER_CDP_URL`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kitesurf_url: Option<String>,
+    pub headless: bool,
+}
+
+impl BrowserSettings {
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

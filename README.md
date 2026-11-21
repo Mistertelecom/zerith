@@ -13,7 +13,7 @@
 
   <p>
     <a href="https://github.com/Mistertelecom/zerith/releases">
-      <img alt="Release v0.2.1" src="https://img.shields.io/badge/version-v0.2.1-111827?style=flat-square" />
+      <img alt="Release v0.2.2" src="https://img.shields.io/badge/version-v0.2.2-111827?style=flat-square" />
     </a>
     <a href="https://github.com/Mistertelecom/zerith/actions/workflows/zerith.yml">
       <img alt="CI Status" src="https://github.com/Mistertelecom/zerith/actions/workflows/zerith.yml/badge.svg" />
@@ -69,7 +69,7 @@ It combines human-in-the-loop tool governance, a native multi-account LLM gatewa
 
 ---
 
-## What's Inside (v0.2.1)
+## What's Inside (v0.2.2)
 
 ### 1. Speed, Prompt Caching & Native Gateway
 - **Native Multi-Account LLM Gateway (`zerith-providers`):** Direct support for OpenAI, Anthropic, Codex (OAuth), Antigravity (OAuth), DeepSeek, Gemini, OpenRouter, Ollama, LM Studio, and custom OpenAI/Anthropic endpoints—with per-account quotas, cooldowns, combos, and automatic failover.

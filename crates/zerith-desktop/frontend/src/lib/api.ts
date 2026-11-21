@@ -890,6 +890,9 @@ export interface TerminalSnapshot {
   device: string | null;
   host: string | null;
   role: string | null;
+  client: string | null;
+  vpn: string | null;
+  transport: string | null;
   idleSecs: number;
 }
 

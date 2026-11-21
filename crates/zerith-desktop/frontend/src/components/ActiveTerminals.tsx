@@ -1,7 +1,7 @@
 // Active interactive terminals (`terminal_open`, `net_connect`) with live tail
-// inspection, Ctrl+C interrupt (including in-flight commands), and close actions.
+// inspection, client/VPN/transport badges, command history, quick keys, and log copy.
 import { useCallback, useEffect, useState } from "react";
-import { Eye, EyeOff, Send, Square, Terminal, X } from "lucide-react";
+import { Check, Copy, Eye, EyeOff, Send, Square, Terminal, X } from "lucide-react";
 import {
   onTerminalsChanged,
   terminalsApi,
@@ -22,6 +22,9 @@ export function ActiveTerminals({ active }: { active: boolean }) {
   const [tailText, setTailText] = useState<string>("");
   const [cmd, setCmd] = useState("");
   const [sending, setSending] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [historyByTerm, setHistoryByTerm] = useState<Record<string, string[]>>({});
+  const [histCursor, setHistCursor] = useState<number>(-1);
 
   const refresh = useCallback(() => {
     terminalsApi
@@ -56,17 +59,28 @@ export function ActiveTerminals({ active }: { active: boolean }) {
 
   const pullTail = useCallback((id: string) => {
     void terminalsApi
-      .tail(id, 4096)
+      .tail(id, 16384)
       .then(setTailText)
       .catch(() => setTailText(""));
   }, []);
 
   useEffect(() => {
     if (!openTail) return;
+    setHistCursor(-1);
     pullTail(openTail);
-    const t = setInterval(() => pullTail(openTail), 1500);
+    const t = setInterval(() => pullTail(openTail), 1000);
     return () => clearInterval(t);
   }, [openTail, pullTail]);
+
+  const sendRaw = useCallback(
+    (id: string, raw: string) => {
+      void terminalsApi
+        .send(id, raw)
+        .then(() => setTimeout(() => pullTail(id), 150))
+        .catch(() => undefined);
+    },
+    [pullTail],
+  );
 
   if (!items.length) return null;
 
@@ -77,15 +91,28 @@ export function ActiveTerminals({ active }: { active: boolean }) {
           ? `${t.device}${t.host ? ` (${t.host})` : ""}`
           : t.command;
         const expanded = openTail === t.id;
+        const transportLabel = (t.transport || (t.command.startsWith("telnet://") ? "telnet" : "ssh")).toUpperCase();
+        const termHist = historyByTerm[t.id] ?? [];
         return (
           <div key={t.id} className="term-block">
             <div className="job-row">
               <span className="job-icon" aria-hidden>
                 <Terminal size={14} strokeWidth={2} />
               </span>
+              <span className="term-badge">{transportLabel}</span>
               <code className="job-cmd" title={t.command}>
                 {label}
               </code>
+              {t.client ? (
+                <span className="term-badge" title={tr(lang, "Cliente", "Client")}>
+                  {t.client}
+                </span>
+              ) : null}
+              {t.vpn ? (
+                <span className="term-badge" title="WireGuard VPN">
+                  VPN: {t.vpn}
+                </span>
+              ) : null}
               {t.vendor || t.role ? (
                 <span className="term-badge">
                   {[t.vendor, t.role].filter(Boolean).join(" · ")}
@@ -99,13 +126,13 @@ export function ActiveTerminals({ active }: { active: boolean }) {
                 className="btn btn-sm"
                 title={
                   expanded
-                    ? tr(lang, "Ocultar saída", "Hide output")
-                    : tr(lang, "Ver tail ao vivo", "View live tail")
+                    ? tr(lang, "Ocultar console", "Hide console")
+                    : tr(lang, "Abrir console ao vivo", "Open live console")
                 }
                 onClick={() => setOpenTail(expanded ? null : t.id)}
               >
                 {expanded ? <EyeOff size={13} /> : <Eye size={13} />}
-                Tail
+                Console
               </button>
               <button
                 className="btn btn-sm"
@@ -139,13 +166,20 @@ export function ActiveTerminals({ active }: { active: boolean }) {
                   onSubmit={(e) => {
                     e.preventDefault();
                     if (!cmd.trim() || sending) return;
+                    const trimmedCmd = cmd.trim();
                     const text = cmd + "\n";
                     setSending(true);
+                    setHistoryByTerm((prev) => {
+                      const prevList = prev[t.id] ?? [];
+                      const nextList = [trimmedCmd, ...prevList.filter((x) => x !== trimmedCmd)].slice(0, 40);
+                      return { ...prev, [t.id]: nextList };
+                    });
+                    setHistCursor(-1);
                     void terminalsApi
                       .send(t.id, text)
                       .then(() => {
                         setCmd("");
-                        pullTail(t.id);
+                        setTimeout(() => pullTail(t.id), 120);
                       })
                       .catch(() => undefined)
                       .finally(() => setSending(false));
@@ -154,9 +188,61 @@ export function ActiveTerminals({ active }: { active: boolean }) {
                   <input
                     value={cmd}
                     onChange={(e) => setCmd(e.target.value)}
-                    placeholder={tr(lang, "Enviar entrada + Enter…", "Send input + Enter…")}
+                    onKeyDown={(e) => {
+                      if (e.key === "ArrowUp" && termHist.length > 0) {
+                        e.preventDefault();
+                        const nextIdx = Math.min(histCursor + 1, termHist.length - 1);
+                        setHistCursor(nextIdx);
+                        setCmd(termHist[nextIdx]);
+                      } else if (e.key === "ArrowDown") {
+                        e.preventDefault();
+                        if (histCursor <= 0) {
+                          setHistCursor(-1);
+                          setCmd("");
+                        } else {
+                          const nextIdx = histCursor - 1;
+                          setHistCursor(nextIdx);
+                          setCmd(termHist[nextIdx]);
+                        }
+                      }
+                    }}
+                    placeholder={tr(
+                      lang,
+                      "Comando + Enter (↑/↓ histórico)…",
+                      "Command + Enter (↑/↓ history)…",
+                    )}
                     aria-label={tr(lang, "Enviar entrada ao terminal", "Send input to terminal")}
                   />
+                  <button
+                    className="btn btn-sm"
+                    type="button"
+                    title={tr(lang, "Enviar ? (ajuda de CLI Cisco/Huawei)", "Send ? (CLI help)")}
+                    onClick={() => sendRaw(t.id, "?")}
+                  >
+                    ?
+                  </button>
+                  <button
+                    className="btn btn-sm"
+                    type="button"
+                    title={tr(lang, "Enviar Espaço (avançar página --More--)", "Send Space (next page)")}
+                    onClick={() => sendRaw(t.id, " ")}
+                  >
+                    Space
+                  </button>
+                  <button
+                    className="btn btn-sm"
+                    type="button"
+                    title={tr(lang, "Copiar log do console", "Copy console log")}
+                    onClick={() => {
+                      if (!tailText) return;
+                      void navigator.clipboard?.writeText(tailText);
+                      setCopied(true);
+                      setTimeout(() => setCopied(false), 1500);
+                    }}
+                  >
+                    {copied ? <Check size={12} /> : <Copy size={12} />}
+                    {copied ? tr(lang, "Copiado", "Copied") : "Log"}
+                  </button>
                   <button
                     className="btn btn-sm"
                     type="submit"

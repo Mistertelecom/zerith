@@ -21,7 +21,7 @@ use zerith_security::Action;
 use crate::fntool::{make_with, opt_str, str_arg};
 use crate::{CallCtx, Exec, Permission, Result, Tool, ToolError};
 
-const MAX_OPEN: usize = 6;
+const MAX_OPEN: usize = 24;
 const MAX_AUTO_PAGES: usize = 64;
 const LOOP_TAIL_BYTES: usize = 4096;
 const IDLE_REAP: Duration = Duration::from_secs(20 * 60);
@@ -658,7 +658,7 @@ fn collect(
     let (mut progress_at, mut last_emit) = (0usize, Instant::now());
     let (mut pages, mut page_at) = (0usize, 0usize);
     let note = loop {
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(12));
         let now = len();
         if now != last {
             (last, changed) = (now, Instant::now());
@@ -712,14 +712,18 @@ fn collect(
             }
         }
         let pager_waiting = auto_page && pages < MAX_AUTO_PAGES && looks_like_pager(&tail_clean);
+        let prompt_settle = if tail_clean.contains('\n') {
+            Duration::from_millis(80)
+        } else {
+            Duration::from_millis(120)
+        };
         let done = !pager_waiting
             && match expect {
                 Some(re) => re.is_match(&tail_clean),
                 None => {
                     now > 0
                         && (quiet >= Duration::from_secs(2)
-                            || (quiet >= Duration::from_millis(400)
-                                && looks_like_prompt(&tail_clean)))
+                            || (quiet >= prompt_settle && looks_like_prompt(&tail_clean)))
                 }
             };
         if done {
@@ -824,8 +828,214 @@ fn clean(raw: &[u8]) -> String {
 
 type Spawned = (Proc, Box<dyn Write + Send>, Box<dyn Read + Send>);
 
+enum Proc {
+    Os(OsProc),
+    Socket {
+        alive: Arc<AtomicBool>,
+        stream: std::net::TcpStream,
+    },
+}
+
+impl Proc {
+    fn alive(&self) -> bool {
+        match self {
+            Self::Os(p) => p.alive(),
+            Self::Socket { alive, .. } => alive.load(Ordering::SeqCst),
+        }
+    }
+
+    fn kill(&mut self) {
+        match self {
+            Self::Os(p) => p.kill(),
+            Self::Socket { alive, stream } => {
+                alive.store(false, Ordering::SeqCst);
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
+        }
+    }
+}
+
+/// Processes raw Telnet RFC 854 stream bytes, stripping IAC negotiation
+/// sequences and generating immediate negotiation replies (including NAWS
+/// 250x60 window size so router output never wraps at 80 columns).
+pub(crate) fn strip_and_reply_telnet_iac(raw: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let mut clean_out = Vec::with_capacity(raw.len());
+    let mut replies = Vec::new();
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i] != 0xFF {
+            clean_out.push(raw[i]);
+            i += 1;
+            continue;
+        }
+        if i + 1 >= raw.len() {
+            break;
+        }
+        let cmd = raw[i + 1];
+        match cmd {
+            0xFF => {
+                clean_out.push(0xFF);
+                i += 2;
+            }
+            // IAC DO <opt>
+            0xFD => {
+                if i + 2 >= raw.len() {
+                    break;
+                }
+                let opt = raw[i + 2];
+                if opt == 0x03 {
+                    // SUPPRESS-GO-AHEAD -> IAC WILL SGA
+                    replies.extend_from_slice(&[0xFF, 0xFB, 0x03]);
+                } else if opt == 0x1F {
+                    // NAWS -> IAC WILL NAWS + subnegotiation 250x60
+                    replies.extend_from_slice(&[
+                        0xFF, 0xFB, 0x1F, 0xFF, 0xFA, 0x1F, 0x00, 250, 0x00, 60, 0xFF, 0xF0,
+                    ]);
+                } else {
+                    // IAC WONT <opt>
+                    replies.extend_from_slice(&[0xFF, 0xFC, opt]);
+                }
+                i += 3;
+            }
+            // IAC WILL <opt>
+            0xFB => {
+                if i + 2 >= raw.len() {
+                    break;
+                }
+                let opt = raw[i + 2];
+                if opt == 0x01 || opt == 0x03 {
+                    // ECHO or SGA -> IAC DO <opt>
+                    replies.extend_from_slice(&[0xFF, 0xFD, opt]);
+                } else {
+                    // IAC DONT <opt>
+                    replies.extend_from_slice(&[0xFF, 0xFE, opt]);
+                }
+                i += 3;
+            }
+            // IAC WONT / IAC DONT
+            0xFC | 0xFE => {
+                if i + 2 >= raw.len() {
+                    break;
+                }
+                i += 3;
+            }
+            // IAC SB ... IAC SE
+            0xFA => {
+                i += 2;
+                while i + 1 < raw.len() {
+                    if raw[i] == 0xFF && raw[i + 1] == 0xF0 {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            _ => {
+                i += 2;
+            }
+        }
+    }
+    (clean_out, replies)
+}
+
+struct TelnetReader {
+    stream: std::net::TcpStream,
+    alive: Arc<AtomicBool>,
+}
+
+impl Read for TelnetReader {
+    fn read(&mut self, out_buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut raw = [0u8; 4096];
+        loop {
+            let n = match self.stream.read(&mut raw) {
+                Ok(0) => {
+                    self.alive.store(false, Ordering::SeqCst);
+                    return Ok(0);
+                }
+                Ok(n) => n,
+                Err(e) => {
+                    self.alive.store(false, Ordering::SeqCst);
+                    return Err(e);
+                }
+            };
+            let (clean_bytes, reply) = strip_and_reply_telnet_iac(&raw[..n]);
+            if !reply.is_empty() {
+                let _ = self.stream.write_all(&reply);
+                let _ = self.stream.flush();
+            }
+            if !clean_bytes.is_empty() {
+                let copy_len = clean_bytes.len().min(out_buf.len());
+                out_buf[..copy_len].copy_from_slice(&clean_bytes[..copy_len]);
+                return Ok(copy_len);
+            }
+        }
+    }
+}
+
+struct TelnetWriter {
+    stream: std::net::TcpStream,
+}
+
+impl Write for TelnetWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut norm = Vec::with_capacity(buf.len() + 2);
+        for (idx, &b) in buf.iter().enumerate() {
+            if b == b'\r' && buf.get(idx + 1).copied() != Some(b'\n') {
+                norm.extend_from_slice(b"\r\n");
+            } else {
+                norm.push(b);
+            }
+        }
+        self.stream.write_all(&norm)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.flush()
+    }
+}
+
+fn spawn_telnet(target: &str) -> std::io::Result<Spawned> {
+    use std::net::{TcpStream, ToSocketAddrs};
+    let trimmed = target.trim();
+    let (host, port) = match trimmed.rsplit_once(':') {
+        Some((h, p)) if !h.is_empty() && !h.contains(':') => {
+            let port = p.parse::<u16>().unwrap_or(23);
+            (h, port)
+        }
+        _ => (trimmed, 23u16),
+    };
+    let addr = (host, port)
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| std::io::Error::other(format!("DNS não resolveu {host}:{port}")))?;
+    let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(10))?;
+    let _ = stream.set_nodelay(true);
+    let r_stream = stream.try_clone()?;
+    let w_stream = stream.try_clone()?;
+    let alive = Arc::new(AtomicBool::new(true));
+    Ok((
+        Proc::Socket {
+            alive: alive.clone(),
+            stream,
+        },
+        Box::new(TelnetWriter { stream: w_stream }),
+        Box::new(TelnetReader {
+            stream: r_stream,
+            alive,
+        }),
+    ))
+}
+
+fn spawn(command: &str, cwd: &std::path::Path) -> std::io::Result<Spawned> {
+    if let Some(target) = command.trim().strip_prefix("telnet://") {
+        return spawn_telnet(target);
+    }
+    spawn_os(command, cwd)
+}
+
 #[cfg(windows)]
-struct Proc {
+struct OsProc {
     hpc: isize,
     process: windows_sys::Win32::Foundation::HANDLE,
 }
@@ -833,10 +1043,10 @@ struct Proc {
 // SAFETY: the handles are plain kernel handles, used from one thread at a time
 // (a session is taken out of the table while a call works on it).
 #[cfg(windows)]
-unsafe impl Send for Proc {}
+unsafe impl Send for OsProc {}
 
 #[cfg(windows)]
-impl Proc {
+impl OsProc {
     fn alive(&self) -> bool {
         use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
         use windows_sys::Win32::System::Threading::WaitForSingleObject;
@@ -864,7 +1074,7 @@ impl Proc {
 /// The program under a ConPTY: it sees a real console (so ssh asks for the
 /// password, a REPL shows its prompt) and we see the console's VT output.
 #[cfg(windows)]
-fn spawn(command: &str, cwd: &std::path::Path) -> std::io::Result<Spawned> {
+fn spawn_os(command: &str, cwd: &std::path::Path) -> std::io::Result<Spawned> {
     use std::fs::File;
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::FromRawHandle;
@@ -961,10 +1171,10 @@ fn spawn(command: &str, cwd: &std::path::Path) -> std::io::Result<Spawned> {
         }
         CloseHandle(pi.hThread);
         Ok((
-            Proc {
+            Proc::Os(OsProc {
                 hpc,
                 process: pi.hProcess,
-            },
+            }),
             Box::new(File::from_raw_handle(in_w as _)),
             Box::new(File::from_raw_handle(out_r as _)),
         ))
@@ -972,10 +1182,10 @@ fn spawn(command: &str, cwd: &std::path::Path) -> std::io::Result<Spawned> {
 }
 
 #[cfg(not(windows))]
-struct Proc(std::process::Child);
+struct OsProc(std::process::Child);
 
 #[cfg(not(windows))]
-impl Proc {
+impl OsProc {
     fn alive(&self) -> bool {
         // try_wait needs &mut; a zero-signal kill answers "still there?".
         std::process::Command::new("kill")
@@ -993,7 +1203,7 @@ impl Proc {
 
 /// `script` gives the program a pseudo-terminal without a pty crate.
 #[cfg(not(windows))]
-fn spawn(command: &str, cwd: &std::path::Path) -> std::io::Result<Spawned> {
+fn spawn_os(command: &str, cwd: &std::path::Path) -> std::io::Result<Spawned> {
     use std::process::{Command, Stdio};
     let mut c = Command::new("script");
     if cfg!(target_os = "macos") {
@@ -1015,7 +1225,7 @@ fn spawn(command: &str, cwd: &std::path::Path) -> std::io::Result<Spawned> {
         .stdout
         .take()
         .ok_or_else(|| std::io::Error::other("sem stdout"))?;
-    Ok((Proc(child), Box::new(input), Box::new(output)))
+    Ok((Proc::Os(OsProc(child)), Box::new(input), Box::new(output)))
 }
 
 #[cfg(test)]

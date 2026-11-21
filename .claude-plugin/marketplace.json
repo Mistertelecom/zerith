@@ -12,7 +12,7 @@
     {
       "name": "zerith-netops",
       "description": "Consultoria de redes, ISP/Telecom e engenharia de infraestrutura: troubleshooting BGP/OSPF/MPLS/EVPN/CGNAT/PPPoE multi-vendor (Cisco, Huawei, Juniper, MikroTik), janelas de mudança segura com rollback e auditoria de hardening de borda.",
-      "version": "0.2.3",
+      "version": "0.2.4",
       "category": "networking",
       "license": "GPL-3.0-only",
       "homepage": "https://github.com/Mistertelecom/zerith",

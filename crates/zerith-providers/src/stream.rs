@@ -36,19 +36,46 @@ fn text_event(v: &Value) -> Option<StreamEvent> {
 }
 
 /// Calls `f` with every `data:` payload until it returns `true` or the body
-/// ends. Cancellation is checked before each line; a read error mid-stream is
-/// an error, never a silently shortened answer.
+/// ends. Cancellation is checked both between lines and every 80 ms while
+/// waiting for the next line so silent reasoning phases abort immediately.
 pub(crate) fn for_each_data(
     resp: ureq::Response,
     cancel: &Cancel,
+    f: impl FnMut(&str) -> Result<bool>,
+) -> Result<()> {
+    for_each_data_reader(resp.into_reader(), cancel, f)
+}
+
+pub(crate) fn for_each_data_reader(
+    reader: impl std::io::Read + Send + 'static,
+    cancel: &Cancel,
     mut f: impl FnMut(&str) -> Result<bool>,
 ) -> Result<()> {
-    let reader = std::io::BufReader::new(resp.into_reader());
-    for line in reader.lines() {
+    if cancel.is_cancelled() {
+        return Err(ProviderError::Cancelled);
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<String>>();
+    std::thread::spawn(move || {
+        let buf = std::io::BufReader::new(reader);
+        for line in buf.lines() {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    loop {
         if cancel.is_cancelled() {
             return Err(ProviderError::Cancelled);
         }
-        let line = line.map_err(|e| ProviderError::Transport(e.to_string()))?;
+        let line = match rx.recv_timeout(std::time::Duration::from_millis(80)) {
+            Ok(res) => res.map_err(|e| ProviderError::Transport(e.to_string()))?,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        if cancel.is_cancelled() {
+            return Err(ProviderError::Cancelled);
+        }
         let Some(data) = line.strip_prefix("data:") else {
             continue;
         };
@@ -311,5 +338,51 @@ mod tests {
         assert!(matches!(r, Err(ProviderError::RateLimited { .. })));
         let (r, _) = replay(&[r#"{"error":{"message":"what"}}"#]);
         assert!(matches!(r, Err(ProviderError::Malformed(_))));
+    }
+
+    #[test]
+    fn a_stalled_stream_aborts_immediately_when_cancelled() {
+        struct StalledReader {
+            emitted_first: bool,
+        }
+        impl std::io::Read for StalledReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if !self.emitted_first {
+                    self.emitted_first = true;
+                    let first = b"data: hello\n";
+                    buf[..first.len()].copy_from_slice(first);
+                    return Ok(first.len());
+                }
+                std::thread::sleep(std::time::Duration::from_secs(10));
+                Ok(0)
+            }
+        }
+
+        let cancel = Cancel::default();
+        let cancel_trigger = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(90));
+            cancel_trigger.cancel();
+        });
+
+        let started = std::time::Instant::now();
+        let mut seen = Vec::new();
+        let res = for_each_data_reader(
+            StalledReader {
+                emitted_first: false,
+            },
+            &cancel,
+            |d| {
+                seen.push(d.to_string());
+                Ok(false)
+            },
+        );
+        let elapsed = started.elapsed();
+        assert!(matches!(res, Err(ProviderError::Cancelled)), "{res:?}");
+        assert_eq!(seen, vec!["hello"]);
+        assert!(
+            elapsed < std::time::Duration::from_millis(800),
+            "cancel took too long: {elapsed:?}"
+        );
     }
 }

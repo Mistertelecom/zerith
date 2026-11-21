@@ -207,7 +207,7 @@ pub fn is_secret_env_key(key: &str) -> bool {
         || up.ends_with("_PRIVATE_KEY")
 }
 
-fn scrub_secret_env(cmd: &mut Command) {
+pub fn scrub_secret_env(cmd: &mut Command) {
     for &k in SECRET_ENV_VARS {
         cmd.env_remove(k);
     }
@@ -264,9 +264,16 @@ impl Jail {
     /// Applies what can be applied before the process exists. On Windows that
     /// is nothing (a Job Object is attached after creation: use [`spawn`]).
     ///
+    /// By default, environment variables are preserved so consulting/dev tools
+    /// (`gh`, `aws`, `ansible`, `netmiko`, SSH agents) keep their credentials;
+    /// opt-in scrubbing is only applied in `ReadOnly` mode when
+    /// `ZERITH_SCRUB_ENV=1` is set.
+    ///
     /// [`spawn`]: Jail::spawn
     pub fn wrap(&self, mut cmd: Command) -> Command {
-        if self.level != Sandbox::DangerFullAccess {
+        if self.level == Sandbox::ReadOnly
+            && std::env::var_os("ZERITH_SCRUB_ENV").as_deref() == Some(std::ffi::OsStr::new("1"))
+        {
             scrub_secret_env(&mut cmd);
         }
         #[allow(unused_mut)]
@@ -690,7 +697,7 @@ mod tests {
     }
 
     #[test]
-    fn wrap_scrubs_secret_env_vars_unless_danger_full_access() {
+    fn wrap_preserves_env_by_default_and_scrub_helper_works_on_demand() {
         let mut inner = Command::new("echo");
         inner
             .env("OPENAI_API_KEY", "sk-secret")
@@ -700,23 +707,30 @@ mod tests {
         let jailed = Jail::new(Sandbox::WorkspaceWrite, ".").wrap(inner);
         assert!(jailed
             .get_envs()
-            .any(|(k, v)| k == "OPENAI_API_KEY" && v.is_none()));
-        assert!(jailed
-            .get_envs()
-            .any(|(k, v)| k == "TELEGRAM_BOT_TOKEN" && v.is_none()));
-        assert!(jailed
-            .get_envs()
-            .any(|(k, v)| k == "CUSTOM_ACCESS_TOKEN" && v.is_none()));
+            .any(|(k, v)| k == "OPENAI_API_KEY" && v == Some(std::ffi::OsStr::new("sk-secret"))));
         assert!(jailed
             .get_envs()
             .any(|(k, v)| k == "A" && v == Some(std::ffi::OsStr::new("1"))));
 
-        let mut danger_cmd = Command::new("echo");
-        danger_cmd.env("OPENAI_API_KEY", "sk-keep");
-        let unjailed = Jail::new(Sandbox::DangerFullAccess, ".").wrap(danger_cmd);
-        assert!(unjailed
+        let mut scrubbed = Command::new("echo");
+        scrubbed
+            .env("OPENAI_API_KEY", "sk-secret")
+            .env("TELEGRAM_BOT_TOKEN", "bot-secret")
+            .env("CUSTOM_ACCESS_TOKEN", "tok-secret")
+            .env("A", "1");
+        scrub_secret_env(&mut scrubbed);
+        assert!(scrubbed
             .get_envs()
-            .any(|(k, v)| k == "OPENAI_API_KEY" && v == Some(std::ffi::OsStr::new("sk-keep"))));
+            .any(|(k, v)| k == "OPENAI_API_KEY" && v.is_none()));
+        assert!(scrubbed
+            .get_envs()
+            .any(|(k, v)| k == "TELEGRAM_BOT_TOKEN" && v.is_none()));
+        assert!(scrubbed
+            .get_envs()
+            .any(|(k, v)| k == "CUSTOM_ACCESS_TOKEN" && v.is_none()));
+        assert!(scrubbed
+            .get_envs()
+            .any(|(k, v)| k == "A" && v == Some(std::ffi::OsStr::new("1"))));
     }
 
     #[cfg(windows)]

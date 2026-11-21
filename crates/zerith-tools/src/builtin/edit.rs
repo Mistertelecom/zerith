@@ -53,10 +53,11 @@ pub(super) fn edit_file(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Res
         _ => {
             std::fs::write(&path, text.replace(old, new))?;
             exec.host.note_read(&path);
-            Ok(format!(
-                "{n} ocorrência(s) substituída(s) em {}",
-                path.display()
-            ))
+            let mut msg = format!("{n} ocorrência(s) substituída(s) em {}", path.display());
+            if let Some(diags) = crate::lsp::warm_diagnostics_for_edit(ctx.workspace, &path) {
+                msg.push_str(&format!("\n\n[diagnósticos LSP]\n{diags}"));
+            }
+            Ok(msg)
         }
     }
 }
@@ -199,9 +200,13 @@ pub(super) fn multi_edit(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Re
     exec.host.before_write(&path)?;
     std::fs::write(&path, out_bytes)?;
     exec.host.note_read(&path);
-    Ok(format!(
+    let mut msg = format!(
         "{} edição(ões) atômica(s) ({applied_count} substituição(ões)) em {}",
         edits.len(),
         path.display()
-    ))
+    );
+    if let Some(diags) = crate::lsp::warm_diagnostics_for_edit(ctx.workspace, &path) {
+        msg.push_str(&format!("\n\n[diagnósticos LSP]\n{diags}"));
+    }
+    Ok(msg)
 }

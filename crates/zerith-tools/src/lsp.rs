@@ -357,6 +357,48 @@ pub fn shutdown_all() {
     drop(drained);
 }
 
+/// If a Language Server is ALREADY warm in the pool for `(workspace, language)`,
+/// notifies it of the file edit (`didOpen`/`didChange`) and returns any non-empty
+/// diagnostics immediately without spawning a cold server process.
+pub fn warm_diagnostics_for_edit(workspace: &Path, path: &Path) -> Option<String> {
+    let lang = Language::detect(path)?;
+    let ws = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+    let sess = {
+        let m = pool().lock().ok()?;
+        let s = m.get(&(ws, lang))?.clone();
+        if !s.is_alive() {
+            return None;
+        }
+        s.touch();
+        s
+    };
+    let uri = sess.open_doc(path, lang).ok()?;
+    if let Ok(res) = sess.request(
+        "textDocument/diagnostic",
+        json!({ "textDocument": { "uri": uri } }),
+        Duration::from_millis(500),
+    ) {
+        if let Some(items) = res.get("items").and_then(Value::as_array) {
+            if !items.is_empty() {
+                return Some(format_diagnostics(items));
+            }
+            return None;
+        }
+    }
+    std::thread::sleep(Duration::from_millis(160));
+    let diags = sess
+        .diagnostics
+        .lock()
+        .ok()
+        .and_then(|d| d.get(&uri).cloned())
+        .unwrap_or_default();
+    if diags.is_empty() {
+        None
+    } else {
+        Some(format_diagnostics(&diags))
+    }
+}
+
 fn session_for(workspace: &Path, path: &Path) -> Result<(Arc<LspSession>, Language, String)> {
     let lang = Language::detect(path).ok_or_else(|| {
         ToolError::BadArguments(format!("extensão sem suporte LSP: {}", path.display()))

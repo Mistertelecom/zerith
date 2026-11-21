@@ -229,6 +229,39 @@ impl Store {
         )
     }
 
+    /// Permanently deletes a session and its messages/todos/checkpoints/events.
+    pub fn delete_session(&self, id: &str) -> Result<()> {
+        if self
+            .conn()
+            .execute("DELETE FROM sessions WHERE id = ?1", params![id])?
+            == 0
+        {
+            return Err(StoreError::NotFound(format!("session {id}")));
+        }
+        let _ = self.set_session_pinned(id, false);
+        Ok(())
+    }
+
+    /// Ordered list of pinned session ids (newest pin first).
+    pub fn pinned_sessions(&self) -> Result<Vec<String>> {
+        let Some(raw) = self.setting("sessions.pinned")? else {
+            return Ok(Vec::new());
+        };
+        Ok(serde_json::from_str::<Vec<String>>(&raw).unwrap_or_default())
+    }
+
+    /// Pins or unpins a session and returns the updated list of pinned session ids.
+    pub fn set_session_pinned(&self, id: &str, pinned: bool) -> Result<Vec<String>> {
+        let mut list = self.pinned_sessions()?;
+        list.retain(|x| x != id);
+        if pinned {
+            list.insert(0, id.to_string());
+        }
+        let json = serde_json::to_string(&list).unwrap_or_else(|_| "[]".into());
+        self.set_setting("sessions.pinned", &json)?;
+        Ok(list)
+    }
+
     fn update_one(&self, sql: &str, p: &[&dyn ToSql], id: &str) -> Result<()> {
         if self.conn().execute(sql, p)? == 0 {
             return Err(StoreError::NotFound(format!("session {id}")));

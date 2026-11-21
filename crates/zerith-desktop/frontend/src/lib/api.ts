@@ -579,6 +579,12 @@ export const api = {
     invoke<Session>("session_fork", { sessionId, uptoMessageId, title }),
   setArchived: (id: string, archived: boolean) =>
     invoke<void>("set_archived", { id, archived }),
+  renameSession: (id: string, title: string) =>
+    invoke<void>("rename_session", { id, title }),
+  deleteSession: (id: string) => invoke<void>("delete_session", { id }),
+  pinnedSessions: () => invoke<string[]>("pinned_sessions"),
+  setSessionPinned: (id: string, pinned: boolean) =>
+    invoke<string[]>("set_session_pinned", { id, pinned }),
   exportSession: (id: string) => invoke<string>("export_session", { id }),
   savePrefs: (patch: {
     theme?: Theme;
@@ -631,6 +637,9 @@ export const api = {
   memoryUpdate: (id: number, text: string) =>
     invoke<void>("memory_update", { id, text }),
   memoryForget: (id: number) => invoke<void>("memory_forget", { id }),
+  memoryAdd: (kind: FactKind, text: string) =>
+    invoke<Fact>("memory_add", { kind, text }),
+  memoryImportHermes: () => invoke<number>("memory_import_hermes"),
   skillsList: () => invoke<SkillView[]>("skills_list"),
   skillsCatalog: (force = false) =>
     invoke<Catalogue>("skills_catalog", { force }),

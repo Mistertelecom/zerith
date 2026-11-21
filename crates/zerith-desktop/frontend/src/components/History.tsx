@@ -14,6 +14,7 @@ import {
   MessageSquare,
   MessagesSquare,
   Search,
+  Trash2,
 } from "lucide-react";
 import { api, type ReportView, type SessionRow, type SourceView } from "../lib/api";
 import { Card, EmptyState, Logo, Segmented, Stat } from "./ui";
@@ -200,6 +201,19 @@ export function HistoryTab() {
                     }
                   >
                     {r.archived ? <ArchiveRestore size={14} strokeWidth={2} /> : <Archive size={14} strokeWidth={2} />}
+                  </button>
+                  <button
+                    className="icon-btn sm danger"
+                    title="Excluir"
+                    aria-label={`Excluir ${r.title}`}
+                    onClick={() =>
+                      void api
+                        .deleteSession(r.id)
+                        .then(() => load())
+                        .catch((e) => setError(String(e)))
+                    }
+                  >
+                    <Trash2 size={14} strokeWidth={2} />
                   </button>
                 </span>
               </div>

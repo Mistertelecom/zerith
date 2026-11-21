@@ -121,6 +121,7 @@ export default function App() {
   const [boot, setBoot] = useState<Boot | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [sessions, setSessions] = useState<Session[]>([]);
+  const [pinnedSessions, setPinnedSessions] = useState<string[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [messages, setMessages] = useState<Block[]>([]);
   // One live turn per conversation, keyed by session id: a chat that is not
@@ -285,6 +286,10 @@ export default function App() {
         setBoot(b);
         setSessions(b.sessions);
         setMemoryPaused(b.memory_paused);
+        void api
+          .pinnedSessions()
+          .then(setPinnedSessions)
+          .catch(() => undefined);
         void api
           .recentWorkspaces()
           .then(setRecent)
@@ -736,6 +741,10 @@ export default function App() {
         setBoot(b);
         setSessions(b.sessions);
         setMemoryPaused(b.memory_paused);
+        void api
+          .pinnedSessions()
+          .then(setPinnedSessions)
+          .catch(() => undefined);
         void Promise.all([
           api.accounts(),
           api.routing().catch(() => ({}) as Routing),
@@ -996,6 +1005,48 @@ export default function App() {
             setSelected(null);
             setMessages([]);
             draftRef.current?.focus();
+          }}
+          pinned={pinnedSessions}
+          onTogglePin={(id, pin) => {
+            void api
+              .setSessionPinned(id, pin)
+              .then(setPinnedSessions)
+              .catch((e) => setStatus(String(e)));
+          }}
+          onRename={(id, title) => {
+            void api
+              .renameSession(id, title)
+              .then(() =>
+                setSessions((prev) =>
+                  prev.map((s) => (s.id === id ? { ...s, title } : s)),
+                ),
+              )
+              .catch((e) => setStatus(String(e)));
+          }}
+          onArchive={(id) => {
+            void api
+              .setArchived(id, true)
+              .then(() => {
+                setSessions((prev) => prev.filter((s) => s.id !== id));
+                if (selected === id) {
+                  setSelected(null);
+                  setMessages([]);
+                }
+              })
+              .catch((e) => setStatus(String(e)));
+          }}
+          onDelete={(id) => {
+            void api
+              .deleteSession(id)
+              .then(() => {
+                setSessions((prev) => prev.filter((s) => s.id !== id));
+                setPinnedSessions((prev) => prev.filter((x) => x !== id));
+                if (selected === id) {
+                  setSelected(null);
+                  setMessages([]);
+                }
+              })
+              .catch((e) => setStatus(String(e)));
           }}
           status={(id) => {
             const t = turns[id];

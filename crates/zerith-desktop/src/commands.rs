@@ -269,6 +269,37 @@ pub async fn set_archived(
 }
 
 #[tauri::command]
+pub async fn rename_session(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    title: String,
+) -> Cmd<()> {
+    state.with_store(|st| st.rename_session(&id, &title).map_err(|e| e.to_string()))
+}
+
+#[tauri::command]
+pub async fn delete_session(state: tauri::State<'_, AppState>, id: String) -> Cmd<()> {
+    state.with_store(|st| st.delete_session(&id).map_err(|e| e.to_string()))
+}
+
+#[tauri::command]
+pub async fn pinned_sessions(state: tauri::State<'_, AppState>) -> Cmd<Vec<String>> {
+    state.with_store(|st| st.pinned_sessions().map_err(|e| e.to_string()))
+}
+
+#[tauri::command]
+pub async fn set_session_pinned(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    pinned: bool,
+) -> Cmd<Vec<String>> {
+    state.with_store(|st| {
+        st.set_session_pinned(&id, pinned)
+            .map_err(|e| e.to_string())
+    })
+}
+
+#[tauri::command]
 pub async fn export_session(state: tauri::State<'_, AppState>, id: String) -> Cmd<String> {
     let db = state.db();
     wire::export_session(&db, &id).map(|p| p.display().to_string())

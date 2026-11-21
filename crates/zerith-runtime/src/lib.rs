@@ -504,26 +504,45 @@ pub(crate) fn system_prompt(
 /// A failed recall is not a failed turn: memory is an aid, and losing it must
 /// degrade the answer, not block it.
 pub(crate) fn recall_block(memory: &dyn MemoryBackend, scope: &Scope, query: &str) -> String {
-    // Instructions and preferences apply to every turn, whatever was asked;
-    // other facts come in when the prompt matches them.
-    // ponytail: newest 50 rules, then the ranking; a rule beyond that only
-    // comes back through recall.
-    let rules = memory
-        .list(scope, 50)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|f| {
-            matches!(
+    // Instructions, preferences, entities (people, clients, hosts) and decisions
+    // apply to every turn, whatever was asked (Hermes parity); general facts and
+    // project notes join when FTS matches or when the user asks a profile/memory
+    // question.
+    let recent = memory.list(scope, 50).unwrap_or_default();
+    let q_low = query.to_lowercase();
+    let asks_profile = [
+        "quem sou",
+        "meu nome",
+        "minha empresa",
+        "meus clientes",
+        "minha memória",
+        "minha memoria",
+        "o que você sabe",
+        "o que voce sabe",
+        "lembra de mim",
+        "who am i",
+        "what do you know",
+        "my name",
+        "my memory",
+    ]
+    .iter()
+    .any(|kw| q_low.contains(kw));
+    let rules = recent.iter().filter(|f| {
+        asks_profile
+            || matches!(
                 f.kind,
-                zerith_memory::FactKind::Instruction | zerith_memory::FactKind::Preference
+                zerith_memory::FactKind::Instruction
+                    | zerith_memory::FactKind::Preference
+                    | zerith_memory::FactKind::Entity
+                    | zerith_memory::FactKind::Decision
             )
-        });
+    });
     let hits = memory.recall(scope, query, MEMORY_HITS).unwrap_or_default();
     let mut seen = std::collections::HashSet::new();
     let mut block = String::from("# O que você já sabe sobre o usuário\n");
     let mut used = block.len();
     let mut any = false;
-    for fact in rules.chain(hits.into_iter().map(|h| h.fact)) {
+    for fact in rules.cloned().chain(hits.into_iter().map(|h| h.fact)) {
         if fact.superseded_by.is_some() || !seen.insert(fact.id) {
             continue;
         }
@@ -1210,7 +1229,7 @@ pub(crate) fn tool_guidance(tools: &zerith_tools::Registry) -> String {
     }
     if has("memory_save") {
         out.push_str(
-            "\n\n# Memória\nQuando o usuário revelar uma preferência, instrução ou fato durável sobre ele ou o projeto, salve com `memory_save` na hora, sem pedir. Não salve progresso de tarefa nem segredos.",
+            "\n\n# Memória\nQuando o usuário revelar uma preferência, instrução, entidade (nome, empresa, cliente, servidor, IP, ASN), decisão ou fato durável, salve com `memory_save` na hora, sem pedir (usando `kind`: `instruction`, `preference`, `entity`, `decision`, `project` ou `fact`). Use `memory_recall` para listar/buscar fatos salvos, `memory_update` para atualizar um fato que mudou e `memory_forget` para apagar um fato obsoleto. Não salve progresso de tarefa nem segredos.",
         );
     }
     if has("edit_file") {

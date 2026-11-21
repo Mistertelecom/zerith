@@ -17,15 +17,25 @@ pub struct Extracted {
 /// Markers that mean "store this". Longest first so `lembre-se que` wins over
 /// `lembre que`, and the captured text never keeps the marker.
 const MARKERS: &[&str] = &[
+    "lembre-se de que",
     "lembre-se que",
+    "lembre de que",
     "lembre que",
     "lembra que",
     "não esqueça que",
     "nao esqueca que",
+    "salve na memória que",
+    "salve na memoria que",
+    "guarde na memória que",
+    "guarde na memoria que",
     "guarde que",
+    "memorize que",
     "anote que",
+    "save to memory that",
     "remember that",
+    "remember:",
     "keep in mind that",
+    "note that",
 ];
 
 /// Rules the user wants applied every time, not facts to recall.

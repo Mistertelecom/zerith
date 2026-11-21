@@ -49,7 +49,10 @@ impl Tool for Builtin {
         )
     }
     fn uses_memory(&self) -> bool {
-        matches!(self.spec.name.as_str(), "memory_recall" | "memory_save")
+        matches!(
+            self.spec.name.as_str(),
+            "memory_recall" | "memory_save" | "memory_update" | "memory_forget"
+        )
     }
 }
 
@@ -219,9 +222,9 @@ pub(crate) fn all() -> Vec<Box<dyn crate::Tool>> {
         ),
         tool(
             "memory_recall",
-            "Consulta fatos duráveis da memória do usuário.",
-            json!({"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}),
-            "linhas \"[confirmed|inferred] texto\"",
+            "Consulta ou lista fatos duráveis da memória do usuário (retorna [#id], tipo, confiança e texto). Se query for vazio ou \"*\", lista os fatos ativos.",
+            json!({"type": "object", "properties": {"query": {"type": "string", "description": "termos para buscar ou \"*\" para listar todos os fatos recentes"}}}),
+            "linhas \"[#id] [confirmed|inferred] (kind) texto\"",
             Permission::Read,
             5,
             |_, _| Ok(None),
@@ -229,16 +232,41 @@ pub(crate) fn all() -> Vec<Box<dyn crate::Tool>> {
         ),
         tool(
             "memory_save",
-            "Guarda na memória durável um fato, preferência ou instrução que o usuário disse ou confirmou e que vale para conversas futuras (ex.: editor favorito, idioma, estilo de resposta, nome do projeto, \"sempre rode os testes\"). Use por conta própria, sem pedir, assim que o usuário revelar algo assim. Uma frase curta e autossuficiente, na terceira pessoa (\"O usuário prefere respostas curtas\"). Não salve progresso de tarefa, resultados temporários nem segredos (senhas, chaves, tokens).",
+            "Guarda na memória durável um fato, preferência, entidade (cliente, servidor, IP, ASN, pessoa), decisão, projeto ou instrução que o usuário disse ou confirmou e que vale para conversas futuras. Use por conta própria, sem pedir, assim que o usuário revelar algo assim. Uma frase curta e autossuficiente, na terceira pessoa (\"O usuário prefere respostas curtas\"). Não salve progresso de tarefa, resultados temporários nem segredos (senhas, chaves, tokens).",
             json!({"type": "object", "properties": {
                 "text": {"type": "string", "description": "o fato, em uma frase autossuficiente"},
-                "kind": {"type": "string", "enum": ["instruction", "preference", "fact"], "description": "instruction: regra a seguir sempre; preference: gosto do usuário; fact: informação (padrão)"}
+                "kind": {"type": "string", "enum": ["instruction", "preference", "fact", "entity", "decision", "project"], "description": "instruction: regra; preference: gosto; entity: pessoa/cliente/equipamento/IP; decision: decisão; project: projeto atual; fact: informação geral (padrão)"}
             }, "required": ["text"]}),
-            "confirmação do que foi salvo, ou que já estava na memória",
+            "confirmação do que foi salvo com seu [#id], ou que já estava na memória",
             Permission::Read,
             5,
             |_, _| Ok(None),
             memory_save,
+        ),
+        tool(
+            "memory_update",
+            "Atualiza o texto de um fato existente na memória pelo seu id numérico (obtido via memory_recall).",
+            json!({"type": "object", "properties": {
+                "id": {"type": "integer", "description": "id numérico do fato na memória"},
+                "text": {"type": "string", "description": "novo texto atualizado do fato"}
+            }, "required": ["id", "text"]}),
+            "confirmação da atualização do fato",
+            Permission::Read,
+            5,
+            |_, _| Ok(None),
+            memory_update,
+        ),
+        tool(
+            "memory_forget",
+            "Remove permanentemente um fato obsoleto ou incorreto da memória pelo seu id numérico (obtido via memory_recall).",
+            json!({"type": "object", "properties": {
+                "id": {"type": "integer", "description": "id numérico do fato a remover"}
+            }, "required": ["id"]}),
+            "confirmação da remoção do fato",
+            Permission::Read,
+            5,
+            |_, _| Ok(None),
+            memory_forget,
         ),
         tool(
             "session_search",
@@ -617,19 +645,41 @@ fn shell_exec(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>, snapshot: bool) 
 }
 
 fn memory_recall(args: &Value, ctx: &CallCtx<'_>, _: &Exec<'_>) -> Result<String> {
-    let query = str_arg(args, "query")?;
+    let query = args["query"].as_str().unwrap_or("*").trim();
     let (Some(mem), Some(scope)) = (ctx.memory, ctx.scope) else {
         return Err(ToolError::Denied("nenhuma memória configurada".into()));
     };
-    let hits = mem
-        .recall(scope, query, 8)
-        .map_err(|e| ToolError::Failed(e.to_string()))?;
-    if hits.is_empty() {
+    let mut facts: Vec<zerith_memory::Fact> = if query.is_empty() || query == "*" {
+        Vec::new()
+    } else {
+        mem.recall(scope, query, 12)
+            .map_err(|e| ToolError::Failed(e.to_string()))?
+            .into_iter()
+            .map(|h| h.fact)
+            .collect()
+    };
+    if facts.is_empty() {
+        facts = mem
+            .list(scope, 25)
+            .map_err(|e| ToolError::Failed(e.to_string()))?
+            .into_iter()
+            .filter(|f| f.superseded_by.is_none())
+            .collect();
+    }
+    if facts.is_empty() {
         return Ok("nenhum fato encontrado".into());
     }
-    Ok(hits
+    Ok(facts
         .iter()
-        .map(|h| format!("[{}] {}", h.fact.confidence.as_str(), h.fact.text))
+        .map(|f| {
+            format!(
+                "[#{}] [{}] ({}) {}",
+                f.id,
+                f.confidence.as_str(),
+                f.kind.as_str(),
+                f.text
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n"))
 }
@@ -640,10 +690,12 @@ fn memory_save(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<Strin
         return Err(ToolError::BadArguments("text está vazio".into()));
     }
     let kind = match args["kind"].as_str().unwrap_or("fact") {
-        k @ ("instruction" | "preference" | "fact") => zerith_memory::FactKind::parse(k),
+        k @ ("instruction" | "preference" | "fact" | "entity" | "decision" | "project") => {
+            zerith_memory::FactKind::parse(k)
+        }
         other => {
             return Err(ToolError::BadArguments(format!(
-                "kind precisa ser instruction, preference ou fact, não {other}"
+                "kind precisa ser instruction, preference, fact, entity, decision ou project, não {other}"
             )))
         }
     };
@@ -661,23 +713,58 @@ fn memory_save(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<Strin
         ));
     }
     let known = mem
-        .recall(scope, text, 20)
+        .list(scope, 100)
         .map_err(|e| ToolError::Failed(e.to_string()))?;
-    if known
+    if let Some(existing) = known
         .iter()
-        .any(|h| h.fact.superseded_by.is_none() && h.fact.text.trim().eq_ignore_ascii_case(text))
+        .find(|f| f.superseded_by.is_none() && f.text.trim().eq_ignore_ascii_case(text))
     {
-        return Ok(format!("já estava na memória: {text}"));
+        return Ok(format!(
+            "já estava na memória [#{id}]: {text}",
+            id = existing.id
+        ));
     }
-    mem.remember(
-        scope,
-        kind,
-        text,
-        zerith_memory::Confidence::Confirmed,
-        session.as_deref(),
-    )
-    .map_err(|e| ToolError::Failed(e.to_string()))?;
-    Ok(format!("salvo na memória ({}): {text}", kind.as_str()))
+    let id = mem
+        .remember(
+            scope,
+            kind,
+            text,
+            zerith_memory::Confidence::Confirmed,
+            session.as_deref(),
+        )
+        .map_err(|e| ToolError::Failed(e.to_string()))?;
+    Ok(format!(
+        "salvo na memória [#{id}] ({}): {text}",
+        kind.as_str()
+    ))
+}
+
+fn memory_update(args: &Value, ctx: &CallCtx<'_>, _: &Exec<'_>) -> Result<String> {
+    let id = args["id"]
+        .as_i64()
+        .ok_or_else(|| ToolError::BadArguments("id precisa ser um inteiro".into()))?;
+    let text = str_arg(args, "text")?.trim();
+    if text.is_empty() {
+        return Err(ToolError::BadArguments("text está vazio".into()));
+    }
+    let Some(mem) = ctx.memory else {
+        return Err(ToolError::Denied("memória desligada ou pausada".into()));
+    };
+    mem.update(id, text)
+        .map_err(|e| ToolError::Failed(e.to_string()))?;
+    Ok(format!("fato [#{id}] atualizado na memória: {text}"))
+}
+
+fn memory_forget(args: &Value, ctx: &CallCtx<'_>, _: &Exec<'_>) -> Result<String> {
+    let id = args["id"]
+        .as_i64()
+        .ok_or_else(|| ToolError::BadArguments("id precisa ser um inteiro".into()))?;
+    let Some(mem) = ctx.memory else {
+        return Err(ToolError::Denied("memória desligada ou pausada".into()));
+    };
+    mem.forget(id)
+        .map_err(|e| ToolError::Failed(e.to_string()))?;
+    Ok(format!("fato [#{id}] removido da memória"))
 }
 
 fn session_search(args: &Value, _ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {

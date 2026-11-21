@@ -6,9 +6,11 @@ import {
   CircleCheck,
   FolderGit2,
   Heart,
+  Import,
   Lightbulb,
   ListChecks,
   Pencil,
+  Plus,
   Scale,
   Search,
   SearchX,
@@ -38,6 +40,10 @@ export function MemoryTab(props: { paused?: boolean; onPause?: (paused: boolean)
   const [hits, setHits] = useState<number[] | null>(null);
   const [query, setQuery] = useState("");
   const [editing, setEditing] = useState<{ id: number; text: string } | null>(null);
+  const [adding, setAdding] = useState(false);
+  const [newKind, setNewKind] = useState<FactKind>("fact");
+  const [newText, setNewText] = useState("");
+  const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [ownPaused, setOwnPaused] = useState(false);
 
@@ -119,6 +125,36 @@ export function MemoryTab(props: { paused?: boolean; onPause?: (paused: boolean)
     }
   };
 
+  const addFact = async () => {
+    const clean = newText.trim();
+    if (!clean) return;
+    try {
+      const created = await api.memoryAdd(newKind, clean);
+      setFacts((prev) => [created, ...(prev ?? []).filter((f) => f.id !== created.id)]);
+      setNewText("");
+      setAdding(false);
+      setNotice("Fato salvo na memória.");
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const importHermes = async () => {
+    try {
+      const count = await api.memoryImportHermes();
+      load();
+      setNotice(
+        count > 0
+          ? `${count} fatos importados da memória do Hermes (MEMORY.md / USER.md).`
+          : "Nenhum arquivo MEMORY.md / USER.md encontrado em ~/.hermes/memories.",
+      );
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
   if (error)
     return (
       <div className="page pn">
@@ -186,7 +222,59 @@ export function MemoryTab(props: { paused?: boolean; onPause?: (paused: boolean)
             {hits.length} {hits.length === 1 ? "resultado" : "resultados"}
           </span>
         )}
+        <span className="pn-spacer" />
+        <button className="btn btn-sm" onClick={() => void importHermes()}>
+          <Import size={14} strokeWidth={2} /> Importar do Hermes
+        </button>
+        <button
+          className={"btn btn-sm " + (adding ? "btn-ghost" : "btn-primary")}
+          onClick={() => setAdding((v) => !v)}
+        >
+          {adding ? <X size={14} strokeWidth={2} /> : <Plus size={14} strokeWidth={2} />}
+          {adding ? "Cancelar" : "Novo fato"}
+        </button>
       </div>
+
+      {notice ? (
+        <div className="toast" role="status">
+          <CircleCheck size={16} strokeWidth={1.75} />
+          <span>{notice}</span>
+        </div>
+      ) : null}
+
+      {adding ? (
+        <Card title="Novo fato" icon={Brain} description="Adicione uma instrução, preferência, cliente/entidade ou fato durável.">
+          <div className="pn-item on" style={{ gap: 8 }}>
+            <select
+              className="select"
+              style={{ width: 150 }}
+              value={newKind}
+              onChange={(e) => setNewKind(e.target.value as FactKind)}
+            >
+              {KINDS.map(([k, lbl]) => (
+                <option key={k} value={k}>
+                  {lbl}
+                </option>
+              ))}
+            </select>
+            <input
+              className="input"
+              style={{ flex: 1 }}
+              autoFocus
+              placeholder="Ex.: O usuário se chama João e gerencia a Mistertelecom"
+              value={newText}
+              onChange={(e) => setNewText(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") void addFact();
+                if (e.key === "Escape") setAdding(false);
+              }}
+            />
+            <button className="btn btn-primary btn-sm" onClick={() => void addFact()}>
+              <Check size={14} strokeWidth={2} /> Salvar
+            </button>
+          </div>
+        </Card>
+      ) : null}
 
       {groups.length === 0 ? (
         <div className="card">

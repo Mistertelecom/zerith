@@ -75,6 +75,106 @@ pub async fn memory_forget(state: State<'_, AppState>, id: i64) -> Result<(), St
     .map_err(|e| e.to_string())?
 }
 
+#[tauri::command]
+pub async fn memory_add(
+    state: State<'_, AppState>,
+    kind: String,
+    text: String,
+) -> Result<zerith_memory::Fact, String> {
+    let clean = text.trim().to_string();
+    if clean.is_empty() {
+        return Err("o fato não pode ficar vazio".into());
+    }
+    let fk = zerith_memory::FactKind::parse(kind.trim());
+    let db = state.db().to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mem = open_at(&db)?;
+        let scope = zerith_memory::default_scope();
+        let id = mem
+            .remember(
+                &scope,
+                fk,
+                &clean,
+                zerith_memory::Confidence::Confirmed,
+                Some("manual"),
+            )
+            .map_err(|e| e.to_string())?;
+        mem.get(id).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Imports facts from local Hermes `MEMORY.md` and `USER.md` files (`~/.hermes/memories/`).
+#[tauri::command]
+pub async fn memory_import_hermes(state: State<'_, AppState>) -> Result<usize, String> {
+    let db = state.db().to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || {
+        let home = std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| "pasta pessoal não encontrada".to_string())?;
+        let hermes_dir = home.join(".hermes");
+        let mut files = vec![
+            hermes_dir.join("memories").join("USER.md"),
+            hermes_dir.join("memories").join("MEMORY.md"),
+        ];
+        if let Ok(profiles) = std::fs::read_dir(hermes_dir.join("profiles")) {
+            for entry in profiles.flatten() {
+                let p = entry.path().join("memories");
+                files.push(p.join("USER.md"));
+                files.push(p.join("MEMORY.md"));
+            }
+        }
+        let mem = open_at(&db)?;
+        let scope = zerith_memory::default_scope();
+        let mut count = 0usize;
+        for file in files {
+            let Ok(raw) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            let is_user = file
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case("USER.md"));
+            for chunk in raw.split(['\n', '§']) {
+                let line = chunk.trim().trim_start_matches(['-', '*', '•', ' ']).trim();
+                if line.len() < 4 || line.starts_with('#') || line.starts_with("<!--") {
+                    continue;
+                }
+                let low = line.to_lowercase();
+                let kind = if low.contains("sempre")
+                    || low.contains("nunca")
+                    || low.contains("always")
+                    || low.contains("never")
+                {
+                    zerith_memory::FactKind::Instruction
+                } else if low.contains("prefere") || low.contains("prefer") {
+                    zerith_memory::FactKind::Preference
+                } else if is_user {
+                    zerith_memory::FactKind::Entity
+                } else {
+                    zerith_memory::FactKind::Fact
+                };
+                if mem
+                    .remember(
+                        &scope,
+                        kind,
+                        line,
+                        zerith_memory::Confidence::Confirmed,
+                        Some("hermes"),
+                    )
+                    .is_ok()
+                {
+                    count += 1;
+                }
+            }
+        }
+        Ok(count)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 fn open_at(db: &std::path::Path) -> Result<SqliteMemory, String> {
     SqliteMemory::open(db).map_err(|e| e.to_string())
 }

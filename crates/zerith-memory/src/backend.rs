@@ -45,12 +45,21 @@ impl Scope {
     }
 
     /// Where a new fact of `kind` is written.
+    ///
+    /// User preferences, instructions, entities (people, clients, hosts),
+    /// general facts, and decisions are stored in the user scope (`last`) so
+    /// they follow the user across folders and conversations (Hermes parity);
+    /// `FactKind::Project` stays scoped to the specific project folder (`first`).
     pub fn write_for(&self, kind: FactKind) -> &str {
         let first = self.0.split(SEP).next().unwrap_or("");
         let last = self.0.rsplit(SEP).next().unwrap_or(first);
         match kind {
-            FactKind::Preference | FactKind::Instruction => last,
-            _ => first,
+            FactKind::Project => first,
+            FactKind::Preference
+            | FactKind::Instruction
+            | FactKind::Fact
+            | FactKind::Entity
+            | FactKind::Decision => last,
         }
     }
 }

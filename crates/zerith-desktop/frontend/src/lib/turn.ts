@@ -27,6 +27,7 @@ export interface ToolRow {
   args: string;
   ok?: boolean;
   preview?: string;
+  progress?: string;
 }
 
 export interface TurnState {
@@ -34,7 +35,13 @@ export interface TurnState {
   tasks: Todo[];
   approval: { id: number; tool: string; summary: string } | null;
   question: { id: number; questions: Question[] } | null;
-  usage: { input: number; output: number } | null;
+  usage: {
+    input: number;
+    output: number;
+    cacheRead?: number;
+    cacheWrite?: number;
+    ttftMs?: number;
+  } | null;
   saved: number;
   route: { provider: string; model: string } | null;
   /** Children the turn delegated to, live: who runs on which model. */
@@ -110,6 +117,32 @@ export function applyEvent(prev: TurnState, ev: TurnEvent): TurnState {
       }
       return state;
     }
+    case "toolProgress": {
+      const a = assistant(state);
+      let idx = -1;
+      for (let i = a.tools.length - 1; i >= 0; i--) {
+        if (a.tools[i].ok === undefined && a.tools[i].name === ev.tool) {
+          idx = i;
+          break;
+        }
+      }
+      if (idx < 0) {
+        for (let i = a.tools.length - 1; i >= 0; i--) {
+          if (a.tools[i].ok === undefined) {
+            idx = i;
+            break;
+          }
+        }
+      }
+      if (idx >= 0) {
+        const next = ((a.tools[idx].progress ?? "") + ev.chunk).slice(-4000);
+        a.tools[idx] = { ...a.tools[idx], progress: next };
+      }
+      return state;
+    }
+    case "steered":
+      state.blocks = [...state.blocks, { kind: "note", text: `Direcionado: ${ev.text}` }];
+      return state;
     case "approval":
       state.approval = { id: ev.id, tool: ev.tool, summary: ev.summary };
       return state;
@@ -117,7 +150,13 @@ export function applyEvent(prev: TurnState, ev: TurnEvent): TurnState {
       state.question = { id: ev.id, questions: ev.questions };
       return state;
     case "usage":
-      state.usage = { input: ev.input, output: ev.output };
+      state.usage = {
+        input: ev.input,
+        output: ev.output,
+        cacheRead: ev.cacheRead ?? 0,
+        cacheWrite: ev.cacheWrite ?? 0,
+        ttftMs: ev.ttftMs ?? 0,
+      };
       return state;
     case "tasks":
       state.tasks = ev.items;

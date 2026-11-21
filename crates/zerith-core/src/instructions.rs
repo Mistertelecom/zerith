@@ -75,6 +75,20 @@ fn cap(files: Vec<(PathBuf, String)>, budget: usize) -> Vec<(PathBuf, String)> {
     out
 }
 
+/// `system_prompt_base()` followed by the instruction files, without mutable
+/// per-session headers so providers keep the prefix cached across turns.
+pub fn system_prompt_base_with_instructions(instructions: &[(PathBuf, String)]) -> String {
+    let mut p = crate::system_prompt_base();
+    for (path, text) in instructions {
+        p.push_str(&format!(
+            "\n\n# Instructions from {}\n\n{}",
+            path.display(),
+            text.trim_end()
+        ));
+    }
+    p
+}
+
 /// `system_prompt(title)` followed by the instruction files. The instructions
 /// come after the fixed text so the provider's prefix cache still covers it.
 pub fn system_prompt_with_instructions(title: &str, instructions: &[(PathBuf, String)]) -> String {

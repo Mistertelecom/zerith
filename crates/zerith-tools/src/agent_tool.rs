@@ -22,6 +22,7 @@ pub(crate) fn all(parallel: bool) -> Vec<Box<dyn Tool>> {
                 "prompt": {"type": "string", "description": "a tarefa completa e o formato esperado da resposta"},
                 "agent": {"type": "string", "description": "explore, plan, general ou nome de um agente definido (padrão: general)"},
                 "model": {"type": "string"},
+                "isolation": {"type": "string", "enum": ["worktree"], "description": "use \"worktree\" para isolar alterações em um git worktree temporário"},
                 "run_in_background": {"type": "boolean", "description": "devolve um id na hora; busque o resultado com agent_result"}
             }, "required": ["description", "prompt"]}),
             "o texto final do subagente",
@@ -35,6 +36,7 @@ pub(crate) fn all(parallel: bool) -> Vec<Box<dyn Tool>> {
                     agent: opt_str(a, "agent").map(str::to_string),
                     model: opt_str(a, "model").map(str::to_string),
                     background: a["run_in_background"].as_bool().unwrap_or(false),
+                    isolation: opt_str(a, "isolation").map(str::to_string),
                 };
                 let (session, svc) = exec.host.bound()?;
                 svc.agent(&session, req, exec.cancel, exec.deadline, exec.host.sink())

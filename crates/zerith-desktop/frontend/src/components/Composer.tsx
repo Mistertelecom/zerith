@@ -105,12 +105,17 @@ export function Composer(props: {
   draft: string;
   onDraft: (v: string) => void;
   onSend: () => void;
+  onSteer?: (text: string) => void;
   onRun: (name: CommandName) => void;
   busy: boolean;
   onCancel: () => void;
   mode: string;
   modes: readonly (readonly [string, string])[];
   onMode: (v: string) => void;
+  effort?: string;
+  onEffort?: (v: string) => void;
+  lastUserText?: string;
+  contextGauge?: { used: number; limit: number; cacheHitPct?: number } | null;
   model: string;
   models: { value: string; label: string }[];
   onModel: (v: string) => void;
@@ -218,8 +223,12 @@ export function Composer(props: {
   // App sends its own draft, so the lines go in first and the send waits one
   // render for them.
   const send = () => {
+    if (props.busy) {
+      const t = props.draft.trim();
+      if (t && props.onSteer) props.onSteer(t);
+      return;
+    }
     if (!images.length) return props.onSend();
-    if (props.busy) return;
     const lines = images.map(
       (i) => `![${i.name.replace(/[[\]\n]/g, "")}](<${i.path}>)`,
     );
@@ -442,6 +451,22 @@ export function Composer(props: {
                   return;
                 }
               }
+              if (e.key === "Tab" && e.shiftKey) {
+                e.preventDefault();
+                const i = props.modes.findIndex(([v]) => v === props.mode);
+                props.onMode(props.modes[(i + 1) % props.modes.length][0]);
+                return;
+              }
+              if (
+                e.key === "ArrowUp" &&
+                !props.draft.trim() &&
+                props.lastUserText &&
+                !(rows.length && trigger)
+              ) {
+                e.preventDefault();
+                props.onDraft(props.lastUserText);
+                return;
+              }
               if (e.key === "Enter" && !e.shiftKey) {
                 e.preventDefault();
                 send();
@@ -482,6 +507,29 @@ export function Composer(props: {
               options={props.modes.map(([v, label]) => ({ value: v, label }))}
               onPick={props.onMode}
             />
+            {props.onEffort ? (
+              <PillMenu
+                label="Esforço"
+                icon={<Brain size={14} strokeWidth={2} />}
+                text={
+                  props.effort === "low"
+                    ? "Baixo"
+                    : props.effort === "medium"
+                      ? "Médio"
+                      : props.effort === "high"
+                        ? "Alto"
+                        : "Off"
+                }
+                value={props.effort ?? "off"}
+                options={[
+                  { value: "off", label: "Off (padrão)" },
+                  { value: "low", label: "Baixo" },
+                  { value: "medium", label: "Médio" },
+                  { value: "high", label: "Alto" },
+                ]}
+                onPick={props.onEffort}
+              />
+            ) : null}
             <PillMenu
               label="Modelo"
               icon={
@@ -505,14 +553,26 @@ export function Composer(props: {
             />
             <span className="spacer" />
             {props.busy ? (
-              <button
-                className="send stop"
-                onClick={props.onCancel}
-                aria-label="Parar"
-                title="Parar"
-              >
-                <Square size={12} strokeWidth={2} fill="currentColor" />
-              </button>
+              <div className="send-busy-group">
+                {props.draft.trim() && props.onSteer ? (
+                  <button
+                    className="btn btn-primary send ready steer"
+                    onClick={send}
+                    aria-label="Direcionar"
+                    title="Direcionar o turno atual"
+                  >
+                    <ArrowUp size={16} strokeWidth={2.25} />
+                  </button>
+                ) : null}
+                <button
+                  className="send stop"
+                  onClick={props.onCancel}
+                  aria-label="Parar"
+                  title="Parar"
+                >
+                  <Square size={12} strokeWidth={2} fill="currentColor" />
+                </button>
+              </div>
             ) : (
               <button
                 className={"btn btn-primary send" + (canSend ? " ready" : "")}
@@ -528,11 +588,29 @@ export function Composer(props: {
         </div>
         <div className="hint">
           <span className="hint-text">{note ?? props.hint}</span>
+          {props.contextGauge && props.contextGauge.used > 0 ? (() => {
+            const pct = Math.min(
+              100,
+              Math.round((100 * props.contextGauge.used) / Math.max(1, props.contextGauge.limit)),
+            );
+            const cls = pct >= 85 ? "danger" : pct >= 70 ? "warn" : "";
+            return (
+              <span
+                className={`ctx-gauge ${cls}`}
+                title={`${props.contextGauge.used.toLocaleString("pt-BR")} / ${props.contextGauge.limit.toLocaleString("pt-BR")} tokens`}
+              >
+                <Gauge size={12} strokeWidth={2} />
+                {pct}% ({Math.round(props.contextGauge.used / 1000)}k/{Math.round(props.contextGauge.limit / 1000)}k)
+                {props.contextGauge.cacheHitPct ? ` · cache ${props.contextGauge.cacheHitPct}%` : ""}
+              </span>
+            );
+          })() : null}
           <span className="hint-keys">
-            <kbd className="kbd">Enter</kbd> enviar
-            <span className="hint-sep" />
             <kbd className="kbd">Shift</kbd>
-            <kbd className="kbd">Enter</kbd> nova linha
+            <kbd className="kbd">Tab</kbd> modo
+            <span className="hint-sep" />
+            <kbd className="kbd">Ctrl</kbd>
+            <kbd className="kbd">K</kbd> comandos
           </span>
         </div>
       </div>

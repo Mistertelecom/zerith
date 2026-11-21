@@ -91,6 +91,7 @@ pub async fn plugin_action(
     target: String,
 ) -> Result<PluginsView, String> {
     let root = state.root().join("plugins");
+    let cache = state.mcp_cache();
     tauri::async_runtime::spawn_blocking(move || {
         use zerith_plugins::{market, Status};
         let lib = zerith_plugins::Library::open(&root).map_err(|e| e.to_string())?;
@@ -106,6 +107,7 @@ pub async fn plugin_action(
             other => return Err(format!("ação desconhecida: {other}")),
         };
         done.map_err(|e| e.to_string())?;
+        cache.invalidate();
         plugins_view(&root)
     })
     .await

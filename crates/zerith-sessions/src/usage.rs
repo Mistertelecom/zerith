@@ -19,6 +19,10 @@ pub struct NewUsageRecord {
     pub role_kind: String,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub cache_write_tokens: u64,
     /// Tokens avoided by the RTK protocol for this request.
     pub saved_rtk_tokens: u64,
     /// Tokens avoided by the Ponytail protocol for this request.
@@ -30,6 +34,8 @@ pub struct NewUsageRecord {
     /// Request outcome, e.g. `"ok"`, `"rate_limited"`, `"error"`.
     pub status: String,
     pub latency_ms: u64,
+    #[serde(default)]
+    pub ttft_ms: u64,
 }
 
 impl Default for NewUsageRecord {
@@ -42,12 +48,15 @@ impl Default for NewUsageRecord {
             role_kind: "main".to_string(),
             prompt_tokens: 0,
             completion_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             saved_rtk_tokens: 0,
             saved_ponytail_tokens: 0,
             saved_caveman_tokens: 0,
             saved_tokens: 0,
             status: "ok".to_string(),
             latency_ms: 0,
+            ttft_ms: 0,
         }
     }
 }
@@ -60,6 +69,10 @@ pub struct AccountWindowStats {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub cache_write_tokens: u64,
     pub saved_rtk_tokens: u64,
     pub saved_ponytail_tokens: u64,
     pub saved_caveman_tokens: u64,
@@ -81,6 +94,10 @@ pub struct ModelUsageStats {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub cache_write_tokens: u64,
     pub saved_rtk_tokens: u64,
     pub saved_ponytail_tokens: u64,
     pub saved_caveman_tokens: u64,
@@ -95,6 +112,10 @@ pub struct UsageSummary {
     pub models: Vec<ModelUsageStats>,
     pub total_prompt_tokens: u64,
     pub total_completion_tokens: u64,
+    #[serde(default)]
+    pub total_cache_read_tokens: u64,
+    #[serde(default)]
+    pub total_cache_write_tokens: u64,
     pub total_saved_rtk_tokens: u64,
     pub total_saved_ponytail_tokens: u64,
     pub total_saved_caveman_tokens: u64,
@@ -167,9 +188,10 @@ impl Store {
             "INSERT INTO usage_records(
                  session_id, account_id, provider, model, role_kind,
                  prompt_tokens, completion_tokens,
+                 cache_read_tokens, cache_write_tokens,
                  saved_rtk_tokens, saved_ponytail_tokens, saved_caveman_tokens, saved_tokens,
-                 status, latency_ms, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                 status, latency_ms, ttft_ms, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 session_id,
                 rec.account_id,
@@ -178,12 +200,15 @@ impl Store {
                 role_kind,
                 to_sql_i64(rec.prompt_tokens),
                 to_sql_i64(rec.completion_tokens),
+                to_sql_i64(rec.cache_read_tokens),
+                to_sql_i64(rec.cache_write_tokens),
                 to_sql_i64(saved_rtk),
                 to_sql_i64(saved_ponytail),
                 to_sql_i64(saved_caveman),
                 to_sql_i64(saved_total),
                 status,
                 to_sql_i64(rec.latency_ms),
+                to_sql_i64(rec.ttft_ms),
                 now_ms(),
             ],
         )?;
@@ -235,6 +260,8 @@ impl Store {
         let (
             prompt_tokens,
             completion_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
             saved_rtk_tokens,
             saved_ponytail_tokens,
             saved_caveman_tokens,
@@ -245,6 +272,8 @@ impl Store {
             "SELECT
                  COALESCE(SUM(prompt_tokens), 0),
                  COALESCE(SUM(completion_tokens), 0),
+                 COALESCE(SUM(cache_read_tokens), 0),
+                 COALESCE(SUM(cache_write_tokens), 0),
                  COALESCE(SUM(saved_rtk_tokens), 0),
                  COALESCE(SUM(saved_ponytail_tokens), 0),
                  COALESCE(SUM(saved_caveman_tokens), 0),
@@ -264,6 +293,8 @@ impl Store {
                     from_sql_u64(r.get::<_, i64>(5)?),
                     from_sql_u64(r.get::<_, i64>(6)?),
                     from_sql_u64(r.get::<_, i64>(7)?),
+                    from_sql_u64(r.get::<_, i64>(8)?),
+                    from_sql_u64(r.get::<_, i64>(9)?),
                 ))
             },
         )?;
@@ -304,6 +335,8 @@ impl Store {
             prompt_tokens,
             completion_tokens,
             total_tokens: prompt_tokens.saturating_add(completion_tokens),
+            cache_read_tokens,
+            cache_write_tokens,
             saved_rtk_tokens,
             saved_ponytail_tokens,
             saved_caveman_tokens,
@@ -368,6 +401,8 @@ impl Store {
                      role_kind,
                      COALESCE(SUM(prompt_tokens), 0),
                      COALESCE(SUM(completion_tokens), 0),
+                     COALESCE(SUM(cache_read_tokens), 0),
+                     COALESCE(SUM(cache_write_tokens), 0),
                      COALESCE(SUM(saved_rtk_tokens), 0),
                      COALESCE(SUM(saved_ponytail_tokens), 0),
                      COALESCE(SUM(saved_caveman_tokens), 0),
@@ -391,11 +426,13 @@ impl Store {
                     prompt_tokens,
                     completion_tokens,
                     total_tokens: prompt_tokens.saturating_add(completion_tokens),
-                    saved_rtk_tokens: from_sql_u64(r.get::<_, i64>(5)?),
-                    saved_ponytail_tokens: from_sql_u64(r.get::<_, i64>(6)?),
-                    saved_caveman_tokens: from_sql_u64(r.get::<_, i64>(7)?),
-                    saved_tokens: from_sql_u64(r.get::<_, i64>(8)?),
-                    requests: from_sql_u64(r.get::<_, i64>(9)?),
+                    cache_read_tokens: from_sql_u64(r.get::<_, i64>(5)?),
+                    cache_write_tokens: from_sql_u64(r.get::<_, i64>(6)?),
+                    saved_rtk_tokens: from_sql_u64(r.get::<_, i64>(7)?),
+                    saved_ponytail_tokens: from_sql_u64(r.get::<_, i64>(8)?),
+                    saved_caveman_tokens: from_sql_u64(r.get::<_, i64>(9)?),
+                    saved_tokens: from_sql_u64(r.get::<_, i64>(10)?),
+                    requests: from_sql_u64(r.get::<_, i64>(11)?),
                 })
             })?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
@@ -404,6 +441,8 @@ impl Store {
         let (
             total_prompt_tokens,
             total_completion_tokens,
+            total_cache_read_tokens,
+            total_cache_write_tokens,
             total_saved_rtk_tokens,
             total_saved_ponytail_tokens,
             total_saved_caveman_tokens,
@@ -413,6 +452,8 @@ impl Store {
             "SELECT
                  COALESCE(SUM(prompt_tokens), 0),
                  COALESCE(SUM(completion_tokens), 0),
+                 COALESCE(SUM(cache_read_tokens), 0),
+                 COALESCE(SUM(cache_write_tokens), 0),
                  COALESCE(SUM(saved_rtk_tokens), 0),
                  COALESCE(SUM(saved_ponytail_tokens), 0),
                  COALESCE(SUM(saved_caveman_tokens), 0),
@@ -430,6 +471,8 @@ impl Store {
                     from_sql_u64(r.get::<_, i64>(4)?),
                     from_sql_u64(r.get::<_, i64>(5)?),
                     from_sql_u64(r.get::<_, i64>(6)?),
+                    from_sql_u64(r.get::<_, i64>(7)?),
+                    from_sql_u64(r.get::<_, i64>(8)?),
                 ))
             },
         )?;
@@ -471,6 +514,8 @@ impl Store {
             models,
             total_prompt_tokens,
             total_completion_tokens,
+            total_cache_read_tokens,
+            total_cache_write_tokens,
             total_saved_rtk_tokens,
             total_saved_ponytail_tokens,
             total_saved_caveman_tokens,
@@ -525,12 +570,15 @@ mod tests {
                 role_kind: "main".into(),
                 prompt_tokens: 1000,
                 completion_tokens: 250,
+                cache_read_tokens: 700,
+                cache_write_tokens: 100,
                 saved_rtk_tokens: 200,
                 saved_ponytail_tokens: 120,
                 saved_caveman_tokens: 80,
                 saved_tokens: 0,
                 status: "ok".into(),
                 latency_ms: 320,
+                ttft_ms: 90,
             })
             .unwrap();
         // Explicit per-protocol savings with saved_tokens >= specific_sum.
@@ -549,6 +597,7 @@ mod tests {
                 saved_tokens: 150,
                 status: "ok".into(),
                 latency_ms: 210,
+                ..Default::default()
             })
             .unwrap();
         // Legacy fallback: only saved_tokens populated -> attributed to RTK.
@@ -567,6 +616,7 @@ mod tests {
                 saved_tokens: 300,
                 status: "rate_limited".into(),
                 latency_ms: 50,
+                ..Default::default()
             })
             .unwrap();
 
@@ -579,6 +629,8 @@ mod tests {
         let summary = s.usage_summary(24).unwrap();
         assert_eq!(summary.total_prompt_tokens, 2300);
         assert_eq!(summary.total_completion_tokens, 550);
+        assert_eq!(summary.total_cache_read_tokens, 700);
+        assert_eq!(summary.total_cache_write_tokens, 100);
         assert_eq!(summary.total_saved_rtk_tokens, 560);
         assert_eq!(summary.total_saved_ponytail_tokens, 170);
         assert_eq!(summary.total_saved_caveman_tokens, 120);
@@ -603,6 +655,8 @@ mod tests {
         assert_eq!(acct_a.prompt_tokens, 1500);
         assert_eq!(acct_a.completion_tokens, 350);
         assert_eq!(acct_a.total_tokens, 1850);
+        assert_eq!(acct_a.cache_read_tokens, 700);
+        assert_eq!(acct_a.cache_write_tokens, 100);
         assert_eq!(acct_a.saved_rtk_tokens, 260);
         assert_eq!(acct_a.saved_ponytail_tokens, 170);
         assert_eq!(acct_a.saved_caveman_tokens, 120);

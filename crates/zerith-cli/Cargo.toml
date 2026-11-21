@@ -21,3 +21,4 @@ zerith-plugins = { path = "../zerith-plugins" }
 zerith-mcp = { path = "../zerith-mcp" }
 zerith-security = { path = "../zerith-security" }
 serde_json.workspace = true
+ureq.workspace = true

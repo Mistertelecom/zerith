@@ -31,11 +31,12 @@ pub const SUMMARY_HEADER: &str = "[resumo da conversa anterior, gerado automatic
 
 /// The fixed instruction of the summary call.
 pub const SUMMARY_PROMPT: &str =
-    "Você resume o início de uma conversa entre um usuário e um agente de código, \
-para que o agente continue o trabalho sem reler tudo. Escreva em português, em tópicos curtos: \
-(1) o que o usuário pediu, com as palavras dele quando forem curtas; (2) decisões tomadas; \
-(3) arquivos lidos ou alterados e comandos relevantes; (4) estado atual e pendências. \
-Não invente nada que não esteja no texto. No máximo 400 palavras.";
+    "Você resume o início de uma conversa entre um usuário e um agente técnico, \
+para que o agente continue o trabalho sem reler tudo. Escreva em português, em tópicos objetivos: \
+(1) pedido do usuário; (2) decisões tomadas; (3) entidades exatas (preserve literalmente IPs, CIDRs, \
+ASNs, VLANs, VRFs, nomes de interfaces, hostnames, caminhos de arquivo, símbolos de código e mensagens de erro); \
+(4) arquivos/equipamentos lidos ou alterados; (5) estado atual e pendências. \
+Não invente nada que não esteja no texto. No máximo 500 palavras.";
 
 /// How many rows `compact_now` reads.
 const COMPACT_WINDOW: usize = 500;
@@ -409,13 +410,42 @@ fn compact_with(
 }
 
 /// Whether a history of `tokens` should be summarized before the next turn:
-/// past [`AUTO_COMPACT_PCT`] of the window (`context_limit`, else
-/// [`DEFAULT_CONTEXT`]).
-pub fn needs_compaction(tokens: usize, context_limit: Option<u32>) -> bool {
+/// past `pct`% of the window (`context_limit`, else [`DEFAULT_CONTEXT`]).
+pub fn needs_compaction_at(tokens: usize, context_limit: Option<u32>, pct: usize) -> bool {
     let window = context_limit
         .filter(|&l| l > 0)
         .map_or(DEFAULT_CONTEXT, |l| l as usize);
-    tokens * 100 > window * AUTO_COMPACT_PCT
+    tokens * 100 > window * pct
+}
+
+/// Whether a history of `tokens` should be summarized before the next turn:
+/// past [`AUTO_COMPACT_PCT`] of the window (`context_limit`, else
+/// [`DEFAULT_CONTEXT`]).
+pub fn needs_compaction(tokens: usize, context_limit: Option<u32>) -> bool {
+    needs_compaction_at(tokens, context_limit, AUTO_COMPACT_PCT)
+}
+
+/// Picks the configured summarization model (`compact_model` -> `explore_model`
+/// -> active conversation model).
+pub(crate) fn compact_model_spec<'a>(
+    settings: &'a zerith_core::Settings,
+    fallback: &'a str,
+) -> &'a str {
+    settings
+        .routing
+        .compact_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            settings
+                .routing
+                .explore_model
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or(fallback)
 }
 
 /// `auto_compact` for the account `model` is routed to: its window (the
@@ -429,6 +459,44 @@ pub fn auto_compact_routed(
     session_id: &str,
     model: &str,
     history: usize,
+    cancel: &Cancel,
+) -> Result<Option<CompactReport>> {
+    auto_compact_routed_at(
+        store,
+        settings,
+        client,
+        session_id,
+        model,
+        history,
+        AUTO_COMPACT_PCT,
+        cancel,
+    )
+}
+
+/// Background pre-compaction trigger at 70% of the active model's context window.
+pub fn pre_compact_routed(
+    store: &Store,
+    settings: &zerith_core::Settings,
+    client: &Client,
+    session_id: &str,
+    model: &str,
+    history: usize,
+    cancel: &Cancel,
+) -> Result<Option<CompactReport>> {
+    auto_compact_routed_at(
+        store, settings, client, session_id, model, history, 70, cancel,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn auto_compact_routed_at(
+    store: &Store,
+    settings: &zerith_core::Settings,
+    client: &Client,
+    session_id: &str,
+    model: &str,
+    history: usize,
+    threshold_pct: usize,
     cancel: &Cancel,
 ) -> Result<Option<CompactReport>> {
     let first = crate::resolve_gateway(settings, model, client.config())
@@ -448,17 +516,32 @@ pub fn auto_compact_routed(
         .or_else(|| {
             zerith_providers::models::context_window(first.as_ref().map_or(model, |c| &c.model))
         });
-    let routed = first.and_then(|c| Client::new(c.config).ok().map(|cl| (cl, c.model)));
-    let (client, model) = match &routed {
+
+    let sum_spec = compact_model_spec(settings, model);
+    let sum_cand = if sum_spec == model {
+        first
+    } else {
+        crate::resolve_gateway(settings, sum_spec, client.config())
+            .0
+            .candidates
+            .into_iter()
+            .next()
+    };
+    let routed = sum_cand.and_then(|c| Client::new(c.config).ok().map(|cl| (cl, c.model)));
+    let (client, sum_model) = match &routed {
         Some((cl, m)) => (cl, m.as_str()),
         None => (client, model),
     };
-    auto_compact(
+    auto_compact_at(
         store,
         session_id,
         history,
         limit,
-        &ClientSummarizer { client, model },
+        threshold_pct,
+        &ClientSummarizer {
+            client,
+            model: sum_model,
+        },
         cancel,
     )
 }
@@ -474,11 +557,31 @@ pub fn auto_compact(
     summarizer: &dyn Summarizer,
     cancel: &Cancel,
 ) -> Result<Option<CompactReport>> {
+    auto_compact_at(
+        store,
+        session_id,
+        history,
+        context_limit,
+        AUTO_COMPACT_PCT,
+        summarizer,
+        cancel,
+    )
+}
+
+pub fn auto_compact_at(
+    store: &Store,
+    session_id: &str,
+    history: usize,
+    context_limit: Option<u32>,
+    threshold_pct: usize,
+    summarizer: &dyn Summarizer,
+    cancel: &Cancel,
+) -> Result<Option<CompactReport>> {
     // ponytail: counts the replayed rows only; the system prompt and tool
-    // specs (a few k tokens) ride on the 25% margin.
+    // specs (a few k tokens) ride on the margin.
     let rows = store.history_rows(session_id, history.max(1))?;
     let tokens: usize = replay_items(&rows).iter().map(|i| cost(&i.msg)).sum();
-    if !needs_compaction(tokens, context_limit) {
+    if !needs_compaction_at(tokens, context_limit, threshold_pct) {
         return Ok(None);
     }
     compact_with(store, session_id, summarizer, cancel, "auto")
@@ -602,6 +705,24 @@ pub(crate) fn pair(items: Vec<Item>) -> Vec<Item> {
     }
     close(&mut out, &mut open);
     out
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+
+    #[test]
+    fn compact_model_prefers_compact_then_explore_then_fallback() {
+        let mut s = zerith_core::Settings::default();
+        assert_eq!(compact_model_spec(&s, "main-m"), "main-m");
+        s.routing.explore_model = Some("exp-m".into());
+        assert_eq!(compact_model_spec(&s, "main-m"), "exp-m");
+        s.routing.compact_model = Some("cmp-m".into());
+        assert_eq!(compact_model_spec(&s, "main-m"), "cmp-m");
+        assert!(SUMMARY_PROMPT.contains("CIDR"));
+        assert!(needs_compaction_at(71, Some(100), 70));
+        assert!(!needs_compaction_at(70, Some(100), 70));
+    }
 }
 
 #[cfg(test)]

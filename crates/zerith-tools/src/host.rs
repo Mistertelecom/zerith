@@ -27,6 +27,8 @@ pub struct AgentRequest {
     pub agent: Option<String>,
     pub model: Option<String>,
     pub background: bool,
+    /// Optional workspace isolation mode (`"worktree"`).
+    pub isolation: Option<String>,
 }
 
 /// A skill body, ready for the model.
@@ -52,17 +54,49 @@ pub enum HostEvent {
     },
     /// The session's task list changed; the loop reloads and publishes it.
     Tasks,
+    /// Incremental stdout/stderr or terminal output while a tool runs.
+    ToolProgress { tool: String, chunk: String },
+}
+
+pub type LiveHook = Arc<dyn Fn(HostEvent) + Send + Sync>;
+
+#[derive(Default)]
+struct SinkInner {
+    queue: Mutex<Vec<HostEvent>>,
+    live: Mutex<Option<LiveHook>>,
 }
 
 /// A cheap handle to the event queue, usable from worker threads.
 #[derive(Clone, Default)]
-pub struct EventSink(Arc<Mutex<Vec<HostEvent>>>);
+pub struct EventSink(Arc<SinkInner>);
 
 impl EventSink {
+    pub fn set_live(&self, cb: Option<LiveHook>) {
+        if let Ok(mut g) = self.0.live.lock() {
+            *g = cb;
+        }
+    }
+
     pub fn push(&self, e: HostEvent) {
-        if let Ok(mut q) = self.0.lock() {
+        if matches!(&e, HostEvent::ToolProgress { .. }) {
+            // Clone outside any queue lock so callbacks never run with locks held.
+            let cb = self.0.live.lock().ok().and_then(|g| g.clone());
+            if let Some(cb) = cb {
+                cb(e);
+            }
+            return;
+        }
+        if let Ok(mut q) = self.0.queue.lock() {
             q.push(e);
         }
+    }
+
+    pub(crate) fn take(&self) -> Vec<HostEvent> {
+        self.0
+            .queue
+            .lock()
+            .map(|mut q| std::mem::take(&mut *q))
+            .unwrap_or_default()
     }
 }
 
@@ -94,6 +128,11 @@ pub trait Services: Send + Sync {
     /// `skill_search`. `None`: no library.
     fn skills_root(&self) -> Option<zerith_skills::Library> {
         None
+    }
+
+    /// Searches past session messages by text/FTS query.
+    fn session_search(&self, _query: &str, _limit: usize) -> std::result::Result<String, String> {
+        Err("busca em sessões indisponível neste contexto".into())
     }
 }
 
@@ -173,11 +212,12 @@ impl Host {
 
     /// Events queued since the last call. Workers push, the loop drains.
     pub fn take_events(&self) -> Vec<HostEvent> {
-        self.events
-            .0
-            .lock()
-            .map(|mut q| std::mem::take(&mut *q))
-            .unwrap_or_default()
+        self.events.take()
+    }
+
+    pub fn session_search(&self, query: &str, limit: usize) -> Result<String> {
+        let (_, svc) = self.bound()?;
+        svc.session_search(query, limit).map_err(ToolError::Failed)
     }
 
     /// Records that the model loaded a skill, with the `allowed-tools` it

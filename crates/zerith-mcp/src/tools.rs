@@ -61,6 +61,9 @@ struct Server {
     cfg: ServerConfig,
     extra: Extra,
     client: Mutex<Option<Client>>,
+    /// Cached `tools/list` response so warm registries re-populate fresh `Registry`
+    /// instances without extra RPC round-trips or child respawns.
+    cached_tools: Mutex<Option<Vec<ToolInfo>>>,
 }
 
 impl Server {
@@ -128,8 +131,24 @@ impl Server {
                 | McpError::Http(_))
         ) {
             *slot = None;
+            if let Ok(mut cache) = self.cached_tools.lock() {
+                *cache = None;
+            }
         }
         result
+    }
+
+    fn tools_cached(&self) -> std::result::Result<Vec<ToolInfo>, McpError> {
+        if let Ok(cache) = self.cached_tools.lock() {
+            if let Some(list) = cache.as_ref() {
+                return Ok(list.clone());
+            }
+        }
+        let tools = self.with(|c| c.tools())?;
+        if let Ok(mut cache) = self.cached_tools.lock() {
+            *cache = Some(tools.clone());
+        }
+        Ok(tools)
     }
 }
 
@@ -257,6 +276,7 @@ impl McpRegistry {
                         cfg,
                         extra: Extra::default(),
                         client: Mutex::new(None),
+                        cached_tools: Mutex::new(None),
                     })
                 })
                 .collect(),
@@ -299,6 +319,7 @@ impl McpRegistry {
                 cfg,
                 extra: Extra::default(),
                 client: Mutex::new(None),
+                cached_tools: Mutex::new(None),
             }));
         }
     }
@@ -329,12 +350,45 @@ impl McpRegistry {
     pub fn register_into(&self, registry: &mut Registry) -> Registered {
         let mut done = Registered::default();
         let mut listed: Vec<(&Arc<Server>, Vec<ToolInfo>)> = Vec::new();
-        for server in &self.servers {
-            match server.with(|c| c.tools()) {
-                Ok(t) => listed.push((server, t)),
-                Err(e) => done
-                    .errors
-                    .push(format!("servidor MCP {}: {e}", server.cfg.name)),
+        if self.servers.len() <= 1 {
+            for server in &self.servers {
+                match server.tools_cached() {
+                    Ok(t) => listed.push((server, t)),
+                    Err(e) => done
+                        .errors
+                        .push(format!("servidor MCP {}: {e}", server.cfg.name)),
+                }
+            }
+        } else {
+            type ProbeSlot = Mutex<Option<std::result::Result<Vec<ToolInfo>, McpError>>>;
+            let mut results: Vec<Option<std::result::Result<Vec<ToolInfo>, McpError>>> =
+                (0..self.servers.len()).map(|_| None).collect();
+            let slots: Vec<ProbeSlot> = (0..self.servers.len()).map(|_| Mutex::new(None)).collect();
+            std::thread::scope(|s| {
+                for (i, server) in self.servers.iter().enumerate() {
+                    let slot = &slots[i];
+                    s.spawn(move || {
+                        let res = server.tools_cached();
+                        if let Ok(mut g) = slot.lock() {
+                            *g = Some(res);
+                        }
+                    });
+                }
+            });
+            for (i, slot) in slots.into_iter().enumerate() {
+                results[i] = slot.into_inner().ok().flatten();
+            }
+            for (server, res) in self.servers.iter().zip(results) {
+                match res {
+                    Some(Ok(t)) => listed.push((server, t)),
+                    Some(Err(e)) => done
+                        .errors
+                        .push(format!("servidor MCP {}: {e}", server.cfg.name)),
+                    None => done.errors.push(format!(
+                        "servidor MCP {}: inicialização interrompida",
+                        server.cfg.name
+                    )),
+                }
             }
         }
         let sizes: Vec<(usize, usize)> = listed

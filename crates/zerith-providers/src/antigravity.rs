@@ -101,6 +101,9 @@ pub(crate) fn body(req: &ChatRequest, project: Option<&str>) -> Value {
     if let Some(t) = req.temperature {
         gen["temperature"] = json!(t);
     }
+    if let Some(budget) = crate::thinking_budget(req.reasoning_effort.as_deref()) {
+        gen["thinkingConfig"] = json!({"thinkingBudget": budget});
+    }
     if gen.as_object().is_some_and(|o| !o.is_empty()) {
         request["generationConfig"] = gen;
     }
@@ -304,10 +307,13 @@ impl GeminiStream {
         if let Some(u) = r.get("usageMetadata") {
             let prompt = u["promptTokenCount"].as_u64().unwrap_or(0);
             let total = u["totalTokenCount"].as_u64().unwrap_or(0);
+            let cached = u["cachedContentTokenCount"].as_u64().unwrap_or(0);
             self.usage = Some(Usage {
                 prompt_tokens: prompt,
                 completion_tokens: total.saturating_sub(prompt),
                 total_tokens: total,
+                cache_read_tokens: cached,
+                cache_write_tokens: 0,
             });
         }
         Ok(false)

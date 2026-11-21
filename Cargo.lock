@@ -4907,9 +4907,10 @@ dependencies = [
 
 [[package]]
 name = "zerith-cli"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "serde_json",
+ "ureq",
  "zerith-core",
  "zerith-importers",
  "zerith-mcp",
@@ -4925,7 +4926,7 @@ dependencies = [
 
 [[package]]
 name = "zerith-core"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "keyring",
  "serde",
@@ -4938,7 +4939,7 @@ dependencies = [
 
 [[package]]
 name = "zerith-desktop"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "base64 0.22.1",
  "ring",
@@ -4965,7 +4966,7 @@ dependencies = [
 
 [[package]]
 name = "zerith-importers"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "rusqlite",
  "serde",
@@ -4980,7 +4981,7 @@ dependencies = [
 
 [[package]]
 name = "zerith-mcp"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "base64 0.22.1",
  "ring",
@@ -4998,7 +4999,7 @@ dependencies = [
 
 [[package]]
 name = "zerith-memory"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "rusqlite",
  "serde",
@@ -5011,7 +5012,7 @@ dependencies = [
 
 [[package]]
 name = "zerith-plugins"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "serde",
  "serde_json",
@@ -5023,7 +5024,7 @@ dependencies = [
 
 [[package]]
 name = "zerith-providers"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "base64 0.22.1",
  "ring",
@@ -5036,7 +5037,7 @@ dependencies = [
 
 [[package]]
 name = "zerith-runtime"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "serde_json",
  "tempfile",
@@ -5055,7 +5056,7 @@ dependencies = [
 
 [[package]]
 name = "zerith-security"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "serde_json",
  "tempfile",
@@ -5066,7 +5067,7 @@ dependencies = [
 
 [[package]]
 name = "zerith-sessions"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "rusqlite",
  "serde",
@@ -5078,7 +5079,7 @@ dependencies = [
 
 [[package]]
 name = "zerith-skills"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "serde",
  "serde_json",
@@ -5090,12 +5091,14 @@ dependencies = [
 
 [[package]]
 name = "zerith-tools"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "regex",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
+ "toml 1.1.8+spec-1.1.0",
  "ureq",
  "walkdir",
  "windows-sys 0.61.2",

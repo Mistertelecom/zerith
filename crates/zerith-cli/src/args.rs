@@ -95,6 +95,7 @@ pub struct ChatArgs {
     pub prompt: String,
     pub session: SessionArgs,
     pub model: Option<String>,
+    pub remote: Option<String>,
 }
 
 pub fn parse_chat(args: &[String]) -> Result<ChatArgs, String> {
@@ -102,6 +103,7 @@ pub fn parse_chat(args: &[String]) -> Result<ChatArgs, String> {
         prompt: String::new(),
         session: SessionArgs::default(),
         model: None,
+        remote: None,
     };
     let mut words: Vec<&str> = Vec::new();
     let mut i = 1;
@@ -119,6 +121,15 @@ pub fn parse_chat(args: &[String]) -> Result<ChatArgs, String> {
             i += 2;
             continue;
         }
+        if a == "--remote" {
+            out.remote = Some(
+                args.get(i + 1)
+                    .ok_or("--remote precisa de um valor")?
+                    .clone(),
+            );
+            i += 2;
+            continue;
+        }
         if !a.starts_with("--") {
             words.push(a);
         }
@@ -129,6 +140,59 @@ pub fn parse_chat(args: &[String]) -> Result<ChatArgs, String> {
         return Err("chat precisa de um prompt".into());
     }
     out.prompt = words.join(" ");
+    Ok(out)
+}
+
+/// `zerith repl` (or bare `zerith chat`) arguments for interactive sessions.
+#[derive(Debug, Default, PartialEq)]
+pub struct ReplArgs {
+    pub session: SessionArgs,
+    pub model: Option<String>,
+    pub mode: Option<Permission>,
+    pub effort: Option<String>,
+    pub workspace: Option<std::path::PathBuf>,
+    pub remote: Option<String>,
+}
+
+pub fn parse_repl(args: &[String]) -> Result<ReplArgs, String> {
+    let mut out = ReplArgs::default();
+    let mut i = 1;
+    while i < args.len() {
+        if session_flag(args, &mut i, &mut out.session)? {
+            continue;
+        }
+        let a = args[i].as_str();
+        let next = || {
+            args.get(i + 1)
+                .cloned()
+                .ok_or_else(|| format!("{a} precisa de um valor"))
+        };
+        match a {
+            "--model" => out.model = Some(next()?),
+            "--mode" | "--permission-mode" => {
+                let v = next()?;
+                out.mode = Some(Permission::parse(&v).ok_or_else(|| {
+                    format!(
+                        "{a} inválido: {v} (use default, acceptEdits, plan, dontAsk ou bypassPermissions)"
+                    )
+                })?);
+            }
+            "--effort" => {
+                let v = next()?.trim().to_ascii_lowercase();
+                if !matches!(v.as_str(), "off" | "low" | "medium" | "high") {
+                    return Err(format!(
+                        "--effort inválido: {v} (use off, low, medium ou high)"
+                    ));
+                }
+                out.effort = Some(v);
+            }
+            "--workspace" | "-C" => out.workspace = Some(std::path::PathBuf::from(next()?)),
+            "--remote" => out.remote = Some(next()?),
+            other => return Err(format!("argumento desconhecido em repl: {other}")),
+        }
+        i += 2;
+    }
+    out.session.check()?;
     Ok(out)
 }
 
@@ -151,6 +215,7 @@ pub struct Headless {
     /// Inline JSON (starts with `{`) or a file path.
     pub json_schema: Option<String>,
     pub no_tools: bool,
+    pub remote: Option<String>,
 }
 
 pub fn is_headless(args: &[String]) -> bool {
@@ -200,6 +265,7 @@ pub fn parse_headless(args: &[String]) -> Result<Headless, String> {
         permission_mode: None,
         json_schema: None,
         no_tools: false,
+        remote: None,
     };
     let mut prompt = None;
     let mut i = 0;
@@ -260,6 +326,7 @@ pub fn parse_headless(args: &[String]) -> Result<Headless, String> {
                 })?)
             }
             "--json-schema" => out.json_schema = Some(value()?),
+            "--remote" => out.remote = Some(value()?),
             other => return Err(format!("argumento desconhecido: {other}")),
         }
         i += 2;
@@ -548,7 +615,8 @@ mod tests {
                     target: Target::Key("s".into()),
                     fork: false
                 },
-                model: Some("m1".into())
+                model: Some("m1".into()),
+                remote: None,
             }
         );
         assert!(parse_chat(&v(&["chat", "--model", "m1"])).is_err());
@@ -779,5 +847,40 @@ mod tests {
             "x"
         )
         .is_err());
+    }
+
+    #[test]
+    fn repl_flags_parse_with_empty_or_flag_only_args() {
+        assert_eq!(parse_repl(&v(&["chat"])).unwrap(), ReplArgs::default());
+        let parsed = parse_repl(&v(&[
+            "repl",
+            "--model",
+            "gpt-5",
+            "--mode",
+            "acceptEdits",
+            "--effort",
+            "high",
+            "--continue",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.model.as_deref(), Some("gpt-5"));
+        assert_eq!(parsed.mode, Some(Permission::AcceptEdits));
+        assert_eq!(parsed.effort.as_deref(), Some("high"));
+        assert_eq!(parsed.session.target, Target::Latest);
+        assert!(parse_repl(&v(&["repl", "--effort", "extreme"])).is_err());
+    }
+
+    #[test]
+    fn remote_flag_parses_in_chat_repl_and_headless() {
+        let c = parse_chat(&v(&["chat", "--remote", "prod", "verifica", "logs"])).unwrap();
+        assert_eq!(c.remote.as_deref(), Some("prod"));
+        assert_eq!(c.prompt, "verifica logs");
+
+        let r = parse_repl(&v(&["repl", "--remote", "docker://lab-frr/etc/frr"])).unwrap();
+        assert_eq!(r.remote.as_deref(), Some("docker://lab-frr/etc/frr"));
+
+        let h = parse_headless(&v(&["-p", "status", "--remote", "ssh://ops@10.0.0.1"])).unwrap();
+        assert_eq!(h.remote.as_deref(), Some("ssh://ops@10.0.0.1"));
+        assert!(parse_chat(&v(&["chat", "--remote"])).is_err());
     }
 }

@@ -874,6 +874,7 @@ mod tests {
                         prompt_tokens: 3,
                         completion_tokens: 4,
                         total_tokens: 7,
+                        ..Default::default()
                     }),
                     stop_reason: Some("tool_calls".into()),
                 }

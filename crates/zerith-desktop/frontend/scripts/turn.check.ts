@@ -83,4 +83,14 @@ assert.equal((lent[4] as { id?: number }).id, 9);
 assert.equal((lent[0] as { id?: number }).id, 1, "older prompts untouched");
 assert.equal(borrowIds(lent, stored, 10), lent, "nothing to borrow = same list");
 assert.equal((borrowIds(live, stored, null)[4] as { id?: number }).id, 9, "failed turn: newest user row");
+
+// Onda 2: live toolProgress caps at 4000 chars on the open tool row and steered leaves a note
+let liveState: TurnState = { ...emptyTurn, busy: true };
+liveState = applyEvent(liveState, { type: "toolCall", id: "t1", name: "shell", args: '{"command":"ping"}' });
+liveState = applyEvent(liveState, { type: "toolProgress", tool: "shell", chunk: "linha 1\n" });
+liveState = applyEvent(liveState, { type: "toolProgress", tool: "shell", chunk: "x".repeat(4500) });
+const liveTool = (liveState.blocks[0] as Extract<Block, { kind: "assistant" }>).tools[0];
+assert.equal(liveTool.progress?.length, 4000);
+liveState = applyEvent(liveState, { type: "steered", text: "foco no BGP" });
+assert.deepEqual(liveState.blocks[1], { kind: "note", text: "Direcionado: foco no BGP" });
 console.log("turn ok");

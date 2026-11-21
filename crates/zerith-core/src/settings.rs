@@ -54,6 +54,57 @@ pub struct Settings {
     pub learning: LearningSettings,
     #[serde(default, skip_serializing_if = "ContextSettings::is_default")]
     pub context: ContextSettings,
+    #[serde(default, skip_serializing_if = "GatewaySettings::is_empty")]
+    pub gateway: GatewaySettings,
+    #[serde(default, skip_serializing_if = "RemoteSettings::is_empty")]
+    pub remote: RemoteSettings,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GatewaySettings {
+    #[serde(default, skip_serializing_if = "TelegramSettings::is_empty")]
+    pub telegram: TelegramSettings,
+}
+
+impl GatewaySettings {
+    pub fn is_empty(&self) -> bool {
+        self.telegram.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TelegramSettings {
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_chats: Vec<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_workspace: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
+}
+
+impl TelegramSettings {
+    pub fn is_empty(&self) -> bool {
+        !self.enabled
+            && self.allowed_chats.is_empty()
+            && self.default_workspace.is_none()
+            && self.default_model.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RemoteSettings {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub targets: BTreeMap<String, String>,
+}
+
+impl RemoteSettings {
+    pub fn is_empty(&self) -> bool {
+        self.targets.is_empty()
+    }
 }
 
 /// Long conversations. `billion_context` routes the chat through a local
@@ -208,6 +259,8 @@ pub struct RoutingSettings {
     pub explore_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact_model: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub role_models: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -854,7 +907,15 @@ fn env_table(env: &impl Fn(&str) -> Option<String>) -> Table {
 /// dropped, so the loading report can say so.
 fn tighten_only(t: &mut Table) -> Option<String> {
     let mut removed: Vec<&str> = Vec::new();
-    for k in ["hooks", "base_url", "provider", "providers", "accounts"] {
+    for k in [
+        "hooks",
+        "base_url",
+        "provider",
+        "providers",
+        "accounts",
+        "gateway",
+        "remote",
+    ] {
         if t.remove(k).is_some() {
             removed.push(k);
         }
@@ -1345,6 +1406,7 @@ output_dir = \"C:/Windows/Temp/evil\"
                 ("empty-role".into(), "   ".into()),
             ]),
             combos: Vec::new(),
+            ..Default::default()
         };
 
         assert_eq!(

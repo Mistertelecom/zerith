@@ -12,7 +12,8 @@ use serde::Deserialize;
 use tauri::{AppHandle, Emitter, Manager};
 use zerith_providers::Cancel;
 use zerith_runtime::{
-    approval_channel, question_channel, Approval, ApprovalSender, QuestionSender,
+    approval_channel_with_grants, inbox_channel, question_channel, Approval, ApprovalSender,
+    InboxSender, QuestionSender, SharedGrants,
 };
 
 use crate::state::AppState;
@@ -25,26 +26,38 @@ pub struct Running {
     pub cancel: Cancel,
     pub approvals: ApprovalSender,
     pub questions: QuestionSender,
+    pub inbox: InboxSender,
 }
 
-/// Every turn currently running, by session.
+/// Every turn currently running, by session, plus per-session `AllowSession` grants.
 #[derive(Default)]
-pub struct Turns(Mutex<HashMap<String, Running>>);
+pub struct Turns {
+    running: Mutex<HashMap<String, Running>>,
+    grants: Mutex<HashMap<String, SharedGrants>>,
+}
 
 impl Turns {
     /// Replaces whatever ran for this session before: one turn per conversation.
     pub fn start(&self, id: &str, run: Running) -> Option<Running> {
-        self.0.lock().ok()?.insert(id.to_string(), run)
+        self.running.lock().ok()?.insert(id.to_string(), run)
     }
 
     pub fn take(&self, id: &str) -> Option<Running> {
-        self.0.lock().ok()?.remove(id)
+        self.running.lock().ok()?.remove(id)
     }
 
     /// Reads without removing, so an approval can be answered mid-turn.
     pub fn with<R>(&self, id: &str, f: impl FnOnce(&Running) -> R) -> Option<R> {
-        let map = self.0.lock().ok()?;
+        let map = self.running.lock().ok()?;
         map.get(id).map(f)
+    }
+
+    /// Returns the persistent session grants bucket for `id`.
+    pub fn grants_for(&self, id: &str) -> SharedGrants {
+        let Ok(mut map) = self.grants.lock() else {
+            return SharedGrants::default();
+        };
+        map.entry(id.to_string()).or_default().clone()
     }
 }
 
@@ -55,6 +68,8 @@ pub struct SendArgs {
     pub prompt: String,
     pub mode: String,
     pub agent: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
     // No `history`: the replay window is the execution profile's
     // (`history_window`), read by the turn. An old window still sending one
     // is fine, serde ignores the field.
@@ -83,11 +98,15 @@ pub fn send_turn(
         mode: turn::parse_mode(&args.mode),
         memory_paused: crate::wire::memory_paused(&state.db()),
         agent: args.agent.clone(),
+        reasoning_effort: args.reasoning_effort.clone(),
+        mcp_cache: Some(state.mcp_cache()),
     };
 
     let cancel = Cancel::default();
-    let (approvals, approval_gate) = approval_channel();
+    let (approvals, approval_gate) =
+        approval_channel_with_grants(turns.grants_for(&args.session_id));
     let (questions, question_gate) = question_channel();
+    let (inbox, inbox_rx) = inbox_channel();
     let session = args.session_id.clone();
     turns.start(
         &session,
@@ -95,6 +114,7 @@ pub fn send_turn(
             cancel: cancel.clone(),
             approvals: approvals.clone(),
             questions: questions.clone(),
+            inbox,
         },
     );
 
@@ -136,6 +156,7 @@ pub fn send_turn(
                 &cancel,
                 &approval_gate,
                 &question_gate,
+                Some(&inbox_rx),
                 &mut emit,
             )
         }));
@@ -226,6 +247,22 @@ pub fn answer_question(
         .ok_or_else(|| "Turno encerrado".to_string())
 }
 
+/// Sends a steering instruction into an active turn's inbox.
+#[tauri::command]
+pub fn steer_turn(
+    turns: tauri::State<'_, Turns>,
+    session_id: String,
+    prompt: String,
+) -> Result<bool, String> {
+    let text = prompt.trim().to_string();
+    if text.is_empty() {
+        return Err("Escreva uma instrução".into());
+    }
+    turns
+        .with(&session_id, |r| r.inbox.send(text))
+        .ok_or_else(|| "Nenhum turno rodando nesta conversa".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,5 +307,28 @@ mod tests {
         let mut evs = Vec::new();
         outcome(caught, &mut |e| evs.push(e));
         assert_eq!(failed(&evs), ["erro interno: 3 de 4"]);
+    }
+
+    #[test]
+    fn session_grants_persist_between_turns_and_stay_isolated() {
+        let turns = Turns::default();
+        let (_tx1, _gate1) = approval_channel_with_grants(turns.grants_for("s1"));
+        let key = zerith_runtime::approval_grant_key(
+            "shell",
+            &serde_json::json!({"command": "git status"}),
+        );
+        {
+            let shared = turns.grants_for("s1");
+            shared.lock().unwrap().insert(key.clone());
+        }
+        let s1_turn2 = turns.grants_for("s1");
+        let s2_turn1 = turns.grants_for("s2");
+        assert!(s1_turn2.lock().unwrap().contains(&key));
+        assert!(!s2_turn1.lock().unwrap().contains(&key));
+        let chained = zerith_runtime::approval_grant_key(
+            "shell",
+            &serde_json::json!({"command": "git status && rm -rf x"}),
+        );
+        assert!(!s1_turn2.lock().unwrap().contains(&chained));
     }
 }

@@ -182,12 +182,17 @@ pub fn run() {
             providers::account_quota,
             providers::account_models,
             chat::cancel_turn,
+            chat::steer_turn,
             chat::answer_approval,
             chat::answer_question,
             commands::boot,
             commands::list_sessions,
             commands::background_jobs,
             commands::background_job_stop,
+            commands::terminals_list,
+            commands::terminal_tail,
+            commands::terminal_interrupt,
+            commands::terminal_close,
             commands::create_session,
             commands::session_messages,
             commands::session_fork,
@@ -284,11 +289,13 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("erro ao preparar a janela do Zerith")
-        .run(|_, event| {
+        .run(|app, event| {
             // A background job outlives its turn, not the app: closing the
             // window stops whatever is still running.
             if matches!(event, tauri::RunEvent::Exit) {
                 zerith_tools::kill_all_jobs();
+                use tauri::Manager;
+                app.state::<state::AppState>().invalidate_mcp_cache();
             }
         });
 }

@@ -14,13 +14,14 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::Duration;
 
 use serde_json::Value;
 use zerith_memory::{MemoryBackend, Scope};
 use zerith_providers::{Cancel, ToolCall};
 use zerith_security::{Action, Policy, Verdict};
-use zerith_tools::{CallCtx, Registry, OUTPUT_CAP_CHARS};
+use zerith_tools::{CallCtx, HostEvent, Registry, OUTPUT_CAP_CHARS};
 
 use crate::agent::{Approval, ApprovalGate};
 use crate::{spill, RunEvent};
@@ -216,24 +217,80 @@ impl Pipeline<'_> {
             }
         }
 
-        let need = match (policy_ask, ask) {
+        let (mut need, net_grant) = match (policy_ask, ask) {
             // If middleware explicitly asked, keep `forced = true` even when
             // policy also asked, so a prior AllowSession cannot waive a hook.
-            (Some(why), Some(_)) => Some((why, true)),
+            (Some(why), Some(_)) => (Some((why, true)), None),
             // Same for an `ask` rule the user wrote (`shell(ssh *)`: every
             // command on a production router is shown), and for any remote
             // access, whose blast radius is another machine.
             // ponytail: the rule is recognized by its message prefix; a
             // Verdict::AskRule variant if a second caller needs it.
             (Some(why), None) => {
-                let forced = why.starts_with("regra ") || remote_access(&inv.name, &inv.args);
-                Some((why, forced))
+                if let Some((risk, critical, grant_override)) =
+                    classify_terminal_call(&inv.name, &inv.args)
+                {
+                    use zerith_tools::network::NetCmdRisk;
+                    match risk {
+                        NetCmdRisk::Dangerous => (
+                            Some((format!("⚠️ COMANDO DESTRUTIVO DE REDE: {why}"), true)),
+                            Some(grant_override),
+                        ),
+                        NetCmdRisk::Mutation => {
+                            let label = if critical {
+                                format!("[equipamento crítico] {why}")
+                            } else {
+                                why
+                            };
+                            (Some((label, true)), Some(grant_override))
+                        }
+                        NetCmdRisk::ReadOnly => {
+                            let forced = why.starts_with("regra ");
+                            (Some((why, forced)), Some(grant_override))
+                        }
+                    }
+                } else {
+                    let forced = why.starts_with("regra ") || remote_access(&inv.name, &inv.args);
+                    (Some((why, forced)), None)
+                }
             }
-            (None, Some(s)) => Some((s, true)),
-            (None, None) => None,
+            (None, Some(s)) => (Some((s, true)), None),
+            (None, None) => (None, None),
         };
+        // Even in Bypass mode, dangerous network commands require explicit forced approval.
+        if need.is_none() {
+            if let Some((zerith_tools::network::NetCmdRisk::Dangerous, _, grant_override)) =
+                classify_terminal_call(&inv.name, &inv.args)
+            {
+                let summary = inv
+                    .args
+                    .get("input")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| {
+                        inv.args.get("commands").and_then(Value::as_array).map(|a| {
+                            a.iter()
+                                .filter_map(Value::as_str)
+                                .collect::<Vec<_>>()
+                                .join("; ")
+                        })
+                    })
+                    .unwrap_or_else(|| inv.name.clone());
+                need = Some((format!("⚠️ COMANDO DESTRUTIVO DE REDE: {summary}"), true));
+                if let Some((why, forced)) = need {
+                    if let Err(refusal) =
+                        self.approve(&inv.name, &grant_override, why, forced, on_event)
+                    {
+                        return settle(inv, false, refusal);
+                    }
+                    return Prepared { inv, settled: None };
+                }
+            }
+        }
         if let Some((why, forced)) = need {
-            if let Err(refusal) = self.approve(&inv.name, why, forced, on_event) {
+            let grant_key =
+                net_grant.unwrap_or_else(|| crate::agent::approval_grant_key(&inv.name, &inv.args));
+            if let Err(refusal) = self.approve(&inv.name, &grant_key, why, forced, on_event) {
                 return settle(inv, false, refusal);
             }
         }
@@ -245,6 +302,7 @@ impl Pipeline<'_> {
     fn approve(
         &self,
         tool: &str,
+        grant_key: &str,
         why: String,
         forced: bool,
         on_event: &mut dyn FnMut(RunEvent),
@@ -254,7 +312,7 @@ impl Pipeline<'_> {
                 "negado: precisa de aprovação ({why}) e não há quem aprove"
             ));
         };
-        if !forced && gate.granted(tool) {
+        if !forced && gate.granted(grant_key) {
             return Ok(());
         }
         let id = NEXT_APPROVAL.fetch_add(1, Ordering::Relaxed);
@@ -275,7 +333,7 @@ impl Pipeline<'_> {
         match gate.wait(id, self.cancel) {
             Approval::AllowOnce => Ok(()),
             Approval::AllowSession => {
-                gate.grant(tool);
+                gate.grant(grant_key);
                 Ok(())
             }
             Approval::Deny => Err("negado pelo usuário".into()),
@@ -299,19 +357,36 @@ impl Pipeline<'_> {
         let todo: Vec<usize> = (0..jobs.len())
             .filter(|&i| jobs[i].settled.is_none())
             .collect();
+        if todo.is_empty() {
+            return out;
+        }
+        struct ClearLive(zerith_tools::EventSink);
+        impl Drop for ClearLive {
+            fn drop(&mut self) {
+                self.0.set_live(None);
+            }
+        }
+        let (live_tx, live_rx) = mpsc::sync_channel::<HostEvent>(256);
+        let sink = tools.host().sink();
+        sink.set_live(Some(Arc::new(move |ev| {
+            let _ = live_tx.try_send(ev);
+        })));
+        let _guard = ClearLive(sink);
+
         let all_safe = todo
             .iter()
             .all(|&i| tools.concurrency_safe(&jobs[i].inv.name, &jobs[i].inv.args));
         if max_parallel <= 1 || todo.len() < 2 || !all_safe {
+            let cancel = self.cancel;
             for i in todo {
                 let inv = &jobs[i].inv;
-                out[i] = Some(if self.relays() && inv.name == "agent" {
-                    let cancel = self.cancel;
-                    self.pumped(on_event, || run_plain(tools, policy, inv, cancel))
-                } else {
+                out[i] = Some(if tools.uses_memory(&inv.name) {
                     self.run_one(tools, policy, inv)
+                } else {
+                    self.pumped_live(on_event, &live_rx, || run_plain(tools, policy, inv, cancel))
                 });
             }
+            Self::drain_live(&live_rx, on_event);
             return out;
         }
 
@@ -342,13 +417,27 @@ impl Pipeline<'_> {
                     g[i] = Some(r);
                 }
             }
-            while self.relays() && finished.load(Ordering::SeqCst) < pool.len() {
-                self.pump(on_event);
-                std::thread::sleep(std::time::Duration::from_millis(20));
+            while finished.load(Ordering::SeqCst) < pool.len() {
+                if self.relays() {
+                    self.pump(on_event);
+                }
+                Self::drain_live(&live_rx, on_event);
+                std::thread::sleep(Duration::from_millis(15));
             }
         });
-        self.pump(on_event);
+        if self.relays() {
+            self.pump(on_event);
+        }
+        Self::drain_live(&live_rx, on_event);
         out
+    }
+
+    fn drain_live(live_rx: &mpsc::Receiver<HostEvent>, on_event: &mut dyn FnMut(RunEvent)) {
+        while let Ok(ev) = live_rx.try_recv() {
+            if let HostEvent::ToolProgress { tool, chunk } = ev {
+                on_event(RunEvent::ToolProgress { tool, chunk });
+            }
+        }
     }
 
     fn relays(&self) -> bool {
@@ -365,19 +454,36 @@ impl Pipeline<'_> {
         }
     }
 
-    /// Runs `job` on a scoped thread while this one pumps subagent prompts.
-    fn pumped<R: Send>(
+    /// Runs `job` on a scoped thread while pumping subagent prompts and live tool progress.
+    fn pumped_live<R: Send>(
         &self,
         on_event: &mut dyn FnMut(RunEvent),
+        live_rx: &mpsc::Receiver<HostEvent>,
         job: impl FnOnce() -> R + Send,
     ) -> R {
         std::thread::scope(|s| {
             let h = s.spawn(job);
-            while !h.is_finished() {
-                self.pump(on_event);
-                std::thread::sleep(std::time::Duration::from_millis(20));
+            for _ in 0..4 {
+                if h.is_finished() {
+                    break;
+                }
+                std::thread::yield_now();
             }
-            self.pump(on_event);
+            while !h.is_finished() {
+                if self.relays() {
+                    self.pump(on_event);
+                }
+                Self::drain_live(live_rx, on_event);
+                if let Ok(HostEvent::ToolProgress { tool, chunk }) =
+                    live_rx.recv_timeout(Duration::from_millis(15))
+                {
+                    on_event(RunEvent::ToolProgress { tool, chunk });
+                }
+            }
+            if self.relays() {
+                self.pump(on_event);
+            }
+            Self::drain_live(live_rx, on_event);
             h.join().unwrap_or_else(|p| std::panic::resume_unwind(p))
         })
     }
@@ -425,9 +531,78 @@ impl Pipeline<'_> {
     }
 }
 
+/// Classifies commands sent to an active remote/network terminal session.
+/// Returns `Some((worst_risk, is_critical_device, grant_key))` when the call
+/// targets a remote or vendor-tagged terminal session.
+fn classify_terminal_call(
+    tool: &str,
+    args: &Value,
+) -> Option<(zerith_tools::network::NetCmdRisk, bool, String)> {
+    use zerith_tools::network::{classify_network_command, DeviceRole, NetCmdRisk, Vendor};
+    if !matches!(tool, "terminal_send" | "terminal_batch") {
+        return None;
+    }
+    let id = args.get("id").and_then(Value::as_str).unwrap_or("");
+    let meta = zerith_tools::terminal_meta(id);
+    let has_vendor = meta.as_ref().and_then(|m| m.0.as_ref()).is_some();
+    let is_remote = has_vendor || remote_access(tool, args);
+    if !is_remote {
+        return None;
+    }
+    if tool == "terminal_send" && args.get("secret").and_then(Value::as_str).is_some() {
+        return Some((
+            NetCmdRisk::Mutation,
+            true,
+            format!("terminal_net:secret:{id}"),
+        ));
+    }
+    let cmds: Vec<&str> = match tool {
+        "terminal_send" => args
+            .get("input")
+            .and_then(Value::as_str)
+            .map(|s| vec![s])
+            .unwrap_or_default(),
+        "terminal_batch" => args
+            .get("commands")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    if cmds.is_empty() {
+        return None;
+    }
+    let vendor = meta
+        .as_ref()
+        .and_then(|m| m.0.as_deref())
+        .and_then(Vendor::parse)
+        .unwrap_or(Vendor::Generic);
+    let critical = meta
+        .as_ref()
+        .and_then(|m| m.2.as_deref())
+        .and_then(DeviceRole::parse)
+        .is_some_and(DeviceRole::is_critical);
+    let mut worst = NetCmdRisk::ReadOnly;
+    for cmd in cmds {
+        let r = classify_network_command(vendor, cmd);
+        if r > worst {
+            worst = r;
+        }
+    }
+    let grant_key = match worst {
+        NetCmdRisk::ReadOnly => format!("terminal_net:readonly:{id}"),
+        NetCmdRisk::Mutation => format!("terminal_net:mutation:{id}"),
+        NetCmdRisk::Dangerous => format!("terminal_net:dangerous:{id}"),
+    };
+    Some((worst, critical, grant_key))
+}
+
 /// A shell command that reaches another machine's prompt (SSH, Telnet, serial
 /// tools). Each one is approved on its own, never by a session grant.
 fn remote_access(tool: &str, args: &Value) -> bool {
+    if tool == "net_connect" {
+        return true;
+    }
     const REMOTE: &[&str] = &[
         "ssh", "plink", "telnet", "sshpass", "scp", "sftp", "putty", "kitty",
     ];
@@ -435,7 +610,7 @@ fn remote_access(tool: &str, args: &Value) -> bool {
     let cmd = match tool {
         "shell" | "terminal_open" => args["command"].as_str().unwrap_or(""),
         // Every line typed into an ssh/telnet session reaches the router.
-        "terminal_send" => {
+        "terminal_send" | "terminal_batch" => {
             owned = zerith_tools::terminal_program(args["id"].as_str().unwrap_or(""))
                 .unwrap_or_default();
             &owned
@@ -493,5 +668,6 @@ mod remote_tests {
         assert!(!sh("cargo test -q"));
         assert!(!sh("git status"));
         assert!(!remote_access("read_file", &json!({ "path": "ssh" })));
+        assert!(remote_access("net_connect", &json!({ "device": "core-1" })));
     }
 }

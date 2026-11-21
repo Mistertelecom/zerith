@@ -5,10 +5,12 @@
 
 mod args;
 mod cmds;
+mod daemon;
 mod headless;
 mod media_cmd;
 mod schema;
 mod signals;
+mod telegram;
 
 use std::process::ExitCode;
 use zerith_core::{secrets, Paths, Settings};
@@ -24,7 +26,9 @@ use zerith_skills::catalog;
 use zerith_skills::{discover, scan, Library, Status};
 use zerith_tools::{CallCtx, Registry};
 
-use crate::args::{parse_chat, parse_import_hermes, parse_rename, select_session, SessionArgs};
+use crate::args::{
+    parse_chat, parse_import_hermes, parse_rename, parse_repl, select_session, SessionArgs, Target,
+};
 use crate::headless::{load_settings, provider_config, resolve_model, ExitWith};
 
 fn main() -> ExitCode {
@@ -87,14 +91,21 @@ usage:
   zerith usage [--hours N]
   zerith quota [--hours N]
   zerith accounts [list|add <id> <provider> ...|remove|enable|disable|reset-cooldown <id>]
-  zerith routing [show|main|subagent|explore|plan <model>|role <agent> <model>|combo <name> <m1,m2,...>]
+  zerith routing [show|main|subagent|explore|plan|compact <model>|role <agent> <model>|combo <name> <m1,m2,...>]
   zerith tokensaver [show|ponytail <off|lite|full|ultra>|caveman <off|lite|full|ultra|wenyan>|rtk <on|off>]
-  zerith chat [--session <id>|--resume [id|name]|--continue] [--fork] [--model <id>] <prompt>
+  zerith repl [--session <id>|--resume [id|name]|--continue] [--model <id>] [--mode <mode>] [--effort <off|low|medium|high>] [--remote <uri|alias>]
+  zerith chat [--session <id>|--resume [id|name]|--continue] [--fork] [--model <id>] [--remote <uri|alias>] [<prompt>]
   zerith -p <prompt> [--output-format text|json|stream-json] [--model M]
         [--session ID | --resume [id|name] | --continue] [--fork]
         [--max-turns N] [--max-budget-usd X --price-in P --price-out P]
         [--allowed-tools a,b] [--disallowed-tools a,b] [--permission-mode MODE]
-        [--json-schema <json|file>] [--no-tools]
+        [--json-schema <json|file>] [--no-tools] [--remote <uri|alias>]
+  zerith schedule add <nome> --cron <expr> (--command <cmd> --no-agent | --prompt <p>) [--workspace dir] [--model M]
+  zerith schedule list|remove <id|nome>|toggle <id|nome> <on|off>|run <id|nome>
+  zerith daemon [--once] [--poll-secs N]
+  zerith gateway telegram setup --token <tok|-> --chats <id1,id2> [--model M] [--workspace dir]
+  zerith gateway telegram run [--poll-secs N]
+  zerith remote list|add <alias> <ssh://...|docker://...>|exec <alvo> [--] <cmd...>
   zerith media show|models|set|key|generate   (imagem e vídeo; veja `zerith media`)
   zerith config show
   zerith secret set <name> [value] | get <name> | delete <name>
@@ -188,6 +199,8 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         ("login", _) => cmds::login_cmd(&paths, args, &home_dir())?,
         ("routing", _) => cmds::routing_cmd(&paths, args)?,
         ("tokensaver", _) => cmds::tokensaver_cmd(&paths, args)?,
+        ("repl", _) => repl(&paths, args)?,
+        ("chat", None) => repl(&paths, args)?,
         ("chat", _) => chat(&paths, args)?,
         ("import", Some("hermes")) => import_hermes(&paths, args)?,
         ("import", Some("hermes-skills")) => {
@@ -237,6 +250,10 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         ("plugin", _) | ("plugins", _) => cmds::plugin_cmd(&paths, args)?,
         ("mcp", _) => cmds::mcp_cmd(&paths, args)?,
         ("plan", _) => plan(&paths, args)?,
+        ("schedule", _) => daemon::schedule_cmd(&paths, args)?,
+        ("daemon", _) => daemon::daemon_cmd(&paths, args)?,
+        ("gateway", _) => telegram::cmd(&paths, args)?,
+        ("remote", _) => remote_cmd(&paths, args)?,
         ("media", _) => media_cmd::run(&paths, args)?,
         _ => {
             println!("{}", usage());
@@ -701,15 +718,156 @@ fn parse_answer(line: &str) -> zerith_runtime::Approval {
     }
 }
 
+struct CliTurnCtx<'a> {
+    settings: &'a Settings,
+    store: &'a Store,
+    client: &'a Client,
+    memory: Option<&'a dyn MemoryBackend>,
+    scope: &'a Scope,
+    skills: Option<&'a Library>,
+    tools: &'a mut Registry,
+    policy: &'a mut Policy,
+    approver: &'a zerith_runtime::ApprovalSender,
+    gate: &'a zerith_runtime::ApprovalGate,
+    interactive: bool,
+    workspace: &'a std::path::Path,
+    spill_dir: std::path::PathBuf,
+    cancel: &'a Cancel,
+}
+
+fn execute_cli_turn(
+    ctx: &mut CliTurnCtx<'_>,
+    session_id: &str,
+    model: &str,
+    prompt: &str,
+    reasoning_effort: Option<&str>,
+) -> Result<TurnReport, Box<dyn std::error::Error>> {
+    let guards = Guards::new(ctx.settings.clone(), ctx.policy, session_id.to_string());
+    ctx.tools.register(guards.enter_plan_mode_tool());
+    ctx.tools.register(guards.exit_plan_mode_tool());
+    let opts = AgentOptions {
+        tools: Some(ctx.tools),
+        policy: Some(ctx.policy),
+        approvals: ctx.interactive.then_some(ctx.gate),
+        middleware: vec![Box::new(guards)],
+        spill_dir: Some(ctx.spill_dir.clone()),
+        reasoning_effort: reasoning_effort.map(str::to_string),
+        ..AgentOptions::for_profile(zerith_runtime::active_profile())
+    };
+    match zerith_runtime::compact::auto_compact_routed(
+        ctx.store,
+        ctx.settings,
+        ctx.client,
+        session_id,
+        model,
+        opts.history,
+        ctx.cancel,
+    ) {
+        Ok(Some(r)) => eprintln!(
+            "zerith: histórico resumido ({} → {} tokens)",
+            r.tokens_before, r.tokens_after
+        ),
+        Ok(None) => {}
+        Err(e) => eprintln!("zerith: resumo automático falhou: {e}"),
+    }
+
+    let mut streamed = false;
+    let mut digest = zerith_runtime::learn::TurnDigest::new(prompt);
+    let result = run_agent_turn(
+        ctx.store,
+        ctx.client,
+        TurnContext {
+            memory: ctx.memory,
+            scope: Some(ctx.scope),
+            skills: ctx.skills,
+            settings: Some(ctx.settings),
+            project_dir: Some(ctx.workspace),
+            ..TurnContext::default()
+        },
+        opts,
+        session_id,
+        model,
+        prompt,
+        ctx.cancel,
+        |e| {
+            digest.observe(&e);
+            match e {
+                RunEvent::Delta(text) => {
+                    streamed = true;
+                    print!("{text}");
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                }
+                RunEvent::Reasoning(r) => eprintln!("[reasoning] {r}"),
+                RunEvent::ApprovalNeeded { id, tool, summary } => {
+                    ctx.approver.answer(id, ask_terminal(&tool, &summary));
+                }
+                RunEvent::ToolCall { name, args, .. } => eprintln!("\n[tool] {name} {args}"),
+                RunEvent::ToolResult {
+                    name,
+                    ok,
+                    output_preview,
+                    ..
+                } => eprintln!(
+                    "[tool:{}] {name}: {output_preview}",
+                    if ok { "ok" } else { "erro" }
+                ),
+                RunEvent::Steered { text } => eprintln!("\n[steer] {text}"),
+                RunEvent::Route {
+                    account_id,
+                    provider,
+                    model,
+                    attempts,
+                } if attempts > 1 => {
+                    eprintln!(
+                        "[gateway:failover] tentativa #{attempts} -> conta {account_id} ({provider}/{model})"
+                    );
+                }
+                _ => {}
+            }
+        },
+    );
+
+    if let Ok(r) = &result {
+        digest.answer = r.text.clone();
+        headless::learn_after(
+            ctx.settings,
+            ctx.store,
+            ctx.client,
+            session_id,
+            model,
+            ctx.memory.map(|m| (m, ctx.scope)),
+            ctx.skills,
+            &digest,
+            ctx.cancel,
+        );
+    }
+
+    let report = match result {
+        Ok(r) => r,
+        Err(RunError::Provider(ProviderError::Cancelled)) => {
+            return Err(Box::new(ExitWith(
+                signals::received().unwrap_or(143),
+                "cancelado".into(),
+            )))
+        }
+        Err(e) => return Err(e.into()),
+    };
+    if streamed {
+        println!();
+    } else {
+        println!("{}", report.text);
+    }
+    eprintln!("{}", format_chat_footer(&report, model));
+    Ok(report)
+}
+
 /// One turn: resolve the session, stream the answer, persist it whole.
-///
-/// The turn runs on this thread. A CLI has nothing else to do while it waits,
-/// so the extra thread `run_turn_async` exists for the window, not here.
 fn chat(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let args::ChatArgs {
         prompt,
         session: session_flag,
         model: model_flag,
+        remote: remote_flag,
     } = parse_chat(args)?;
 
     let mut settings = load_settings(paths);
@@ -728,11 +886,20 @@ fn chat(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>
     paths.ensure()?;
     let store = Store::open(paths.db())?;
     let session_id = select_session(&store, &session_flag, &prompt)?;
-    let _: &SessionArgs = &session_flag;
 
     let workspace = std::env::current_dir().unwrap_or_else(|_| paths.root().to_path_buf());
     let mut policy = Policy::from_settings(&settings, &workspace)?;
     let mut tools = Registry::new();
+    let remote_label = if let Some(raw) = remote_flag.as_deref() {
+        let target = zerith_tools::remote::parse_remote_target(raw, &settings.remote.targets)?;
+        tools.register(zerith_tools::remote::remote_shell_tool(
+            target,
+            raw.to_string(),
+        ));
+        Some(raw.to_string())
+    } else {
+        None
+    };
     let mut mcp = zerith_mcp::McpRegistry::load(paths, Some(&workspace));
     if let Some(c) = &contrib {
         mcp.extend(c.mcp.iter().map(|(_, s)| s.clone()).collect());
@@ -744,7 +911,7 @@ fn chat(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>
     for e in &done.errors {
         eprintln!("zerith: {e}");
     }
-    let prompt = if mcp.is_empty() {
+    let expanded = if mcp.is_empty() {
         prompt
     } else {
         let (text, errors) = mcp.expand_mentions(&prompt);
@@ -753,9 +920,12 @@ fn chat(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>
         }
         text
     };
-    let guards = Guards::new(settings.clone(), &mut policy, session_id.clone());
-    tools.register(guards.enter_plan_mode_tool());
-    tools.register(guards.exit_plan_mode_tool());
+    let prompt = match remote_label {
+        Some(raw) => format!(
+            "[alvo remoto ativo: {raw} — use a ferramenta remote_shell para executar comandos nesse host/container]\n\n{expanded}"
+        ),
+        None => expanded,
+    };
     let have: Vec<String> = tools.specs().iter().map(|s| s.name.clone()).collect();
     for t in zerith_tools::authoring_tools(zerith_tools::Authoring {
         paths: paths.clone(),
@@ -766,14 +936,9 @@ fn chat(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>
         tools.register(t);
     }
 
-    // Memory shares the same database file: one store, one schema, no second
-    // source of truth to keep in sync.
     let memory = SqliteMemory::open(paths.db())?;
     let scope = Scope::workspace(&workspace);
     let memory = (!settings.memory.paused).then_some(&memory as &dyn MemoryBackend);
-
-    // Installed skills are consulted, but only their names and descriptions
-    // reach the prompt unless the user named one.
     let skills = Library::open(paths.skills()).ok().map(|l| {
         if let Some(c) = &contrib {
             l.with_extra(c.skill_dirs())
@@ -784,104 +949,26 @@ fn chat(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>
 
     let cancel = Cancel::default();
     signals::install(cancel.clone());
-
-    // A person at a terminal answers s/n; a pipe or CI has no one to ask and
-    // keeps the old answer (denied), so a script never hangs on a prompt.
     let (approver, gate) = zerith_runtime::approval_channel();
     let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
-    let opts = AgentOptions {
-        tools: Some(&tools),
-        policy: Some(&policy),
-        approvals: interactive.then_some(&gate),
-        middleware: vec![Box::new(guards)],
-        spill_dir: Some(paths.root().join("spill")),
-        ..AgentOptions::for_profile(zerith_runtime::active_profile())
+
+    let mut ctx = CliTurnCtx {
+        settings: &settings,
+        store: &store,
+        client: &client,
+        memory,
+        scope: &scope,
+        skills: skills.as_ref(),
+        tools: &mut tools,
+        policy: &mut policy,
+        approver: &approver,
+        gate: &gate,
+        interactive,
+        workspace: &workspace,
+        spill_dir: paths.root().join("spill"),
+        cancel: &cancel,
     };
-    match zerith_runtime::compact::auto_compact_routed(
-        &store,
-        &settings,
-        &client,
-        &session_id,
-        &model,
-        opts.history,
-        &cancel,
-    ) {
-        Ok(Some(r)) => eprintln!(
-            "zerith: histórico resumido ({} → {} tokens)",
-            r.tokens_before, r.tokens_after
-        ),
-        Ok(None) => {}
-        Err(e) => eprintln!("zerith: resumo automático falhou: {e}"),
-    }
-
-    let mut streamed = false;
-    let mut digest = zerith_runtime::learn::TurnDigest::new(&prompt);
-    let result = run_agent_turn(
-        &store,
-        &client,
-        TurnContext {
-            memory,
-            scope: Some(&scope),
-            skills: skills.as_ref(),
-            settings: Some(&settings),
-            ..TurnContext::default()
-        },
-        opts,
-        &session_id,
-        &model,
-        &prompt,
-        &cancel,
-        |e| {
-            digest.observe(&e);
-            match e {
-                RunEvent::Delta(text) => {
-                    streamed = true;
-                    print!("{text}");
-                    let _ = std::io::Write::flush(&mut std::io::stdout());
-                }
-                RunEvent::Reasoning(r) => eprintln!("[reasoning] {r}"),
-                RunEvent::ApprovalNeeded { id, tool, summary } => {
-                    approver.answer(id, ask_terminal(&tool, &summary));
-                }
-                RunEvent::ToolCall { name, args, .. } => eprintln!("\n[tool] {name} {args}"),
-                RunEvent::ToolResult {
-                    name,
-                    ok,
-                    output_preview,
-                    ..
-                } => eprintln!(
-                    "[tool:{}] {name}: {output_preview}",
-                    if ok { "ok" } else { "erro" }
-                ),
-                RunEvent::Route {
-                    account_id,
-                    provider,
-                    model,
-                    attempts,
-                } if attempts > 1 => {
-                    eprintln!(
-                    "[gateway:failover] tentativa #{attempts} -> conta {account_id} ({provider}/{model})"
-                );
-                }
-                _ => {}
-            }
-        },
-    );
-
-    if let Ok(r) = &result {
-        digest.answer = r.text.clone();
-        headless::learn_after(
-            &settings,
-            &store,
-            &client,
-            &session_id,
-            &model,
-            memory.map(|m| (m, &scope)),
-            skills.as_ref(),
-            &digest,
-            &cancel,
-        );
-    }
+    let res = execute_cli_turn(&mut ctx, &session_id, &model, &prompt, None);
 
     let end = zerith_core::hooks::run_hooks(
         zerith_core::hooks::HookEvent::SessionEnd,
@@ -896,22 +983,352 @@ fn chat(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>
         eprintln!("zerith: {e}");
     }
 
-    let report = match result {
-        Ok(r) => r,
-        Err(RunError::Provider(ProviderError::Cancelled)) => {
-            return Err(Box::new(ExitWith(
-                signals::received().unwrap_or(143),
-                "cancelado".into(),
-            )))
-        }
-        Err(e) => return Err(e.into()),
-    };
-    if streamed {
-        println!();
-    } else {
-        println!("{}", report.text);
+    res?;
+    Ok(())
+}
+
+#[derive(Debug, PartialEq)]
+enum ReplSlash<'a> {
+    Help,
+    Exit,
+    Clear,
+    Compact,
+    Sessions(Option<&'a str>),
+    Model(Option<&'a str>),
+    Mode(Option<&'a str>),
+    Effort(Option<&'a str>),
+    Rewind(Option<i64>),
+    Unknown(&'a str),
+}
+
+fn parse_repl_slash(line: &str) -> Option<ReplSlash<'_>> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('/') {
+        return None;
     }
-    eprintln!("{}", format_chat_footer(&report, &model));
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let cmd = parts.next().unwrap_or("");
+    let rest = parts.next().map(str::trim).filter(|s| !s.is_empty());
+    Some(match cmd {
+        "/help" | "/?" => ReplSlash::Help,
+        "/exit" | "/quit" => ReplSlash::Exit,
+        "/clear" | "/new" => ReplSlash::Clear,
+        "/compact" => ReplSlash::Compact,
+        "/sessions" => ReplSlash::Sessions(rest),
+        "/model" => ReplSlash::Model(rest),
+        "/mode" => ReplSlash::Mode(rest),
+        "/effort" => ReplSlash::Effort(rest),
+        "/rewind" => ReplSlash::Rewind(rest.and_then(|s| s.parse().ok())),
+        other => ReplSlash::Unknown(other),
+    })
+}
+
+/// Interactive multi-turn terminal REPL keeping store, warm HTTP client,
+/// MCP servers, policy handle, and session grants loaded across turns.
+fn repl(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::{BufRead, Write};
+    let parsed = parse_repl(args)?;
+
+    let mut settings = load_settings(paths);
+    let contrib = zerith_plugins::Library::open(&paths.root().join("plugins"))
+        .and_then(|l| l.contributions())
+        .ok();
+    if let Some(c) = &contrib {
+        c.apply_hooks(&mut settings);
+    }
+    zerith_runtime::bili::attach(paths.root(), settings.context.billion_context);
+    let cfg = provider_config(&settings)?;
+    let mut model = resolve_model(parsed.model, &settings, &cfg)
+        .ok_or("sem modelo: use --model, routing.main_model ou ZERITH_MODEL")?;
+    let client = Client::new(cfg)?;
+
+    paths.ensure()?;
+    let store = Store::open(paths.db())?;
+    let workspace = parsed
+        .workspace
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| paths.root().to_path_buf()));
+    let base_policy = Policy::from_settings(&settings, &workspace)?;
+    let mode_handle =
+        zerith_security::ModeHandle::new(parsed.mode.unwrap_or_else(|| base_policy.mode()));
+    let mut policy = base_policy.with_handle(mode_handle.clone());
+
+    let mut tools = Registry::new();
+    let remote_label = if let Some(raw) = parsed.remote.as_deref() {
+        let target = zerith_tools::remote::parse_remote_target(raw, &settings.remote.targets)?;
+        tools.register(zerith_tools::remote::remote_shell_tool(
+            target,
+            raw.to_string(),
+        ));
+        Some(raw.to_string())
+    } else {
+        None
+    };
+    let mut mcp = zerith_mcp::McpRegistry::load(paths, Some(&workspace));
+    if let Some(c) = &contrib {
+        mcp.extend(c.mcp.iter().map(|(_, s)| s.clone()).collect());
+    }
+    for note in &mcp.notes {
+        eprintln!("zerith: {note}");
+    }
+    let done = mcp.register_into(&mut tools);
+    for e in &done.errors {
+        eprintln!("zerith: {e}");
+    }
+    let have: Vec<String> = tools.specs().iter().map(|s| s.name.clone()).collect();
+    for t in zerith_tools::authoring_tools(zerith_tools::Authoring {
+        paths: paths.clone(),
+        project_dir: Some(workspace.clone()),
+        tools: have,
+        mode: policy.mode().settings_name().to_string(),
+    }) {
+        tools.register(t);
+    }
+
+    let memory = SqliteMemory::open(paths.db())?;
+    let scope = Scope::workspace(&workspace);
+    let memory = (!settings.memory.paused).then_some(&memory as &dyn MemoryBackend);
+    let skills = Library::open(paths.skills()).ok().map(|l| {
+        if let Some(c) = &contrib {
+            l.with_extra(c.skill_dirs())
+        } else {
+            l
+        }
+    });
+
+    let grants: zerith_runtime::SharedGrants = Default::default();
+    let (approver, gate) = zerith_runtime::approval_channel_with_grants(grants.clone());
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
+
+    let mut session_id: Option<String> = if !matches!(parsed.session.target, Target::New) {
+        Some(select_session(&store, &parsed.session, "REPL")?)
+    } else {
+        None
+    };
+    let mut effort: Option<String> = parsed.effort;
+    let mut announced_remote = false;
+    let stdin = std::io::stdin();
+    let mut reader = std::io::BufReader::new(stdin.lock());
+
+    eprintln!(
+        "zerith REPL · modelo `{model}` · modo `{}` · /help para comandos, /exit para sair",
+        mode_handle.get().settings_name()
+    );
+    if let Some(raw) = &remote_label {
+        eprintln!("zerith: alvo remoto ativo `{raw}` (ferramenta remote_shell habilitada)");
+    }
+
+    loop {
+        let sid_tag = session_id
+            .as_deref()
+            .map(|s| s.chars().take(8).collect::<String>())
+            .unwrap_or_else(|| "nova".into());
+        eprint!(
+            "\nzerith[{sid_tag}|{}|{}]> ",
+            mode_handle.get().settings_name(),
+            model
+        );
+        let _ = std::io::stderr().flush();
+
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(cmd) = parse_repl_slash(trimmed) {
+            match cmd {
+                ReplSlash::Help => eprintln!(
+                    "/help  /model <id>  /mode <default|acceptEdits|plan|bypass>  \
+                     /effort <off|low|medium|high>  /compact  /rewind [N]  \
+                     /sessions [id]  /clear  /exit"
+                ),
+                ReplSlash::Exit => break,
+                ReplSlash::Clear => {
+                    session_id = None;
+                    announced_remote = false;
+                    if let Ok(mut g) = grants.lock() {
+                        g.clear();
+                    }
+                    eprintln!("zerith: próxima mensagem iniciará nova sessão (grants limpos).");
+                }
+                ReplSlash::Model(Some(m)) => {
+                    model = m.to_string();
+                    eprintln!("zerith: modelo -> {model}");
+                }
+                ReplSlash::Model(None) => eprintln!("zerith: modelo atual -> {model}"),
+                ReplSlash::Mode(Some(m)) => match zerith_security::Mode::parse(m) {
+                    Some(parsed_mode) => {
+                        mode_handle.set(parsed_mode);
+                        eprintln!("zerith: modo -> {}", parsed_mode.settings_name());
+                    }
+                    None => eprintln!(
+                        "zerith: modo inválido `{m}` (use default, acceptEdits, plan ou bypass)"
+                    ),
+                },
+                ReplSlash::Mode(None) => {
+                    eprintln!(
+                        "zerith: modo atual -> {}",
+                        mode_handle.get().settings_name()
+                    )
+                }
+                ReplSlash::Effort(Some(e)) => {
+                    let norm = e.to_ascii_lowercase();
+                    if norm == "off" {
+                        effort = None;
+                        eprintln!("zerith: effort -> off");
+                    } else if matches!(norm.as_str(), "low" | "medium" | "high") {
+                        effort = Some(norm.clone());
+                        eprintln!("zerith: effort -> {norm}");
+                    } else {
+                        eprintln!("zerith: effort inválido `{e}` (use off, low, medium ou high)");
+                    }
+                }
+                ReplSlash::Effort(None) => {
+                    eprintln!(
+                        "zerith: effort atual -> {}",
+                        effort.as_deref().unwrap_or("off")
+                    )
+                }
+                ReplSlash::Compact => {
+                    let Some(sid) = session_id.as_deref() else {
+                        eprintln!("zerith: nenhuma sessão ativa para compactar.");
+                        continue;
+                    };
+                    let cancel = Cancel::default();
+                    match zerith_runtime::compact::compact_now(
+                        &store, &client, sid, &model, &cancel, None,
+                    ) {
+                        Ok(Some(r)) => eprintln!(
+                            "zerith: compactado ({} -> {} tokens)",
+                            r.tokens_before, r.tokens_after
+                        ),
+                        Ok(None) => eprintln!("zerith: nada para compactar."),
+                        Err(e) => eprintln!("zerith: falha ao compactar: {e}"),
+                    }
+                }
+                ReplSlash::Rewind(turn) => {
+                    let Some(sid) = session_id.as_deref() else {
+                        eprintln!("zerith: nenhuma sessão ativa.");
+                        continue;
+                    };
+                    match turn {
+                        Some(t) => match zerith_sessions::checkpoints::restore_turn(
+                            &store,
+                            paths.root(),
+                            sid,
+                            t,
+                        ) {
+                            Ok(rep) => eprintln!(
+                                "zerith: restaurado turno {t} (arquivos restaurados={}, removidos={}, msgs={})",
+                                rep.files_restored, rep.files_removed, rep.messages_archived
+                            ),
+                            Err(e) => eprintln!("zerith: rewind falhou: {e}"),
+                        },
+                        None => match zerith_sessions::checkpoints::list(&store, paths.root(), sid)
+                        {
+                            Ok(cps) if cps.is_empty() => eprintln!("zerith: sem checkpoints nesta sessão."),
+                            Ok(cps) => {
+                                for cp in cps {
+                                    eprintln!("  turno {} ({} arquivos)", cp.turn, cp.files);
+                                }
+                                eprintln!("use /rewind <turno> para restaurar.");
+                            }
+                            Err(e) => eprintln!("zerith: erro ao listar checkpoints: {e}"),
+                        },
+                    }
+                }
+                ReplSlash::Sessions(None) => match store.list_sessions(15) {
+                    Ok(rows) => {
+                        for s in rows {
+                            eprintln!(
+                                "  {}  {}",
+                                s.id.chars().take(8).collect::<String>(),
+                                s.title
+                            );
+                        }
+                    }
+                    Err(e) => eprintln!("zerith: {e}"),
+                },
+                ReplSlash::Sessions(Some(key)) => match store.resolve_session(key) {
+                    Ok(s) => {
+                        session_id = Some(s.id.clone());
+                        eprintln!("zerith: sessão ativa -> {} ({})", s.id, s.title);
+                    }
+                    Err(e) => eprintln!("zerith: {e}"),
+                },
+                ReplSlash::Unknown(other) => {
+                    eprintln!("zerith: comando desconhecido {other} (tente /help)");
+                }
+            }
+            continue;
+        }
+
+        let sid = match &session_id {
+            Some(s) => s.clone(),
+            None => {
+                let s = select_session(&store, &SessionArgs::default(), trimmed)?;
+                let _ = store.set_workspace(&s, &workspace.to_string_lossy());
+                session_id = Some(s.clone());
+                s
+            }
+        };
+        let expanded = if mcp.is_empty() {
+            trimmed.to_string()
+        } else {
+            let (text, errors) = mcp.expand_mentions(trimmed);
+            for e in &errors {
+                eprintln!("zerith: {e}");
+            }
+            text
+        };
+        let prompt = match remote_label.as_deref() {
+            Some(raw) if !announced_remote => {
+                announced_remote = true;
+                format!(
+                    "[alvo remoto ativo: {raw} — use a ferramenta remote_shell para executar comandos nesse host/container]\n\n{expanded}"
+                )
+            }
+            _ => expanded,
+        };
+
+        let cancel = Cancel::default();
+        let mut ctx = CliTurnCtx {
+            settings: &settings,
+            store: &store,
+            client: &client,
+            memory,
+            scope: &scope,
+            skills: skills.as_ref(),
+            tools: &mut tools,
+            policy: &mut policy,
+            approver: &approver,
+            gate: &gate,
+            interactive,
+            workspace: &workspace,
+            spill_dir: paths.root().join("spill"),
+            cancel: &cancel,
+        };
+        if let Err(e) = execute_cli_turn(&mut ctx, &sid, &model, &prompt, effort.as_deref()) {
+            eprintln!("zerith: {}", redact(&e.to_string()));
+        }
+    }
+
+    if let Some(sid) = session_id {
+        let end = zerith_core::hooks::run_hooks(
+            zerith_core::hooks::HookEvent::SessionEnd,
+            &zerith_core::hooks::HookPayload {
+                session_id: sid,
+                cwd: workspace,
+                ..Default::default()
+            },
+            &settings,
+        );
+        for e in &end.errors {
+            eprintln!("zerith: {e}");
+        }
+    }
     Ok(())
 }
 
@@ -1186,6 +1603,98 @@ fn skills(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
+fn remote_cmd(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    match args.get(1).map(String::as_str) {
+        Some("list") | None => {
+            let settings = load_settings(paths);
+            if settings.remote.targets.is_empty() {
+                println!("(nenhum alvo remoto configurado em [remote.targets])");
+                return Ok(());
+            }
+            for (alias, uri) in &settings.remote.targets {
+                println!("{alias}\t{uri}");
+            }
+            Ok(())
+        }
+        Some("add") => {
+            let alias = args
+                .get(2)
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .ok_or("uso: zerith remote add <alias> <ssh://...|docker://...>")?;
+            let uri = args
+                .get(3)
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .ok_or("uso: zerith remote add <alias> <ssh://...|docker://...>")?;
+            if alias.starts_with('-')
+                || alias.contains('/')
+                || alias.chars().any(char::is_whitespace)
+            {
+                return Err(format!("alias inválido: {alias}").into());
+            }
+            let empty = std::collections::BTreeMap::new();
+            let _ = zerith_tools::remote::parse_remote_target(uri, &empty)?;
+            Settings::save_user(paths, |s| {
+                s.remote.targets.insert(alias.to_string(), uri.to_string());
+            })?;
+            println!("Alvo remoto `{alias}` salvo -> {uri}");
+            Ok(())
+        }
+        Some("remove") | Some("rm") => {
+            let alias = args.get(2).ok_or("uso: zerith remote remove <alias>")?;
+            let mut removed = false;
+            Settings::save_user(paths, |s| {
+                removed = s.remote.targets.remove(alias).is_some();
+            })?;
+            if removed {
+                println!("Alvo remoto removido: {alias}");
+                Ok(())
+            } else {
+                Err(format!("alvo remoto não encontrado: {alias}").into())
+            }
+        }
+        Some("exec") => {
+            let target_arg = args
+                .get(2)
+                .ok_or("uso: zerith remote exec <alvo> [--] <comando...>")?;
+            let rest = args.get(3..).unwrap_or(&[]);
+            let cmd_parts = if rest.first().map(String::as_str) == Some("--") {
+                &rest[1..]
+            } else {
+                rest
+            };
+            if cmd_parts.is_empty() {
+                return Err("informe o comando a executar no alvo remoto".into());
+            }
+            let command = cmd_parts.join(" ");
+            let settings = load_settings(paths);
+            let target =
+                zerith_tools::remote::parse_remote_target(target_arg, &settings.remote.targets)?;
+            let (prog, prog_args) = zerith_tools::remote::wrap_remote_command(&target, &command);
+            let status = std::process::Command::new(&prog)
+                .args(&prog_args)
+                .status()?;
+            if status.success() {
+                Ok(())
+            } else {
+                let code = status.code().unwrap_or(1) as u8;
+                Err(Box::new(ExitWith(
+                    code.max(1),
+                    format!(
+                        "comando remoto encerrou com código {}",
+                        status.code().unwrap_or(1)
+                    ),
+                )))
+            }
+        }
+        Some(other) => Err(format!(
+            "subcomando remote desconhecido: {other} (use list|add|remove|exec)"
+        )
+        .into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1217,6 +1726,7 @@ mod tests {
             saved_tokens: 50,
             account_id: Some("acct-a".into()),
             model_used: Some("gpt-4o".into()),
+            ..Default::default()
         };
         let with_saved = format_chat_footer(&report, "fallback");
         assert_eq!(
@@ -1232,5 +1742,35 @@ mod tests {
             without_saved,
             "\n[turn] s-1  conta -  modelo fallback-m  tokens 120→45  msg 9"
         );
+    }
+
+    #[test]
+    fn repl_slash_parser_recognizes_all_commands() {
+        assert_eq!(parse_repl_slash("/help"), Some(ReplSlash::Help));
+        assert_eq!(parse_repl_slash("  /quit "), Some(ReplSlash::Exit));
+        assert_eq!(
+            parse_repl_slash("/model claude-opus-4"),
+            Some(ReplSlash::Model(Some("claude-opus-4")))
+        );
+        assert_eq!(
+            parse_repl_slash("/mode plan"),
+            Some(ReplSlash::Mode(Some("plan")))
+        );
+        assert_eq!(
+            parse_repl_slash("/effort high"),
+            Some(ReplSlash::Effort(Some("high")))
+        );
+        assert_eq!(
+            parse_repl_slash("/rewind 3"),
+            Some(ReplSlash::Rewind(Some(3)))
+        );
+        assert_eq!(parse_repl_slash("/rewind"), Some(ReplSlash::Rewind(None)));
+        assert_eq!(
+            parse_repl_slash("/sessions abc"),
+            Some(ReplSlash::Sessions(Some("abc")))
+        );
+        assert_eq!(parse_repl_slash("/compact"), Some(ReplSlash::Compact));
+        assert_eq!(parse_repl_slash("/clear"), Some(ReplSlash::Clear));
+        assert_eq!(parse_repl_slash("oi tudo bem"), None);
     }
 }

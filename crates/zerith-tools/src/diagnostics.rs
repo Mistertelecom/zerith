@@ -307,10 +307,8 @@ fn action(args: &Value, ctx: &CallCtx<'_>) -> Result<Option<Action>> {
 
 fn run(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
     let (plan, files) = args_of(args, ctx)?;
-    let shell = crate::builtin::all()
-        .into_iter()
-        .find(|t| t.spec().name == "shell")
-        .ok_or_else(|| ToolError::Failed("ferramenta shell ausente".into()))?;
+    let custom_cmd = args["command"].as_str().is_some();
+    let shell_args = json!({"command": plan.command, "timeout_secs": exec.deadline.saturating_duration_since(Instant::now()).as_secs().max(1)});
     let sub = CallCtx {
         workspace: &plan.dir,
         policy: ctx.policy,
@@ -318,12 +316,19 @@ fn run(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
         scope: None,
     };
     let started = Instant::now();
-    let left = exec.deadline.saturating_duration_since(started).as_secs();
-    let out = match shell.run(
-        &json!({"command": plan.command, "timeout_secs": left.max(1)}),
-        &sub,
-        exec,
-    ) {
+    // Auto-detected checkers (`cargo check`, `tsc --noEmit`, `go vet`, `ruff`,
+    // `py_compile`) are read-only verification commands and must not trigger an
+    // expensive shadow-git snapshot.
+    let res = if custom_cmd {
+        let shell = crate::builtin::all()
+            .into_iter()
+            .find(|t| t.spec().name == "shell")
+            .ok_or_else(|| ToolError::Failed("ferramenta shell ausente".into()))?;
+        shell.run(&shell_args, &sub, exec)
+    } else {
+        crate::builtin::shell_without_snapshot(&shell_args, &sub, exec)
+    };
+    let out = match res {
         Ok(t) => t,
         Err(ToolError::Failed(t)) if t.starts_with("exit ") => t,
         Err(e) => return Err(e),
@@ -500,5 +505,49 @@ src\\main.rs:2:18: error[E0308]: mismatched types: expected `u32`, found `&str`\
         std::fs::write(py.join("a.py"), "x = 1").unwrap();
         let p = plan(&py, &[], None).unwrap();
         assert_eq!(p.dir, py, "loose .py files beat a Cargo.toml further up");
+    }
+
+    #[test]
+    fn autodetected_diagnostics_skips_before_shell_snapshot() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-scratch");
+        std::fs::create_dir_all(&base).unwrap();
+        let tmp = tempfile::Builder::new().tempdir_in(base).unwrap();
+        std::fs::write(tmp.path().join("ok.py"), "x = 1\n").unwrap();
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let host = crate::Host::default();
+        let h = Arc::clone(&hits);
+        host.on_before_shell(move |_| {
+            h.fetch_add(1, Ordering::SeqCst);
+        });
+        let policy = zerith_security::Policy::new(
+            zerith_security::preset("workspace-write").unwrap(),
+            zerith_security::Mode::AcceptEdits,
+            tmp.path(),
+        );
+        let ctx = CallCtx {
+            workspace: tmp.path(),
+            policy: &policy,
+            memory: None,
+            scope: None,
+        };
+        let cancel = zerith_providers::Cancel::default();
+        let exec = Exec {
+            host: &host,
+            cancel: &cancel,
+            timeout: std::time::Duration::from_secs(30),
+            deadline: Instant::now() + std::time::Duration::from_secs(30),
+        };
+        let diag = all().into_iter().next().unwrap();
+        let _ = diag.run(&json!({}), &ctx, &exec);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "auto-detected diagnostics must not snapshot the workspace"
+        );
     }
 }

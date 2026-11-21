@@ -428,9 +428,46 @@ fn cmd_name(t: &mut Vec<String>) {
 }
 
 const READ_ONLY: &[&str] = &[
-    "ls", "dir", "cat", "head", "tail", "pwd", "echo", "wc", "which", "where", "whoami", "stat",
-    "type", "uname", "hostname", "diff", "cmp", "du", "df", "basename", "dirname", "realpath",
-    "grep", "egrep", "fgrep", "rg", "findstr", "true", "false",
+    "ls",
+    "dir",
+    "cat",
+    "head",
+    "tail",
+    "pwd",
+    "echo",
+    "wc",
+    "which",
+    "where",
+    "whoami",
+    "stat",
+    "type",
+    "uname",
+    "hostname",
+    "diff",
+    "cmp",
+    "du",
+    "df",
+    "basename",
+    "dirname",
+    "realpath",
+    "grep",
+    "egrep",
+    "fgrep",
+    "rg",
+    "findstr",
+    "true",
+    "false",
+    // Read-only network diagnostics
+    "ping",
+    "tracert",
+    "traceroute",
+    "nslookup",
+    "dig",
+    "whois",
+    "ipconfig",
+    "netstat",
+    "ss",
+    "mtr",
 ];
 
 const GIT_READ_ONLY: &[&str] = &[
@@ -489,6 +526,53 @@ pub fn is_read_only_in(part: &str, d: Dialect) -> bool {
             }
         }
         "rg" | "grep" | "egrep" | "fgrep" => !bad_arg(&["--pre", "--hostname-bin"]),
+        "ip" => {
+            let mut a = args;
+            while let Some(f) = a.first() {
+                if f.starts_with('-') {
+                    a = &a[1..];
+                } else {
+                    break;
+                }
+            }
+            let obj = a.first().map(|s| s.to_ascii_lowercase());
+            let sub = a.get(1).map(|s| s.to_ascii_lowercase());
+            let ok_obj = matches!(
+                obj.as_deref(),
+                Some(
+                    "a" | "addr"
+                        | "address"
+                        | "r"
+                        | "ro"
+                        | "route"
+                        | "l"
+                        | "link"
+                        | "n"
+                        | "neigh"
+                        | "neighbor"
+                        | "rule"
+                )
+            );
+            let ok_sub = matches!(sub.as_deref(), None | Some("show" | "list" | "ls" | "get"));
+            ok_obj && ok_sub
+        }
+        "arp" => !args.iter().any(|a| {
+            matches!(a.as_str(), "-d" | "-s" | "-f")
+                || a.starts_with("--delete")
+                || a.starts_with("--set")
+        }),
+        "route" => {
+            let first = args.first().map(|s| s.to_ascii_lowercase());
+            let mutates = args.iter().any(|a| {
+                matches!(
+                    a.to_ascii_lowercase().as_str(),
+                    "add" | "del" | "delete" | "change" | "flush"
+                )
+            });
+            !mutates
+                && (args.is_empty()
+                    || matches!(first.as_deref(), Some("print" | "get" | "-n" | "-e")))
+        }
         n => READ_ONLY.contains(&n),
     }
 }
@@ -670,5 +754,39 @@ mod tests {
             split.iter().any(|p| p.contains("rm -rf /")),
             "quote-aware matching_paren must surface nested commands: {split:?}"
         );
+    }
+
+    #[test]
+    fn network_diagnostics_readonly_vs_mutating() {
+        for ok in [
+            "ping -c 4 8.8.8.8",
+            "traceroute 1.1.1.1",
+            "tracert 10.0.0.1",
+            "nslookup openai.com",
+            "dig +short mx example.com",
+            "ip addr show",
+            "ip -br link show",
+            "ip route get 8.8.8.8",
+            "arp -a",
+            "route print",
+            "ss -tulpn",
+            "netstat -rn",
+            "mtr -r -c 3 1.1.1.1",
+        ] {
+            assert!(all_read_only(ok), "should be read-only: {ok}");
+        }
+        for bad in [
+            "ip addr add 10.0.0.2/24 dev eth0",
+            "ip route del default",
+            "ip link set eth0 down",
+            "ip netns exec ns1 sh",
+            "route add 0.0.0.0 mask 0.0.0.0 10.0.0.1",
+            "route del default",
+            "arp -d 10.0.0.1",
+            "arp -s 10.0.0.1 aa:bb:cc:dd:ee:ff",
+            "ping 8.8.8.8 > ping.txt",
+        ] {
+            assert!(!all_read_only(bad), "must NOT be read-only: {bad}");
+        }
     }
 }

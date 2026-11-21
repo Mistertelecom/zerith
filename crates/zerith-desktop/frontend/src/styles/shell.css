@@ -819,3 +819,36 @@
 .job-meta .dot {
   margin: 0;
 }
+
+.term-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.term-badge {
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--layer-2);
+  border: 1px solid var(--line);
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--label-secondary);
+  white-space: nowrap;
+}
+
+.term-tail {
+  margin: 0;
+  padding: 8px 10px;
+  max-height: 160px;
+  overflow: auto;
+  border-radius: 6px;
+  background: var(--code-bg);
+  border: 1px solid var(--line);
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--label-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+}

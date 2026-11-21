@@ -110,5 +110,7 @@ pub(crate) fn extra() -> Vec<Box<dyn Tool>> {
     v.extend(crate::browser::all());
     v.extend(crate::diagnostics::all());
     v.extend(crate::terminal::all());
+    v.extend(crate::network::all());
+    v.extend(crate::lsp::all());
     v
 }

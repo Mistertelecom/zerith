@@ -12,7 +12,9 @@ zerith-skills = { path = "../zerith-skills" }
 zerith-memory = { path = "../zerith-memory" }
 # Only for `Cancel`: the token a turn shares between the stream and its tools.
 zerith-providers = { path = "../zerith-providers" }
+serde = { workspace = true }
 serde_json.workspace = true
+toml.workspace = true
 thiserror.workspace = true
 walkdir = "2"
 # Already in Cargo.lock (through other crates): grep patterns.

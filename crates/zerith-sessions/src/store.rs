@@ -16,6 +16,8 @@ pub enum StoreError {
     Io(#[from] std::io::Error),
     #[error("not found: {0}")]
     NotFound(String),
+    #[error("invalid: {0}")]
+    Invalid(String),
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;

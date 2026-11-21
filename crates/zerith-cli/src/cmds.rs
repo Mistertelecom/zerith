@@ -1408,6 +1408,7 @@ enum RoutingField {
     Subagent,
     Explore,
     Plan,
+    Compact,
 }
 
 impl RoutingField {
@@ -1417,6 +1418,7 @@ impl RoutingField {
             Self::Subagent => "subagent_model",
             Self::Explore => "explore_model",
             Self::Plan => "plan_model",
+            Self::Compact => "compact_model",
         }
     }
 
@@ -1426,6 +1428,7 @@ impl RoutingField {
             Self::Subagent => &mut r.subagent_model,
             Self::Explore => &mut r.explore_model,
             Self::Plan => &mut r.plan_model,
+            Self::Compact => &mut r.compact_model,
         }
     }
 }
@@ -1475,12 +1478,13 @@ fn parse_routing(args: &[String]) -> Result<RoutingAction, String> {
             }
             Ok(RoutingAction::Show)
         }
-        "main" | "subagent" | "explore" | "plan" => {
+        "main" | "subagent" | "explore" | "plan" | "compact" => {
             let field = match sub {
                 "main" => RoutingField::Main,
                 "subagent" => RoutingField::Subagent,
                 "explore" => RoutingField::Explore,
                 "plan" => RoutingField::Plan,
+                "compact" => RoutingField::Compact,
                 _ => unreachable!(),
             };
             let raw = args
@@ -1574,6 +1578,10 @@ pub fn format_routing(r: &RoutingSettings) -> String {
     out.push_str(&format!(
         "plan_model      {}\n",
         r.plan_model.as_deref().unwrap_or("(padrão)")
+    ));
+    out.push_str(&format!(
+        "compact_model   {}\n",
+        r.compact_model.as_deref().unwrap_or("(padrão)")
     ));
     if r.role_models.is_empty() {
         out.push_str("role_models     (nenhum)\n");
@@ -1869,6 +1877,7 @@ mod tests {
                 saved_tokens: 400,
                 status: "ok".into(),
                 latency_ms: 100,
+                ..Default::default()
             })
             .unwrap();
         store
@@ -1886,6 +1895,7 @@ mod tests {
                 saved_tokens: 100,
                 status: "ok".into(),
                 latency_ms: 80,
+                ..Default::default()
             })
             .unwrap();
 

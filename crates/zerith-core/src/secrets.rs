@@ -5,7 +5,9 @@
 //! the store is unavailable the caller gets an error saying so, never a key
 //! silently written to disk.
 
+use std::collections::HashMap;
 use std::fmt;
+use std::sync::{OnceLock, RwLock};
 
 pub const SERVICE: &str = "zerith";
 
@@ -59,21 +61,129 @@ fn map_err(name: &str, e: keyring::Error) -> SecretError {
     }
 }
 
+/// In-memory cache for [`OsKeyring`] reads (`None` caches `NotFound`; transient
+/// `Unavailable` errors are never cached). Kept coherent on `set`/`delete`.
+static SECRET_CACHE: OnceLock<RwLock<HashMap<String, Option<String>>>> = OnceLock::new();
+
+fn secret_cache() -> &'static RwLock<HashMap<String, Option<String>>> {
+    SECRET_CACHE.get_or_init(Default::default)
+}
+
+/// Clears the process-wide in-memory secret cache.
+pub fn clear_secret_cache() {
+    if let Ok(mut guard) = secret_cache().write() {
+        guard.clear();
+    }
+}
+
+/// Wraps any [`SecretStore`] with a read-through/write-through in-memory cache.
+/// `Unavailable` errors are never cached so a transient OS lock can recover.
+pub struct CachedSecretStore<S> {
+    inner: S,
+    cache: RwLock<HashMap<String, Option<String>>>,
+}
+
+impl<S> CachedSecretStore<S> {
+    pub fn new(inner: S) -> Self {
+        Self {
+            inner,
+            cache: RwLock::new(HashMap::new()),
+        }
+    }
+}
+
+impl<S: SecretStore> SecretStore for CachedSecretStore<S> {
+    fn get(&self, name: &str) -> Result<String, SecretError> {
+        if let Ok(guard) = self.cache.read() {
+            if let Some(hit) = guard.get(name) {
+                return hit
+                    .clone()
+                    .ok_or_else(|| SecretError::NotFound(name.to_string()));
+            }
+        }
+        match self.inner.get(name) {
+            Ok(v) => {
+                if let Ok(mut guard) = self.cache.write() {
+                    guard.insert(name.to_string(), Some(v.clone()));
+                }
+                Ok(v)
+            }
+            Err(SecretError::NotFound(n)) => {
+                if let Ok(mut guard) = self.cache.write() {
+                    guard.insert(name.to_string(), None);
+                }
+                Err(SecretError::NotFound(n))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn set(&self, name: &str, value: &str) -> Result<(), SecretError> {
+        self.inner.set(name, value)?;
+        if let Ok(mut guard) = self.cache.write() {
+            guard.insert(name.to_string(), Some(value.to_string()));
+        }
+        Ok(())
+    }
+
+    fn delete(&self, name: &str) -> Result<(), SecretError> {
+        let res = self.inner.delete(name);
+        if matches!(res, Ok(()) | Err(SecretError::NotFound(_))) {
+            if let Ok(mut guard) = self.cache.write() {
+                guard.insert(name.to_string(), None);
+            }
+        }
+        res
+    }
+}
+
 impl SecretStore for OsKeyring {
     fn get(&self, name: &str) -> Result<String, SecretError> {
-        Self::entry(name)?
+        if let Ok(guard) = secret_cache().read() {
+            if let Some(hit) = guard.get(name) {
+                return hit
+                    .clone()
+                    .ok_or_else(|| SecretError::NotFound(name.to_string()));
+            }
+        }
+        match Self::entry(name)?
             .get_password()
             .map_err(|e| map_err(name, e))
+        {
+            Ok(v) => {
+                if let Ok(mut guard) = secret_cache().write() {
+                    guard.insert(name.to_string(), Some(v.clone()));
+                }
+                Ok(v)
+            }
+            Err(SecretError::NotFound(n)) => {
+                if let Ok(mut guard) = secret_cache().write() {
+                    guard.insert(name.to_string(), None);
+                }
+                Err(SecretError::NotFound(n))
+            }
+            Err(e) => Err(e),
+        }
     }
     fn set(&self, name: &str, value: &str) -> Result<(), SecretError> {
         Self::entry(name)?
             .set_password(value)
-            .map_err(|e| map_err(name, e))
+            .map_err(|e| map_err(name, e))?;
+        if let Ok(mut guard) = secret_cache().write() {
+            guard.insert(name.to_string(), Some(value.to_string()));
+        }
+        Ok(())
     }
     fn delete(&self, name: &str) -> Result<(), SecretError> {
-        Self::entry(name)?
+        let res = Self::entry(name)?
             .delete_credential()
-            .map_err(|e| map_err(name, e))
+            .map_err(|e| map_err(name, e));
+        if matches!(res, Ok(()) | Err(SecretError::NotFound(_))) {
+            if let Ok(mut guard) = secret_cache().write() {
+                guard.insert(name.to_string(), None);
+            }
+        }
+        res
     }
 }
 
@@ -530,5 +640,44 @@ mod tests {
     fn masking_never_shows_the_middle() {
         assert_eq!(mask("short"), "****");
         assert_eq!(mask("sk-abcdefghijklmnop"), "sk-a…mnop");
+    }
+
+    #[test]
+    fn cached_secret_store_hits_memory_and_invalidates_on_mutations() {
+        use std::cell::Cell;
+        struct Counting(Mem, Cell<usize>);
+        impl SecretStore for Counting {
+            fn get(&self, n: &str) -> Result<String, SecretError> {
+                self.1.set(self.1.get() + 1);
+                self.0.get(n)
+            }
+            fn set(&self, n: &str, v: &str) -> Result<(), SecretError> {
+                self.0.set(n, v)
+            }
+            fn delete(&self, n: &str) -> Result<(), SecretError> {
+                self.0.delete(n)
+            }
+        }
+
+        let store = CachedSecretStore::new(Counting(Mem(RefCell::default(), false), Cell::new(0)));
+        assert!(matches!(store.get("k"), Err(SecretError::NotFound(_))));
+        assert!(matches!(store.get("k"), Err(SecretError::NotFound(_))));
+        assert_eq!(
+            store.inner.1.get(),
+            1,
+            "NotFound is cached after first miss"
+        );
+
+        store.set("k", "v1").unwrap();
+        assert_eq!(store.get("k").unwrap(), "v1");
+        assert_eq!(store.inner.1.get(), 1, "set populates cache");
+
+        store.delete("k").unwrap();
+        assert!(matches!(store.get("k"), Err(SecretError::NotFound(_))));
+        assert_eq!(
+            store.inner.1.get(),
+            1,
+            "delete clears cached value to NotFound"
+        );
     }
 }

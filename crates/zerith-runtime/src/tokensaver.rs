@@ -272,6 +272,22 @@ pub fn compress_tool_output(tool_name: &str, text: &str) -> RtkOutcome {
         }
     }
 
+    if matches!(
+        tool_name,
+        "terminal_send" | "terminal_batch" | "terminal_open" | "net_connect" | "shell"
+    ) {
+        if is_network_config(head) {
+            if let Some(res) = accept(filter_network_config(text), "network-config") {
+                return res;
+            }
+        }
+        if is_network_table(&head_lines) {
+            if let Some(res) = accept(filter_network_table(text), "network-table") {
+                return res;
+            }
+        }
+    }
+
     if let Some(res) = accept(filter_dedup_log(text), "dedup-log") {
         return res;
     }
@@ -999,6 +1015,183 @@ fn filter_smart_truncate(text: &str) -> Option<String> {
     out.push_str(&format!("\n... (+{omitted} lines truncated)\n"));
     out.push_str(&lines[lines.len() - 60..].join("\n"));
     Some(out)
+}
+
+// --- network-config & network-table -----------------------------------------
+
+fn is_network_config(head: &str) -> bool {
+    const CUES: &[&str] = &[
+        "Building configuration",
+        "Current configuration",
+        "sysname ",
+        "router bgp ",
+        "router ospf ",
+        "ip vrf ",
+        "ip vpn-instance ",
+        "set system ",
+        "/interface ",
+        "config system ",
+    ];
+    let hits = CUES.iter().filter(|c| head.contains(**c)).count();
+    hits >= 1
+        && (head.contains("interface ")
+            || head.contains("/interface ")
+            || head.contains("router ")
+            || head.contains("Current configuration"))
+}
+
+fn filter_network_config(text: &str) -> Option<String> {
+    let mut kept = Vec::new();
+    let mut in_cert = false;
+    let mut skipped_comments = 0usize;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.contains("-----BEGIN CERTIFICATE-----") {
+            in_cert = true;
+            kept.push("  [certificado omitido pelo Token Saver]".to_string());
+            continue;
+        }
+        if in_cert {
+            if t.contains("-----END CERTIFICATE-----") {
+                in_cert = false;
+            }
+            continue;
+        }
+        if t.is_empty() || t == "!" || t == "#" || t.chars().all(|c| c == '!' || c == '#') {
+            skipped_comments += 1;
+            continue;
+        }
+        kept.push(line.trim_end().to_string());
+    }
+    if skipped_comments == 0 && kept.len() == text.lines().count() {
+        return None;
+    }
+    if skipped_comments > 0 {
+        kept.push(format!(
+            "# [RTK: {skipped_comments} separadores/linhas vazias omitidos]"
+        ));
+    }
+    Some(kept.join("\n"))
+}
+
+fn is_network_table(head_lines: &[&str]) -> bool {
+    let cues = head_lines.iter().any(|l| {
+        let low = l.to_ascii_lowercase();
+        low.contains("bgp")
+            || low.contains("neighbor")
+            || low.contains("prefx")
+            || low.contains("state/pfxrcd")
+            || low.contains("gateway")
+            || low.contains("mac address")
+            || low.contains("protocol  interface")
+            || (low.contains("destination") && low.contains("nexthop"))
+    });
+    if !cues {
+        return false;
+    }
+    let ip_or_mac = head_lines
+        .iter()
+        .filter(|l| {
+            let dots = l.bytes().filter(|&b| b == b'.').count();
+            let colons = l.bytes().filter(|&b| b == b':').count();
+            dots >= 3 || colons >= 4
+        })
+        .count();
+    ip_or_mac >= 3
+}
+
+fn is_table_anomaly(line: &str) -> bool {
+    let low = line.to_ascii_lowercase();
+    low.contains("idle")
+        || low.contains("active")
+        || low.contains("connect")
+        || low.contains(" down")
+        || low.contains("err-disable")
+        || low.contains("drop")
+        || low.contains("fail")
+        || low.contains("blocked")
+}
+
+fn filter_network_table(text: &str) -> Option<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() < 45 {
+        return None;
+    }
+    let keep_head = 25usize.min(lines.len());
+    let tail_start = lines.len().saturating_sub(5);
+    let mut out: Vec<String> = lines[..keep_head]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    let mut anomalies = Vec::new();
+    let mut omitted = 0usize;
+    for l in &lines[keep_head..tail_start] {
+        if is_table_anomaly(l) && anomalies.len() < 20 {
+            anomalies.push((*l).to_string());
+        } else {
+            omitted += 1;
+        }
+    }
+    if !anomalies.is_empty() {
+        out.push(format!("--- anomalias ({}) ---", anomalies.len()));
+        out.extend(anomalies);
+    }
+    if omitted > 0 {
+        out.push(format!(
+            "... (+{omitted} linhas normais de tabela omitidas)"
+        ));
+    }
+    out.extend(lines[tail_start..].iter().map(|s| (*s).to_string()));
+    Some(out.join("\n"))
+}
+
+#[cfg(test)]
+mod network_rtk_tests {
+    use super::*;
+
+    #[test]
+    fn compresses_router_config_comments_and_certs_while_preserving_routes() {
+        let mut cfg = String::from("Building configuration...\n!\n!\ninterface GigabitEthernet0/0\n ip address 10.0.0.1 255.255.255.252\n!\n");
+        for _ in 0..80 {
+            cfg.push_str("!\n!\n");
+        }
+        cfg.push_str("crypto pki certificate chain TP\n-----BEGIN CERTIFICATE-----\n");
+        for _ in 0..8 {
+            cfg.push_str("MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA\n");
+        }
+        cfg.push_str(
+            "-----END CERTIFICATE-----\nrouter bgp 65001\n neighbor 192.0.2.2 remote-as 65002\n!\n",
+        );
+        let out = compress_tool_output("terminal_send", &cfg);
+        assert_eq!(out.filter, Some("network-config"));
+        assert!(out.text.contains("router bgp 65001"));
+        assert!(out.text.contains("10.0.0.1 255.255.255.252"));
+        assert!(!out.text.contains("MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A"));
+    }
+
+    #[test]
+    fn compresses_large_bgp_table_keeping_anomalies_and_summary() {
+        let mut tbl = String::from(
+            "Neighbor        V    AS MsgRcvd MsgSent   TblVer  InQ OutQ Up/Down  State/PfxRcd\n",
+        );
+        for i in 1..=60 {
+            if i == 42 {
+                tbl.push_str(&format!(
+                    "10.0.1.{i:<3}     4 65010       0       0        1    0    0 01:10:00 Idle\n"
+                ));
+            } else {
+                tbl.push_str(&format!(
+                    "10.0.1.{i:<3}     4 65010   12000   12000       99    0    0 12w3d    1500\n"
+                ));
+            }
+        }
+        tbl.push_str("Total number of neighbors 60\n");
+        let out = compress_tool_output("terminal_batch", &tbl);
+        assert_eq!(out.filter, Some("network-table"));
+        assert!(out.text.contains("Idle"), "must keep anomaly row");
+        assert!(out.text.contains("Total number of neighbors 60"));
+        assert!(out.text.contains("linhas normais de tabela omitidas"));
+    }
 }
 
 #[cfg(test)]

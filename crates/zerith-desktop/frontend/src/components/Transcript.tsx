@@ -27,7 +27,14 @@ import {
 import type { Block, ToolRow } from "../lib/turn";
 import { ZerithMark } from "./ui";
 import { TurnChanges } from "./Changes";
-import { parseBlocks, type Inline, type MdBlock } from "./markdown";
+import { highlightCode } from "./highlight";
+import {
+  parseBlocks,
+  parseBlocksCached,
+  splitStableMarkdown,
+  type Inline,
+  type MdBlock,
+} from "./markdown";
 
 /** "Aprendi: …" under an answer, with one undo for everything it saved. */
 function LearnedNote(props: { text: string; items: LearnedItem[] }) {
@@ -241,6 +248,29 @@ function inlines(nodes: Inline[]): ReactNode[] {
   });
 }
 
+const HighlightedCode = memo(function HighlightedCode({
+  lang,
+  text,
+}: {
+  lang: string;
+  text: string;
+}) {
+  const tokens = useMemo(() => highlightCode(lang, text), [lang, text]);
+  return (
+    <>
+      {tokens.map((t, idx) =>
+        t.cls ? (
+          <span key={idx} className={t.cls}>
+            {t.text}
+          </span>
+        ) : (
+          <Fragment key={idx}>{t.text}</Fragment>
+        ),
+      )}
+    </>
+  );
+});
+
 function blocks(list: MdBlock[]): ReactNode[] {
   return list.map((b, i) => {
     switch (b.t) {
@@ -268,7 +298,9 @@ function blocks(list: MdBlock[]): ReactNode[] {
               <CopyButton text={b.text} label="Copiar" />
             </div>
             <pre>
-              <code>{b.text}</code>
+              <code>
+                <HighlightedCode lang={b.lang} text={b.text} />
+              </code>
             </pre>
           </div>
         );
@@ -307,9 +339,26 @@ function blocks(list: MdBlock[]): ReactNode[] {
   });
 }
 
+const StableMarkdown = memo(function StableMarkdown({ text }: { text: string }) {
+  const tree = useMemo(() => parseBlocksCached(text), [text]);
+  return <>{blocks(tree)}</>;
+});
+
 function Markdown({ text, streaming }: { text: string; streaming: boolean }) {
-  const tree = useMemo(() => parseBlocks(text), [text]);
-  return <div className={"md" + (streaming ? " streaming" : "")}>{blocks(tree)}</div>;
+  const { stable, tail } = useMemo(
+    () => (streaming ? splitStableMarkdown(text) : { stable: text, tail: "" }),
+    [text, streaming],
+  );
+  const tailTree = useMemo(
+    () => (tail ? parseBlocks(tail) : []),
+    [tail],
+  );
+  return (
+    <div className={"md" + (streaming ? " streaming" : "")}>
+      {stable ? <StableMarkdown text={stable} /> : null}
+      {tailTree.length ? blocks(tailTree) : null}
+    </div>
+  );
 }
 
 const STATE_LABEL = { run: "executando", ok: "concluída", fail: "falhou" } as const;
@@ -319,8 +368,12 @@ function ToolLine({ row }: { row: ToolRow }) {
   const Icon = toolIcon(row.name);
   const arg = argSummary(row.args);
   const args = parseArgs(row.args);
-  const body = row.preview ?? (args ? JSON.stringify(args, null, 2) : row.args);
+  const body = row.preview ?? row.progress ?? (args ? JSON.stringify(args, null, 2) : row.args);
   const state = row.ok === undefined ? "run" : row.ok ? "ok" : "fail";
+  const liveTail =
+    state === "run" && row.progress
+      ? row.progress.split(/\r?\n/).slice(-8).join("\n")
+      : null;
   return (
     <div className={`tool ${state}` + (open ? " open" : "")}>
       <button className="tool-head" onClick={() => setOpen(!open)} aria-expanded={open} disabled={!body}>
@@ -342,6 +395,7 @@ function ToolLine({ row }: { row: ToolRow }) {
         </span>
         <ChevronRight size={14} strokeWidth={2} className="chev" />
       </button>
+      {liveTail && !open ? <pre className="tool-body live">{liveTail}</pre> : null}
       {open && body ? <pre className="tool-body">{body}</pre> : null}
     </div>
   );

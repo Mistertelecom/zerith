@@ -158,6 +158,7 @@ pub async fn mcp_add(
     headers: String,
 ) -> Result<Vec<McpView>, String> {
     let paths = Paths::with_root(state.root());
+    let cache = state.mcp_cache();
     blocking(move || {
         let mut words = command.split_whitespace().map(str::to_string);
         let server = ServerConfig {
@@ -176,6 +177,7 @@ pub async fn mcp_add(
         let name = server.name.clone();
         add_server(&paths, server)?;
         set_extra(&paths, &name, &extra)?;
+        cache.invalidate();
         Ok(list(&paths))
     })
     .await
@@ -184,6 +186,7 @@ pub async fn mcp_add(
 #[tauri::command]
 pub async fn mcp_remove(state: State<'_, AppState>, name: String) -> Result<Vec<McpView>, String> {
     let paths = Paths::with_root(state.root());
+    let cache = state.mcp_cache();
     blocking(move || {
         if !remove_server(&paths, &name)? {
             return Err(format!(
@@ -191,6 +194,7 @@ pub async fn mcp_remove(state: State<'_, AppState>, name: String) -> Result<Vec<
             ));
         }
         oauth::forget(paths.root(), &zerith_core::secrets::OsKeyring, &name)?;
+        cache.invalidate();
         Ok(list(&paths))
     })
     .await
@@ -203,8 +207,10 @@ pub async fn mcp_toggle(
     enabled: bool,
 ) -> Result<Vec<McpView>, String> {
     let paths = Paths::with_root(state.root());
+    let cache = state.mcp_cache();
     blocking(move || {
         set_enabled(&paths, &name, enabled)?;
+        cache.invalidate();
         Ok(list(&paths))
     })
     .await
@@ -213,6 +219,7 @@ pub async fn mcp_toggle(
 #[tauri::command]
 pub async fn mcp_approve(state: State<'_, AppState>, name: String) -> Result<Vec<McpView>, String> {
     let paths = Paths::with_root(state.root());
+    let cache = state.mcp_cache();
     blocking(move || {
         let proj = project(&paths).ok_or("nenhum projeto ativo para aprovar servidor MCP")?;
         let l = load_servers(&paths, Some(&proj));
@@ -222,6 +229,7 @@ pub async fn mcp_approve(state: State<'_, AppState>, name: String) -> Result<Vec
             .find(|s| s.name == name)
             .ok_or_else(|| format!("nenhum servidor de projeto pendente chamado {name}"))?;
         approve_project_server(&paths, &proj, server)?;
+        cache.invalidate();
         Ok(list(&paths))
     })
     .await
@@ -275,6 +283,7 @@ pub async fn mcp_oauth_login(
 ) -> Result<Vec<McpView>, String> {
     use tauri::Emitter;
     let paths = Paths::with_root(state.root());
+    let cache = state.mcp_cache();
     blocking(move || {
         let l = load_servers(&paths, project(&paths).as_deref());
         let url = l
@@ -297,6 +306,7 @@ pub async fn mcp_oauth_login(
                 }
             },
         )?;
+        cache.invalidate();
         Ok(list(&paths))
     })
     .await
@@ -313,8 +323,10 @@ pub async fn mcp_oauth_logout(
     name: String,
 ) -> Result<Vec<McpView>, String> {
     let paths = Paths::with_root(state.root());
+    let cache = state.mcp_cache();
     blocking(move || {
         oauth::logout(&zerith_core::secrets::OsKeyring, &name)?;
+        cache.invalidate();
         Ok(list(&paths))
     })
     .await
@@ -346,9 +358,12 @@ pub async fn mcp_hermes_import(
     names: Vec<String>,
 ) -> Result<ImportView, String> {
     let paths = Paths::with_root(state.root());
+    let cache = state.mcp_cache();
     blocking(move || {
         let home = hermes_setup::hermes_home().ok_or("Hermes não encontrado neste computador")?;
-        hermes_setup::import_hermes_mcp(&home, &paths, &names).map(ImportView::from)
+        let r = hermes_setup::import_hermes_mcp(&home, &paths, &names).map(ImportView::from)?;
+        cache.invalidate();
+        Ok(r)
     })
     .await
 }

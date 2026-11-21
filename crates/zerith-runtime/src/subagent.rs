@@ -344,6 +344,8 @@ pub struct ChildSpec {
     /// `(id, name)` under which the child reports its live progress (step and
     /// tool) to the person while it runs. `None`: silent until it ends.
     pub announce: Option<(String, String)>,
+    /// Optional isolation mode (`"worktree"`).
+    pub isolation: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -397,9 +399,106 @@ pub fn run_child(spec: ChildSpec) -> Result<ChildOutput, ChildError> {
     run_child_with(spec, &[])
 }
 
+struct WorktreeGuard {
+    repo_root: PathBuf,
+    worktree_dir: PathBuf,
+    active: bool,
+}
+
+impl WorktreeGuard {
+    fn enter(workspace: &Path, id: &str) -> Result<Self, String> {
+        let top = std::process::Command::new("git")
+            .arg("-C")
+            .arg(workspace)
+            .args(["rev-parse", "--show-toplevel"])
+            .output()
+            .map_err(|e| format!("falha ao rodar git: {e}"))?;
+        if !top.status.success() {
+            return Err("isolation=\"worktree\" requer um repositório git válido".into());
+        }
+        let repo_root = PathBuf::from(String::from_utf8_lossy(&top.stdout).trim());
+        let wt_dir = std::env::temp_dir().join(format!("zerith-wt-{id}"));
+        if wt_dir.exists() {
+            let _ = std::fs::remove_dir_all(&wt_dir);
+        }
+        let add = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo_root)
+            .args(["worktree", "add", "--detach"])
+            .arg(&wt_dir)
+            .arg("HEAD")
+            .output()
+            .map_err(|e| format!("falha ao criar git worktree: {e}"))?;
+        if !add.status.success() {
+            return Err(format!(
+                "git worktree add falhou: {}",
+                String::from_utf8_lossy(&add.stderr).trim()
+            ));
+        }
+        Ok(Self {
+            repo_root,
+            worktree_dir: wt_dir,
+            active: true,
+        })
+    }
+
+    /// Removes the worktree if clean; if dirty, keeps it and returns diff stat note.
+    fn finish(mut self) -> Option<String> {
+        self.active = false;
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&self.worktree_dir)
+            .args(["status", "--porcelain"])
+            .output();
+        let dirty = status
+            .as_ref()
+            .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+            .unwrap_or(false);
+        if !dirty {
+            let _ = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&self.repo_root)
+                .args(["worktree", "remove", "--force"])
+                .arg(&self.worktree_dir)
+                .output();
+            return None;
+        }
+        let stat = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&self.worktree_dir)
+            .args(["diff", "--stat"])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        Some(format!(
+            "\n\n[worktree isolado preservado em {}]\n{}",
+            self.worktree_dir.display(),
+            if stat.is_empty() {
+                "(arquivos não rastreados ou alterações pendentes)"
+            } else {
+                &stat
+            }
+        ))
+    }
+}
+
+impl Drop for WorktreeGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&self.repo_root)
+                .args(["worktree", "remove", "--force"])
+                .arg(&self.worktree_dir)
+                .output();
+        }
+    }
+}
+
 /// [`run_child`] with the parent's middleware around every tool call.
 pub(crate) fn run_child_with(
-    spec: ChildSpec,
+    mut spec: ChildSpec,
     middleware: &[SharedMiddleware],
 ) -> Result<ChildOutput, ChildError> {
     let fail = |e: &dyn std::fmt::Display| ChildError::Failed(e.to_string());
@@ -407,6 +506,17 @@ pub(crate) fn run_child_with(
     let session = store
         .create_subagent_session(&spec.parent, &spec.title, Some(&spec.model))
         .map_err(|e| fail(&e))?;
+    let wt_guard = if spec.isolation.as_deref() == Some("worktree") {
+        let g = WorktreeGuard::enter(&spec.policy.workspace, &session.id)
+            .map_err(ChildError::Failed)?;
+        spec.policy.workspace = g.worktree_dir.clone();
+        if spec.scope.is_some() {
+            spec.scope = Some(Scope::workspace(&g.worktree_dir));
+        }
+        Some(g)
+    } else {
+        None
+    };
     let client = Client::new(spec.cfg.clone()).map_err(|e| fail(&e))?;
     let memory = spec
         .scope
@@ -444,6 +554,7 @@ pub(crate) fn run_child_with(
         skills: skills.as_ref(),
         agent: spec.def.as_ref(),
         settings: spec.settings.as_ref(),
+        project_dir: Some(&spec.policy.workspace),
         ..TurnContext::default()
     };
     let mut step = 0usize;
@@ -549,8 +660,12 @@ pub(crate) fn run_child_with(
                     }
                 )));
             }
+            let mut text = report.text;
+            if let Some(wt_note) = wt_guard.and_then(WorktreeGuard::finish) {
+                text.push_str(&wt_note);
+            }
             Ok(ChildOutput {
-                text: report.text,
+                text,
                 session_id: session.id,
                 saved: Saved {
                     rtk: report.saved_rtk_tokens,
@@ -793,6 +908,9 @@ pub(crate) fn flush(
                 model,
             }),
             HostEvent::Tasks => tasks = true,
+            HostEvent::ToolProgress { tool, chunk } => {
+                on_event(RunEvent::ToolProgress { tool, chunk });
+            }
         }
     }
     if tasks {
@@ -903,6 +1021,7 @@ impl Services for Runtime {
             settings: Some(settings),
             approvals: self.approvals.clone(),
             announce: Some((id.clone(), format!("{name}: {description}"))),
+            isolation: req.isolation.clone(),
         };
         let totals = self.saved.clone();
         let middleware = self.middleware.clone();
@@ -1016,5 +1135,128 @@ impl Services for Runtime {
 
     fn skills_root(&self) -> Option<zerith_skills::Library> {
         self.skills_root.clone()
+    }
+
+    fn session_search(&self, query: &str, limit: usize) -> Result<String, String> {
+        let store = Store::open(self.db()?).map_err(|e| e.to_string())?;
+        search_store_messages(&store, query, limit)
+    }
+}
+
+pub(crate) fn search_store_messages(
+    store: &Store,
+    query: &str,
+    limit: usize,
+) -> Result<String, String> {
+    let hits = store
+        .search_messages(query, limit)
+        .map_err(|e| e.to_string())?;
+    if hits.is_empty() {
+        return Ok("nenhuma mensagem encontrada em sessões anteriores".into());
+    }
+    let mut titles: HashMap<String, String> = HashMap::new();
+    let mut lines = Vec::with_capacity(hits.len());
+    for hit in hits {
+        let title = if let Some(t) = titles.get(&hit.session_id) {
+            t.clone()
+        } else {
+            let t = store
+                .session(&hit.session_id)
+                .ok()
+                .flatten()
+                .map(|s| s.title)
+                .unwrap_or_else(|| "sem título".into());
+            titles.insert(hit.session_id.clone(), t.clone());
+            t
+        };
+        let short: String = hit.session_id.chars().take(8).collect();
+        let snippet = one_line(&hit.snippet);
+        lines.push(format!("[{short} · \"{title}\"] {snippet}"));
+    }
+    Ok(lines.join("\n"))
+}
+
+#[cfg(test)]
+mod session_search_tests {
+    use super::*;
+    use zerith_sessions::{NewMessage, SessionSource};
+
+    #[test]
+    fn session_search_returns_matching_prior_messages() {
+        let store = Store::open_in_memory().unwrap();
+        let s = store
+            .create_session("Auditoria BGP AS65001", SessionSource::Native)
+            .unwrap();
+        store
+            .append(
+                &s.id,
+                &NewMessage::new(Role::User, "Verificar sessão BGP neighbor 192.0.2.1"),
+            )
+            .unwrap();
+        let res = search_store_messages(&store, "BGP", 10).unwrap();
+        assert!(res.contains("Auditoria BGP AS65001"), "{res}");
+        assert!(res.contains("192.0.2.1"), "{res}");
+    }
+}
+
+#[cfg(test)]
+mod worktree_tests {
+    use super::*;
+
+    fn git(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("git deve estar disponível no ambiente de teste")
+    }
+
+    #[test]
+    fn worktree_guard_cleans_up_clean_and_preserves_dirty_with_diff_stat() {
+        let base = std::env::temp_dir().join(format!(
+            "zerith-wt-repo-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        assert!(git(&base, &["init"]).status.success());
+        assert!(git(&base, &["config", "user.email", "test@zerith.local"])
+            .status
+            .success());
+        assert!(git(&base, &["config", "user.name", "Zerith Test"])
+            .status
+            .success());
+        std::fs::write(base.join("app.txt"), "linha1\n").unwrap();
+        assert!(git(&base, &["add", "app.txt"]).status.success());
+        assert!(git(&base, &["commit", "-m", "init"]).status.success());
+
+        // 1. Clean worktree is removed automatically on finish().
+        let clean = WorktreeGuard::enter(&base, "clean-sub").unwrap();
+        let clean_path = clean.worktree_dir.clone();
+        assert!(clean_path.exists());
+        assert!(clean.finish().is_none());
+        assert!(!clean_path.exists(), "worktree limpo deveria ser removido");
+
+        // 2. Dirty worktree is preserved and returns a diff-stat note.
+        let dirty = WorktreeGuard::enter(&base, "dirty-sub").unwrap();
+        let dirty_path = dirty.worktree_dir.clone();
+        std::fs::write(dirty_path.join("app.txt"), "linha1\nlinha2\n").unwrap();
+        let note = dirty.finish().expect("worktree sujo deve retornar nota");
+        assert!(note.contains("app.txt"), "{note}");
+        assert!(dirty_path.exists(), "worktree sujo deve ser preservado");
+
+        let _ = git(
+            &base,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                &dirty_path.to_string_lossy(),
+            ],
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

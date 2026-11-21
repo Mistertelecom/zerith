@@ -203,6 +203,7 @@ impl MemoryBackend for SqliteMemory {
         let Some(query) = fts_query(query) else {
             return Ok(Vec::new());
         };
+        let fetch = (limit.saturating_mul(3)).clamp(20, 200);
         let sql = "SELECT f.id, f.scope, f.kind, f.text, f.source, f.session_id, f.confidence,
                           f.created_at, f.updated_at, f.superseded_by, bm25(memory_fts) AS score
                    FROM memory_fts
@@ -210,13 +211,35 @@ impl MemoryBackend for SqliteMemory {
                    WHERE memory_fts MATCH ?1 AND (?2 = '*' OR instr('|' || ?2 || '|', '|' || f.scope || '|') > 0) AND f.deleted = 0
                    ORDER BY score LIMIT ?3";
         let mut st = self.conn.prepare(sql)?;
-        let rows = st.query_map(params![query, scope.as_str(), limit as i64], |r| {
+        let rows = st.query_map(params![query, scope.as_str(), fetch as i64], |r| {
             Ok(RecallHit {
                 fact: Self::row_to_fact(r)?,
                 score: r.get(10)?,
             })
         })?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        let now = now_ms();
+        let mut hits: Vec<RecallHit> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        // FTS5 `bm25()` returns smaller (more negative) values for better matches.
+        // Subtract small workspace and recency bonuses to nudge recent project
+        // facts ahead without overriding strongly higher keyword matches.
+        for h in &mut hits {
+            let ws_bonus =
+                if h.fact.scope.starts_with("project:") || h.fact.scope.starts_with("workspace:") {
+                    0.35
+                } else {
+                    0.0
+                };
+            let age_days = (now - h.fact.updated_at).max(0) as f64 / 86_400_000.0;
+            let recency_bonus = 0.25 / (1.0 + age_days / 30.0);
+            h.score -= ws_bonus + recency_bonus;
+        }
+        hits.sort_by(|a, b| {
+            a.score
+                .partial_cmp(&b.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        hits.truncate(limit);
+        Ok(hits)
     }
 
     fn list(&self, scope: &Scope, limit: usize) -> Result<Vec<Fact>> {
@@ -296,19 +319,96 @@ impl MemoryBackend for SqliteMemory {
     }
 }
 
+const STOPWORDS: &[&str] = &[
+    // PT-BR
+    "a", "ao", "aos", "as", "com", "como", "da", "das", "de", "do", "dos", "e", "em", "na", "nas",
+    "no", "nos", "o", "os", "ou", "para", "por", "qual", "quando", "que", "se", "sem", "ser",
+    "seu", "sua", "um", "uma", "uns", "umas", // EN
+    "an", "and", "are", "as", "at", "be", "by", "for", "from", "how", "in", "is", "it", "of", "on",
+    "or", "that", "the", "this", "to", "was", "were", "what", "when", "where", "which", "who",
+    "will", "with",
+];
+
 /// FTS5 has its own grammar: a bare `:` or a quote is a syntax error, and
 /// returning `None` for an unusable query is better than surfacing a parse
-/// failure to the agent. Every word is quoted and the words are OR-ed so one
-/// unknown term does not hide the rest.
+/// failure to the agent. Common PT/EN stopwords are dropped unless nothing
+/// else remains, and surviving terms are OR-ed.
 fn fts_query(q: &str) -> Option<String> {
-    let words: Vec<String> = q
+    let raw_words: Vec<&str> = q
         .split(|c: char| !c.is_alphanumeric())
         .filter(|w| !w.is_empty())
+        .collect();
+    if raw_words.is_empty() {
+        return None;
+    }
+    let filtered: Vec<String> = raw_words
+        .iter()
+        .filter(|w| {
+            let low = w.to_ascii_lowercase();
+            !STOPWORDS.contains(&low.as_str())
+        })
         .map(|w| format!("\"{w}\""))
         .collect();
-    if words.is_empty() {
-        None
+    if !filtered.is_empty() {
+        Some(filtered.join(" OR "))
     } else {
-        Some(words.join(" OR "))
+        Some(
+            raw_words
+                .into_iter()
+                .map(|w| format!("\"{w}\""))
+                .collect::<Vec<_>>()
+                .join(" OR "),
+        )
+    }
+}
+
+#[cfg(test)]
+mod fts_tests {
+    use super::*;
+
+    #[test]
+    fn fts_query_drops_pt_en_stopwords_unless_all_are_stopwords() {
+        assert_eq!(
+            fts_query("como configurar o BGP no roteador").as_deref(),
+            Some("\"configurar\" OR \"BGP\" OR \"roteador\"")
+        );
+        assert_eq!(
+            fts_query("the with for").as_deref(),
+            Some("\"the\" OR \"with\" OR \"for\"")
+        );
+        assert_eq!(fts_query("... :::"), None);
+    }
+
+    #[test]
+    fn recall_boosts_recent_project_scope_over_older_user_scope() {
+        let mem = SqliteMemory::open_in_memory().unwrap();
+        let old_id = mem
+            .remember(
+                &Scope::user("local"),
+                FactKind::Fact,
+                "vlan 100 trunk gateway",
+                Confidence::Confirmed,
+                None,
+            )
+            .unwrap();
+        mem.conn
+            .execute(
+                "UPDATE memory_facts SET updated_at = ?1 WHERE id = ?2",
+                params![now_ms() - 90 * 86_400_000, old_id],
+            )
+            .unwrap();
+        mem.remember(
+            &Scope::project("rede"),
+            FactKind::Fact,
+            "vlan 100 trunk gateway",
+            Confidence::Confirmed,
+            None,
+        )
+        .unwrap();
+
+        let hits = mem.recall(&Scope::all(), "vlan trunk", 10).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].fact.scope, "project:rede");
+        assert_eq!(hits[1].fact.scope, "user:local");
     }
 }

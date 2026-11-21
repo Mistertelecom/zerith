@@ -93,8 +93,17 @@ export type TurnEvent =
       ok: boolean;
       preview: string;
     }
+  | { type: "toolProgress"; tool: string; chunk: string }
+  | { type: "steered"; text: string }
   | { type: "approval"; id: number; tool: string; summary: string }
-  | { type: "usage"; input: number; output: number }
+  | {
+      type: "usage";
+      input: number;
+      output: number;
+      cacheRead?: number;
+      cacheWrite?: number;
+      ttftMs?: number;
+    }
   | { type: "compacted"; before: number; after: number }
   | { type: "autoCompacted"; before: number; after: number }
   | { type: "tasks"; items: Todo[] }
@@ -122,6 +131,8 @@ export type TurnEvent =
       text: string;
       promptTokens: number;
       completionTokens: number;
+      cacheReadTokens?: number;
+      cacheWriteTokens?: number;
       savedTokens: number;
       modelUsed: string | null;
     }
@@ -191,6 +202,7 @@ export interface Routing {
   subagent_model?: string | null;
   explore_model?: string | null;
   plan_model?: string | null;
+  compact_model?: string | null;
   role_models?: Record<string, string>;
   /** With `subagent_model` set, a combo is a delegation profile the chat can pick. */
   combos?: { name: string; models: string[]; subagent_model?: string | null }[];
@@ -222,6 +234,8 @@ export interface UsageSummary {
   }[];
   total_prompt_tokens: number;
   total_completion_tokens: number;
+  total_cache_read_tokens?: number;
+  total_cache_write_tokens?: number;
   total_saved_tokens: number;
   total_saved_rtk_tokens: number;
   total_saved_ponytail_tokens: number;
@@ -705,6 +719,7 @@ export const api = {
     prompt: string;
     mode: string;
     agent?: string | null;
+    reasoningEffort?: string | null;
     history?: number;
   }) =>
     invoke<void>("send_turn", {
@@ -714,10 +729,13 @@ export const api = {
         prompt: args.prompt,
         mode: args.mode,
         agent: args.agent ?? null,
+        reasoning_effort: args.reasoningEffort ?? null,
         // 0 = the profile's history window (the core decides).
         history: args.history ?? 0,
       },
     }),
+  steerTurn: (sessionId: string, prompt: string) =>
+    invoke<boolean>("steer_turn", { sessionId, prompt }),
   cancelTurn: (sessionId: string) => invoke<void>("cancel_turn", { sessionId }),
   answerApproval: (
     sessionId: string,
@@ -849,6 +867,26 @@ export interface BackgroundJob {
 export const jobsApi = {
   list: () => invoke<BackgroundJob[]>("background_jobs"),
   stop: (id: string) => invoke<string>("background_job_stop", { id }),
+};
+
+export interface TerminalSnapshot {
+  id: string;
+  command: string;
+  alive: boolean;
+  busy: boolean;
+  vendor: string | null;
+  device: string | null;
+  host: string | null;
+  role: string | null;
+  idleSecs: number;
+}
+
+export const terminalsApi = {
+  list: () => invoke<TerminalSnapshot[]>("terminals_list"),
+  tail: (id: string, maxBytes = 4096) =>
+    invoke<string>("terminal_tail", { id, maxBytes }),
+  interrupt: (id: string) => invoke<void>("terminal_interrupt", { id }),
+  close: (id: string) => invoke<void>("terminal_close", { id }),
 };
 
 export const updateApi = {

@@ -5,11 +5,12 @@
 //! loading MCP servers are all disk or network work.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use zerith_memory::{MemoryBackend, SqliteMemory};
 use zerith_providers::{Cancel, Client};
 use zerith_runtime::{
-    run_agent_turn, AgentOptions, ApprovalGate, QuestionGate, RunEvent, TurnContext,
+    run_agent_turn, AgentOptions, ApprovalGate, InboxReceiver, QuestionGate, RunEvent, TurnContext,
 };
 use zerith_security::{Mode, Policy};
 use zerith_sessions::Store;
@@ -26,6 +27,8 @@ pub struct Setup {
     pub mode: Mode,
     pub memory_paused: bool,
     pub agent: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub mcp_cache: Option<Arc<crate::state::McpCache>>,
 }
 
 /// One thing that happened during the turn, already shaped for the window.
@@ -64,6 +67,9 @@ pub enum TurnEvent {
     Usage {
         input: u64,
         output: u64,
+        cache_read: u64,
+        cache_write: u64,
+        ttft_ms: u64,
     },
     Compacted {
         before: usize,
@@ -100,11 +106,20 @@ pub enum TurnEvent {
         before: u64,
         after: u64,
     },
+    ToolProgress {
+        tool: String,
+        chunk: String,
+    },
+    Steered {
+        text: String,
+    },
     Done {
         stored: Option<i64>,
         text: String,
         prompt_tokens: u64,
         completion_tokens: u64,
+        cache_read_tokens: u64,
+        cache_write_tokens: u64,
         saved_tokens: u64,
         model_used: Option<String>,
     },
@@ -134,7 +149,19 @@ fn shape(ev: RunEvent) -> Option<TurnEvent> {
             preview: output_preview,
         },
         RunEvent::ApprovalNeeded { id, tool, summary } => TurnEvent::Approval { id, tool, summary },
-        RunEvent::Usage { input, output } => TurnEvent::Usage { input, output },
+        RunEvent::Usage {
+            input,
+            output,
+            cache_read,
+            cache_write,
+            ttft_ms,
+        } => TurnEvent::Usage {
+            input,
+            output,
+            cache_read,
+            cache_write,
+            ttft_ms,
+        },
         RunEvent::Compacted { before, after } => TurnEvent::Compacted { before, after },
         RunEvent::Tasks { items } => TurnEvent::Tasks { items },
         RunEvent::Subagent {
@@ -175,6 +202,8 @@ fn shape(ev: RunEvent) -> Option<TurnEvent> {
             before: before_bytes as u64,
             after: after_bytes as u64,
         },
+        RunEvent::ToolProgress { tool, chunk } => TurnEvent::ToolProgress { tool, chunk },
+        RunEvent::Steered { text } => TurnEvent::Steered { text },
     })
 }
 
@@ -188,6 +217,7 @@ pub fn run(
     cancel: &Cancel,
     approvals: &ApprovalGate,
     questions: &QuestionGate,
+    inbox: Option<&InboxReceiver>,
     on: &mut dyn FnMut(TurnEvent),
 ) -> Result<(), String> {
     let store = Store::open(&setup.db).map_err(|e| e.to_string())?;
@@ -197,10 +227,11 @@ pub fn run(
     // background; this turn goes direct instead of waiting for the boot.
     zerith_runtime::bili::ensure(&setup.root, cfg.context.billion_context, false);
     // User messages replayed per turn: the execution profile's, as in the CLI.
-    let history = cfg.profile.limits().history_window;
-    // `configured_providers` already puts the routed primary first, so the head
-    // of the list is the provider this turn should use.
-    let provider = crate::wire::configured_providers(&setup.root)
+    let limits = cfg.profile.limits();
+    let history = limits.history_window;
+    // `configured_providers_from` reuses the already-loaded `Settings` so we
+    // never parse settings.toml twice per turn.
+    let provider = crate::wire::configured_providers_from(&cfg, &setup.root)
         .into_iter()
         .next()
         .ok_or_else(|| "Nenhum provedor configurado".to_string())?;
@@ -224,10 +255,20 @@ pub fn run(
         .ok();
 
     let mut tools = Registry::new();
-    let mut mcp = zerith_mcp::McpRegistry::load(&paths, Some(&setup.workspace));
-    if let Some(c) = &contrib {
-        mcp.extend(c.mcp.iter().map(|(_, s)| s.clone()).collect());
-    }
+    let build_mcp = || {
+        let mut reg = zerith_mcp::McpRegistry::load(&paths, Some(&setup.workspace));
+        if let Some(c) = &contrib {
+            reg.extend(c.mcp.iter().map(|(_, s)| s.clone()).collect());
+        }
+        reg
+    };
+    let mcp: Arc<zerith_mcp::McpRegistry> = match &setup.mcp_cache {
+        Some(cache) => {
+            let fp = crate::state::mcp_config_fingerprint(&setup.root, &setup.workspace);
+            cache.get_or_build(&setup.workspace, fp, limits.cache_entries, build_mcp)
+        }
+        None => Arc::new(build_mcp()),
+    };
     let _ = mcp.register_into(&mut tools);
     let prompt = if mcp.is_empty() {
         prompt.to_string()
@@ -297,6 +338,8 @@ pub fn run(
                 .collect(),
             spill_dir: Some(setup.root.join("spill")),
             history,
+            inbox,
+            reasoning_effort: setup.reasoning_effort.clone(),
             ..AgentOptions::default()
         },
         session_id,
@@ -327,9 +370,47 @@ pub fn run(
                 text: r.text,
                 prompt_tokens: r.prompt_tokens,
                 completion_tokens: r.completion_tokens,
+                cache_read_tokens: r.cache_read_tokens,
+                cache_write_tokens: r.cache_write_tokens,
                 saved_tokens: r.saved_tokens,
-                model_used: r.model_used,
+                model_used: r.model_used.clone(),
             });
+            // Best-effort background pre-compaction when context usage sits in [70%, 85%).
+            let model_for_win = r.model_used.as_deref().unwrap_or(model);
+            let ctx_limit = zerith_runtime::resolve_gateway(&settings, model, client.config())
+                .0
+                .candidates
+                .into_iter()
+                .next()
+                .and_then(|c| c.config.context_limit)
+                .or(client.config().context_limit)
+                .or_else(|| zerith_providers::models::context_window(model_for_win));
+            if let Some(win) = ctx_limit.filter(|&w| w > 0) {
+                let pct = r.prompt_tokens.saturating_mul(100) / u64::from(win);
+                if (70..85).contains(&pct) {
+                    let db_bg = setup.db.clone();
+                    let settings_bg = settings.clone();
+                    let cfg_bg = client.config().clone();
+                    let sid_bg = session_id.to_string();
+                    let model_bg = model.to_string();
+                    std::thread::spawn(move || {
+                        if let (Ok(bg_store), Ok(bg_client)) =
+                            (Store::open(&db_bg), Client::new(cfg_bg))
+                        {
+                            let bg_cancel = Cancel::default();
+                            let _ = zerith_runtime::compact::pre_compact_routed(
+                                &bg_store,
+                                &settings_bg,
+                                &bg_client,
+                                &sid_bg,
+                                &model_bg,
+                                history,
+                                &bg_cancel,
+                            );
+                        }
+                    });
+                }
+            }
             // After Done, on its own thread: the answer never waits for it.
             crate::learn::spawn(crate::learn::Job {
                 root: setup.root.clone(),

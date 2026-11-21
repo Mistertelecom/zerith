@@ -13,7 +13,9 @@ pub mod secrets;
 pub mod settings;
 pub mod shellparse;
 
-pub use instructions::{load_instructions, system_prompt_with_instructions};
+pub use instructions::{
+    load_instructions, system_prompt_base_with_instructions, system_prompt_with_instructions,
+};
 pub use paths::Paths;
 pub use settings::{
     AccountEntry, CavemanLevel, ComboEntry, MediaSettings, MediaSlot, PonytailLevel,
@@ -35,6 +37,16 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Static system prompt prefix shared by every host (CLI, desktop, daemon,
+/// gateway). Keeping mutable session state (like the title) out of this text
+/// maximizes provider prompt-cache hits across turns and sessions.
+pub fn system_prompt_base() -> String {
+    "You are Zerith, a native desktop AI agent harness running on the user's \
+     own machine. Answer in the language the user writes in. Be direct and \
+     concrete; say what you do not know."
+        .to_string()
+}
+
 /// The system prompt for a native session.
 ///
 /// Kept in core because the CLI, the desktop window and a future RPC host must
@@ -44,11 +56,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// `title` is the session's name. It is the only per-session fact the prompt
 /// uses, and it is passed in rather than read from storage so this stays pure.
 pub fn system_prompt(title: &str) -> String {
-    format!(
-        "You are Zerith, a native desktop AI agent harness running on the user's \
-         own machine. Answer in the language the user writes in. Be direct and \
-         concrete; say what you do not know.\n\nConversation: {title}"
-    )
+    format!("{}\n\nConversation: {title}", system_prompt_base())
 }
 
 #[cfg(test)]

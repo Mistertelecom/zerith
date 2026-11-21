@@ -6,13 +6,14 @@
 //! the agent loop calls this from a worker thread. No async runtime in a
 //! harness that does not need one.
 
-use crate::config::{AuthMode, OAuthTool, Protocol, ProviderConfig};
+use crate::config::{AuthMode, OAuthTool, Protocol, ProviderConfig, ProviderKind};
 use crate::retry::{self, map_err, RetryPolicy};
 use crate::stream::OpenAiStream;
 use crate::{Cancel, ChatRequest, ProviderError, Result, Role, StreamEvent, ToolCall};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -23,6 +24,10 @@ pub struct Usage {
     pub completion_tokens: u64,
     #[serde(default)]
     pub total_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub cache_write_tokens: u64,
 }
 
 /// What `test connection` reports. Latency is measured locally, not taken from
@@ -62,6 +67,32 @@ pub struct Completion {
     pub tool_calls: Vec<ToolCall>,
 }
 
+/// Reuses HTTP/TLS connection pools across turns and steps for each timeout bucket.
+fn pooled_agent(timeout_ms: u64) -> ureq::Agent {
+    static POOL: OnceLock<Mutex<HashMap<u64, ureq::Agent>>> = OnceLock::new();
+    let pool = POOL.get_or_init(Default::default);
+    let mut guard = pool.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = guard.get(&timeout_ms) {
+        return existing.clone();
+    }
+    // Connect and per-read timeouts, never a total one: in ureq 2 a total
+    // timeout covers the body too, and would cut a long stream that is
+    // still producing tokens. A read that stalls this long is a dead peer.
+    let t = Duration::from_millis(timeout_ms);
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(t.min(Duration::from_secs(30)))
+        .timeout_read(t)
+        .timeout_write(t)
+        .max_idle_connections(32)
+        .max_idle_connections_per_host(8)
+        .build();
+    if guard.len() >= 16 {
+        guard.clear();
+    }
+    guard.insert(timeout_ms, agent.clone());
+    agent
+}
+
 impl Client {
     /// Building a client only needs an endpoint: `GET /models` is usually
     /// public, and requiring a key first would hide a working local server.
@@ -70,15 +101,7 @@ impl Client {
         if cfg.base_url.trim().is_empty() {
             return Err(ProviderError::NoEndpoint);
         }
-        // Connect and per-read timeouts, never a total one: in ureq 2 a total
-        // timeout covers the body too, and would cut a long stream that is
-        // still producing tokens. A read that stalls this long is a dead peer.
-        let t = Duration::from_millis(cfg.timeout_ms);
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(t.min(Duration::from_secs(30)))
-            .timeout_read(t)
-            .timeout_write(t)
-            .build();
+        let agent = pooled_agent(cfg.timeout_ms);
         Ok(Self {
             cfg,
             agent,
@@ -283,7 +306,7 @@ impl Client {
         if self.cfg.protocol == Protocol::Gemini {
             return crate::antigravity::complete(self, req, cancel);
         }
-        let resp = self.post("chat/completions", &body(req, false), cancel)?;
+        let resp = self.post("chat/completions", &body_for(self, req, false), cancel)?;
         let text = resp
             .into_string()
             .map_err(|e| ProviderError::Transport(e.to_string()))?;
@@ -311,7 +334,7 @@ impl Client {
         if self.cfg.protocol == Protocol::Gemini {
             return crate::antigravity::stream(self, req, cancel, &mut on_event);
         }
-        let resp = self.post("chat/completions", &body(req, true), cancel)?;
+        let resp = self.post("chat/completions", &body_for(self, req, true), cancel)?;
         let mut state = OpenAiStream::default();
         crate::stream::for_each_data(resp, cancel, |data| state.feed(data, &mut on_event))?;
         state.finish(&mut on_event)
@@ -378,7 +401,7 @@ pub(crate) fn body(req: &ChatRequest, stream: bool) -> Value {
     if let Some(t) = req.temperature {
         b["temperature"] = json!(t);
     }
-    if let Some(e) = &req.reasoning_effort {
+    if let Some(e) = crate::normalize_reasoning_effort(req.reasoning_effort.as_deref()) {
         b["reasoning_effort"] = json!(e);
     }
     if stream {
@@ -411,6 +434,65 @@ pub(crate) fn body(req: &ChatRequest, stream: bool) -> Value {
     b
 }
 
+pub(crate) fn body_for(client: &Client, req: &ChatRequest, stream: bool) -> Value {
+    let mut b = body(req, stream);
+    if let Some(key) = req.prompt_cache_key.as_deref().filter(|k| !k.is_empty()) {
+        if matches!(client.cfg.kind, ProviderKind::OpenAi | ProviderKind::Codex) {
+            b["prompt_cache_key"] = json!(key);
+        }
+    }
+    // OpenRouter preserves Anthropic prompt cache_control breakpoints when
+    // targeting Claude models over the OpenAI-compatible wire.
+    if client.cfg.kind == ProviderKind::OpenRouter
+        && req.model.to_ascii_lowercase().contains("claude")
+    {
+        if let Some(msgs) = b.get_mut("messages").and_then(Value::as_array_mut) {
+            if let Some(sys) = msgs.iter_mut().find(|m| m["role"] == "system") {
+                if let Some(text) = sys
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                {
+                    sys["content"] = json!([{
+                        "type": "text",
+                        "text": text,
+                        "cache_control": {"type": "ephemeral"}
+                    }]);
+                }
+            }
+        }
+    }
+    b
+}
+
+pub(crate) fn parse_openai_usage(u: &Value) -> Option<Usage> {
+    if !u.is_object() {
+        return None;
+    }
+    let prompt_tokens = u["prompt_tokens"].as_u64().unwrap_or(0);
+    let completion_tokens = u["completion_tokens"].as_u64().unwrap_or(0);
+    let total_tokens = u["total_tokens"]
+        .as_u64()
+        .unwrap_or_else(|| prompt_tokens.saturating_add(completion_tokens));
+    let cache_read_tokens = u["prompt_tokens_details"]["cached_tokens"]
+        .as_u64()
+        .or_else(|| u["prompt_cache_hit_tokens"].as_u64())
+        .or_else(|| u["cache_read_input_tokens"].as_u64())
+        .unwrap_or(0);
+    let cache_write_tokens = u["cache_creation_input_tokens"]
+        .as_u64()
+        .or_else(|| u["prompt_tokens_details"]["cache_write_tokens"].as_u64())
+        .or_else(|| u["prompt_cache_creation_tokens"].as_u64())
+        .unwrap_or(0);
+    Some(Usage {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
+    })
+}
+
 fn parse_completion(text: &str) -> Result<Completion> {
     let v: Value = serde_json::from_str(text)?;
     if let Some(e) = v.get("error") {
@@ -438,9 +520,7 @@ fn parse_completion(text: &str) -> Result<Completion> {
     Ok(Completion {
         text: str_at(&msg["content"]).unwrap_or_default(),
         reasoning: str_at(&msg["reasoning_content"]),
-        usage: v
-            .get("usage")
-            .and_then(|u| serde_json::from_value(u.clone()).ok()),
+        usage: v.get("usage").and_then(parse_openai_usage),
         finish_reason: str_at(&choice["finish_reason"]),
         tool_calls,
     })
@@ -562,5 +642,51 @@ mod tests {
         let dbg = format!("{cred:?}");
         assert!(!dbg.contains("secret-access"));
         assert!(!dbg.contains("secret-refresh"));
+    }
+
+    #[test]
+    fn prompt_cache_key_and_openrouter_claude_cache_control_are_emitted() {
+        let openai = Client::new(ProviderConfig::new(ProviderKind::OpenAi)).unwrap();
+        let req = ChatRequest::new(
+            "gpt-4o",
+            vec![ChatMessage::system("sys"), ChatMessage::user("hi")],
+        )
+        .prompt_cache_key("sess-42");
+        let ob = body_for(&openai, &req, false);
+        assert_eq!(ob["prompt_cache_key"], "sess-42");
+
+        let or = Client::new(ProviderConfig::new(ProviderKind::OpenRouter)).unwrap();
+        let creq = ChatRequest::new(
+            "anthropic/claude-sonnet-4-5",
+            vec![ChatMessage::system("sys"), ChatMessage::user("hi")],
+        )
+        .prompt_cache_key("sess-42");
+        let orb = body_for(&or, &creq, false);
+        assert!(orb.get("prompt_cache_key").is_none());
+        assert_eq!(
+            orb["messages"][0]["content"][0]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+    }
+
+    #[test]
+    fn parse_openai_usage_reads_cached_tokens_across_providers() {
+        let u1 = parse_openai_usage(&json!({
+            "prompt_tokens": 1000,
+            "completion_tokens": 50,
+            "total_tokens": 1050,
+            "prompt_tokens_details": {"cached_tokens": 768}
+        }))
+        .unwrap();
+        assert_eq!(u1.cache_read_tokens, 768);
+
+        let u2 = parse_openai_usage(&json!({
+            "prompt_tokens": 900,
+            "completion_tokens": 40,
+            "prompt_cache_hit_tokens": 640
+        }))
+        .unwrap();
+        assert_eq!(u2.cache_read_tokens, 640);
+        assert_eq!(u2.total_tokens, 940);
     }
 }

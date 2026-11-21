@@ -173,10 +173,14 @@ fn a_plain_answer_streams_and_is_stored_once() {
     assert_eq!(report.text, "olá");
     assert_eq!(report.prompt_tokens, 10);
     assert!(events.contains(&RunEvent::Delta("olá".into())));
-    assert!(events.contains(&RunEvent::Usage {
-        input: 10,
-        output: 2
-    }));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        RunEvent::Usage {
+            input: 10,
+            output: 2,
+            ..
+        }
+    )));
     assert_eq!(rows(&store, &sid).len(), 2);
     let req = &fake.seen.lock().unwrap()[0];
     assert_eq!(req.0, "/v1/chat/completions");
@@ -764,7 +768,14 @@ fn anthropic_streams_tool_use_and_gets_tool_results_back() {
 
     let seen = fake.seen.lock().unwrap();
     assert_eq!(seen[0].0, "/v1/messages");
-    assert!(seen[0].1["system"].as_str().unwrap().contains("Zerith"));
+    assert!(seen[0].1["system"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("Zerith"));
+    assert_eq!(
+        seen[0].1["system"][0]["cache_control"],
+        json!({"type": "ephemeral"})
+    );
     assert!(seen[0].1["tools"][0]["input_schema"].is_object());
     let msgs = seen[1].1["messages"].as_array().unwrap();
     let last = msgs.last().unwrap();

@@ -96,7 +96,10 @@ fn a_session_remembers_its_folder() {
         s.create_session("antiga", SessionSource::Native).unwrap();
     }
     let s = Store::open(&db).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 8);
+    assert_eq!(
+        s.schema_version().unwrap(),
+        zerith_sessions::migrations::CURRENT_VERSION
+    );
     let old = s.list_sessions(10).unwrap().remove(0);
     assert_eq!(s.workspace(&old.id).unwrap(), None);
 

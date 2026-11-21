@@ -9,14 +9,41 @@ use rusqlite::Connection;
 /// Highest version this build knows. Migrations are applied by version number,
 /// not by "everything above the maximum", so a gap (v6 present, v5 not yet) is
 /// filled in later instead of being skipped forever.
-pub const CURRENT_VERSION: i32 = 8;
+pub const CURRENT_VERSION: i32 = 10;
 
 /// Sequential migrations. Index 0 is version 1.
 const MIGRATIONS: &[&str] = &[V1, V2, V3, V4];
 
 /// Migrations with an explicit version, applied after the sequential ones.
-/// Task list owns v5, checkpoints v6, usage/cooldowns v7, session folder v8.
-const VERSIONED: &[(i32, &str)] = &[(5, V5), (6, V6), (7, V7), (8, V8)];
+/// Task list owns v5, checkpoints v6, usage/cooldowns v7, session folder v8,
+/// prompt cache & TTFT metrics v9, scheduled cron tasks v10.
+const VERSIONED: &[(i32, &str)] = &[(5, V5), (6, V6), (7, V7), (8, V8), (9, V9), (10, V10)];
+
+const V10: &str = r#"
+-- Scheduled cron jobs (`zerith schedule` / `zerith daemon`).
+CREATE TABLE schedules (
+    id          TEXT PRIMARY KEY,
+    name        TEXT NOT NULL UNIQUE,
+    cron_expr   TEXT NOT NULL,
+    workspace   TEXT NOT NULL,
+    prompt      TEXT,
+    command     TEXT,
+    no_agent    INTEGER NOT NULL DEFAULT 0,
+    model       TEXT,
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    last_run_at INTEGER,
+    last_status TEXT,
+    last_output TEXT,
+    created_at  INTEGER NOT NULL
+);
+"#;
+
+const V9: &str = r#"
+-- Prompt cache hits/writes and time-to-first-token per request.
+ALTER TABLE usage_records ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE usage_records ADD COLUMN cache_write_tokens INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE usage_records ADD COLUMN ttft_ms INTEGER NOT NULL DEFAULT 0;
+"#;
 
 const V8: &str = r#"
 -- The folder a conversation works in (tools root, AGENTS.md, @ mentions).

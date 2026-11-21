@@ -358,6 +358,16 @@ pub fn run(paths: &Paths, args: &[String]) -> Result<(), Boxed> {
     let mut tools = Registry::new();
     let mut mcp = McpRegistry::load(paths, Some(&workspace));
     let mut guards = None;
+    let remote_label = if let Some(raw) = h.remote.as_deref() {
+        let target = zerith_tools::remote::parse_remote_target(raw, &settings.remote.targets)?;
+        tools.register(zerith_tools::remote::remote_shell_tool(
+            target,
+            raw.to_string(),
+        ));
+        Some(raw.to_string())
+    } else {
+        None
+    };
     if !h.no_tools {
         if let Some(c) = &contrib {
             mcp.extend(c.mcp.iter().map(|(_, s)| s.clone()).collect());
@@ -386,7 +396,7 @@ pub fn run(paths: &Paths, args: &[String]) -> Result<(), Boxed> {
         }
     }
     // `@server:resource` in the prompt becomes inline context.
-    let prompt = if h.no_tools || mcp.is_empty() {
+    let expanded = if h.no_tools || mcp.is_empty() {
         h.prompt.clone()
     } else {
         let (text, errors) = mcp.expand_mentions(&h.prompt);
@@ -394,6 +404,12 @@ pub fn run(paths: &Paths, args: &[String]) -> Result<(), Boxed> {
             eprintln!("zerith: {e}");
         }
         text
+    };
+    let prompt = match remote_label {
+        Some(raw) if !h.no_tools => format!(
+            "[alvo remoto ativo: {raw} — use a ferramenta remote_shell para executar comandos nesse host/container]\n\n{expanded}"
+        ),
+        _ => expanded,
     };
 
     let memory = SqliteMemory::open(paths.db())?;
@@ -460,7 +476,7 @@ pub fn run(paths: &Paths, args: &[String]) -> Result<(), Boxed> {
         &cancel,
         |e| {
             digest.observe(&e);
-            if let (RunEvent::Usage { input, output }, Some((pi, po)), Some(max)) =
+            if let (RunEvent::Usage { input, output, .. }, Some((pi, po)), Some(max)) =
                 (&e, prices, h.max_budget_usd)
             {
                 spent.set(spent.get() + cost_usd(*input, *output, pi, po));
@@ -661,8 +677,21 @@ fn stream_event_json(e: RunEvent) -> Option<serde_json::Value> {
         RunEvent::Done { stored } => {
             serde_json::json!({"type": "done", "message_id": stored})
         }
-        RunEvent::Usage { input, output } => {
-            serde_json::json!({"type": "usage", "input": input, "output": output})
+        RunEvent::Usage {
+            input,
+            output,
+            cache_read,
+            cache_write,
+            ttft_ms,
+        } => {
+            serde_json::json!({
+                "type": "usage",
+                "input": input,
+                "output": output,
+                "cache_read": cache_read,
+                "cache_write": cache_write,
+                "ttft_ms": ttft_ms,
+            })
         }
         RunEvent::ToolCall { id, name, args } => {
             serde_json::json!({"type": "tool_call", "id": id, "name": name, "args": args})
@@ -699,6 +728,15 @@ fn stream_event_json(e: RunEvent) -> Option<serde_json::Value> {
             "before_bytes": before_bytes,
             "after_bytes": after_bytes,
             "filter": filter,
+        }),
+        RunEvent::ToolProgress { tool, chunk } => serde_json::json!({
+            "type": "tool_progress",
+            "tool": tool,
+            "chunk": chunk,
+        }),
+        RunEvent::Steered { text } => serde_json::json!({
+            "type": "steered",
+            "text": text,
         }),
         _ => return None,
     })
@@ -955,6 +993,7 @@ mod tests {
             saved_tokens: 45,
             account_id: Some("acc-1".into()),
             model_used: Some("gpt-4o".into()),
+            ..Default::default()
         };
         let usage = build_usage_json(&report);
         assert_eq!(usage["prompt_tokens"], 100);

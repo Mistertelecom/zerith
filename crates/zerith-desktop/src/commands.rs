@@ -329,3 +329,23 @@ pub async fn reveal_root(state: tauri::State<'_, AppState>) -> Cmd<()> {
     let root = state.root().to_path_buf();
     wire::reveal(&root)
 }
+
+#[tauri::command]
+pub async fn terminals_list() -> Cmd<Vec<zerith_tools::TerminalSnapshot>> {
+    Ok(zerith_tools::list_active_terminals())
+}
+
+#[tauri::command]
+pub async fn terminal_tail(id: String, max_bytes: Option<usize>) -> Cmd<String> {
+    zerith_tools::terminal_tail(&id, max_bytes.unwrap_or(4096))
+}
+
+#[tauri::command]
+pub async fn terminal_interrupt(id: String) -> Cmd<()> {
+    zerith_tools::interrupt_terminal(&id)
+}
+
+#[tauri::command]
+pub async fn terminal_close(id: String) -> Cmd<()> {
+    zerith_tools::close_terminal(&id)
+}

@@ -192,3 +192,68 @@ export function parseInline(src: string): Inline[] {
   if (last < src.length) out.push(src.slice(last));
   return out;
 }
+
+const PARSE_CACHE = new Map<string, MdBlock[]>();
+const PARSE_CACHE_MAX = 256;
+
+/** Bounded LRU cache for completed Markdown chunks during streaming and
+ * history navigation. */
+export function parseBlocksCached(src: string): MdBlock[] {
+  if (!src) return [];
+  const hit = PARSE_CACHE.get(src);
+  if (hit) {
+    PARSE_CACHE.delete(src);
+    PARSE_CACHE.set(src, hit);
+    return hit;
+  }
+  const parsed = parseBlocks(src);
+  if (PARSE_CACHE.size >= PARSE_CACHE_MAX) {
+    const oldest = PARSE_CACHE.keys().next().value;
+    if (oldest !== undefined) PARSE_CACHE.delete(oldest);
+  }
+  PARSE_CACHE.set(src, parsed);
+  return parsed;
+}
+
+/** Splits streaming Markdown into a finished top-level prefix (`stable`) and
+ * the trailing active block (`tail`), only breaking on blank lines outside
+ * open code fences or nested list continuations. */
+export function splitStableMarkdown(src: string): { stable: string; tail: string } {
+  const norm = src.replace(/\r\n?/g, "\n");
+  const lines = norm.split("\n");
+  let fenceChar = "";
+  let fenceLen = 0;
+  let splitLine = -1;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (fenceChar) {
+      const t = line.trim();
+      if (t.length >= fenceLen && t[0] === fenceChar && /^(`+|~+)$/.test(t)) {
+        fenceChar = "";
+        fenceLen = 0;
+      }
+      continue;
+    }
+    const fence = FENCE.exec(line);
+    if (fence) {
+      fenceChar = fence[1][0];
+      fenceLen = fence[1].length;
+      continue;
+    }
+    // Split after a blank line only when the next non-blank line starts at column 0
+    // and is not a loose continuation item (`- b` after `- a`) or quote continuation.
+    if (!line.trim() && i + 1 < lines.length) {
+      const next = lines[i + 1];
+      if (next.trim() && !/^\s/.test(next) && !QUOTE.test(next) && !ITEM.test(next)) {
+        splitLine = i + 1;
+      }
+    }
+  }
+
+  if (splitLine <= 0) return { stable: "", tail: norm };
+  return {
+    stable: lines.slice(0, splitLine).join("\n"),
+    tail: lines.slice(splitLine).join("\n"),
+  };
+}

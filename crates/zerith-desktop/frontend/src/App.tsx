@@ -11,6 +11,7 @@ import {
   Loader,
   PanelRight,
   Route,
+  Search,
   type LucideIcon,
 } from "lucide-react";
 import {
@@ -45,8 +46,17 @@ import { TitleBar } from "./components/TitleBar";
 import { AppVersion } from "./components/Update";
 import { FolderPill } from "./components/FolderPill";
 import { BackgroundJobs } from "./components/BackgroundJobs";
+import { ActiveTerminals } from "./components/ActiveTerminals";
 
 const MODEL_KEY = "zerith.model";
+const EFFORT_KEY = "zerith.effort";
+
+function estimateContextWindow(model: string): number {
+  const m = model.toLowerCase();
+  if (/gemini|hydrogen|argon/.test(m)) return 1_000_000;
+  if (/claude|opus|sonnet|haiku|gpt-5|o3|o4/.test(m)) return 200_000;
+  return 128_000;
+}
 
 // Models the user took out of the chat menu (`account:model` values).
 const HIDDEN_KEY = "zerith.hiddenModels";
@@ -154,6 +164,19 @@ export default function App() {
         .map((c) => c.name),
     );
   const [mode, setMode] = useState<string>("default");
+  const [effort, setEffortState] = useState<string>(
+    () => localStorage.getItem(EFFORT_KEY) || "off",
+  );
+  const setEffort = useCallback((v: string) => {
+    setEffortState(v);
+    try {
+      localStorage.setItem(EFFORT_KEY, v);
+    } catch {
+      // ignore storage errors
+    }
+  }, []);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [paletteQuery, setPaletteQuery] = useState("");
   const [memoryPaused, setMemoryPaused] = useState(false);
   const [settings, setSettings] = useState<SettingsTab | null>(null);
   const [status, setStatus] = useState("");
@@ -282,11 +305,49 @@ export default function App() {
     };
   }, [selected, setTurn]);
 
+  const pendingDeltasRef = useRef<Map<string, { text: string; reasoning: string }>>(new Map());
+  const rafRef = useRef<number | null>(null);
+
+  const flushDeltas = useCallback(() => {
+    if (rafRef.current !== null) {
+      cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+    }
+    const pending = pendingDeltasRef.current;
+    if (pending.size === 0) return;
+    const snapshot = Array.from(pending.entries());
+    pending.clear();
+    setTurns((all) => {
+      const next = { ...all };
+      for (const [sid, buf] of snapshot) {
+        let s = next[sid] ?? emptyTurn;
+        if (buf.reasoning) s = applyEvent(s, { type: "reasoning", text: buf.reasoning });
+        if (buf.text) s = applyEvent(s, { type: "delta", text: buf.text });
+        next[sid] = s;
+      }
+      return next;
+    });
+  }, []);
+
   // Turn events, for every conversation at once. The state of a chat that is
   // not open is kept here, so switching away and back shows the same stream,
   // the Stop button and any approval that arrived while away.
   useEffect(() => {
     const ev = onTurnEvent((id, event) => {
+      if (event.type === "delta" || event.type === "reasoning") {
+        const cur = pendingDeltasRef.current.get(id) ?? { text: "", reasoning: "" };
+        if (event.type === "delta") cur.text += event.text;
+        else cur.reasoning += event.text;
+        pendingDeltasRef.current.set(id, cur);
+        if (rafRef.current === null) {
+          rafRef.current = requestAnimationFrame(() => {
+            rafRef.current = null;
+            flushDeltas();
+          });
+        }
+        return;
+      }
+      flushDeltas();
       if (event.type === "route") {
         setSessions((list) =>
           list.map((s) =>
@@ -298,6 +359,7 @@ export default function App() {
       updateTurn(id, (prev) => applyEvent(prev, event));
     });
     const done = onTurnDone((id) => {
+      flushDeltas();
       updateTurn(id, finishTurn);
       // The open conversation gets its stored rows back (with their ids, which
       // "Editar" needs); a closed one rereads them when it is opened.
@@ -327,12 +389,13 @@ export default function App() {
       }));
     });
     return () => {
+      flushDeltas();
       void ev.then((u) => u());
       void done.then((u) => u());
       void learned.then((u) => u());
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [updateTurn]);
+  }, [updateTurn, flushDeltas]);
 
   const send = useCallback(async () => {
     const prompt = draft.trim();
@@ -371,12 +434,35 @@ export default function App() {
       ]);
       updateTurn(id, () => ({ ...emptyTurn, busy: true }));
       // `history: 0` = the execution profile's window, decided by the core.
-      await api.sendTurn({ sessionId: id, model, prompt, mode, history: 0 });
+      await api.sendTurn({
+        sessionId: id,
+        model,
+        prompt,
+        mode,
+        reasoningEffort: effort === "off" ? null : effort,
+        history: 0,
+      });
     } catch (e) {
       setError(String(e));
       if (id) updateTurn(id, (prev) => ({ ...prev, busy: false }));
     }
-  }, [draft, model, mode, selected, turns, folder, updateTurn]);
+  }, [draft, model, mode, effort, selected, turns, folder, updateTurn]);
+
+  const steer = useCallback(
+    async (text: string) => {
+      if (!selected || !text.trim()) return;
+      const trimmed = text.trim();
+      setDraft("");
+      try {
+        await api.steerTurn(selected, trimmed);
+        setStatus("Instrução enviada ao turno em andamento");
+      } catch (e) {
+        setDraft(trimmed);
+        setError(String(e));
+      }
+    },
+    [selected],
+  );
 
   // "Editar" / "Ramificar daqui": a copy of the conversation up to `upto`
   // (same folder), opened in place of this one, which stays untouched. An
@@ -594,6 +680,53 @@ export default function App() {
     return [...out, ...turn.blocks];
   }, [messages, turn.blocks]);
 
+  const lastUserText = useMemo(() => {
+    for (let i = surface.length - 1; i >= 0; i--) {
+      if (surface[i].kind === "user") return surface[i].text;
+    }
+    return undefined;
+  }, [surface]);
+
+  const contextGauge = useMemo(() => {
+    const used = turn.usage?.input ?? 0;
+    if (!used) return null;
+    const limit = estimateContextWindow(turn.route?.model || model);
+    const cacheRead = turn.usage?.cacheRead ?? 0;
+    const cacheHitPct = cacheRead > 0 ? Math.round((100 * cacheRead) / used) : undefined;
+    return { used, limit, cacheHitPct };
+  }, [turn.usage, turn.route?.model, model]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        setPaletteQuery("");
+        setPaletteOpen((v) => !v);
+        return;
+      }
+      if (e.key === "Escape" && paletteOpen) {
+        e.preventDefault();
+        setPaletteOpen(false);
+        return;
+      }
+      if (
+        e.key === "Tab" &&
+        e.shiftKey &&
+        !settings &&
+        !paletteOpen &&
+        !(e.target as HTMLElement | null)?.closest?.("textarea")
+      ) {
+        e.preventDefault();
+        const i = MODES.findIndex(([v]) => v === mode);
+        const next = MODES[(i + 1) % MODES.length];
+        setMode(next[0]);
+        setStatus(`Modo: ${next[1]}`);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [paletteOpen, settings, mode]);
+
   const tail = (
     <>
       {turn.approval ? (
@@ -730,6 +863,7 @@ export default function App() {
             selected={selected}
             sessions={sessions}
           />
+          <ActiveTerminals active={Object.values(turns).some((t) => t.busy)} />
           <div className="main-body">
             {/* The composer keeps its place in the tree, so the first send from
               the hero does not remount it. */}
@@ -759,12 +893,17 @@ export default function App() {
                 draft={draft}
                 onDraft={setDraft}
                 onSend={() => void send()}
+                onSteer={(t) => void steer(t)}
                 onRun={runCommand}
                 busy={turn.busy}
                 onCancel={() => selected && void api.cancelTurn(selected)}
                 mode={mode}
                 modes={MODES}
                 onMode={setMode}
+                effort={effort}
+                onEffort={setEffort}
+                lastUserText={lastUserText}
+                contextGauge={contextGauge}
                 model={model}
                 models={models}
                 onModel={setModel}
@@ -948,6 +1087,23 @@ export default function App() {
                       <dt>Saída</dt>
                       <dd>{num(turn.usage?.output ?? 0)}</dd>
                     </div>
+                    {(turn.usage?.cacheRead ?? 0) > 0 ? (
+                      <div className="saved">
+                        <dt>Cache hit</dt>
+                        <dd>
+                          {num(turn.usage!.cacheRead!)}
+                          {turn.usage!.input > 0
+                            ? ` (${Math.round((100 * turn.usage!.cacheRead!) / turn.usage!.input)}%)`
+                            : ""}
+                        </dd>
+                      </div>
+                    ) : null}
+                    {(turn.usage?.ttftMs ?? 0) > 0 ? (
+                      <div>
+                        <dt>TTFT</dt>
+                        <dd>{turn.usage!.ttftMs} ms</dd>
+                      </div>
+                    ) : null}
                     <div className={turn.saved > 0 ? "saved" : undefined}>
                       <dt>Economizados</dt>
                       <dd>{num(turn.saved)}</dd>
@@ -978,6 +1134,142 @@ export default function App() {
             }}
           />
         ) : null}
+        {paletteOpen ? (
+          <CommandPalette
+            query={paletteQuery}
+            onQuery={setPaletteQuery}
+            onClose={() => setPaletteOpen(false)}
+            actions={[
+              {
+                label: "Nova conversa",
+                hint: "Começar do zero",
+                run: () => {
+                  setSelected(null);
+                  setMessages([]);
+                  draftRef.current?.focus();
+                },
+              },
+              {
+                label: "Alternar modo de permissão",
+                hint: MODES.find(([v]) => v === mode)?.[1] ?? mode,
+                run: () => {
+                  const i = MODES.findIndex(([v]) => v === mode);
+                  setMode(MODES[(i + 1) % MODES.length][0]);
+                },
+              },
+              {
+                label: "Compactar conversa atual",
+                hint: "/compact",
+                run: () => runCommand("compact"),
+              },
+              {
+                label: inspector ? "Ocultar painel lateral" : "Mostrar painel lateral",
+                hint: "Inspetor",
+                run: () => setInspector((v) => !v),
+              },
+              {
+                label: "Abrir Delegação & Modelos",
+                hint: "Roteamento",
+                run: () => setSettings("Delegação"),
+              },
+              {
+                label: "Abrir Contas & Provedores",
+                hint: "Ajustes",
+                run: () => setSettings("Contas"),
+              },
+              {
+                label: "Abrir Skills",
+                hint: "Ajustes",
+                run: () => setSettings("Skills"),
+              },
+              {
+                label: "Abrir MCP",
+                hint: "Ajustes",
+                run: () => setSettings("MCP"),
+              },
+              ...sessions.slice(0, 8).map((s) => ({
+                label: `Conversa: ${s.title}`,
+                hint: s.model ?? "sessão",
+                run: () => setSelected(s.id),
+              })),
+            ]}
+          />
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function CommandPalette(props: {
+  query: string;
+  onQuery: (v: string) => void;
+  onClose: () => void;
+  actions: { label: string; hint: string; run: () => void }[];
+}) {
+  const [cursor, setCursor] = useState(0);
+  const q = props.query.trim().toLowerCase();
+  const filtered = props.actions.filter(
+    (a) =>
+      !q ||
+      a.label.toLowerCase().includes(q) ||
+      a.hint.toLowerCase().includes(q),
+  );
+  useEffect(() => setCursor(0), [props.query]);
+  const pick = (i: number) => {
+    const item = filtered[i];
+    if (!item) return;
+    props.onClose();
+    item.run();
+  };
+  return (
+    <div className="palette-backdrop" onMouseDown={props.onClose}>
+      <div
+        className="palette-modal"
+        role="dialog"
+        aria-label="Paleta de comandos"
+        onMouseDown={(e) => e.stopPropagation()}
+      >
+        <div className="palette-search">
+          <Search size={15} strokeWidth={2} />
+          <input
+            autoFocus
+            type="text"
+            placeholder="Ir para conversa ou executar comando…"
+            value={props.query}
+            onChange={(e) => props.onQuery(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "ArrowDown") {
+                e.preventDefault();
+                setCursor((i) => (filtered.length ? (i + 1) % filtered.length : 0));
+              } else if (e.key === "ArrowUp") {
+                e.preventDefault();
+                setCursor((i) =>
+                  filtered.length ? (i - 1 + filtered.length) % filtered.length : 0,
+                );
+              } else if (e.key === "Enter") {
+                e.preventDefault();
+                pick(cursor);
+              }
+            }}
+          />
+        </div>
+        <div className="palette-list">
+          {filtered.length === 0 ? (
+            <div className="palette-empty">Nenhum comando encontrado</div>
+          ) : (
+            filtered.map((a, i) => (
+              <button
+                key={a.label + i}
+                className={"palette-item" + (i === cursor ? " active" : "")}
+                onMouseEnter={() => setCursor(i)}
+                onClick={() => pick(i)}
+              >
+                <span>{a.label}</span>
+                <span className="palette-hint">{a.hint}</span>
+              </button>
+            ))
+          )}
+        </div>
       </div>
     </div>
   );

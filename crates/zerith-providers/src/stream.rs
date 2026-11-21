@@ -175,7 +175,7 @@ impl OpenAiStream {
             }
         }
         if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
-            if let Ok(u) = serde_json::from_value::<Usage>(u.clone()) {
+            if let Some(u) = crate::openai::parse_openai_usage(u) {
                 self.usage = Some(u);
             }
         }

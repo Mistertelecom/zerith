@@ -28,8 +28,9 @@ mod tasks;
 pub mod tokensaver;
 
 pub use agent::{
-    approval_channel, inbox_channel, run_agent_turn, AgentOptions, Approval, ApprovalGate,
-    ApprovalSender, InboxReceiver, InboxSender, DEFAULT_MAX_PARALLEL_TOOLS, DEFAULT_MAX_STEPS,
+    approval_channel, approval_channel_with_grants, approval_grant_key, inbox_channel,
+    run_agent_turn, AgentOptions, Approval, ApprovalGate, ApprovalSender, InboxReceiver,
+    InboxSender, SharedGrants, DEFAULT_MAX_PARALLEL_TOOLS, DEFAULT_MAX_STEPS,
 };
 pub use compact::{compact_now, CompactReport, Summarizer};
 pub use events::{cancel_with, CancelCause, CauseSlot};
@@ -96,6 +97,9 @@ pub enum RunEvent {
     Usage {
         input: u64,
         output: u64,
+        cache_read: u64,
+        cache_write: u64,
+        ttft_ms: u64,
     },
     /// The history was summarized to fit the context window (token estimates).
     Compacted {
@@ -135,6 +139,15 @@ pub enum RunEvent {
         before_bytes: usize,
         after_bytes: usize,
         filter: Option<String>,
+    },
+    /// Live incremental stdout/stderr or terminal output while a tool runs.
+    ToolProgress {
+        tool: String,
+        chunk: String,
+    },
+    /// A user steering message sent mid-turn was folded into history.
+    Steered {
+        text: String,
     },
 }
 
@@ -202,6 +215,8 @@ pub struct TurnReport {
     pub reasoning: Option<String>,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
     pub saved_rtk_tokens: u64,
     pub saved_ponytail_tokens: u64,
     pub saved_caveman_tokens: u64,
@@ -316,13 +331,148 @@ pub fn run_turn_in(
     )
 }
 
-/// The system prompt: identity, then recalled facts, then skills. Facts land
-/// *after* the static part so the provider's prefix cache stays warm.
+/// Prompt split between the invariant cacheable system prefix and the per-turn
+/// dynamic context (recalled memory, prompt-matched skills).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptContext {
+    pub static_system: String,
+    pub dynamic_reminder: Option<String>,
+}
+
+/// Builds the static system prefix (cached across turns) and an optional
+/// per-turn `<system-reminder>` block attached transiently to the user message
+/// at inference time (never persisted in session history).
 ///
-/// `skill_tool` says whether the model has the `skill` tool this turn. With it
-/// the prompt lists skills by name and description and the model loads a body
-/// on demand; without it (a plain turn) a skill named in the request is
-/// inlined, the only way a tool-less turn can use one.
+/// `_title` is intentionally omitted from `static_system` (and only omitted when
+/// no dynamic reminder is needed) so renaming or generating a session title
+/// never busts the provider's prefix cache.
+pub fn build_prompt_context(
+    _title: &str,
+    ctx: TurnContext<'_>,
+    skill_tool: bool,
+    session_id: &str,
+    prompt: &str,
+) -> PromptContext {
+    let paths = zerith_core::Paths::resolve();
+    let dir = ctx
+        .project_dir
+        .map(std::path::Path::to_path_buf)
+        .or_else(|| std::env::current_dir().ok());
+    let mut static_system = match dir {
+        Some(cwd) if !ctx.no_project_instructions => {
+            zerith_core::system_prompt_base_with_instructions(&zerith_core::load_instructions(
+                &paths, &cwd,
+            ))
+        }
+        _ => zerith_core::system_prompt_base(),
+    };
+    if let Some(a) = ctx.agent {
+        static_system.push_str(&format!("\n\n# Agente: {}\n\n{}", a.name, a.instructions));
+    }
+    if let Some(st) = ctx.settings {
+        if let Some(pt) = tokensaver::ponytail_prompt(st.token_saver.ponytail) {
+            static_system.push_str("\n\n");
+            static_system.push_str(pt);
+        }
+        if let Some(cv) = tokensaver::caveman_prompt(st.token_saver.caveman) {
+            static_system.push_str("\n\n");
+            static_system.push_str(cv);
+        }
+    }
+
+    let mut dyn_parts: Vec<String> = Vec::new();
+
+    if let (Some(mem), Some(scope)) = (ctx.memory, ctx.scope) {
+        if let Some(f) = zerith_memory::extract_allowed(mem, session_id, prompt) {
+            let _ = mem.remember(scope, f.kind, &f.text, f.confidence, Some(session_id));
+        }
+        let known = recall_block(mem, scope, prompt);
+        if !known.is_empty() {
+            dyn_parts.push(known);
+        }
+    }
+
+    if let Some(lib) = ctx.skills {
+        if let Ok(mut catalog) = lib.catalog() {
+            catalog.sort_by(|a, b| a.0.cmp(&b.0));
+            if !catalog.is_empty() {
+                let full_len: usize = catalog.iter().map(|(n, d)| n.len() + d.len() + 5).sum();
+                let header = if skill_tool {
+                    "# Skills disponíveis\nPara usar uma, chame a ferramenta `skill` com o nome e siga as instruções que ela devolver."
+                } else {
+                    "# Skills disponíveis"
+                };
+                if full_len + header.len() <= SKILLS_BUDGET_CHARS
+                    && (skill_tool || !catalog.iter().any(|(n, _)| names_skill(prompt, n)))
+                {
+                    let mut sec = String::from(header);
+                    for line in skill_lines(&catalog, false) {
+                        sec.push_str(&line);
+                    }
+                    static_system.push_str("\n\n");
+                    static_system.push_str(&sec);
+                } else if skill_tool {
+                    // Static pointer stays in the cached system prompt; BM25
+                    // hits for this turn travel in the transient reminder.
+                    static_system.push_str(&format!(
+                        "\n\n{header}\nHá {} skills instaladas; use `skill_search` para achar ou consulte as mais relevantes no lembrete da mensagem.",
+                        catalog.len()
+                    ));
+                    let ranked = skills_index(lib, prompt, SKILLS_BUDGET_CHARS);
+                    if !ranked.is_empty() {
+                        dyn_parts.push(ranked);
+                    }
+                } else {
+                    let block = skills_block(lib, prompt, SKILLS_BUDGET_CHARS);
+                    if !block.is_empty() {
+                        dyn_parts.push(block);
+                    }
+                }
+            }
+        }
+    }
+
+    let dynamic_reminder = (!dyn_parts.is_empty()).then(|| {
+        format!(
+            "<system-reminder>\n{}\n</system-reminder>",
+            dyn_parts.join("\n\n")
+        )
+    });
+    PromptContext {
+        static_system,
+        dynamic_reminder,
+    }
+}
+
+/// Attaches transient dynamic context to the originating user message in an
+/// outgoing `ChatRequest` slice without mutating persisted history or
+/// hook/steer user injections.
+pub(crate) fn inject_dynamic_reminder(
+    messages: &mut [zerith_providers::ChatMessage],
+    target_idx: Option<usize>,
+    reminder: Option<&str>,
+) {
+    let Some(reminder) = reminder.map(str::trim).filter(|r| !r.is_empty()) else {
+        return;
+    };
+    let slot = match target_idx.and_then(|i| messages.get_mut(i)) {
+        Some(m) if m.role == zerith_providers::Role::User => Some(m),
+        _ => messages
+            .iter_mut()
+            .rev()
+            .find(|m| m.role == zerith_providers::Role::User),
+    };
+    if let Some(user_msg) = slot {
+        if user_msg.content.is_empty() {
+            user_msg.content = reminder.to_string();
+        } else {
+            user_msg.content = format!("{}\n\n{reminder}", user_msg.content);
+        }
+    }
+}
+
+/// The system prompt: combined static + dynamic helper preserved for unit tests.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn system_prompt(
     title: &str,
     ctx: TurnContext<'_>,
@@ -330,59 +480,11 @@ pub(crate) fn system_prompt(
     session_id: &str,
     prompt: &str,
 ) -> String {
-    // Project instructions (AGENTS.md / CLAUDE.md) from the working directory
-    // up to the git root, plus the user-level file. Static per project, so it
-    // sits with the identity and keeps the prefix cache warm.
-    let paths = zerith_core::Paths::resolve();
-    let dir = ctx
-        .project_dir
-        .map(std::path::Path::to_path_buf)
-        .or_else(|| std::env::current_dir().ok());
-    let mut prompt_text = match dir {
-        Some(cwd) if !ctx.no_project_instructions => zerith_core::system_prompt_with_instructions(
-            title,
-            &zerith_core::load_instructions(&paths, &cwd),
-        ),
-        _ => zerith_core::system_prompt(title),
-    };
-    if let Some(a) = ctx.agent {
-        prompt_text.push_str(&format!("\n\n# Agente: {}\n\n{}", a.name, a.instructions));
+    let built = build_prompt_context(title, ctx, skill_tool, session_id, prompt);
+    match built.dynamic_reminder {
+        Some(d) => format!("{}\n\n{}", built.static_system, d),
+        None => built.static_system,
     }
-    if let Some(st) = ctx.settings {
-        if let Some(pt) = tokensaver::ponytail_prompt(st.token_saver.ponytail) {
-            prompt_text.push_str("\n\n");
-            prompt_text.push_str(pt);
-        }
-        if let Some(cv) = tokensaver::caveman_prompt(st.token_saver.caveman) {
-            prompt_text.push_str("\n\n");
-            prompt_text.push_str(cv);
-        }
-    }
-    if let (Some(mem), Some(scope)) = (ctx.memory, ctx.scope) {
-        // A fact the user stated is stored before the answer is asked for, so
-        // the same turn can already recall it — and a crash after this point
-        // still keeps what the user said.
-        if let Some(f) = zerith_memory::extract_allowed(mem, session_id, prompt) {
-            let _ = mem.remember(scope, f.kind, &f.text, f.confidence, Some(session_id));
-        }
-        let known = recall_block(mem, scope, prompt);
-        if !known.is_empty() {
-            prompt_text.push_str("\n\n");
-            prompt_text.push_str(&known);
-        }
-    }
-    if let Some(lib) = ctx.skills {
-        let block = if skill_tool {
-            skills_index(lib, prompt, SKILLS_BUDGET_CHARS)
-        } else {
-            skills_block(lib, prompt, SKILLS_BUDGET_CHARS)
-        };
-        if !block.is_empty() {
-            prompt_text.push_str("\n\n");
-            prompt_text.push_str(&block);
-        }
-    }
-    prompt_text
 }
 
 /// A helper for hosts that drive a turn on a worker thread and read events on
@@ -970,7 +1072,7 @@ mod tests {
 
     /// A backend that answers from a fixed list, so the prompt rendering can be
     /// tested without a database or a network.
-    struct Fixed(Vec<String>);
+    pub(crate) struct Fixed(pub(crate) Vec<String>);
 
     impl MemoryBackend for Fixed {
         fn remember(
@@ -1663,5 +1765,55 @@ mod gateway_tests {
         let pt_pos = prompt.find("Ponytail Full").unwrap();
         let cv_pos = prompt.find("Caveman Full").unwrap();
         assert!(ag_pos < pt_pos && pt_pos < cv_pos, "{prompt}");
+    }
+
+    #[test]
+    fn static_system_prompt_is_invariant_across_different_titles_and_prompts() {
+        let mem = tests::Fixed(vec!["usa Cisco IOS".into()]);
+        let scope = Scope::user("t");
+        let a = build_prompt_context(
+            "Titulo Um",
+            TurnContext {
+                memory: Some(&mem),
+                scope: Some(&scope),
+                no_project_instructions: true,
+                ..TurnContext::default()
+            },
+            true,
+            "s1",
+            "primeiro pedido",
+        );
+        let b = build_prompt_context(
+            "Titulo Dois",
+            TurnContext {
+                memory: Some(&mem),
+                scope: Some(&scope),
+                no_project_instructions: true,
+                ..TurnContext::default()
+            },
+            true,
+            "s2",
+            "segundo pedido completamente diferente",
+        );
+        assert_eq!(a.static_system, b.static_system);
+        assert!(!a.static_system.contains("Titulo Um"));
+        assert!(!a.static_system.contains("usa Cisco IOS"));
+        let rem = a.dynamic_reminder.as_deref().unwrap();
+        assert!(rem.contains("<system-reminder>"), "{rem}");
+        assert!(rem.contains("usa Cisco IOS"), "{rem}");
+
+        // Without dynamic memory or overflowing skills, no reminder is added.
+        let plain = build_prompt_context(
+            "Titulo Tres",
+            TurnContext {
+                no_project_instructions: true,
+                ..TurnContext::default()
+            },
+            true,
+            "s3",
+            "oi",
+        );
+        assert_eq!(plain.static_system, a.static_system);
+        assert_eq!(plain.dynamic_reminder, None);
     }
 }

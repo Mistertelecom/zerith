@@ -97,7 +97,11 @@ pub(crate) fn body(req: &ChatRequest, stream: bool) -> Value {
         "stream": stream,
     });
     if !system.is_empty() {
-        b["system"] = json!(system.join("\n\n"));
+        b["system"] = json!([{
+            "type": "text",
+            "text": system.join("\n\n"),
+            "cache_control": {"type": "ephemeral"}
+        }]);
     }
     // Last block of the conversation: the next request starts with all of it,
     // so it is read from cache instead of billed again (4 breakpoints max:
@@ -112,6 +116,19 @@ pub(crate) fn body(req: &ChatRequest, stream: bool) -> Value {
     b["messages"] = json!(messages);
     if let Some(t) = req.temperature {
         b["temperature"] = json!(t);
+    }
+    if let Some(budget) = crate::thinking_budget(req.reasoning_effort.as_deref()) {
+        // Anthropic API rejects `temperature` when extended thinking is active
+        // and requires `max_tokens > budget_tokens`.
+        if let Some(obj) = b.as_object_mut() {
+            obj.remove("temperature");
+        }
+        let current_max = b["max_tokens"].as_u64().unwrap_or(0);
+        let floor = u64::from(budget).saturating_add(1024);
+        if current_max < floor {
+            b["max_tokens"] = json!(floor);
+        }
+        b["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
     }
     if !req.tools.is_empty() {
         b["tools"] = req
@@ -152,8 +169,14 @@ fn body_for(client: &Client, req: &ChatRequest, stream: bool) -> Value {
             .is_some_and(|c| c.tool == crate::OAuthTool::ClaudeCode);
     if subscription {
         let mut blocks = vec![json!({"type": "text", "text": CLAUDE_CODE_IDENTITY})];
-        if let Some(own) = b.get("system").and_then(Value::as_str) {
-            blocks.push(json!({"type": "text", "text": own}));
+        match b.get("system") {
+            Some(Value::Array(arr)) => blocks.extend(arr.iter().cloned()),
+            Some(Value::String(own)) => blocks.push(json!({
+                "type": "text",
+                "text": own,
+                "cache_control": {"type": "ephemeral"}
+            })),
+            _ => {}
         }
         b["system"] = json!(blocks);
     }
@@ -208,14 +231,17 @@ fn usage(u: &Value, input_seen: u64) -> Option<Usage> {
     }
     // With the prompt cache, `input_tokens` counts only the uncached part:
     // the prompt really sent is that plus what was read from / written to cache.
-    let cached = u["cache_read_input_tokens"].as_u64().unwrap_or(0)
-        + u["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+    let cache_read = u["cache_read_input_tokens"].as_u64().unwrap_or(0);
+    let cache_write = u["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+    let cached = cache_read + cache_write;
     let input = u["input_tokens"].as_u64().unwrap_or(input_seen) + cached;
     let output = u["output_tokens"].as_u64().unwrap_or(0);
     Some(Usage {
         prompt_tokens: input,
         completion_tokens: output,
         total_tokens: input + output,
+        cache_read_tokens: cache_read,
+        cache_write_tokens: cache_write,
     })
 }
 
@@ -238,6 +264,8 @@ pub(crate) struct AnthropicStream {
     /// (index, call) for every tool_use block, in order.
     calls: Vec<(u64, ToolCall)>,
     input_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
     usage: Option<Usage>,
     stop_reason: Option<String>,
     stopped: bool,
@@ -253,8 +281,14 @@ impl AnthropicStream {
         let index = v["index"].as_u64().unwrap_or(0);
         match v["type"].as_str() {
             Some("message_start") => {
-                // Cached prompt is reported apart: count it as input too.
-                self.input_tokens = usage(&v["message"]["usage"], 0).map_or(0, |u| u.prompt_tokens);
+                // Cached prompt is reported apart: count it as input too and
+                // retain cache counters when `message_delta` only reports output.
+                if let Some(u) = usage(&v["message"]["usage"], 0) {
+                    self.input_tokens = u.prompt_tokens;
+                    self.cache_read_tokens = u.cache_read_tokens;
+                    self.cache_write_tokens = u.cache_write_tokens;
+                    self.usage = Some(u);
+                }
             }
             Some("content_block_start") => {
                 let b = &v["content_block"];
@@ -284,7 +318,15 @@ impl AnthropicStream {
                 }
             }
             Some("message_delta") => {
-                self.usage = usage(&v["usage"], self.input_tokens);
+                if let Some(mut u) = usage(&v["usage"], self.input_tokens) {
+                    if u.cache_read_tokens == 0 && self.cache_read_tokens > 0 {
+                        u.cache_read_tokens = self.cache_read_tokens;
+                    }
+                    if u.cache_write_tokens == 0 && self.cache_write_tokens > 0 {
+                        u.cache_write_tokens = self.cache_write_tokens;
+                    }
+                    self.usage = Some(u);
+                }
                 if let Some(r) = v["delta"]["stop_reason"].as_str() {
                     self.stop_reason = Some(r.to_string());
                 }
@@ -355,11 +397,21 @@ mod tests {
         );
         let b = body_for(&oauth, &req, false);
         assert_eq!(b["system"][0]["text"], CLAUDE_CODE_IDENTITY);
+        assert!(b["system"][0].get("cache_control").is_none());
         assert_eq!(b["system"][1]["text"], "sou o zerith");
+        assert_eq!(
+            b["system"][1]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
 
-        // an API key keeps the plain string: nothing to prove there
+        // API key mode marks the static system prompt block for prompt caching.
         let key = Client::new(crate::ProviderConfig::new(crate::ProviderKind::Anthropic)).unwrap();
-        assert_eq!(body_for(&key, &req, false)["system"], "sou o zerith");
+        let kb = body_for(&key, &req, false);
+        assert_eq!(kb["system"][0]["text"], "sou o zerith");
+        assert_eq!(
+            kb["system"][0]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
     }
     use crate::ChatMessage;
 
@@ -368,6 +420,7 @@ mod tests {
         let mut req = ChatRequest::new(
             "claude",
             vec![
+                ChatMessage::system("static sys"),
                 ChatMessage::user("a"),
                 ChatMessage::assistant("b", vec![]),
                 ChatMessage::user("c"),
@@ -389,17 +442,19 @@ mod tests {
         let eph = json!({"type": "ephemeral"});
         assert_eq!(b["tools"][1]["cache_control"], eph);
         assert!(b["tools"][0].get("cache_control").is_none());
+        assert_eq!(b["system"][0]["cache_control"], eph);
         assert_eq!(b["messages"][2]["content"][0]["cache_control"], eph);
         assert!(b["messages"][0]["content"][0]
             .get("cache_control")
             .is_none());
-        // what was read from cache still counts as prompt
+        // what was read from cache still counts as prompt and surfaces cache metrics
         let u = usage(
             &json!({"input_tokens": 10, "cache_read_input_tokens": 900, "cache_creation_input_tokens": 90, "output_tokens": 5}),
             0,
         )
         .unwrap();
         assert_eq!((u.prompt_tokens, u.total_tokens), (1000, 1005));
+        assert_eq!((u.cache_read_tokens, u.cache_write_tokens), (900, 90));
     }
 
     #[test]
@@ -429,7 +484,11 @@ mod tests {
             ],
         );
         let b = body(&req, false);
-        assert_eq!(b["system"], "s");
+        assert_eq!(b["system"][0]["text"], "s");
+        assert_eq!(
+            b["system"][0]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
         assert_eq!(b["max_tokens"], 32000);
         let msgs = b["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 3);

@@ -9,11 +9,12 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use regex::Regex;
+use serde::Serialize;
 use serde_json::{json, Value};
 use zerith_security::Action;
 
@@ -21,32 +22,72 @@ use crate::fntool::{make_with, opt_str, str_arg};
 use crate::{CallCtx, Exec, Permission, Result, Tool, ToolError};
 
 const MAX_OPEN: usize = 6;
+const MAX_AUTO_PAGES: usize = 64;
+const LOOP_TAIL_BYTES: usize = 4096;
 // ponytail: a forgotten session dies on the next terminal call after 30 min
 // idle; a reaper thread if sessions must die exactly on time.
 const IDLE_REAP: Duration = Duration::from_secs(30 * 60);
 const BUF_CAP: usize = 16 * 1024 * 1024;
 
-struct Term {
-    owner: Option<String>,
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalSnapshot {
+    pub id: String,
+    pub command: String,
+    pub alive: bool,
+    pub busy: bool,
+    pub vendor: Option<String>,
+    pub device: Option<String>,
+    pub host: Option<String>,
+    pub role: Option<String>,
+    pub idle_secs: u64,
+}
+
+#[derive(Clone)]
+struct TermMeta {
+    id: String,
     command: String,
-    input: Box<dyn Write + Send>,
+    vendor: Option<String>,
+    device: Option<String>,
+    host: Option<String>,
+    role: Option<String>,
+    buf: Arc<Mutex<Vec<u8>>>,
+    input: Arc<Mutex<Box<dyn Write + Send>>>,
+    last_used: Arc<Mutex<Instant>>,
+    alive: Arc<AtomicBool>,
+    busy: Arc<AtomicBool>,
+}
+
+pub(crate) struct Term {
+    meta: TermMeta,
     /// Output not yet handed to the model.
     buf: Arc<Mutex<Vec<u8>>>,
+    input: Arc<Mutex<Box<dyn Write + Send>>>,
     proc: Proc,
-    used: Instant,
+    owner: Option<String>,
     /// Vault values typed here: scrubbed from every read.
     secrets: Vec<String>,
 }
 
 impl Drop for Term {
     fn drop(&mut self) {
+        self.meta.alive.store(false, Ordering::SeqCst);
+        self.meta.busy.store(false, Ordering::SeqCst);
         self.proc.kill();
+        if let Ok(mut m) = meta_table().lock() {
+            m.remove(&self.meta.id);
+        }
     }
 }
 
 fn table() -> &'static Mutex<HashMap<String, Term>> {
     static T: OnceLock<Mutex<HashMap<String, Term>>> = OnceLock::new();
     T.get_or_init(Default::default)
+}
+
+fn meta_table() -> &'static Mutex<HashMap<String, TermMeta>> {
+    static M: OnceLock<Mutex<HashMap<String, TermMeta>>> = OnceLock::new();
+    M.get_or_init(Default::default)
 }
 
 fn lock() -> std::sync::MutexGuard<'static, HashMap<String, Term>> {
@@ -56,13 +97,108 @@ fn lock() -> std::sync::MutexGuard<'static, HashMap<String, Term>> {
 /// The program a terminal session runs, for the approval rules (a session
 /// on `ssh` is remote access; every input to it is approved on its own).
 pub fn terminal_program(id: &str) -> Option<String> {
-    lock().get(id).map(|t| t.command.clone())
+    meta_table().lock().ok()?.get(id).map(|t| t.command.clone())
+}
+
+/// `(vendor, device, role)` metadata for an active terminal session.
+pub fn terminal_meta(id: &str) -> Option<(Option<String>, Option<String>, Option<String>)> {
+    meta_table()
+        .lock()
+        .ok()?
+        .get(id)
+        .map(|t| (t.vendor.clone(), t.device.clone(), t.role.clone()))
+}
+
+/// Lists all open terminal sessions with live liveness/busy/idle status.
+pub fn list_active_terminals() -> Vec<TerminalSnapshot> {
+    reap();
+    let entries: Vec<TermMeta> = meta_table()
+        .lock()
+        .map(|m| m.values().cloned().collect())
+        .unwrap_or_default();
+    let mut out: Vec<TerminalSnapshot> = entries
+        .into_iter()
+        .map(|m| {
+            let idle_secs = m
+                .last_used
+                .lock()
+                .map(|t| t.elapsed().as_secs())
+                .unwrap_or(0);
+            TerminalSnapshot {
+                id: m.id,
+                command: m.command,
+                alive: m.alive.load(Ordering::SeqCst),
+                busy: m.busy.load(Ordering::SeqCst),
+                vendor: m.vendor,
+                device: m.device,
+                host: m.host,
+                role: m.role,
+                idle_secs,
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
+}
+
+/// Reads the trailing output buffer of `id` without consuming it.
+pub fn terminal_tail(id: &str, max_bytes: usize) -> std::result::Result<String, String> {
+    let buf = meta_table()
+        .lock()
+        .ok()
+        .and_then(|m| m.get(id).map(|t| t.buf.clone()))
+        .ok_or_else(|| format!("terminal {id} não encontrado"))?;
+    let bytes = buf
+        .lock()
+        .map(|b| {
+            let cap = max_bytes.clamp(64, 65536);
+            let start = b.len().saturating_sub(cap);
+            b[start..].to_vec()
+        })
+        .unwrap_or_default();
+    Ok(clean(&bytes))
+}
+
+/// Sends `Ctrl+C` (`0x03`) to `id`, even if a command is currently running.
+pub fn interrupt_terminal(id: &str) -> std::result::Result<(), String> {
+    let input = meta_table()
+        .lock()
+        .ok()
+        .and_then(|m| m.get(id).map(|t| t.input.clone()))
+        .ok_or_else(|| format!("terminal {id} não encontrado"))?;
+    let mut w = input
+        .lock()
+        .map_err(|e| format!("falha ao travar stdin: {e}"))?;
+    w.write_all(b"\x03")
+        .and_then(|_| w.flush())
+        .map_err(|e| format!("falha ao enviar Ctrl+C para {id}: {e}"))
+}
+
+/// Closes terminal session `id` and terminates its child process.
+pub fn close_terminal(id: &str) -> std::result::Result<(), String> {
+    let removed = lock().remove(id);
+    if let Some(term) = removed {
+        drop(term);
+        return Ok(());
+    }
+    // If currently in flight inside send/batch, mark dead so it drops on return.
+    if let Ok(m) = meta_table().lock() {
+        if let Some(meta) = m.get(id) {
+            meta.alive.store(false, Ordering::SeqCst);
+            if let Ok(mut w) = meta.input.lock() {
+                let _ = w.write_all(b"\x03\nexit\n");
+                let _ = w.flush();
+            }
+            return Ok(());
+        }
+    }
+    Err(format!("terminal {id} não existe"))
 }
 
 fn open_list(t: &HashMap<String, Term>) -> String {
     let v: Vec<String> = t
         .iter()
-        .map(|(id, s)| format!("{id} ({})", s.command))
+        .map(|(id, s)| format!("{id} ({})", s.meta.command))
         .collect();
     if v.is_empty() {
         "nenhum".into()
@@ -82,6 +218,7 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
             json!({"type": "object", "properties": {
                 "command": {"type": "string", "description": "o programa e argumentos, ex.: ssh admin@10.0.0.1"},
                 "expect": {"type": "string", "description": "regex: espera até isso aparecer (ex.: \"[Pp]assword:\")"},
+                "auto_page": {"type": "boolean", "description": "envia espaço automaticamente em prompts de paginação (--More--), padrão true"},
                 "timeout_secs": {"type": "integer", "description": "padrão 20, máximo 120"}
             }, "required": ["command"]}),
             "id do terminal e a saída inicial",
@@ -104,6 +241,7 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
                 "input": {"type": "string"},
                 "secret": {"type": "string", "description": "nome no cofre; nunca o valor"},
                 "enter": {"type": "boolean", "description": "padrão true"},
+                "auto_page": {"type": "boolean", "description": "envia espaço automaticamente em prompts de paginação (--More--), padrão true"},
                 "expect": {"type": "string", "description": "regex do que esperar"},
                 "timeout_secs": {"type": "integer", "description": "padrão 15, máximo 600"}
             }, "required": ["id"]}),
@@ -157,12 +295,47 @@ fn expect(args: &Value) -> Result<Option<Regex>> {
 }
 
 fn reap() {
-    lock().retain(|_, t| t.used.elapsed() < IDLE_REAP && t.proc.alive());
+    let mut dropped = Vec::new();
+    {
+        let mut t = lock();
+        let dead: Vec<String> = t
+            .iter()
+            .filter_map(|(id, term)| {
+                let expired = term
+                    .meta
+                    .last_used
+                    .lock()
+                    .map(|lu| lu.elapsed() >= IDLE_REAP)
+                    .unwrap_or(false);
+                (expired || !term.proc.alive()).then(|| id.clone())
+            })
+            .collect();
+        for id in dead {
+            if let Some(term) = t.remove(&id) {
+                dropped.push(term);
+            }
+        }
+    }
+    drop(dropped);
 }
 
-fn open(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
-    let command = str_arg(args, "command")?;
-    let re = expect(args)?;
+pub(crate) struct OpenSpec<'a> {
+    pub command: &'a str,
+    pub cwd: &'a std::path::Path,
+    pub expect: Option<&'a Regex>,
+    pub timeout_dur: Duration,
+    pub auto_page: bool,
+    pub secrets: Vec<String>,
+    pub vendor: Option<String>,
+    pub device: Option<String>,
+    pub host: Option<String>,
+    pub role: Option<String>,
+}
+
+pub(crate) fn open_with_meta(
+    spec: OpenSpec<'_>,
+    exec: &Exec<'_>,
+) -> Result<(String, String, bool)> {
     reap();
     {
         let t = lock();
@@ -173,10 +346,12 @@ fn open(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
             )));
         }
     }
-    let (proc, input, mut out) = spawn(command, ctx.workspace)
-        .map_err(|e| ToolError::Failed(format!("não abriu `{command}`: {e}")))?;
+    let (proc, input_w, mut out) = spawn(spec.command, spec.cwd)
+        .map_err(|e| ToolError::Failed(format!("não abriu `{}`: {e}", spec.command)))?;
     let buf = Arc::new(Mutex::new(Vec::new()));
     let fill = buf.clone();
+    let alive = Arc::new(AtomicBool::new(true));
+    let alive_reader = alive.clone();
     std::thread::spawn(move || {
         let mut chunk = [0u8; 8192];
         while let Ok(n) = out.read(&mut chunk) {
@@ -188,24 +363,76 @@ fn open(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
                 v.extend_from_slice(&chunk[..n]);
             }
         }
+        alive_reader.store(false, Ordering::SeqCst);
     });
     static NEXT: AtomicU64 = AtomicU64::new(1);
     let id = format!("term-{}", NEXT.fetch_add(1, Ordering::Relaxed));
+    let input = Arc::new(Mutex::new(input_w));
+    let last_used = Arc::new(Mutex::new(Instant::now()));
+    let busy = Arc::new(AtomicBool::new(true));
+    let meta = TermMeta {
+        id: id.clone(),
+        command: spec.command.to_string(),
+        vendor: spec.vendor,
+        device: spec.device,
+        host: spec.host,
+        role: spec.role,
+        buf: buf.clone(),
+        input: input.clone(),
+        last_used,
+        alive,
+        busy,
+    };
+    if let Ok(mut m) = meta_table().lock() {
+        m.insert(id.clone(), meta.clone());
+    }
     let term = Term {
+        meta: meta.clone(),
         owner: exec.host.session(),
-        command: command.to_string(),
         input,
         buf,
         proc,
-        used: Instant::now(),
-        secrets: Vec::new(),
+        secrets: spec.secrets,
     };
-    let deadline = exec.deadline.min(Instant::now() + timeout(args, 20, 120));
-    let text = collect(&term, re.as_ref(), deadline, exec);
-    let alive = term.proc.alive();
-    if alive {
+    let deadline = exec.deadline.min(Instant::now() + spec.timeout_dur);
+    let text = collect(
+        "terminal_open",
+        &term,
+        spec.expect,
+        deadline,
+        spec.auto_page,
+        exec,
+    );
+    term.meta.busy.store(false, Ordering::SeqCst);
+    if let Ok(mut u) = term.meta.last_used.lock() {
+        *u = Instant::now();
+    }
+    let still_alive = term.proc.alive() && term.meta.alive.load(Ordering::SeqCst);
+    if still_alive {
         lock().insert(id.clone(), term);
     }
+    Ok((id, text, still_alive))
+}
+
+fn open(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
+    let command = str_arg(args, "command")?;
+    let re = expect(args)?;
+    let auto_page = args["auto_page"].as_bool().unwrap_or(true);
+    let (id, text, alive) = open_with_meta(
+        OpenSpec {
+            command,
+            cwd: ctx.workspace,
+            expect: re.as_ref(),
+            timeout_dur: timeout(args, 20, 120),
+            auto_page,
+            secrets: Vec::new(),
+            vendor: None,
+            device: None,
+            host: None,
+            role: None,
+        },
+        exec,
+    )?;
     Ok(format!(
         "{id} ({command}){}\n{text}",
         if alive {
@@ -216,20 +443,18 @@ fn open(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
     ))
 }
 
-fn send(args: &Value, _: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
-    let id = str_arg(args, "id")?;
-    let re = expect(args)?;
-    // The vault read happens before the session is taken: an unknown name
-    // must not leave the session out of the table.
-    let secret = opt_str(args, "secret")
-        .map(|n| {
-            zerith_core::secrets::get_secret(n).map_err(|e| {
-                ToolError::Failed(format!(
-                    "segredo `{n}` não está no cofre ({e}); peça ao usuário: zerith secret set {n}"
-                ))
-            })
-        })
-        .transpose()?;
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn send_session_command(
+    tool_name: &str,
+    id: &str,
+    input_str: Option<&str>,
+    secret_val: Option<String>,
+    enter: bool,
+    re: Option<&Regex>,
+    timeout_dur: Duration,
+    auto_page: bool,
+    exec: &Exec<'_>,
+) -> Result<(String, bool)> {
     let mut t = {
         let mut table = lock();
         let Some(t) = table.remove(id) else {
@@ -245,33 +470,70 @@ fn send(args: &Value, _: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
         }
         t
     };
+    t.meta.busy.store(true, Ordering::SeqCst);
     let mut data = String::new();
-    if let Some(v) = &secret {
-        data.push_str(v);
-        t.secrets.push(v.clone());
-    } else if let Some(i) = args["input"].as_str() {
+    if let Some(v) = secret_val {
+        data.push_str(&v);
+        t.secrets.push(v);
+    } else if let Some(i) = input_str {
         data.push_str(i);
     }
-    let typed = secret.is_some() || args["input"].is_string();
-    if typed && args["enter"].as_bool().unwrap_or(true) {
+    let typed = !data.is_empty() || input_str.is_some();
+    if typed && enter {
         data.push('\r');
     }
     if !data.is_empty() {
-        if let Err(e) = t
+        let write_res = t
             .input
-            .write_all(data.as_bytes())
-            .and_then(|_| t.input.flush())
-        {
-            return Err(ToolError::Failed(format!("terminal {id} fechado: {e}")));
-        }
+            .lock()
+            .map_err(|e| ToolError::Failed(format!("terminal {id} travado: {e}")))
+            .and_then(|mut w| {
+                w.write_all(data.as_bytes())
+                    .and_then(|_| w.flush())
+                    .map_err(|e| ToolError::Failed(format!("terminal {id} fechado: {e}")))
+            });
+        write_res?;
     }
-    let deadline = exec.deadline.min(Instant::now() + timeout(args, 15, 600));
-    let text = collect(&t, re.as_ref(), deadline, exec);
-    t.used = Instant::now();
-    let alive = t.proc.alive();
+    let deadline = exec.deadline.min(Instant::now() + timeout_dur);
+    let text = collect(tool_name, &t, re, deadline, auto_page, exec);
+    t.meta.busy.store(false, Ordering::SeqCst);
+    if let Ok(mut u) = t.meta.last_used.lock() {
+        *u = Instant::now();
+    }
+    let alive = t.proc.alive() && t.meta.alive.load(Ordering::SeqCst);
     if alive {
         lock().insert(id.to_string(), t);
     }
+    Ok((text, alive))
+}
+
+fn send(args: &Value, _: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
+    let id = str_arg(args, "id")?;
+    let re = expect(args)?;
+    let auto_page = args["auto_page"].as_bool().unwrap_or(true);
+    let enter = args["enter"].as_bool().unwrap_or(true);
+    // The vault read happens before the session is taken: an unknown name
+    // must not leave the session out of the table.
+    let secret = opt_str(args, "secret")
+        .map(|n| {
+            zerith_core::secrets::get_secret(n).map_err(|e| {
+                ToolError::Failed(format!(
+                    "segredo `{n}` não está no cofre ({e}); peça ao usuário: zerith secret set {n}"
+                ))
+            })
+        })
+        .transpose()?;
+    let (text, alive) = send_session_command(
+        "terminal_send",
+        id,
+        args["input"].as_str(),
+        secret,
+        enter,
+        re.as_ref(),
+        timeout(args, 15, 600),
+        auto_page,
+        exec,
+    )?;
     Ok(format!(
         "{id}{}\n{text}",
         if alive {
@@ -284,38 +546,92 @@ fn send(args: &Value, _: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
 
 fn close(args: &Value, _: &CallCtx<'_>, _: &Exec<'_>) -> Result<String> {
     let id = str_arg(args, "id")?;
-    match lock().remove(id) {
-        Some(_) => Ok(format!("{id} fechado")),
-        None => Err(ToolError::Failed(format!("terminal {id} não existe"))),
-    }
+    close_terminal(id)
+        .map(|()| format!("{id} fechado"))
+        .map_err(ToolError::Failed)
 }
 
 /// Waits for the program to settle, then hands over (and drops) everything
 /// unread. Settled: the `expect` pattern showed up, or the output went quiet
 /// on what looks like a prompt, or quiet for 2 s.
-fn collect(t: &Term, expect: Option<&Regex>, deadline: Instant, exec: &Exec<'_>) -> String {
+fn collect(
+    tool: &str,
+    t: &Term,
+    expect: Option<&Regex>,
+    deadline: Instant,
+    auto_page: bool,
+    exec: &Exec<'_>,
+) -> String {
     let len = || t.buf.lock().map(|b| b.len()).unwrap_or(0);
     let (mut last, mut changed) = (len(), Instant::now());
+    let (mut progress_at, mut last_emit) = (0usize, Instant::now());
+    let (mut pages, mut page_at) = (0usize, 0usize);
     let note = loop {
         std::thread::sleep(Duration::from_millis(50));
         let now = len();
         if now != last {
             (last, changed) = (now, Instant::now());
         }
-        let quiet = changed.elapsed();
-        let text = clean(&t.buf.lock().map(|b| b.clone()).unwrap_or_default());
-        let done = match expect {
-            Some(re) => re.is_match(&text),
-            None => {
-                now > 0
-                    && (quiet >= Duration::from_secs(2)
-                        || (quiet >= Duration::from_millis(400) && looks_like_prompt(&text)))
+        if now > progress_at && last_emit.elapsed() >= Duration::from_millis(250) {
+            if now.saturating_sub(progress_at) > LOOP_TAIL_BYTES {
+                progress_at = now - LOOP_TAIL_BYTES;
             }
-        };
+            let chunk_bytes = t
+                .buf
+                .lock()
+                .map(|b| {
+                    let start = progress_at.min(b.len());
+                    let end = b.len().min(start + 1024);
+                    b[start..end].to_vec()
+                })
+                .unwrap_or_default();
+            if !chunk_bytes.is_empty() {
+                progress_at = (progress_at + chunk_bytes.len()).min(now);
+                let mut text = clean(&chunk_bytes);
+                for s in &t.secrets {
+                    text = text.replace(s.as_str(), "[segredo]");
+                }
+                if !text.is_empty() {
+                    exec.host.sink().push(crate::HostEvent::ToolProgress {
+                        tool: tool.to_string(),
+                        chunk: text,
+                    });
+                }
+            }
+            last_emit = Instant::now();
+        }
+        let quiet = changed.elapsed();
+        let tail_bytes = t
+            .buf
+            .lock()
+            .map(|b| b[b.len().saturating_sub(LOOP_TAIL_BYTES)..].to_vec())
+            .unwrap_or_default();
+        let tail_clean = clean(&tail_bytes);
+        if auto_page && pages < MAX_AUTO_PAGES && now > page_at && looks_like_pager(&tail_clean) {
+            if let Ok(mut w) = t.input.lock() {
+                if w.write_all(b" ").and_then(|_| w.flush()).is_ok() {
+                    pages += 1;
+                    page_at = now;
+                    changed = Instant::now();
+                    continue;
+                }
+            }
+        }
+        let pager_waiting = auto_page && pages < MAX_AUTO_PAGES && looks_like_pager(&tail_clean);
+        let done = !pager_waiting
+            && match expect {
+                Some(re) => re.is_match(&tail_clean),
+                None => {
+                    now > 0
+                        && (quiet >= Duration::from_secs(2)
+                            || (quiet >= Duration::from_millis(400)
+                                && looks_like_prompt(&tail_clean)))
+                }
+            };
         if done {
             break None;
         }
-        if !t.proc.alive() {
+        if !t.proc.alive() || !t.meta.alive.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(200));
             break Some("[o programa encerrou]".to_string());
         }
@@ -347,6 +663,27 @@ fn collect(t: &Term, expect: Option<&Regex>, deadline: Instant, exec: &Exec<'_>)
         Some(n) => format!("{text}\n{n}"),
         None => text,
     }
+}
+
+/// Detects CLI pagination prompts at the tail of terminal output.
+pub(crate) fn looks_like_pager(text: &str) -> bool {
+    let tail = text
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .map(str::trim)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if tail.is_empty() {
+        return false;
+    }
+    tail.contains("--more--")
+        || tail.contains("-- more --")
+        || tail.contains("---- more ----")
+        || tail.contains("--- more ---")
+        || tail.contains("---(more")
+        || tail.contains("press any key")
+        || tail.contains("-- [q quit")
 }
 
 /// The last line ends like a prompt: `Router#`, `<Huawei>`, `[admin@MikroTik] >`,
@@ -591,6 +928,10 @@ mod tests {
         assert!(looks_like_prompt("banner\n[admin@MikroTik] > "));
         assert!(looks_like_prompt("Password: "));
         assert!(!looks_like_prompt("carregando 50%... feito"));
+        assert!(looks_like_pager("interface Eth0/0/1\n  ---- More ----"));
+        assert!(looks_like_pager("show bgp\n--More--"));
+        assert!(looks_like_pager("---(more 42%)---"));
+        assert!(!looks_like_pager("Router#"));
     }
 
     fn exec_ctx(f: impl FnOnce(&CallCtx<'_>, &Exec<'_>)) {

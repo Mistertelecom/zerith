@@ -162,6 +162,8 @@ pub struct ChatRequest {
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
     pub reasoning_effort: Option<String>,
+    /// Session cache affinity key sent to providers that support it (OpenAI/Codex).
+    pub prompt_cache_key: Option<String>,
     /// Empty means no tools are offered.
     pub tools: Vec<ToolDef>,
     /// `auto`, `none`, `required`, or a tool name.
@@ -176,6 +178,7 @@ impl ChatRequest {
             max_tokens: None,
             temperature: None,
             reasoning_effort: None,
+            prompt_cache_key: None,
             tools: Vec::new(),
             tool_choice: None,
         }
@@ -193,6 +196,11 @@ impl ChatRequest {
 
     pub fn reasoning_effort(mut self, e: impl Into<String>) -> Self {
         self.reasoning_effort = Some(e.into());
+        self
+    }
+
+    pub fn prompt_cache_key(mut self, k: impl Into<String>) -> Self {
+        self.prompt_cache_key = Some(k.into());
         self
     }
 
@@ -237,4 +245,80 @@ pub fn is_cut_off(stop_reason: &str) -> bool {
             | "max_output_tokens"
             | "model_context_window_exceeded"
     )
+}
+
+/// Normalizes an optional reasoning-effort setting (`low`, `medium`, `high`),
+/// treating empty strings and `"off"` as disabled (`None`).
+pub(crate) fn normalize_reasoning_effort(effort: Option<&str>) -> Option<String> {
+    let trimmed = effort?.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("off") {
+        return None;
+    }
+    Some(trimmed.to_ascii_lowercase())
+}
+
+/// Maps `reasoning_effort` levels to provider thinking token budgets.
+pub(crate) fn thinking_budget(effort: Option<&str>) -> Option<u32> {
+    match normalize_reasoning_effort(effort)?.as_str() {
+        "low" => Some(2048),
+        "medium" => Some(8192),
+        "high" => Some(16384),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod reasoning_effort_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn off_is_omitted_and_levels_map_per_provider_protocol() {
+        let off = ChatRequest::new("claude-sonnet-4-5", vec![ChatMessage::user("oi")])
+            .temperature(0.4)
+            .max_tokens(1024)
+            .reasoning_effort("off");
+        assert!(openai::body(&off, false).get("reasoning_effort").is_none());
+        assert!(codex::body(&off, false).get("reasoning").is_none());
+        let anth_off = anthropic::body(&off, false);
+        assert!(anth_off.get("thinking").is_none());
+        assert!(anth_off.get("temperature").is_some());
+        assert!(antigravity::body(&off, None)
+            .get("request")
+            .and_then(|r| r.get("generationConfig"))
+            .and_then(|g| g.get("thinkingConfig"))
+            .is_none());
+
+        for (level, budget) in [("low", 2048u32), ("medium", 8192), ("high", 16384)] {
+            let req = ChatRequest::new("claude-sonnet-4-5", vec![ChatMessage::user("oi")])
+                .temperature(0.3)
+                .max_tokens(1024)
+                .reasoning_effort(level);
+            assert_eq!(openai::body(&req, false)["reasoning_effort"], json!(level));
+            assert_eq!(
+                codex::body(&req, false)["reasoning"],
+                json!({"effort": level})
+            );
+
+            let anth = anthropic::body(&req, false);
+            assert_eq!(
+                anth["thinking"],
+                json!({"type": "enabled", "budget_tokens": budget})
+            );
+            assert!(
+                anth.get("temperature").is_none(),
+                "Anthropic forbids temperature when thinking is enabled"
+            );
+            assert!(
+                anth["max_tokens"].as_u64().unwrap() >= u64::from(budget) + 1024,
+                "Anthropic requires max_tokens > budget_tokens"
+            );
+
+            let ag = antigravity::body(&req, Some("proj-1"));
+            assert_eq!(
+                ag["request"]["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+                json!(budget)
+            );
+        }
+    }
 }

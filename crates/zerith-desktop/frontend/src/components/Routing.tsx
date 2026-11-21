@@ -16,6 +16,7 @@ import {
   Layers,
   ListChecks,
   MessageSquare,
+  Minimize2,
   PenLine,
   Plug,
   Route,
@@ -40,7 +41,12 @@ import {
 import { catalogEntry } from "../lib/catalog";
 import { Card, EmptyState, Logo } from "./ui";
 
-type Key = "main_model" | "subagent_model" | "explore_model" | "plan_model";
+type Key =
+  | "main_model"
+  | "subagent_model"
+  | "explore_model"
+  | "plan_model"
+  | "compact_model";
 type Opt = { spec: string; model: string; name: string };
 type Group = {
   key: string;
@@ -90,6 +96,12 @@ const ROLES: Record<
     hint: "Monta o passo a passo no modo Plano.",
     icon: ListChecks,
     from: "subagent_model",
+  },
+  compact_model: {
+    label: "Compactar",
+    hint: "Resume históricos longos preservando entidades.",
+    icon: Minimize2,
+    from: "explore_model",
   },
 };
 
@@ -628,7 +640,8 @@ export function RoutingTab(p: {
           <div className="dg-fan">
             {node("subagent_model")}
             {node("explore_model")}
-            {node("plan_model", "", true)}
+            {node("plan_model")}
+            {node("compact_model", "", true)}
           </div>
 
           <div className="dg-agents">

@@ -95,6 +95,12 @@ fn apply_account_defaults(
 /// `ZERITH_API_KEY` or the OS keyring, never from a file.
 pub fn configured_providers(root: &Path) -> Vec<ProviderConfig> {
     let st = load(root);
+    configured_providers_from(&st, root)
+}
+
+/// Resolves configured providers using an already-loaded [`Settings`] snapshot
+/// so turns do not parse TOML files twice.
+pub fn configured_providers_from(st: &Settings, _root: &Path) -> Vec<ProviderConfig> {
     let env_provider_set = std::env::var("ZERITH_PROVIDER").is_ok_and(|v| !v.trim().is_empty());
     let env_url_set = std::env::var("ZERITH_BASE_URL").is_ok_and(|v| !v.trim().is_empty());
     let mut env = ProviderConfig::from_env();

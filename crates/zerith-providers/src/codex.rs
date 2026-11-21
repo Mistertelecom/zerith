@@ -79,6 +79,12 @@ pub(crate) fn body(req: &ChatRequest, stream: bool) -> Value {
     if let Some(t) = req.temperature {
         b["temperature"] = json!(t);
     }
+    if let Some(e) = crate::normalize_reasoning_effort(req.reasoning_effort.as_deref()) {
+        b["reasoning"] = json!({"effort": e});
+    }
+    if let Some(key) = req.prompt_cache_key.as_deref().filter(|k| !k.is_empty()) {
+        b["prompt_cache_key"] = json!(key);
+    }
     b
 }
 
@@ -142,6 +148,10 @@ fn usage(v: &Value) -> Option<Usage> {
         prompt_tokens: v["input_tokens"].as_u64().unwrap_or(0),
         completion_tokens: v["output_tokens"].as_u64().unwrap_or(0),
         total_tokens: v["total_tokens"].as_u64().unwrap_or(0),
+        cache_read_tokens: v["input_tokens_details"]["cached_tokens"]
+            .as_u64()
+            .unwrap_or(0),
+        cache_write_tokens: 0,
     })
 }
 

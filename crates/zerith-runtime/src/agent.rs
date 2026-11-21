@@ -61,10 +61,12 @@ impl ApprovalSender {
 /// here, so a new gate starts asking again. Clones share everything: a
 /// subagent holds a clone of its parent's gate, so its prompts reach the same
 /// person through the parent's events (see [`ApprovalGate::relay`]).
+pub type SharedGrants = Arc<Mutex<HashSet<String>>>;
+
 #[derive(Clone)]
 pub struct ApprovalGate {
     rx: Arc<Mutex<mpsc::Receiver<(u64, Approval)>>>,
-    granted: Arc<Mutex<HashSet<String>>>,
+    granted: SharedGrants,
     /// Answers that arrived for another waiter (parallel children).
     early: Arc<Mutex<HashMap<u64, Approval>>>,
     /// `ApprovalNeeded` events of subagents, for the parent loop to emit.
@@ -72,16 +74,58 @@ pub struct ApprovalGate {
 }
 
 pub fn approval_channel() -> (ApprovalSender, ApprovalGate) {
+    approval_channel_with_grants(Arc::default())
+}
+
+/// Like [`approval_channel`], sharing `AllowSession` grants across turns in a conversation.
+pub fn approval_channel_with_grants(grants: SharedGrants) -> (ApprovalSender, ApprovalGate) {
     let (tx, rx) = mpsc::channel();
     (
         ApprovalSender(tx),
         ApprovalGate {
             rx: Arc::new(Mutex::new(rx)),
-            granted: Arc::default(),
+            granted: grants,
             early: Arc::default(),
             relayed: Arc::default(),
         },
     )
+}
+
+/// Computes the session grant key for a tool call. Simple `shell` commands get
+/// a prefix scope (`shell:prefix:<prog> <subcmd> *` or `shell:prefix:<prog> *`),
+/// whereas chained/piped/redirected commands require an exact normalized match
+/// so `AllowSession` never widens to arbitrary suffixes.
+pub fn approval_grant_key(tool: &str, args: &Value) -> String {
+    if tool != "shell" {
+        return tool.to_string();
+    }
+    let Some(raw) = args.get("command").and_then(Value::as_str) else {
+        return tool.to_string();
+    };
+    let tokens: Vec<&str> = raw.split_whitespace().collect();
+    if tokens.is_empty() {
+        return tool.to_string();
+    }
+    let normalized = tokens.join(" ");
+    let unsafe_meta = raw
+        .chars()
+        .any(|c| matches!(c, ';' | '&' | '|' | '`' | '>' | '<' | '\n' | '\r'))
+        || raw.contains("$(");
+    if unsafe_meta {
+        return format!("shell:exact:{normalized}");
+    }
+    let tok0 = tokens[0];
+    if let Some(tok1) = tokens.get(1) {
+        let plain_subcmd = !tok1.starts_with('-')
+            && !tok1.contains(['/', '\\', '.', '='])
+            && tok1
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        if plain_subcmd {
+            return format!("shell:prefix:{tok0} {tok1} *");
+        }
+    }
+    format!("shell:prefix:{tok0} *")
 }
 
 impl ApprovalGate {
@@ -207,6 +251,11 @@ pub struct AgentOptions<'a> {
     /// Where `ask_user` questions are answered. Without one the call fails
     /// closed ("o usuário não respondeu").
     pub questions: Option<&'a QuestionGate>,
+    /// Optional dynamic reminder appended transiently to the latest user message
+    /// (in addition to recalled memory and dynamic skill matches).
+    pub dynamic_context: Option<String>,
+    /// Optional reasoning effort hint (`"low"`, `"medium"`, `"high"`).
+    pub reasoning_effort: Option<String>,
     /// Depth and concurrency of the subagents this turn may start.
     pub subagents: SubagentOptions,
 }
@@ -229,6 +278,8 @@ impl Default for AgentOptions<'_> {
             inbox: None,
             cancel_cause: None,
             questions: None,
+            dynamic_context: None,
+            reasoning_effort: None,
             subagents: SubagentOptions::default(),
         }
     }
@@ -244,7 +295,7 @@ impl AgentOptions<'_> {
     }
 }
 
-const PREVIEW_CHARS: usize = 200;
+const PREVIEW_CHARS: usize = 4000;
 /// Of a failed attempt's partial text, how much the audit log keeps.
 const ATTEMPT_CHARS: usize = 2000;
 
@@ -403,15 +454,27 @@ fn turn_body(
             Err(e) => eprintln!("zerith: checkpoint indisponível: {e}"),
         }
     }
-    store.append(session_id, &NewMessage::new(Role::User, prompt))?;
+    let prompt_row_id = store.append(session_id, &NewMessage::new(Role::User, prompt))?;
 
     // The model has the skill tool exactly when the registry offers it.
     let skill_tool = agent.tools.is_some_and(|r| r.get("skill").is_some());
-    let mut system_text = crate::system_prompt(title, ctx, skill_tool, session_id, prompt);
+    let mut prompt_ctx = crate::build_prompt_context(title, ctx, skill_tool, session_id, prompt);
     if let Some(r) = agent.tools {
-        system_text.push_str(&crate::tool_guidance(r));
+        prompt_ctx.static_system.push_str(&crate::tool_guidance(r));
     }
-    let system = vec![ChatMessage::system(system_text)];
+    let dynamic_reminder = match (
+        prompt_ctx.dynamic_reminder,
+        agent
+            .dynamic_context
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty()),
+    ) {
+        (Some(a), Some(b)) => Some(format!("{a}\n\n{b}")),
+        (a, None) => a,
+        (None, Some(b)) => Some(b.to_string()),
+    };
+    let system = vec![ChatMessage::system(prompt_ctx.static_system)];
     let kids_saved = if let (Some(r), Some(p)) = (agent.tools, agent.policy) {
         Some(subagent::bind(
             r,
@@ -428,24 +491,19 @@ fn turn_body(
     } else {
         None
     };
-    // The window of the account this turn is routed to: the account's or the
-    // provider's number, else the model table (1M for the long-context
-    // families), else the default, so in-turn compaction is always on.
-    let first = ctx.settings.and_then(|st| {
-        crate::resolve_gateway(st, model, client.config())
-            .0
-            .candidates
-            .into_iter()
-            .next()
-    });
-    let routed_cfg = first.as_ref().map_or(client.config(), |c| &c.config);
+    // Resolve Gateway once per turn (instead of hitting settings/keyring on
+    // every tool step). Its first candidate sets the context window and folding.
+    let mut gateway = match ctx.settings {
+        Some(st) => crate::resolve_gateway(st, model, client.config()).0,
+        None => default_gateway(client, model),
+    };
+    gateway.final_retry = Some(client.retry_policy());
+    let first = gateway.candidates.first();
+    let routed_cfg = first.map_or(client.config(), |c| &c.config);
     let window = first
-        .as_ref()
         .and_then(|c| c.config.context_limit)
         .or(client.config().context_limit)
-        .or_else(|| {
-            zerith_providers::models::context_window(first.as_ref().map_or(model, |c| &c.model))
-        })
+        .or_else(|| zerith_providers::models::context_window(first.map_or(model, |c| &c.model)))
         .filter(|&l| l > 0)
         .map_or(crate::compact::DEFAULT_CONTEXT, |l| l as usize);
     // billion-context folds the history on the wire: it gets the whole
@@ -518,7 +576,8 @@ fn turn_body(
         cancel,
     };
 
-    let (mut prompt_tokens, mut completion_tokens) = (0, 0);
+    let (mut prompt_tokens, mut completion_tokens) = (0u64, 0u64);
+    let (mut cache_read_tokens, mut cache_write_tokens) = (0u64, 0u64);
     let mut pending_rtk_tokens: u64 = 0;
     let mut total_saved_rtk_tokens: u64 = 0;
     let mut total_saved_ponytail_tokens: u64 = 0;
@@ -531,7 +590,7 @@ fn turn_body(
 
     for step in 1..=max_steps {
         on_event(RunEvent::Step { n: step });
-        steer(store, session_id, agent, &mut hist, log)?;
+        steer(store, session_id, agent, &mut hist, log, on_event)?;
 
         if let Some(b) = budget {
             if hist.tokens() > shrink_at(window, schema_tokens, b, folded()) {
@@ -555,7 +614,22 @@ fn turn_body(
             "step/start",
             json!({"n": step, "tokens_estimate": hist.tokens()}),
         );
-        let mut req = ChatRequest::new(model, hist.chat());
+        let mut chat_msgs = hist.chat();
+        let prompt_msg_idx = hist
+            .items
+            .iter()
+            .position(|it| it.lo == prompt_row_id && it.hi == prompt_row_id)
+            .map(|i| hist.system.len() + i);
+        crate::inject_dynamic_reminder(&mut chat_msgs, prompt_msg_idx, dynamic_reminder.as_deref());
+        let mut req = ChatRequest::new(model, chat_msgs).prompt_cache_key(session_id);
+        if let Some(effort) = agent
+            .reasoning_effort
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("off"))
+        {
+            req = req.reasoning_effort(effort);
+        }
         if !defs.is_empty() {
             req = req.tools(defs.clone()).tool_choice("auto");
         }
@@ -564,12 +638,11 @@ fn turn_body(
         let mut painted = String::new();
         let out = request(
             store,
-            client,
+            &gateway,
             ctx,
             agent,
             session_id,
             step,
-            model,
             &req,
             cancel,
             &mut |e: RunEvent| {
@@ -587,7 +660,7 @@ fn turn_body(
         for f in failed {
             log.emit("assistant/attempt", json!({"step": step, "attempt": f}));
         }
-        let (mut out, gw_outcome, step_savings) = match out {
+        let (mut out, gw_outcome, ttft_ms, step_savings) = match out {
             Ok(o) => o,
             Err(e) => {
                 keep_partial(store, session_id, &painted, &e, log)?;
@@ -616,9 +689,14 @@ fn turn_body(
         if let Some(u) = &out.usage {
             prompt_tokens += u.prompt_tokens;
             completion_tokens += u.completion_tokens;
+            cache_read_tokens += u.cache_read_tokens;
+            cache_write_tokens += u.cache_write_tokens;
             on_event(RunEvent::Usage {
                 input: u.prompt_tokens,
                 output: u.completion_tokens,
+                cache_read: u.cache_read_tokens,
+                cache_write: u.cache_write_tokens,
+                ttft_ms,
             });
         }
 
@@ -641,7 +719,7 @@ fn turn_body(
         hist.push(ChatMessage::assistant(out.text, out.calls.clone()), id);
         if out.calls.is_empty() {
             // Told something while the answer streamed: the turn is not over.
-            if step < max_steps && steer(store, session_id, agent, &mut hist, log)? > 0 {
+            if step < max_steps && steer(store, session_id, agent, &mut hist, log, on_event)? > 0 {
                 continue;
             }
             // Background children the model never collected: the turn waits
@@ -903,6 +981,8 @@ fn turn_body(
             reasoning: last.2,
             prompt_tokens,
             completion_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
             saved_rtk_tokens: total_saved_rtk_tokens,
             saved_ponytail_tokens: total_saved_ponytail_tokens,
             saved_caveman_tokens: total_saved_caveman_tokens,
@@ -1041,6 +1121,7 @@ fn steer(
     agent: &AgentOptions<'_>,
     hist: &mut History,
     log: &TurnLog<'_>,
+    on_event: &mut dyn FnMut(RunEvent),
 ) -> Result<usize> {
     let Some(inbox) = agent.inbox else {
         return Ok(0);
@@ -1058,6 +1139,7 @@ fn steer(
             "user/steer",
             json!({"message_id": id, "chars": text.chars().count()}),
         );
+        on_event(RunEvent::Steered { text: text.clone() });
         hist.push(ChatMessage::user(text.clone()), id);
     }
     Ok(msgs.len())
@@ -1223,6 +1305,7 @@ fn record_failover(
         saved_tokens: 0,
         status: status.to_string(),
         latency_ms: 0,
+        ..NewUsageRecord::default()
     });
     failed.push(json!({
         "mode": "gateway_failover",
@@ -1405,36 +1488,62 @@ struct StepSavings {
 #[allow(clippy::too_many_arguments)]
 fn request(
     store: &Store,
-    client: &Client,
+    gateway: &Gateway,
     ctx: TurnContext<'_>,
     agent: &AgentOptions<'_>,
     session_id: &str,
     step: usize,
-    model: &str,
     req: &ChatRequest,
     cancel: &Cancel,
     on_event: &mut dyn FnMut(RunEvent),
     log: &TurnLog<'_>,
     failed: &mut Vec<Value>,
     pending_rtk_tokens: &mut u64,
-) -> Result<(StepOut, GatewayOutcome<()>, StepSavings)> {
-    let mut gateway = match ctx.settings {
-        Some(st) => crate::resolve_gateway(st, model, client.config()).0,
-        None => default_gateway(client, model),
-    };
-    gateway.final_retry = Some(client.retry_policy());
-
+) -> Result<(StepOut, GatewayOutcome<()>, u64, StepSavings)> {
     let role_kind = if agent.subagents.depth > 0 {
         "subagent"
     } else {
         "main"
     };
 
+    let req_started = Instant::now();
+    let mut first_token_ms: Option<u64> = None;
+    let mut record_ev = |event: StreamEvent,
+                         out: &mut StepOut,
+                         painted: &mut bool,
+                         on_event: &mut dyn FnMut(RunEvent)| {
+        if first_token_ms.is_none()
+            && matches!(
+                event,
+                StreamEvent::Delta(_) | StreamEvent::Reasoning(_) | StreamEvent::ToolCalls(_)
+            )
+        {
+            first_token_ms = Some(req_started.elapsed().as_millis() as u64);
+        }
+        apply_stream_event(event, out, painted, on_event);
+    };
+
     let (out, gw_outcome) = if gateway.candidates.len() == 1 {
         let cand = &gateway.candidates[0];
-        request_single(
-            store, &gateway, cand, session_id, role_kind, req, cancel, on_event, failed,
-        )?
+        let (out, outcome) = request_single(
+            store,
+            gateway,
+            cand,
+            session_id,
+            role_kind,
+            req,
+            cancel,
+            &mut |e| {
+                if first_token_ms.is_none()
+                    && matches!(e, RunEvent::Delta(_) | RunEvent::Reasoning(_))
+                {
+                    first_token_ms = Some(req_started.elapsed().as_millis() as u64);
+                }
+                on_event(e);
+            },
+            failed,
+        )?;
+        (out, outcome)
     } else {
         let mut out = StepOut::default();
         let mut painted = false;
@@ -1454,10 +1563,11 @@ fn request(
             |cand, err, cooldown_ms| {
                 record_failover(store, session_id, role_kind, cand, err, cooldown_ms, failed);
             },
-            |event| apply_stream_event(event, &mut out, &mut painted, on_event),
+            |event| record_ev(event, &mut out, &mut painted, on_event),
         )?;
         (out, gw_outcome)
     };
+    let ttft_ms = first_token_ms.unwrap_or(gw_outcome.latency_ms);
 
     on_event(RunEvent::Route {
         account_id: gw_outcome.account_id.clone(),
@@ -1475,15 +1585,23 @@ fn request(
                 "model": gw_outcome.model,
                 "attempts": gw_outcome.attempts,
                 "latency_ms": gw_outcome.latency_ms,
+                "ttft_ms": ttft_ms,
             }),
         );
     }
 
-    let (prompt_tokens, completion_tokens) = out
+    let (prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens) = out
         .usage
         .as_ref()
-        .map(|u| (u.prompt_tokens, u.completion_tokens))
-        .unwrap_or((0, 0));
+        .map(|u| {
+            (
+                u.prompt_tokens,
+                u.completion_tokens,
+                u.cache_read_tokens,
+                u.cache_write_tokens,
+            )
+        })
+        .unwrap_or((0, 0, 0, 0));
     let tool_args_bytes: usize = out.calls.iter().map(|c| c.arguments.len()).sum();
     let step_rtk = std::mem::take(pending_rtk_tokens);
     let (step_ponytail, step_caveman) = match ctx.settings {
@@ -1514,17 +1632,21 @@ fn request(
         role_kind: role_kind.to_string(),
         prompt_tokens,
         completion_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
         saved_rtk_tokens: step_rtk,
         saved_ponytail_tokens: step_ponytail,
         saved_caveman_tokens: step_caveman,
         saved_tokens: step_saved_tokens,
         status: "ok".to_string(),
         latency_ms: gw_outcome.latency_ms,
+        ttft_ms,
     });
 
     Ok((
         out,
         gw_outcome,
+        ttft_ms,
         StepSavings {
             ponytail: step_ponytail,
             caveman: step_caveman,
@@ -1544,5 +1666,48 @@ mod shrink_tests {
         assert_eq!(shrink_at(1_000_000, 20_000, budget, true), 930_000);
         // Never below the normal budget, even when the schemas eat the window.
         assert_eq!(shrink_at(100_000, 90_000, 25_000, true), 25_000);
+    }
+}
+
+#[cfg(test)]
+mod approval_grant_tests {
+    use super::*;
+
+    #[test]
+    fn shell_prefix_scopes_simple_commands_and_isolates_chained_ones() {
+        assert_eq!(
+            approval_grant_key("shell", &json!({"command": "git status -s"})),
+            "shell:prefix:git status *"
+        );
+        assert_eq!(
+            approval_grant_key("shell", &json!({"command": "cargo test --lib"})),
+            "shell:prefix:cargo test *"
+        );
+        assert_eq!(
+            approval_grant_key("shell", &json!({"command": "ping -c 4 8.8.8.8"})),
+            "shell:prefix:ping *"
+        );
+        assert_eq!(
+            approval_grant_key("shell", &json!({"command": "git status && rm -rf /"})),
+            "shell:exact:git status && rm -rf /"
+        );
+        assert_eq!(
+            approval_grant_key("shell", &json!({"command": "ls | xargs rm"})),
+            "shell:exact:ls | xargs rm"
+        );
+        assert_eq!(
+            approval_grant_key("write_file", &json!({"path": "a.txt"})),
+            "write_file"
+        );
+    }
+
+    #[test]
+    fn shared_grants_persist_across_approval_channels() {
+        let shared: SharedGrants = Arc::default();
+        let (_tx1, gate1) = approval_channel_with_grants(shared.clone());
+        gate1.grant("shell:prefix:git commit *");
+        let (_tx2, gate2) = approval_channel_with_grants(shared);
+        assert!(gate2.granted("shell:prefix:git commit *"));
+        assert!(!gate2.granted("shell:exact:git commit -m x && rm -rf ."));
     }
 }

@@ -118,9 +118,15 @@ ask = ["shell(git push *)"]"#,
     assert_eq!(p.check_tool("write_file", &w), Verdict::Allow);
     // Control files still stop, and so does a write outside the folder.
     let own = Action::Write(dir.path().join(".zerith/settings.toml"));
-    assert!(matches!(p.check_tool("write_file", &own), Verdict::Deny(_)), "control file");
+    assert!(
+        matches!(p.check_tool("write_file", &own), Verdict::Deny(_)),
+        "control file"
+    );
     let outside = Action::Write(dir.path().parent().unwrap().join("fora.txt"));
-    assert!(matches!(p.check_tool("write_file", &outside), Verdict::Deny(_)), "outside");
+    assert!(
+        matches!(p.check_tool("write_file", &outside), Verdict::Deny(_)),
+        "outside"
+    );
     let out = Action::Read(PathBuf::from(if cfg!(windows) {
         "C:/Windows/win.ini"
     } else {

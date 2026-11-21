@@ -4962,6 +4962,7 @@ dependencies = [
  "zerith-sessions",
  "zerith-skills",
  "zerith-tools",
+ "zerith-workflows",
 ]
 
 [[package]]
@@ -5107,6 +5108,19 @@ dependencies = [
  "zerith-providers",
  "zerith-security",
  "zerith-skills",
+ "zerith-workflows",
+]
+
+[[package]]
+name = "zerith-workflows"
+version = "0.2.9"
+dependencies = [
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "ureq",
 ]
 
 [[package]]

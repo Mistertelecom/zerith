@@ -319,7 +319,7 @@ fn work_facts_stay_in_their_project_and_preferences_follow_the_user() {
     std::fs::create_dir_all(&b).unwrap();
     let (sa, sb) = (Scope::workspace(&a), Scope::workspace(&b));
     let c = Confidence::Confirmed;
-    m.remember(&sa, FactKind::Fact, "roteador core em 10.0.0.1", c, None)
+    m.remember(&sa, FactKind::Project, "roteador core em 10.0.0.1", c, None)
         .unwrap();
     m.remember(&sa, FactKind::Preference, "responder em portugues", c, None)
         .unwrap();

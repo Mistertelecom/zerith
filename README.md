@@ -8,18 +8,18 @@
   <h1>Zerith</h1>
   <p>
     <strong>Native Rust AI agent harness &amp; Tauri 2 desktop workbench</strong><br />
-    Built for heavy software engineering, multi-vendor network consulting, and autonomous CLI/daemon workflows.
+    Built for heavy software engineering, multi-vendor network consulting, visual cron/WhatsApp automations, and personal finance/research workflows.
   </p>
 
   <p>
     <a href="https://github.com/Mistertelecom/zerith/releases">
-      <img alt="Release v0.2.7" src="https://img.shields.io/badge/version-v0.2.7-111827?style=flat-square" />
+      <img alt="Release v0.3.1" src="https://img.shields.io/badge/version-v0.3.1-111827?style=flat-square" />
     </a>
     <a href="https://github.com/Mistertelecom/zerith/actions/workflows/zerith.yml">
       <img alt="CI Status" src="https://github.com/Mistertelecom/zerith/actions/workflows/zerith.yml/badge.svg" />
     </a>
-    <img alt="Rust 2021" src="https://img.shields.io/badge/Rust-13_crates-b7410e?style=flat-square" />
-    <img alt="Tauri 2" src="https://img.shields.io/badge/Desktop-Tauri_2_+_React-24c8db?style=flat-square" />
+    <img alt="Rust 2021" src="https://img.shields.io/badge/Rust-14_crates-b7410e?style=flat-square" />
+    <img alt="Tauri 2" src="https://img.shields.io/badge/Desktop-Tauri_2-24c8db?style=flat-square" />
     <a href="LICENSE">
       <img alt="License GPL-3.0" src="https://img.shields.io/badge/license-GPL--3.0-blue?style=flat-square" />
     </a>
@@ -28,9 +28,9 @@
 
 ---
 
-Zerith is an original, self-contained AI agent harness written in **Rust** across **13 workspace crates**, paired with a **Tauri 2 + React/TypeScript** desktop app (`zerith-desktop`) and a fast single-binary CLI (`zerith`).
+Zerith is an original, self-contained AI agent harness written in **Rust** across **14 workspace crates**, paired with a **Tauri 2** desktop app (`zerith-desktop`) and a fast single-binary CLI (`zerith`).
 
-It combines human-in-the-loop tool governance, a native multi-account LLM gateway, semantic LSP & worktree coding tools, interactive SSH/PTY network device automation, cron scheduling, local FTS5 memory, and a fail-closed Telegram gateway—with zero external Node/Python runtime daemons required.
+It combines a **pure-SVG Visual Workflows Studio** (`zerith-workflows`), **Strict Orchestrator Mode** (dual Brain + Execution model routing), **Hermes-parity global persistent memory**, **6-language i18n** (English default), **7 auto-enabled bundled plugins**, human-in-the-loop tool governance, semantic LSP & worktree coding tools, interactive SSH/PTY network device automation, cron scheduling, and multi-channel notifications (Evolution API v2, WAHA, WhatsApp Cloud API, Telegram, Discord, Slack, Webhooks)—with zero external Electron/Node runtime daemons.
 
 ---
 
@@ -69,33 +69,49 @@ It combines human-in-the-loop tool governance, a native multi-account LLM gatewa
 
 ---
 
-## What's Inside (v0.2.3)
+## What's Inside (v0.3.1)
 
-### 1. Speed, Prompt Caching & Native Gateway
+### 1. Visual Workflows Studio & Global Channels (`zerith-workflows`)
+- **Ultra-Lightweight Pure-SVG Canvas (Tauri 2):** Lazy-loaded automation studio (`~10 kB` gzip JS + `~2.7 kB` gzip CSS, zero heavy graph dependencies) with dot-grid canvas, node drag-and-drop, zoom, 1-click **Arrange** (topological auto-layout), floating **`+` quick-add** node chaining, live dash-flow execution animations, and a side **Inspector + Runs** timeline drawer.
+- **10 Combinable Global Blocks:** `trigger_cron` (with visual schedule presets), `trigger_manual`, `shell`, `ssh_command`, `http_request`, `transform` (`json_path`, `filter_lines`, `template`), `condition` (`true`/`false` branches), `ai_agent`, `notify_channel`, and `save_file`, plus per-node **"Test block"** execution and 5 ready-to-use templates.
+- **8 Global Delivery Channels (`~/.zerith/workflows.db`):** Configure **WhatsApp (Evolution API v2, WAHA, Meta Cloud API)**, **Telegram Bot**, **Discord Webhook**, **Slack Webhook**, **Generic HTTP Webhook**, or **Desktop Notifications** once with built-in **Send Test**.
+- **AI-Driven Workflow Authoring:** Generate visual workflows directly from natural language in the studio bar or ask the assistant in Chat (`workflow_*` tools + bundled `zerith-workflows` plugin) to build, modify, toggle, and validate workflows live.
+
+### 2. Strict Orchestrator Mode, Skills & Official Plugins
+- **100% Strict Orchestrator Routing:** Toggle **Orchestrator** in the Composer with dedicated **Thinking (Brain)** and **Execution** model selectors on a clean `.orch-bar` toolbar. The Brain model is physically restricted to coordination, memory, inventory, and delegation tools (`agent`, `task_*`, `skill`), delegating file/shell/SSH execution to subagents (`executor`, `workflow-architect`, `finance-analyst`).
+- **Contextual Tool-Schema Pruning & Auto-Inlined Skills:** Heavy tool groups (`browser_*`, `lsp_*`, media authoring, `workflow_*`) are injected only when relevant to the prompt, and top matched plugin skills are auto-inlined cleanly into the transient turn reminder.
+- **7 Auto-Enabled Official Plugins + Marketplace:** Ships out of the box with `zerith-netops`, `zerith-proxmox`, `zerith-noc-observability`, `zerith-ftth-olt`, `zerith-linux-devops`, `zerith-workflows`, and `zerith-finance` (B3 & global undervalued stock screening with Graham/Bazin valuation), plus 1-click Marketplace entries including `last30days` (`mvanhorn/last30days-skill`), `finance-market-analysis` (`himself65/finance-skills`), and `trading-ideas` (`quant-sentiment-ai/claude-equity-research`).
+
+### 3. Hermes-Parity Global Memory & Modern Workbench UX
+- **Global User-Scoped Persistent Memory:** `Preference`, `Instruction`, `Fact`, `Entity` (clients, devices, IPs, ASNs, people), and `Decision` memories follow you globally across workspaces, auto-load into turn context, and expose full AI CRUD (`memory_save`, `memory_recall`, `memory_update`, `memory_forget`), manual UI creation (`+ New fact`), and 1-click **Import from Hermes**.
+- **6-Language Internationalization:** Defaults to **English (`en`)** with live switching across `English`, `Português (BR)`, `Español`, `Français`, `Deutsch`, and `中文`.
+- **Clean Activity & Conversation UX:** Antigravity-style tool activity lines displaying language badges and `#Lstart-end` ranges (`Analyzed [R] learn.rs #L1-165`), plus a right-click sidebar conversation menu (`Rename`, `Pin/Unpin`, `Archive`, `Delete`) with a dedicated **Pinned** section.
+
+### 4. Speed, Prompt Caching & Native Gateway
 - **Native Multi-Account LLM Gateway (`zerith-providers`):** Direct support for OpenAI, Anthropic, Codex (OAuth), Antigravity (OAuth), DeepSeek, Gemini, OpenRouter, Ollama, LM Studio, and custom OpenAI/Anthropic endpoints—with per-account quotas, cooldowns, combos, and automatic failover.
 - **Prompt Caching & Token Saver (`zerith-runtime`):** Provider prompt-cache optimization, deterministic `Ponytail` / `Caveman` / `RTK` output filters, and dynamic `compact_model` routing with automatic 70% background pre-compaction.
 - **Zero Cold-Start Warm Caches:** Pre-warmed, generation-invalidated `McpCache` registries and SQLite schema caching.
 
-### 2. Desktop Workbench & Interactive CLI
+### 5. Desktop Workbench & Interactive CLI
 - **Desktop App (`zerith-desktop`):** Non-blocking background turn runner, Ed25519-signed auto-updater (`update.rs`), live command palette (`Ctrl+K` / `Cmd+K`), `Shift+Tab` mode cycling, `ArrowUp` prompt recall, context window gauge, and diff review with per-turn file `undo`.
 - **Live Turn Control:** Real-time mid-turn steering (`steer_turn`), throttled `ToolProgress` output streaming, end-to-end `reasoning_effort` (`off` / `low` / `medium` / `high`), and session-scoped approval grants with safe command-prefix matching.
 - **Zero-Dependency Syntax Highlighter:** Pure TypeScript tokenizer highlighting Rust, TypeScript/JavaScript, Python, Shell, JSON, TOML, YAML, SQL, and multi-vendor Network CLIs (Cisco IOS/XR/NX-OS, Huawei VRP, Juniper Junos, MikroTik RouterOS, Fortinet FortiOS, FRR) with IP/CIDR, interface, `permit`/`established`, and `deny`/`shutdown` color tokens.
 - **Interactive CLI REPL (`zerith repl`):** Multi-turn terminal session retaining warm HTTP clients, MCP tools, session grants, and slash commands (`/help`, `/model`, `/mode`, `/effort`, `/compact`, `/rewind`, `/sessions`, `/clear`, `/exit`).
 
-### 3. Heavy Software Engineering Toolkit
+### 6. Heavy Software Engineering Toolkit
 - **Fast Search (`glob`, `grep`, `ripgrep` fast-path):** Root and nested `.gitignore` filtering, `-A`/`-B`/`-C` context lines, `case_insensitive` toggles, `rg --sort path` acceleration when present, and multi-threaded Rust fallback.
 - **Atomic Batch Editing (`multi_edit`):** All-or-nothing transactional multi-hunk edits with automatic rollback on failure, CRLF preservation, unique normalized-whitespace matching fallback, ambiguity refusal, and legacy Latin-1 round-trip support.
 - **Stdio LSP Bridge (`lsp.rs`):** Native `lsp_diagnostics`, `lsp_definition`, `lsp_references`, and `lsp_symbols` across Rust, TypeScript/JavaScript, Python, Go, and C/C++.
 - **Git Worktree Isolation & Rewind:** Subagents can run isolated via `WorktreeGuard` (`git worktree`), automatically cleaning up untouched worktrees or preserving dirty ones with a `git diff --stat` report; file + conversation checkpoints restore via `zerith rewind`.
 - **Remote Targets (`--remote` & `zerith remote`):** Run sessions and `remote_shell` against `ssh://` hosts or `docker://` containers with configured aliases in `[remote.targets]` and POSIX shell/flag-injection hardening.
 
-### 4. Network Consulting Suite
+### 7. Network Consulting Suite
 - **Interactive PTY Terminals (`terminal.rs`):** ConPTY/PTY sessions with tail checks, automatic pager handling (`auto_page` for `--More--` / `---- More ----`), interruptible `Ctrl+C` (`0x03`), and the Desktop **Active Terminals** strip (`Tail`, `Ctrl+C`, `Close`).
 - **Device Inventory & Bastion SSH (`network.rs`):** Merge global and workspace `.zerith/inventory.toml` inventories with OS-keyring credentials, `net_inventory`, `net_connect` (auto disable-paging, `jump_host`, `legacy_ssh`), and multi-command `terminal_batch`.
 - **Risk Classification & Red-Flag Safety:** Automatic platform-aware classification (`ReadOnly` / `Mutation` / `Dangerous`) in `pipeline.rs` forcing explicit confirmation on destructive router/switch operations (`reload`, `write erase`, `reset bgp`, etc.) even under `Bypass` mode, alongside expanded `READ_ONLY` shell network diagnostics and RTK `network-config`/`network-table` compression.
 - **Bundled Skill:** Ships with [`bundled-skills/network-consulting/SKILL.md`](bundled-skills/network-consulting/SKILL.md).
 
-### 5. Autonomy, Memory & Messaging
+### 8. Autonomy, CLI Scheduler & Telegram Gateway
 - **Unified SQLite Store (`zerith-sessions` & `zerith-memory`):** Single transactional SQLite file with `V1–V10` schema migrations, `session_search` across past chats, and FTS5 recall combining BM25 with PT/EN stopword stripping, project-scope affinity, and recency weighting.
 - **Cron Scheduler & Daemon (`zerith schedule` / `zerith daemon`):** UTC cron expressions persisted in SQLite supporting zero-LLM-token `--no-agent` shell checks or fail-closed autonomous agent runs, minute deduplication, and Telegram failure alerts.
 - **Telegram Bot Gateway (`zerith gateway telegram`):** OS-keyring token storage (`telegram_bot_token`), fail-closed `allowed_chats` allowlist, inline-keyboard tool approval (`Permitir 1x`, `Permitir sessão`, `Negar`), and UTF-8 safe 4096-char chunking.
@@ -116,6 +132,7 @@ It combines human-in-the-loop tool governance, a native multi-account LLM gatewa
 | `zerith-mcp` | Stdio and HTTP MCP client with warm registry caching, resource expansion (`@server:res`), and per-project approval gating |
 | `zerith-tools` | Tool registry & built-ins (`read_file`, `write_file`, `edit_file`, `multi_edit`, `grep`, `glob`, `shell`, `terminal_*`, `net_*`, `lsp_*`, `remote_shell`, `session_search`, `web_*`) |
 | `zerith-plugins` | Directory plugin manifests (`plugin.json`), explicit trust workflow, hooks, bundled agents/skills/MCP |
+| `zerith-workflows` | Global SQLite DAG workflow engine, pure-Rust 5-field cron evaluator, single-node test, multi-channel HTTP dispatcher (Evolution API, WAHA, Cloud API, Telegram, Discord, Slack, Webhooks) |
 | `zerith-security` | Presets (`read-only`, `workspace-write`, `danger-full-access`), modes (`Default`, `AcceptEdits`, `Plan`, `DontAsk`, `Bypass`), compound shell parser & redaction |
 | `zerith-cli` | Single native `zerith` binary (chat, `-p` headless, `repl`, `schedule`, `daemon`, `gateway`, `remote`, admin) |
 | `zerith-desktop` | Tauri 2 + React 18/TypeScript UI with streaming turns, diff undo, active PTY strip, zero-dep highlighting, and Ed25519 self-updater |

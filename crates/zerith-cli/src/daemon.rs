@@ -80,7 +80,7 @@ fn pid_alive(pid: u32) -> bool {
     }
     #[cfg(target_os = "linux")]
     {
-        Path::new(&format!("/proc/{pid}")).exists()
+        std::path::Path::new(&format!("/proc/{pid}")).exists()
     }
     #[cfg(all(unix, not(target_os = "linux")))]
     {

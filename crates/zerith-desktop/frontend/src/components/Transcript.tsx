@@ -26,7 +26,9 @@ import {
 } from "lucide-react";
 import type { Block, ToolRow } from "../lib/turn";
 import { ZerithMark } from "./ui";
+import { FileLangBadge } from "./FileLangIcon";
 import { TurnChanges } from "./Changes";
+export { FileLangBadge };
 import { highlightCode } from "./highlight";
 import {
   parseBlocks,
@@ -627,70 +629,6 @@ function Markdown({ text, streaming }: { text: string; streaming: boolean }) {
 }
 
 const STATE_LABEL = { run: "executando", ok: "concluída", fail: "falhou" } as const;
-
-type LangMeta = { tag: string; cls: string; title: string };
-
-function fileLangMeta(path: string): LangMeta {
-  const base = path.split(/[\\/]/).pop() ?? path;
-  const lower = base.toLowerCase();
-  const ext = lower.includes(".") ? lower.split(".").pop() ?? "" : lower;
-  switch (ext) {
-    case "rs":
-      return { tag: "R", cls: "lang-rs", title: "Rust" };
-    case "ts":
-    case "tsx":
-      return { tag: "TS", cls: "lang-ts", title: "TypeScript" };
-    case "js":
-    case "jsx":
-    case "mjs":
-    case "cjs":
-      return { tag: "JS", cls: "lang-js", title: "JavaScript" };
-    case "py":
-      return { tag: "PY", cls: "lang-py", title: "Python" };
-    case "go":
-      return { tag: "GO", cls: "lang-go", title: "Go" };
-    case "json":
-    case "toml":
-    case "yaml":
-    case "yml":
-      return { tag: "{}", cls: "lang-cfg", title: ext.toUpperCase() };
-    case "css":
-    case "scss":
-      return { tag: "#", cls: "lang-css", title: "CSS" };
-    case "html":
-    case "htm":
-    case "svg":
-      return { tag: "<>", cls: "lang-html", title: ext.toUpperCase() };
-    case "md":
-    case "mdx":
-      return { tag: "M↓", cls: "lang-md", title: "Markdown" };
-    case "sh":
-    case "bash":
-    case "zsh":
-    case "ps1":
-    case "bat":
-    case "cmd":
-      return { tag: "$_", cls: "lang-sh", title: "Shell" };
-    case "rsc":
-    case "cfg":
-    case "conf":
-    case "ini":
-      return { tag: "⇄", cls: "lang-net", title: "Network Config" };
-    case "sql":
-      return { tag: "DB", cls: "lang-py", title: "SQL" };
-    default:
-      return { tag: (ext.slice(0, 2) || "F").toUpperCase(), cls: "lang-gen", title: base };
-  }
-}
-
-export function FileLangBadge({ path }: { path: string }) {
-  const meta = fileLangMeta(path);
-  return (
-    <span className={`lang-badge ${meta.cls}`} title={meta.title} aria-hidden>
-      {meta.tag}
-    </span>
-  );
-}
 
 const FILE_TOOLS = new Set([
   "read_file",

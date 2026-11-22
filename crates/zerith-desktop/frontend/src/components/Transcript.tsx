@@ -976,7 +976,7 @@ function computeFileLineRange(name: string, argsObj: Record<string, unknown> | n
   return `#L${offset}`;
 }
 
-function ToolLine({ row }: { row: ToolRow }) {
+function ToolLine({ row, sessionId }: { row: ToolRow; sessionId?: string | null }) {
   const [open, setOpen] = useState(false);
   const Icon = toolIcon(row.name);
   const parsed = parseArgs(row.args);
@@ -1006,8 +1006,10 @@ function ToolLine({ row }: { row: ToolRow }) {
   const fileBase = rawPath ? (rawPath.split(/[\\/]/).pop() ?? rawPath) : "";
   const lineRange = isFileTool ? computeFileLineRange(row.name, argsObj, row.preview) : null;
   const label = toolActionLabel(row.name);
+  const firstLine = lineRange ? Number(lineRange.match(/\d+/)?.[0]) || undefined : undefined;
   return (
     <div className={`tool ${state}` + (open ? " open" : "")}>
+      <div className="tool-row">
       <button className="tool-head" onClick={() => setOpen(!open)} aria-expanded={open} disabled={!body}>
         {!isFileTool ? (
           <span className="tool-icon">
@@ -1038,6 +1040,17 @@ function ToolLine({ row }: { row: ToolRow }) {
         </span>
         <ChevronRight size={14} strokeWidth={2} className="chev" />
       </button>
+      {isFileTool && rawPath ? (
+        <button
+          className="tool-open"
+          title="Abrir no editor (VS Code)"
+          aria-label={`Abrir ${fileBase} no editor`}
+          onClick={() => void api.openInEditor(rawPath, sessionId, firstLine).catch(() => undefined)}
+        >
+          <ExternalLink size={13} strokeWidth={2} />
+        </button>
+      ) : null}
+      </div>
       {liveTail && !open ? <pre className="tool-body live">{liveTail}</pre> : null}
       {open && body ? <pre className="tool-body">{body}</pre> : null}
     </div>
@@ -1073,7 +1086,7 @@ const AssistantBlock = memo(function AssistantBlock(props: {
         {b.tools.length > 0 ? (
           <div className="tools">
             {b.tools.map((t, idx) => (
-              <ToolLine key={`${t.id}-${idx}`} row={t} />
+              <ToolLine key={`${t.id}-${idx}`} row={t} sessionId={props.sessionId} />
             ))}
           </div>
         ) : null}

@@ -332,6 +332,7 @@ pub fn run() {
             workspace::read_image,
             workspace::open_image,
             workspace::open_url,
+            workspace::open_in_editor,
             attachments::save_attachment,
             attachments::save_file_attachment,
             attachments::attach_dropped_path,

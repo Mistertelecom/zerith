@@ -1,8 +1,8 @@
 // What one answer did to the files: the bar under it, the diff per file and
 // the undo. Data comes lazily from `turn_changes` once the answer is stored.
 import { useEffect, useState } from "react";
-import { AlertTriangle, Check, ChevronRight, FilePen, Undo2 } from "lucide-react";
-import { changesApi, type FileChange } from "../lib/api";
+import { AlertTriangle, Check, ChevronRight, ExternalLink, FilePen, Undo2 } from "lucide-react";
+import { api, changesApi, type FileChange } from "../lib/api";
 import { tr, useLang } from "../lib/i18n";
 import { FileLangBadge } from "./Transcript";
 
@@ -231,6 +231,7 @@ export function TurnChanges({ sessionId, messageId }: { sessionId: string; messa
             const on = shown === f.path;
             return (
               <div key={f.path} className={"change" + (on ? " on" : "")}>
+                <div className="tool-row">
                 <button
                   type="button"
                   className="change-row"
@@ -262,6 +263,18 @@ export function TurnChanges({ sessionId, messageId }: { sessionId: string; messa
                   )}
                   <span className={"badge change-status " + STATUS_TONE[f.status]}>{f.status}</span>
                 </button>
+                {f.status !== "apagado" ? (
+                  <button
+                    type="button"
+                    className="tool-open"
+                    title={tr(lang, "Abrir no editor (VS Code)", "Open in editor (VS Code)")}
+                    aria-label={tr(lang, `Abrir ${f.rel} no editor`, `Open ${f.rel} in editor`)}
+                    onClick={() => void api.openInEditor(f.path, sessionId).catch(() => undefined)}
+                  >
+                    <ExternalLink size={13} strokeWidth={2} />
+                  </button>
+                ) : null}
+                </div>
                 {on ? (
                   <>
                     {f.diff != null ? (

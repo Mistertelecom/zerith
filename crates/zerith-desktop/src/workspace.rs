@@ -291,6 +291,70 @@ pub async fn open_image(state: State<'_, AppState>, path: String) -> Cmd<()> {
     .map_err(|e| e.to_string())?
 }
 
+/// Opens a file from a conversation's folder in VS Code at `line` (`code -g`),
+/// or in the system's default program when `code` is not on `PATH`. Only
+/// files under a session workspace: a path the model wrote must not open
+/// anything else.
+#[tauri::command]
+pub async fn open_in_editor(
+    state: State<'_, AppState>,
+    path: String,
+    session_id: Option<String>,
+    line: Option<u32>,
+) -> Cmd<()> {
+    let root = state.root().to_path_buf();
+    let db = state.db();
+    tauri::async_runtime::spawn_blocking(move || {
+        let t = path.trim();
+        if t.starts_with("\\\\") || t.starts_with("//") {
+            return Err("caminhos UNC não são permitidos".into());
+        }
+        let p = PathBuf::from(t);
+        let p = if p.is_absolute() {
+            p
+        } else {
+            match &session_id {
+                Some(s) => crate::turn::session_workspace(&db, s).join(p),
+                None => crate::turn::last_workspace(&db).join(p),
+            }
+        };
+        let canon = p
+            .canonicalize()
+            .map_err(|_| format!("arquivo não encontrado: {t}"))?;
+        let roots = allowed_media_roots(&root, &db);
+        if !canon.is_file() || !roots.iter().any(|r| canon.starts_with(r)) {
+            return Err("só abro arquivos das pastas das conversas".into());
+        }
+        let native = reveal_path(&canon);
+        let target = match line {
+            Some(n) if n > 0 => format!("{}:{n}", native.display()),
+            _ => native.display().to_string(),
+        };
+        // `code` is a .cmd on Windows: it has to go through cmd. The path is
+        // canonical and checked above, and `"` cannot occur in a Windows path.
+        let code = if cfg!(windows) {
+            let mut c = std::process::Command::new("cmd");
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                c.raw_arg(format!("/C code -g \"{target}\""));
+                c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+            }
+            c.status()
+        } else {
+            std::process::Command::new("code")
+                .args(["-g", &target])
+                .status()
+        };
+        match code {
+            Ok(s) if s.success() => Ok(()),
+            _ => wire::reveal(&native),
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Which turns this conversation can be rewound to.
 #[tauri::command]
 pub async fn checkpoints(state: State<'_, AppState>, session_id: String) -> Cmd<Vec<i64>> {

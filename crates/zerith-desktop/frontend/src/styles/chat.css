@@ -460,6 +460,30 @@
 .tool-head:hover:not(:disabled) {
   background: var(--hover);
 }
+.tool-row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.tool-open {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 28px;
+  height: 28px;
+  border-radius: var(--r-sm);
+  color: var(--label-tertiary);
+  opacity: 0;
+  transition: opacity var(--t-base) var(--ease), background var(--t-base) var(--ease);
+}
+.tool-row:hover .tool-open,
+.tool-open:focus-visible {
+  opacity: 1;
+}
+.tool-open:hover {
+  background: var(--hover);
+  color: var(--label-primary);
+}
 .tool-head:disabled {
   cursor: default;
 }

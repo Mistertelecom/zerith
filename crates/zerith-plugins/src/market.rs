@@ -401,6 +401,7 @@ mod tests {
             .collect();
         for want in [
             "zerith-infra",
+            "zerith-dev",
             "superpowers",
             "context7",
             "ast-grep",

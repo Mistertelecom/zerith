@@ -1290,10 +1290,22 @@ export default function App() {
         setPaletteOpen(false);
         return;
       }
+      // Esc stops the running answer, unless a dialog or popup owns the key.
+      if (
+        e.key === "Escape" &&
+        !e.defaultPrevented &&
+        turn.busy &&
+        selected &&
+        !document.querySelector('[role="dialog"], [role="listbox"], [role="menu"]')
+      ) {
+        e.preventDefault();
+        cancelRequestedRef.current.add(selected);
+        void api.cancelTurn(selected).catch(() => undefined);
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [paletteOpen]);
+  }, [paletteOpen, turn.busy, selected]);
 
   const exportCurrentReport = useCallback(() => {
     if (!selected) {

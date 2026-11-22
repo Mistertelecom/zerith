@@ -62,10 +62,10 @@ pub fn spill(
         std::fs::create_dir_all(dir)?;
     }
     std::fs::write(&path, full)?;
-    let head: String = full.chars().take(SPILL_HEAD_CHARS).collect();
+    let (head, tail) = zerith_tools::head_tail(full, SPILL_HEAD_CHARS);
     let lines = full.lines().count();
     let shown = format!(
-        "{head}\n\n[saída completa: {} ({lines} linhas); use read_file com offset/limit ou grep]",
+        "{head}\n\n[saída completa: {} ({lines} linhas), meio omitido; use read_file com offset/limit ou grep]\n\n{tail}",
         path.display()
     );
     Ok((path, shown))

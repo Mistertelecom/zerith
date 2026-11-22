@@ -261,9 +261,13 @@ fn plan_mode_denies_shell_and_writes() {
 
 #[test]
 fn big_outputs_are_truncated_with_a_note() {
-    let s = truncate("x".repeat(50), 10);
-    assert!(s.starts_with("xxxxxxxxxx\n"));
-    assert!(s.contains("10 de 50"));
+    let s = truncate(format!("{}error: falhou", "x".repeat(50)), 30);
+    assert!(s.starts_with("xxxxxxxxxxxxxxxxxxxx\n"));
+    assert!(s.contains("30 de 63"));
+    assert!(
+        s.ends_with("\n\nor: falhou"),
+        "o fim, onde ficam os erros, precisa sobrar: {s}"
+    );
 }
 
 #[test]

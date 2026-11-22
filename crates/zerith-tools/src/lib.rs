@@ -361,14 +361,25 @@ impl Registry {
     }
 }
 
-/// Keeps the first `cap` chars and says how much was dropped.
+/// Keeps the start and the end (where build and test errors land) within
+/// `cap` chars, and says how much was dropped from the middle.
 pub fn truncate(s: String, cap: usize) -> String {
     let total = s.chars().count();
     if total <= cap {
         return s;
     }
-    let head: String = s.chars().take(cap).collect();
-    format!("{head}\n\n[saída truncada: {cap} de {total} caracteres; refine o pedido]")
+    let (head, tail) = head_tail(&s, cap);
+    format!("{head}\n\n[saída truncada: {cap} de {total} caracteres, meio omitido; refine o pedido]\n\n{tail}")
+}
+
+/// First and last chars of `s`, two thirds of `cap` at the head.
+pub fn head_tail(s: &str, cap: usize) -> (String, String) {
+    let total = s.chars().count();
+    let head_n = cap * 2 / 3;
+    let tail_n = cap - head_n;
+    let head = s.chars().take(head_n).collect();
+    let tail = s.chars().skip(total.saturating_sub(tail_n)).collect();
+    (head, tail)
 }
 
 #[cfg(test)]

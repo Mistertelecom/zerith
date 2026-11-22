@@ -693,11 +693,16 @@ fn shell_exec(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>, snapshot: bool) 
         .map(|c| c.to_string())
         .unwrap_or_else(|| "sinal".into());
     let mut text = format!("exit {code}\n");
-    if !stdout.is_empty() {
-        text.push_str(&format!("--- stdout\n{stdout}"));
+    // On failure stderr goes first: if the output is cut, the error survives.
+    let mut parts = [("stdout", &stdout), ("stderr", &stderr)];
+    if !status.success() {
+        parts.swap(0, 1);
     }
-    if !stderr.is_empty() {
-        text.push_str(&format!("\n--- stderr\n{stderr}"));
+    for (name, body) in parts.iter().filter(|(_, b)| !b.is_empty()) {
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&format!("--- {name}\n{body}"));
     }
     if status.success() && (killed_descendant || looks_like_detached_launch(cmd)) {
         text.push_str("\n[AVISO] O comando deixou ou tentou abrir um processo filho/janela em segundo plano, que foi ENCERRADO automaticamente ao fim do shell em primeiro plano. Para abrir janelas GUI ou servidores contínuos, execute o comando direto (sem `start`/`nohup`) UMA ÚNICA VEZ com `run_in_background: true`.");

@@ -176,6 +176,19 @@ fn glob_and_grep_walk_the_tree_and_skip_target() {
         .call("grep", &json!({"query": "main", "glob": "*.rs"}), &c)
         .unwrap();
     assert_eq!(hits, "src/sub/a.rs:1: fn Main() {}");
+    std::fs::write(
+        dir.path().join("src/d.rs"),
+        "fn f() {
+    let alvo = 1;
+}
+",
+    )
+    .unwrap();
+    let indented = r.call("grep", &json!({"query": "alvo"}), &c).unwrap();
+    assert!(
+        indented.ends_with(":2:     let alvo = 1;"),
+        "a indentação é o que o edit_file precisa copiar: {indented}"
+    );
 }
 
 #[test]

@@ -333,7 +333,7 @@ fn parse_rg_content_line(line: &str) -> Option<(String, &str, char, &str)> {
         if j > i + 1 && j < bytes.len() && bytes[j] == sep {
             let file = line[..i].replace('\\', "/");
             let ln = &line[i + 1..j];
-            let body = line[j + 1..].trim();
+            let body = line[j + 1..].trim_end();
             return Some((file, ln, sep as char, body));
         }
     }
@@ -517,7 +517,7 @@ fn scan_file(
             if re.is_match(line) {
                 hits += 1;
                 if mode == "content" {
-                    out.push(format!("{shown}:{}: {}", i + 1, line.trim()));
+                    out.push(format!("{shown}:{}: {}", i + 1, line.trim_end()));
                 } else if mode == "files" {
                     return (out, 1);
                 }
@@ -561,7 +561,7 @@ fn scan_file(
             out.push("--".to_string());
         }
         let sep = if matched[i] { ':' } else { '-' };
-        out.push(format!("{shown}{sep}{}{sep} {}", i + 1, all[i].trim()));
+        out.push(format!("{shown}{sep}{}{sep} {}", i + 1, all[i].trim_end()));
         prev_emitted = Some(i);
     }
     (out, hits)

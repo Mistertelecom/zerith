@@ -215,11 +215,13 @@ pub fn compress_tool_output(tool_name: &str, text: &str) -> RtkOutcome {
     out
 }
 
-/// Tools whose output is raw command/terminal text.
+/// Tools whose output is raw command/terminal text. `grep` and `glob` are
+/// not: they already take `head_limit`/`output_mode`, and cutting matches
+/// there makes "find every call site" miss sites the model asked for.
 fn is_command_tool(name: &str) -> bool {
     matches!(
         name,
-        "shell" | "sh" | "remote_shell" | "ssh" | "ssh_command" | "grep" | "glob" | "list_dir"
+        "shell" | "sh" | "remote_shell" | "ssh" | "ssh_command" | "list_dir"
     ) || name.starts_with("terminal_")
         || name.starts_with("net_")
 }
@@ -1519,7 +1521,8 @@ mod tests {
             ));
         }
 
-        let out = compress_tool_output("grep", &s);
+        assert_eq!(compress_tool_output("grep", &s).filter, None);
+        let out = compress_tool_output("shell", &s);
         assert_eq!(out.filter, Some("grep"));
         assert!(out.saved_bytes > 0);
         assert!(

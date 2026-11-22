@@ -442,24 +442,29 @@ fn a_crlf_file_takes_a_multi_line_edit() {
     assert_eq!(after, "um\r\nDOIS\r\nmeio\r\ntres\r\n", "{after:?}");
 }
 
-/// A legacy Latin-1 file still reads; editing it says why it cannot.
+/// A legacy Latin-1 file reads and edits with the same decoding: an accented
+/// `old_string` copied from read_file is found by edit_file, and the bytes
+/// on disk stay Latin-1.
 #[test]
-fn a_non_utf8_file_reads_and_refuses_to_be_edited() {
+fn a_latin1_file_reads_and_edits_with_the_same_accents() {
     let dir = scratch();
     let p = policy(dir.path(), Mode::Bypass);
     std::fs::write(dir.path().join("velho.txt"), b"N\xfamero 1\n").unwrap();
-    let text = Registry::new()
+    let r = Registry::new();
+    let text = r
         .call("read_file", &json!({"path": "velho.txt"}), &ctx(&p))
-        .expect("a CP1252 file is readable");
-    assert!(text.contains("mero"), "{text}");
-    let err = Registry::new()
-        .call(
-            "edit_file",
-            &json!({"path": "velho.txt", "old_string": "mero", "new_string": "x"}),
-            &ctx(&p),
-        )
-        .unwrap_err();
-    assert!(err.to_string().contains("UTF-8"), "{err}");
+        .expect("a Latin-1 file is readable");
+    assert!(text.contains("Número 1"), "{text}");
+    r.call(
+        "edit_file",
+        &json!({"path": "velho.txt", "old_string": "Número 1", "new_string": "Número 2"}),
+        &ctx(&p),
+    )
+    .expect("the accent read is the accent edited");
+    assert_eq!(
+        std::fs::read(dir.path().join("velho.txt")).unwrap(),
+        b"N\xfamero 2\n"
+    );
 }
 
 /// `ping`/`dir` write the OEM code page: read as UTF-8, `Número` came out

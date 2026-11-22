@@ -383,10 +383,15 @@ fn oem(bytes: &[u8]) -> String {
 fn read_file(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
     let path = ctx.resolve(str_arg(args, "path")?);
     let raw = std::fs::read(&path)?;
-    // Legacy pt-BR files are CP1252/Latin-1: a lossy read still reads, an
-    // Input/output error does not.
+    // Legacy pt-BR files are Latin-1/CP1252, not the console's OEM page:
+    // decode them the same way multi_edit/edit_file write them back, so an
+    // accented `old_string` copied from here is found there.
     let lossy = std::str::from_utf8(&raw).is_err();
-    let text = decode(&raw);
+    let text = if lossy {
+        raw.iter().map(|&b| b as char).collect()
+    } else {
+        decode(&raw)
+    };
     let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
     exec.host.note_read(&path);
     let offset = args["offset"].as_u64().unwrap_or(1).max(1) as usize;
@@ -394,7 +399,7 @@ fn read_file(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String>
     let total = text.lines().count();
     if lossy {
         eprintln!(
-            "zerith: {} não está em UTF-8, lido com a página de código do sistema",
+            "zerith: {} não está em UTF-8, lido como Latin-1",
             path.display()
         );
     }

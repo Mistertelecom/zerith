@@ -21,12 +21,14 @@ pub(super) fn edit_file(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Res
         ));
     }
     let raw = std::fs::read(&path)?;
-    let text = String::from_utf8(raw).map_err(|_| {
-        ToolError::Failed(format!(
-            "{} não está em UTF-8 (arquivo antigo em CP1252/Latin-1): converta antes de editar",
-            path.display()
-        ))
-    })?;
+    let Ok(text) = String::from_utf8(raw) else {
+        // Legacy Latin-1 file: multi_edit already reads and writes it byte for byte.
+        let one = serde_json::json!({
+            "path": args["path"],
+            "edits": [{"old_string": old, "new_string": new, "replace_all": all}],
+        });
+        return multi_edit(&one, ctx, exec);
+    };
     // A Windows file uses CRLF while the model, which sees lines through
     // `.lines()`, sends LF. The text as it came is tried first (the file keeps
     // its own style); the CRLF retry is what made a multi-line edit of this

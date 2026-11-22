@@ -313,6 +313,7 @@ pub fn run(
         }
         expanded
     };
+    let prompt = zerith_tools::expand_file_mentions(&prompt, &setup.workspace);
 
     let guards = policy
         .as_mut()

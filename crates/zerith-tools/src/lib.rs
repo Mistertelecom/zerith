@@ -382,5 +382,63 @@ pub fn head_tail(s: &str, cap: usize) -> (String, String) {
     (head, tail)
 }
 
+/// Bytes of one `@file` attached to a prompt, and of all of them together.
+const MENTION_FILE_CAP: usize = 100_000;
+const MENTION_TOTAL_CAP: usize = 250_000;
+
+/// Appends the content of every `@path` in `text` that names a file inside
+/// `workspace`, as an `<arquivo>` block, so the model starts with it instead
+/// of spending a step on read_file. `@server:resource` (MCP) and paths that
+/// escape the workspace are left alone; a file too big is named, not inlined.
+pub fn expand_file_mentions(text: &str, workspace: &Path) -> String {
+    let Ok(root) = workspace.canonicalize() else {
+        return text.to_string();
+    };
+    let mut out = text.to_string();
+    let mut seen: Vec<PathBuf> = Vec::new();
+    let mut total = 0usize;
+    for word in text.split_whitespace() {
+        let Some(rel) = word.strip_prefix('@') else {
+            continue;
+        };
+        let rel = rel.trim_end_matches([',', '.', ';', ')', '?', '!']);
+        if rel.is_empty() || rel.contains(':') && !Path::new(rel).is_absolute() {
+            continue;
+        }
+        let Ok(canon) = root.join(rel).canonicalize() else {
+            continue;
+        };
+        if !canon.starts_with(&root) || !canon.is_file() || seen.contains(&canon) {
+            continue;
+        }
+        seen.push(canon.clone());
+        let size = canon
+            .metadata()
+            .map(|m| m.len() as usize)
+            .unwrap_or(usize::MAX);
+        if size > MENTION_FILE_CAP || total + size > MENTION_TOTAL_CAP {
+            out.push_str(&format!(
+                "\n\n<arquivo caminho=\"{rel}\">[{size} bytes: grande demais para anexar; use read_file com offset/limit]</arquivo>"
+            ));
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&canon) else {
+            continue;
+        };
+        if bytes.contains(&0) {
+            continue; // binary
+        }
+        total += size;
+        let body = match String::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(e) => e.into_bytes().iter().map(|&b| b as char).collect(),
+        };
+        out.push_str(&format!(
+            "\n\n<arquivo caminho=\"{rel}\">\n{body}\n</arquivo>"
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests;

@@ -531,3 +531,19 @@ fn the_shell_hook_fires_only_for_commands_that_may_mutate() {
     .unwrap();
     assert_eq!(*seen.lock().unwrap(), vec![dir.path().to_path_buf(); 2]);
 }
+
+#[test]
+fn at_file_mentions_attach_workspace_files_only() {
+    let dir = scratch();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/a.rs"), "fn a() {}").unwrap();
+    let out = super::expand_file_mentions("veja @src/a.rs, e @nada.rs e @srv:doc", dir.path());
+    assert!(
+        out.contains("<arquivo caminho=\"src/a.rs\">\nfn a() {}\n</arquivo>"),
+        "{out}"
+    );
+    assert!(!out.contains("nada.rs\">"), "{out}");
+    assert!(!out.contains("srv:doc\">"), "{out}");
+    let outside = super::expand_file_mentions("@../fora.txt", &dir.path().join("src"));
+    assert_eq!(outside, "@../fora.txt");
+}

@@ -340,6 +340,12 @@ export function borrowIds(blocks: Block[], list: ChatMessage[], stored?: number 
  * one answer (text of every step, its tool calls as tool lines, the final row's
  * id), so a reopened chat shows tool output as tool lines, not as answers, and
  * a step that only called tools leaves no empty bubble. */
+/** The prompt as typed: `@file` / `@server:resource` contents the host
+ * appended for the model are not shown back in the bubble. */
+export function stripAttachments(text: string): string {
+  return text.replace(/\n\n<(arquivo|recurso) [^>]*>[\s\S]*?<\/\1>/g, "");
+}
+
 export function toBlocks(list: ChatMessage[]): Block[] {
   const out: Block[] = [];
   let a: (Block & { kind: "assistant" }) | null = null;
@@ -348,7 +354,7 @@ export function toBlocks(list: ChatMessage[]): Block[] {
   const calls = new Map<string, string>();
   for (const m of list) {
     if (m.role === "user") {
-      out.push({ kind: "user", text: m.content, id: m.id });
+      out.push({ kind: "user", text: stripAttachments(m.content), id: m.id });
       a = null;
       continue;
     }

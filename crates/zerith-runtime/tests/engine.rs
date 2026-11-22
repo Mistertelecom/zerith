@@ -316,6 +316,12 @@ fn the_step_limit_is_recorded_as_max_steps() {
     r.unwrap();
     let t = &store.turn_summary(&sid).unwrap()[0];
     assert_eq!(t.ended.as_ref().unwrap().reason, "max_steps");
+    let msgs = store.messages(&sid, 100, 0).unwrap();
+    assert!(
+        msgs.iter()
+            .any(|m| m.content.contains("Resta 1 passo de 2")),
+        "o modelo precisa ser avisado antes do último passo"
+    );
 }
 
 #[test]

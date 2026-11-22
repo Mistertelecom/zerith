@@ -342,7 +342,7 @@ pub struct AgentOptions<'a> {
     pub parent_checkpoint: Option<Arc<checkpoints::Checkpoint>>,
 }
 
-pub const DEFAULT_MAX_STEPS: usize = 25;
+pub const DEFAULT_MAX_STEPS: usize = 80;
 pub const DEFAULT_MAX_PARALLEL_TOOLS: usize = 4;
 
 impl Default for AgentOptions<'_> {
@@ -1113,6 +1113,16 @@ fn turn_body(
                 }
                 record(store, session_id, call, &outcome.output, &mut hist)?;
                 let sig = (call.name.clone(), call.arguments.clone());
+                // Edit, then rerun the same test: that is the fix loop, not a stuck one.
+                if outcome.ok
+                    && matches!(
+                        call.name.as_str(),
+                        "write_file" | "edit_file" | "multi_edit"
+                    )
+                {
+                    fail_counts.retain(|(name, _), _| name != "shell");
+                    exec_counts.retain(|(name, _), _| name != "shell");
+                }
                 if outcome.ok {
                     if matches!(
                         call.name.as_str(),
@@ -1124,7 +1134,7 @@ fn turn_body(
                             .or_insert(1);
                         if *count >= 3 {
                             context.push(format!(
-                                "[Loop Detectado] A ferramenta `{}` foi executada {}x com os mesmos argumentos neste turno. NÃO repita a mesma ação — verifique o resultado anterior ou responda ao usuário.",
+                                "[Loop Detectado] A ferramenta `{}` foi executada {}x com os mesmos argumentos neste turno sem nenhuma edição entre elas. NÃO repita a mesma ação: use o resultado anterior ou responda ao usuário.",
                                 call.name, *count
                             ));
                         }
@@ -1136,7 +1146,7 @@ fn turn_body(
                         .or_insert(1);
                     if *count >= 2 {
                         context.push(format!(
-                            "[Loop Detectado] A chamada `{}` com os mesmos argumentos falhou {}x neste turno. PARE de repetir o mesmo comando. Se for app GUI ou servidor contínuo, use `run_in_background: true` uma única vez ou explique o bloqueio ao usuário.",
+                            "[Loop Detectado] A chamada `{}` com os mesmos argumentos falhou {}x neste turno sem nenhuma edição entre elas. Não repita sem mudar algo: leia o erro, corrija a causa ou explique o bloqueio ao usuário. Se travou por ser app GUI ou servidor contínuo, use `run_in_background: true` uma única vez.",
                             call.name, *count
                         ));
                     }
@@ -1168,6 +1178,12 @@ fn turn_body(
                 return Err(ProviderError::Cancelled.into());
             }
             i = j;
+        }
+        // One request left: ask for a wrap-up instead of stopping mid-sentence.
+        if step + 1 == max_steps && max_steps > 1 {
+            context.push(format!(
+                "[Limite] Resta 1 passo de {max_steps}. Não chame mais ferramentas: resuma o que fez, o que falta e como continuar."
+            ));
         }
         // Extra context comes after every result of the step: a user message
         // between two tool results would break their pairing.

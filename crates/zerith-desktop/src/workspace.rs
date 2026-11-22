@@ -257,6 +257,7 @@ pub async fn read_image(state: State<'_, AppState>, path: String) -> Cmd<String>
     .map_err(|e| e.to_string())?
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 fn strip_verbatim_str(s: &str) -> Option<String> {
     if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
         Some(format!(r"\\{rest}"))

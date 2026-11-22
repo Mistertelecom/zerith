@@ -1438,6 +1438,7 @@ mod tests {
         };
 
         let mut raw_cmd = if cfg!(windows) {
+            #[cfg_attr(not(windows), allow(unused_mut))]
             let mut c = Command::new("cmd");
             #[cfg(windows)]
             {

@@ -1449,7 +1449,7 @@ mod worktree_tests {
         settings.accounts.push(AccountEntry {
             id: "or-acc".into(),
             provider: "openrouter".into(),
-            base_url: Some(or_url),
+            base_url: Some(or_url.clone()),
             protocol: Some(WireProtocol::OpenAi),
             enabled: true,
             ..Default::default()
@@ -1464,7 +1464,7 @@ mod worktree_tests {
         });
 
         let mut fallback_cfg = ProviderConfig::new(ProviderKind::OpenAi).with_key("k");
-        fallback_cfg.base_url = "http://127.0.0.1:9/v1".into();
+        fallback_cfg.base_url = or_url; // same URL: the account inherits key "k", so CI needs no real key
         fallback_cfg.protocol = Protocol::OpenAi;
 
         let rt = Runtime {

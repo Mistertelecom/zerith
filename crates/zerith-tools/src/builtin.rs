@@ -513,6 +513,10 @@ pub fn shell_command(cmd: &str) -> Command {
     if let Some(dir) = zerith_core::Paths::resolve().bundled_tools() {
         c.env("PATH", path_with(std::env::var_os("PATH"), &dir));
     }
+    // Output goes to a model and a <pre>, not a terminal: color codes are noise.
+    c.env("NO_COLOR", "1")
+        .env("CARGO_TERM_COLOR", "never")
+        .env("FORCE_COLOR", "0");
     c
 }
 

@@ -812,6 +812,7 @@ fn execute_cli_turn(
                     if ok { "ok" } else { "erro" }
                 ),
                 RunEvent::Steered { text } => eprintln!("\n[steer] {text}"),
+                RunEvent::SkillsLoaded { names } => eprintln!("[skill] {}", names.join(", ")),
                 RunEvent::Route {
                     account_id,
                     provider,

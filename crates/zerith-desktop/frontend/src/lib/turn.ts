@@ -169,6 +169,20 @@ export function applyEvent(prev: TurnState, ev: TurnEvent): TurnState {
       }
       return state;
     }
+    case "skillsLoaded": {
+      const a = assistant(state);
+      a.tools = [
+        ...a.tools,
+        ...ev.names.map((name, i) => ({
+          id: `skill-preload-${a.tools.length + i}`,
+          name: "skill",
+          args: JSON.stringify({ name }),
+          ok: true,
+          preview: "Pré-carregada: o pedido combina com esta skill.",
+        })),
+      ];
+      return state;
+    }
     case "steered":
       state.blocks = [...state.blocks, { kind: "note", text: `Direcionado: ${ev.text}` }];
       return state;

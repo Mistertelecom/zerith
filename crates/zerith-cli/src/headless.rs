@@ -738,6 +738,10 @@ fn stream_event_json(e: RunEvent) -> Option<serde_json::Value> {
             "type": "steered",
             "text": text,
         }),
+        RunEvent::SkillsLoaded { names } => serde_json::json!({
+            "type": "skills_loaded",
+            "names": names,
+        }),
         _ => return None,
     })
 }

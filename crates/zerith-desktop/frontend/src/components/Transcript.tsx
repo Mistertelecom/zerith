@@ -2,6 +2,7 @@ import { Fragment, memo, useEffect, useId, useMemo, useRef, useState, type React
 import { api, learnApi, type LearnedItem } from "../lib/api";
 import {
   AlertTriangle,
+  BookOpen,
   Bot,
   Brain,
   Check,
@@ -440,6 +441,7 @@ function MdImage({ src, alt }: { src: string; alt: string }) {
 
 // First match wins, so web_search is a Globe before "search" makes it a lens.
 const TOOL_ICONS: [RegExp, LucideIcon][] = [
+  [/^skill/, BookOpen],
   [/todo/, ListTodo],
   [/web|fetch|http|url|browse/, Globe],
   [/bash|shell|exec|command|terminal|powershell/, Terminal],
@@ -455,7 +457,7 @@ export function toolIcon(name: string): LucideIcon {
   return TOOL_ICONS.find(([re]) => re.test(n))?.[1] ?? Wrench;
 }
 
-const ARG_KEYS = ["path", "file_path", "filePath", "pattern", "command", "cmd", "url", "query", "glob", "description", "prompt"];
+const ARG_KEYS = ["path", "file_path", "filePath", "pattern", "command", "cmd", "url", "query", "glob", "description", "prompt", "name"];
 
 function parseArgs(args: string): unknown {
   try {
@@ -941,6 +943,7 @@ function toolActionLabel(name: string): string {
       return "Executed";
     case "agent":
       return "Delegated";
+    case "skill":
     case "skill_load":
       return "Loaded skill";
     case "memory_save":
@@ -1077,10 +1080,9 @@ const AssistantBlock = memo(function AssistantBlock(props: {
         {b.text ? (
           <Markdown text={b.text} streaming={b.streaming} />
         ) : thinking && !b.reasoning ? (
-          <span className="typing" role="status" aria-label="Respondendo">
-            <span />
-            <span />
-            <span />
+          <span className="thinking-live" role="status">
+            <Brain size={14} strokeWidth={2} />
+            <span className="think-label">Pensando…</span>
           </span>
         ) : null}
         {b.error ? (

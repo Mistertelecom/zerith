@@ -568,6 +568,12 @@ fn turn_body(
     // The model has the skill tool exactly when the registry offers it.
     let skill_tool = agent.tools.is_some_and(|r| r.get("skill").is_some());
     let mut prompt_ctx = crate::build_prompt_context(title, ctx, skill_tool, session_id, prompt);
+    if let Some(r) = prompt_ctx.dynamic_reminder.as_deref() {
+        let names = crate::preloaded_skill_names(r);
+        if !names.is_empty() {
+            on_event(RunEvent::SkillsLoaded { names });
+        }
+    }
     if let Some(r) = agent.tools {
         prompt_ctx.static_system.push_str(&crate::tool_guidance(r));
     }

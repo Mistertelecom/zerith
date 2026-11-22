@@ -35,6 +35,46 @@ fn max_output(model: &str) -> u32 {
     }
 }
 
+/// How a Claude model takes thinking and effort.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeGen {
+    /// Before 4.6: `thinking: {type: "enabled", budget_tokens}`.
+    Legacy,
+    /// 4.6: adaptive thinking, effort low/medium/high/max.
+    Adaptive,
+    /// 4.7 and later, Fable, Mythos: adaptive, all five effort levels, no
+    /// sampling parameters, reasoning hidden unless `display` asks for it.
+    Current,
+}
+
+/// Reads the generation from ids like `claude-opus-4-7`, `claude-sonnet-4.6`,
+/// `anthropic.claude-haiku-5-5` or `claude-fable-5-2`. Unknown names (and the
+/// old `claude-3-5-sonnet` order) are treated as legacy, the safe request.
+fn claude_gen(model: &str) -> ClaudeGen {
+    let m = model.to_ascii_lowercase();
+    if m.contains("fable") || m.contains("mythos") {
+        return ClaudeGen::Current;
+    }
+    let Some(rest) = ["opus", "sonnet", "haiku"]
+        .iter()
+        .find_map(|f| m.split_once(f).map(|(_, r)| r))
+    else {
+        return ClaudeGen::Legacy;
+    };
+    let nums: Vec<u32> = rest
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|s| !s.is_empty() && s.len() <= 2)
+        .take(2)
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    match nums.as_slice() {
+        [major, ..] if *major >= 5 => ClaudeGen::Current,
+        [4, minor, ..] if *minor >= 7 => ClaudeGen::Current,
+        [4, 6, ..] => ClaudeGen::Adaptive,
+        _ => ClaudeGen::Legacy,
+    }
+}
+
 pub(crate) fn body(req: &ChatRequest, stream: bool) -> Value {
     let mut system = Vec::new();
     let mut messages: Vec<Value> = Vec::new();
@@ -141,19 +181,57 @@ pub(crate) fn body(req: &ChatRequest, stream: bool) -> Value {
     let has_unsigned_tool_turn = req.messages[loop_start..].iter().any(|m| {
         m.role == Role::Assistant && !m.tool_calls.is_empty() && m.thinking_blocks.is_empty()
     });
-    if !has_unsigned_tool_turn {
-        if let Some(budget) = crate::thinking_budget(req.reasoning_effort.as_deref()) {
-            // Anthropic API rejects `temperature` when extended thinking is active
-            // and requires `max_tokens > budget_tokens`.
-            if let Some(obj) = b.as_object_mut() {
-                obj.remove("temperature");
+    let gen = claude_gen(&req.model);
+    if gen == ClaudeGen::Current {
+        // 4.7+ (and Fable/Mythos) reject sampling parameters outright.
+        if let Some(obj) = b.as_object_mut() {
+            obj.remove("temperature");
+        }
+    }
+    let effort = req.reasoning_effort.as_deref();
+    match gen {
+        // Adaptive thinking: the model decides how much to think and
+        // `output_config.effort` sets the depth. Effort works without thinking,
+        // so it is sent even when a replayed tool turn keeps thinking off.
+        ClaudeGen::Current | ClaudeGen::Adaptive => {
+            let accepted: &[&'static str] = if gen == ClaudeGen::Current {
+                &crate::EFFORT_LEVELS
+            } else {
+                // 4.6 has no `xhigh`: it goes down to `high`.
+                &["low", "medium", "high", "max"]
+            };
+            if let Some(e) = crate::clamp_effort(effort, accepted) {
+                b["output_config"] = json!({"effort": e});
+                if !has_unsigned_tool_turn {
+                    if let Some(obj) = b.as_object_mut() {
+                        obj.remove("temperature");
+                    }
+                    // 4.7+ hide the reasoning by default; ask for the summary
+                    // so the chat can show what the model is thinking.
+                    b["thinking"] = if gen == ClaudeGen::Current {
+                        json!({"type": "adaptive", "display": "summarized"})
+                    } else {
+                        json!({"type": "adaptive"})
+                    };
+                }
             }
-            let current_max = b["max_tokens"].as_u64().unwrap_or(0);
-            let floor = u64::from(budget).saturating_add(1024);
-            if current_max < floor {
-                b["max_tokens"] = json!(floor);
+        }
+        ClaudeGen::Legacy => {
+            if !has_unsigned_tool_turn {
+                if let Some(budget) = crate::thinking_budget(effort) {
+                    // Extended thinking forbids `temperature` and needs
+                    // `max_tokens > budget_tokens`.
+                    if let Some(obj) = b.as_object_mut() {
+                        obj.remove("temperature");
+                    }
+                    let current_max = b["max_tokens"].as_u64().unwrap_or(0);
+                    let floor = u64::from(budget).saturating_add(1024);
+                    if current_max < floor {
+                        b["max_tokens"] = json!(floor);
+                    }
+                    b["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
+                }
             }
-            b["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
         }
     }
     if !req.tools.is_empty() {
@@ -833,6 +911,55 @@ mod tests {
             json!(0.4_f32),
             "temperature stays intact when thinking is omitted"
         );
+    }
+
+    #[test]
+    fn claude_generation_is_read_from_the_model_id() {
+        for m in [
+            "claude-opus-4-7",
+            "claude-opus-5-5",
+            "claude-sonnet-5",
+            "claude-fable-5-2",
+            "anthropic.claude-haiku-5-5",
+            "claude-opus-4.8",
+        ] {
+            assert_eq!(claude_gen(m), ClaudeGen::Current, "{m}");
+        }
+        assert_eq!(claude_gen("claude-sonnet-4-6"), ClaudeGen::Adaptive);
+        for m in [
+            "claude-sonnet-4-5",
+            "claude-haiku-4-5",
+            "claude-3-5-sonnet-20241022",
+            "claude-sonnet-4-5-20250929",
+            "qwen-max",
+        ] {
+            assert_eq!(claude_gen(m), ClaudeGen::Legacy, "{m}");
+        }
+    }
+
+    #[test]
+    fn current_claude_gets_adaptive_thinking_with_summary_and_every_effort() {
+        let req = ChatRequest::new("claude-opus-5-5", vec![ChatMessage::user("oi")])
+            .temperature(0.4)
+            .reasoning_effort("max");
+        let b = body(&req, true);
+        assert_eq!(b["output_config"]["effort"], "max");
+        assert_eq!(
+            b["thinking"],
+            json!({"type": "adaptive", "display": "summarized"})
+        );
+        assert!(
+            b.get("temperature").is_none(),
+            "4.7+ reject sampling params"
+        );
+        assert!(b["thinking"].get("budget_tokens").is_none());
+
+        // 4.6 has no xhigh: lowered to high.
+        let req = ChatRequest::new("claude-sonnet-4-6", vec![ChatMessage::user("oi")])
+            .reasoning_effort("xhigh");
+        let b = body(&req, true);
+        assert_eq!(b["output_config"]["effort"], "high");
+        assert_eq!(b["thinking"], json!({"type": "adaptive"}));
     }
 
     #[test]

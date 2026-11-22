@@ -402,7 +402,22 @@
   background: var(--hover);
   color: var(--label-secondary);
 }
-.think.live .think-label {
+.think.live .think-label,
+.thinking-live .think-label {
+  animation: breathe 1.6s var(--ease) infinite;
+}
+/* Shown while the model thinks and nothing has streamed yet. */
+.thinking-live {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 28px;
+  color: var(--label-tertiary);
+  font-size: var(--fs-ui);
+  font-weight: 550;
+}
+.think.live .think-head svg,
+.thinking-live svg {
   animation: breathe 1.6s var(--ease) infinite;
 }
 .think-body {

@@ -78,8 +78,12 @@ pub(crate) fn body(req: &ChatRequest, stream: bool) -> Value {
             })
             .collect();
     }
-    if let Some(e) = crate::normalize_reasoning_effort(req.reasoning_effort.as_deref()) {
-        b["reasoning"] = json!({"effort": e});
+    // Codex models take low/medium/high (some also xhigh; `high` is safe on all).
+    // `summary: auto` streams a readable summary of the reasoning to the chat.
+    if let Some(e) =
+        crate::clamp_effort(req.reasoning_effort.as_deref(), &["low", "medium", "high"])
+    {
+        b["reasoning"] = json!({"effort": e, "summary": "auto"});
     }
     if let Some(key) = req.prompt_cache_key.as_deref().filter(|k| !k.is_empty()) {
         b["prompt_cache_key"] = json!(key);

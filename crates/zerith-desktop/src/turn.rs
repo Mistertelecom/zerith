@@ -125,6 +125,9 @@ pub enum TurnEvent {
     Steered {
         text: String,
     },
+    SkillsLoaded {
+        names: Vec<String>,
+    },
     /// The permission mode changed mid-turn (the plan was approved, or the
     /// model entered plan). `mode` is spelled like `send_turn`'s `mode` arg,
     /// so the window stores it and sends it back on the next turn.
@@ -222,6 +225,7 @@ fn shape(ev: RunEvent) -> Option<TurnEvent> {
         },
         RunEvent::ToolProgress { tool, chunk } => TurnEvent::ToolProgress { tool, chunk },
         RunEvent::Steered { text } => TurnEvent::Steered { text },
+        RunEvent::SkillsLoaded { names } => TurnEvent::SkillsLoaded { names },
     })
 }
 

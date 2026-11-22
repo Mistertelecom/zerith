@@ -421,7 +421,10 @@ pub(crate) fn body(req: &ChatRequest, stream: bool) -> Value {
     {
         b["temperature"] = json!(t);
     }
-    if let Some(e) = crate::normalize_reasoning_effort(req.reasoning_effort.as_deref()) {
+    // OpenAI-compatible servers take low/medium/high: `xhigh`/`max` go down to `high`.
+    if let Some(e) =
+        crate::clamp_effort(req.reasoning_effort.as_deref(), &["low", "medium", "high"])
+    {
         b["reasoning_effort"] = json!(e);
     }
     if stream {

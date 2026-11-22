@@ -273,23 +273,41 @@ pub fn is_cut_off(stop_reason: &str) -> bool {
     )
 }
 
-/// Normalizes an optional reasoning-effort setting (`low`, `medium`, `high`),
-/// treating empty strings and `"off"` as disabled (`None`).
+/// Effort levels, weakest first. The UI offers all five; each provider gets
+/// the strongest one it accepts (see [`clamp_effort`]).
+pub const EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
+/// Normalizes an optional reasoning-effort setting (`low` … `max`), treating
+/// empty strings, `"off"` and unknown words as disabled (`None`).
 pub(crate) fn normalize_reasoning_effort(effort: Option<&str>) -> Option<String> {
-    let trimmed = effort?.trim();
-    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("off") {
-        return None;
-    }
-    Some(trimmed.to_ascii_lowercase())
+    let t = effort?.trim().to_ascii_lowercase();
+    EFFORT_LEVELS.contains(&t.as_str()).then_some(t)
 }
 
-/// Maps `reasoning_effort` levels to provider thinking token budgets.
+/// The requested level, lowered to the strongest one in `accepted` (ordered
+/// weakest first): `max` becomes `high` where only low/medium/high exist.
+pub(crate) fn clamp_effort(
+    effort: Option<&str>,
+    accepted: &[&'static str],
+) -> Option<&'static str> {
+    let want = normalize_reasoning_effort(effort)?;
+    let rank = EFFORT_LEVELS.iter().position(|l| *l == want)?;
+    EFFORT_LEVELS[..=rank]
+        .iter()
+        .rev()
+        .find(|l| accepted.contains(l))
+        .copied()
+}
+
+/// Maps effort levels to thinking token budgets, for APIs that take a budget
+/// (Gemini/Antigravity, Claude models before adaptive thinking).
 pub(crate) fn thinking_budget(effort: Option<&str>) -> Option<u32> {
     match normalize_reasoning_effort(effort)?.as_str() {
         "low" => Some(2048),
         "medium" => Some(8192),
         "high" => Some(16384),
-        _ => None,
+        "xhigh" => Some(24576),
+        _ => Some(32768),
     }
 }
 
@@ -297,6 +315,31 @@ pub(crate) fn thinking_budget(effort: Option<&str>) -> Option<u32> {
 mod reasoning_effort_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn effort_is_lowered_to_the_strongest_level_a_provider_accepts() {
+        let three = ["low", "medium", "high"];
+        assert_eq!(clamp_effort(Some("max"), &three), Some("high"));
+        assert_eq!(clamp_effort(Some("xhigh"), &three), Some("high"));
+        assert_eq!(clamp_effort(Some("medium"), &three), Some("medium"));
+        // 4.6: no xhigh, but max exists.
+        let four = ["low", "medium", "high", "max"];
+        assert_eq!(clamp_effort(Some("xhigh"), &four), Some("high"));
+        assert_eq!(clamp_effort(Some("max"), &four), Some("max"));
+        assert_eq!(clamp_effort(Some("off"), &three), None);
+        assert_eq!(clamp_effort(Some("turbo"), &three), None);
+
+        let req = ChatRequest::new("gpt-5", vec![ChatMessage::user("oi")]).reasoning_effort("max");
+        assert_eq!(openai::body(&req, false)["reasoning_effort"], json!("high"));
+        assert_eq!(
+            codex::body(&req, false)["reasoning"]["effort"],
+            json!("high")
+        );
+        assert_eq!(
+            codex::body(&req, false)["reasoning"]["summary"],
+            json!("auto")
+        );
+    }
 
     #[test]
     fn off_is_omitted_and_levels_map_per_provider_protocol() {
@@ -323,7 +366,7 @@ mod reasoning_effort_tests {
             assert_eq!(openai::body(&req, false)["reasoning_effort"], json!(level));
             assert_eq!(
                 codex::body(&req, false)["reasoning"],
-                json!({"effort": level})
+                json!({"effort": level, "summary": "auto"})
             );
 
             let anth = anthropic::body(&req, false);

@@ -143,6 +143,16 @@ export function Composer(props: {
   textareaRef?: RefObject<HTMLTextAreaElement | null>;
 }) {
   const lang = useLang();
+  // Every level is offered; a provider that lacks one gets the strongest it
+  // accepts (`max` becomes `high` on OpenAI-compatible servers).
+  const effortOptions = [
+    { value: "off", label: tr(lang, "Off (padrão)", "Off (default)"), short: "Off" },
+    { value: "low", label: tr(lang, "Baixo", "Low"), short: tr(lang, "Baixo", "Low") },
+    { value: "medium", label: tr(lang, "Médio", "Medium"), short: tr(lang, "Médio", "Medium") },
+    { value: "high", label: tr(lang, "Alto", "High"), short: tr(lang, "Alto", "High") },
+    { value: "xhigh", label: tr(lang, "Extra alto", "Extra high"), short: "XHigh" },
+    { value: "max", label: tr(lang, "Máximo (rebaixa se o provedor não aceitar)", "Max (lowered if the provider lacks it)"), short: "Max" },
+  ];
   const box = useRef<HTMLTextAreaElement | null>(null);
   const attachTextareaRef = useCallback(
     (el: HTMLTextAreaElement | null) => {
@@ -701,22 +711,9 @@ export function Composer(props: {
               <PillMenu
                 label={tr(lang, "Esforço", "Effort")}
                 icon={<Brain size={14} strokeWidth={2} />}
-                text={
-                  props.effort === "low"
-                    ? tr(lang, "Baixo", "Low")
-                    : props.effort === "medium"
-                      ? tr(lang, "Médio", "Medium")
-                      : props.effort === "high"
-                        ? tr(lang, "Alto", "High")
-                        : "Off"
-                }
+                text={effortOptions.find((o) => o.value === (props.effort ?? "off"))?.short ?? "Off"}
                 value={props.effort ?? "off"}
-                options={[
-                  { value: "off", label: tr(lang, "Off (padrão)", "Off (default)") },
-                  { value: "low", label: tr(lang, "Baixo", "Low") },
-                  { value: "medium", label: tr(lang, "Médio", "Medium") },
-                  { value: "high", label: tr(lang, "Alto", "High") },
-                ]}
+                options={effortOptions}
                 onPick={props.onEffort}
               />
             ) : null}

@@ -149,6 +149,11 @@ pub enum RunEvent {
     Steered {
         text: String,
     },
+    /// Skills preloaded into this turn's context because the request matched
+    /// them (the model follows them without calling `skill`).
+    SkillsLoaded {
+        names: Vec<String>,
+    },
 }
 
 /// How many past messages are replayed to the model, newest first, when no
@@ -1379,6 +1384,24 @@ pub fn skills_block(lib: &zerith_skills::Library, prompt: &str, budget: usize) -
     out
 }
 
+/// Header of the preloaded-skills block in the turn reminder.
+const PRELOADED_SKILLS_HEADER: &str =
+    "# Skills pré-carregadas para este pedido (siga diretamente sem chamar `skill` para elas)";
+
+/// The skills [`auto_inline_skills`] put in `reminder` (its `## name` lines).
+pub fn preloaded_skill_names(reminder: &str) -> Vec<String> {
+    let Some((_, block)) = reminder.split_once(PRELOADED_SKILLS_HEADER) else {
+        return Vec::new();
+    };
+    block
+        .lines()
+        .take_while(|l| !l.starts_with("# ") && !l.starts_with("</system-reminder>"))
+        .filter_map(|l| l.strip_prefix("## "))
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty())
+        .collect()
+}
+
 /// Automatically pre-loads up to 2 high-confidence skills into the transient
 /// `<system-reminder>` on tool-enabled turns so the model follows the right
 /// operational procedure immediately on Step 1 without burning a separate
@@ -1409,9 +1432,7 @@ fn auto_inline_skills(
     if chosen.is_empty() {
         return String::new();
     }
-    let mut out = String::from(
-        "# Skills pré-carregadas para este pedido (siga diretamente sem chamar `skill` para elas)",
-    );
+    let mut out = String::from(PRELOADED_SKILLS_HEADER);
     let mut spent = out.len();
     let mut added = false;
     for name in &chosen {
@@ -1627,6 +1648,30 @@ mod skills_tests {
         assert!(block.contains("CORPO-video-subtitles"), "{block}");
         assert!(!block.contains("filler-00"));
         assert!(block.contains("Há 42 skills instaladas"));
+    }
+
+    #[test]
+    fn preloaded_skill_names_are_read_from_the_reminder() {
+        let r = format!(
+            "<system-reminder>
+# Memória
+- x
+
+{PRELOADED_SKILLS_HEADER}
+
+## mudanca-segura
+corpo
+## olt-gpon
+corpo
+</system-reminder>"
+        );
+        assert_eq!(preloaded_skill_names(&r), ["mudanca-segura", "olt-gpon"]);
+        assert!(preloaded_skill_names(
+            "<system-reminder>
+## nada
+</system-reminder>"
+        )
+        .is_empty());
     }
 
     #[test]

@@ -95,6 +95,7 @@ export type TurnEvent =
     }
   | { type: "toolProgress"; tool: string; chunk: string }
   | { type: "steered"; text: string }
+  | { type: "skillsLoaded"; names: string[] }
   | { type: "approval"; id: number; tool: string; summary: string }
   | {
       type: "usage";

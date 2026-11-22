@@ -872,6 +872,19 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.pill-branch {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  min-width: 0;
+  max-width: 14ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mono);
+  font-size: var(--fs-small);
+  color: var(--label-tertiary);
+}
 .pill-chev {
   flex: none;
   margin-left: -1px;

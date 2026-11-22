@@ -688,6 +688,7 @@ export const api = {
   openImage: (path: string) => invoke<void>("open_image", { path }),
   /** An http(s)/mailto link, in the system browser (the webview opens none). */
   openUrl: (url: string) => invoke<void>("open_url", { url }),
+  gitBranch: (path: string) => invoke<string | null>("git_branch", { path }),
   openInEditor: (path: string, sessionId?: string | null, line?: number) =>
     invoke<void>("open_in_editor", { path, sessionId: sessionId ?? null, line: line ?? null }),
   /** An attached image (data URL) saved under `<root>/attachments`; returns its path. */

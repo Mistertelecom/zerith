@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Check, ChevronDown, ExternalLink, Folder, FolderOpen } from "lucide-react";
+import { Check, ChevronDown, ExternalLink, Folder, FolderOpen, GitBranch } from "lucide-react";
 
 /** Last segment of a Windows or POSIX path. */
 export const folderName = (p: string) =>
@@ -24,6 +24,8 @@ export function measurePillPopover(
 /** The conversation's folder: recent folders, the OS picker, and Explorer.
  * Same look as the composer's other pills (PillMenu classes). */
 export function FolderPill(props: {
+  /** Checked-out git branch of the folder, if it is a repository. */
+  branch?: string | null;
   value: string;
   recent: string[];
   onPick: (path: string) => void;
@@ -69,6 +71,12 @@ export function FolderPill(props: {
       >
         <Folder size={14} strokeWidth={2} />
         <span className="pill-text">{props.value ? folderName(props.value) : "Pasta"}</span>
+        {props.branch ? (
+          <span className="pill-branch" title={"Branch: " + props.branch}>
+            <GitBranch size={12} strokeWidth={2} aria-hidden />
+            {props.branch}
+          </span>
+        ) : null}
         <ChevronDown size={14} strokeWidth={2} className="pill-chev" />
       </button>
       {open ? (

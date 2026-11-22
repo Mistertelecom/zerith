@@ -347,6 +347,19 @@ export default function App() {
   const current = sessions.find((s) => s.id === selected) ?? null;
   // The open conversation's folder; a new one starts in the last used.
   const folder = (selected ? current?.workspace : newFolder) ?? recent[0] ?? "";
+  const [branch, setBranch] = useState<string | null>(null);
+  // Re-read when the folder changes and after each answer (the agent may switch branches).
+  useEffect(() => {
+    if (!folder) return setBranch(null);
+    let live = true;
+    void api
+      .gitBranch(folder)
+      .then((b) => live && setBranch(b))
+      .catch(() => live && setBranch(null));
+    return () => {
+      live = false;
+    };
+  }, [folder, turn.busy]);
   // A change applies to the next turn, even mid-conversation.
   const pickFolder = useCallback(
     (path: string) => {
@@ -2019,6 +2032,7 @@ export default function App() {
                 folder={
                   <FolderPill
                     value={folder}
+                    branch={branch}
                     recent={recent}
                     onPick={pickFolder}
                     onBrowse={() =>

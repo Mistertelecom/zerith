@@ -355,6 +355,60 @@ pub async fn open_in_editor(
     .map_err(|e| e.to_string())?
 }
 
+/// The checked-out branch of the repository holding `path` (walking up), or
+/// a short commit id when detached; `None` outside a repository. Read from
+/// `.git/HEAD`, so no `git` process per keystroke.
+#[tauri::command]
+pub fn git_branch(path: String) -> Option<String> {
+    branch_of(Path::new(&path))
+}
+
+fn branch_of(start: &Path) -> Option<String> {
+    for dir in start.ancestors() {
+        let dot = dir.join(".git");
+        let git_dir = if dot.is_dir() {
+            dot
+        } else if dot.is_file() {
+            // Worktree or submodule: `gitdir: <path>`.
+            let t = std::fs::read_to_string(&dot).ok()?;
+            let g = PathBuf::from(t.trim().strip_prefix("gitdir:")?.trim());
+            if g.is_absolute() {
+                g
+            } else {
+                dir.join(g)
+            }
+        } else {
+            continue;
+        };
+        let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+        let head = head.trim();
+        return Some(match head.strip_prefix("ref: refs/heads/") {
+            Some(b) => b.to_string(),
+            None => head.chars().take(7).collect(),
+        });
+    }
+    None
+}
+
+#[cfg(test)]
+mod git_branch_tests {
+    #[test]
+    fn reads_branch_from_head_walking_up() {
+        let d = std::env::temp_dir().join(format!("zerith-gb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join(".git")).unwrap();
+        std::fs::create_dir_all(d.join("src/sub")).unwrap();
+        std::fs::write(d.join(".git/HEAD"), "ref: refs/heads/feat/x\n").unwrap();
+        assert_eq!(
+            super::branch_of(&d.join("src/sub")).as_deref(),
+            Some("feat/x")
+        );
+        std::fs::write(d.join(".git/HEAD"), "0123456789abcdef\n").unwrap();
+        assert_eq!(super::branch_of(&d).as_deref(), Some("0123456"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
 /// Which turns this conversation can be rewound to.
 #[tauri::command]
 pub async fn checkpoints(state: State<'_, AppState>, session_id: String) -> Cmd<Vec<i64>> {

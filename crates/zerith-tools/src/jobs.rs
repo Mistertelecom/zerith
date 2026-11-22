@@ -145,6 +145,20 @@ pub fn background_jobs() -> Vec<BackgroundJob> {
     out
 }
 
+/// The last `lines` lines job `id` printed, for the window. Read-only: what
+/// the model has not seen yet through `shell_output` stays unseen.
+pub fn background_job_tail(id: &str, lines: usize) -> Option<String> {
+    for table in tables() {
+        let jobs = table.lock().ok()?;
+        if let Some((_, j)) = jobs.iter().find(|(i, _)| i == id) {
+            let out = j.out.lock().ok()?;
+            let all: Vec<&str> = out.text.lines().collect();
+            return Some(all[all.len().saturating_sub(lines)..].join("\n"));
+        }
+    }
+    None
+}
+
 /// Stops job `id` wherever it runs (ids are unique per process): the window's
 /// Stop button. The model sees it as ended at its next `shell_output`.
 /// Stops every job of the process: the window is closing.
@@ -435,6 +449,8 @@ mod tests {
         let listed = |id: &str| background_jobs().into_iter().find(|j| j.id == id);
 
         let seen = listed(&a).expect("a running job is listed");
+        assert!(background_job_tail(&a, 5).is_some());
+        assert!(background_job_tail("job-0", 5).is_none());
         assert_eq!(seen.command, long);
         assert_eq!(seen.session.as_deref(), Some("s-ui"));
         assert!(stop_background_job(&a).unwrap().contains("encerrado"));

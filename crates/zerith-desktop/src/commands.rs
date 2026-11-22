@@ -231,6 +231,12 @@ pub async fn background_jobs() -> Cmd<Vec<JobView>> {
         .collect())
 }
 
+/// The last lines a background job printed (a dev server's log), read-only.
+#[tauri::command]
+pub async fn background_job_tail(id: String) -> Cmd<String> {
+    zerith_tools::background_job_tail(&id, 200).ok_or_else(|| format!("job desconhecido: {id}"))
+}
+
 /// Stops one background job and every process it started.
 #[tauri::command]
 pub async fn background_job_stop(id: String) -> Cmd<String> {

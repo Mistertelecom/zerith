@@ -232,6 +232,7 @@ pub fn run() {
             commands::boot,
             commands::list_sessions,
             commands::background_jobs,
+            commands::background_job_tail,
             commands::background_job_stop,
             commands::terminals_list,
             commands::terminal_tail,

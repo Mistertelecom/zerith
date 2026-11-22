@@ -1053,6 +1053,37 @@
   background: var(--accent-soft);
   color: var(--accent-text);
 }
+.job-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex: none;
+  padding: 2px;
+  border-radius: var(--r-sm);
+  color: var(--label-tertiary);
+}
+.job-toggle:hover {
+  background: var(--hover);
+  color: var(--label-primary);
+}
+.job-toggle .chev {
+  transition: transform var(--t-base) var(--ease);
+}
+.job-toggle.on .chev {
+  transform: rotate(90deg);
+}
+.job-tail {
+  max-height: 220px;
+  overflow: auto;
+  margin: 2px 0 6px 22px;
+  padding: 8px 10px;
+  border-radius: var(--r-sm);
+  background: var(--fill-faint, var(--hover));
+  font-family: var(--mono);
+  font-size: var(--fs-small);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
 .job-cmd {
   flex: 1 1 140px;
   min-width: 0;

@@ -2,7 +2,7 @@
 // button each. A job outlives its turn (a GUI script keeps its window after the
 // answer), so the strip polls while one exists, not only while a turn runs.
 import { useCallback, useEffect, useState } from "react";
-import { CircleStop, SquareTerminal } from "lucide-react";
+import { ChevronRight, CircleStop, SquareTerminal } from "lucide-react";
 import { jobsApi, type BackgroundJob, type Session } from "../lib/api";
 
 function ago(secs: number): string {
@@ -23,6 +23,25 @@ export function BackgroundJobs({
 }) {
   const [jobs, setJobs] = useState<BackgroundJob[]>([]);
   const [stopping, setStopping] = useState<string | null>(null);
+  const [shown, setShown] = useState<string | null>(null);
+  const [tail, setTail] = useState("");
+
+  // The open job's log follows while it is open.
+  useEffect(() => {
+    if (!shown) return;
+    let live = true;
+    const pull = () =>
+      void jobsApi
+        .tail(shown)
+        .then((t) => live && setTail(t))
+        .catch(() => live && setShown(null));
+    pull();
+    const t = setInterval(pull, 1500);
+    return () => {
+      live = false;
+      clearInterval(t);
+    };
+  }, [shown]);
   const load = useCallback(() => {
     jobsApi
       .list()
@@ -45,10 +64,22 @@ export function BackgroundJobs({
             ? (sessions.find((s) => s.id === j.session)?.title ?? "subagente")
             : null;
         return (
-          <div className="job-row" key={j.id}>
-            <span className="job-icon" aria-hidden>
-              <SquareTerminal size={14} strokeWidth={2} />
-            </span>
+          <div className="job" key={j.id}>
+          <div className="job-row">
+            <button
+              type="button"
+              className={"job-toggle" + (shown === j.id ? " on" : "")}
+              aria-expanded={shown === j.id}
+              aria-label={`Ver saída de ${j.id}`}
+              title="Ver a saída"
+              onClick={() => {
+                setTail("");
+                setShown(shown === j.id ? null : j.id);
+              }}
+            >
+              <ChevronRight size={14} strokeWidth={2} className="chev" />
+              <SquareTerminal size={14} strokeWidth={2} aria-hidden />
+            </button>
             <code className="job-cmd" title={j.command}>
               {j.command}
             </code>
@@ -76,6 +107,8 @@ export function BackgroundJobs({
               <CircleStop size={14} strokeWidth={2} />
               Parar
             </button>
+          </div>
+          {shown === j.id ? <pre className="job-tail">{tail || "(sem saída ainda)"}</pre> : null}
           </div>
         );
       })}

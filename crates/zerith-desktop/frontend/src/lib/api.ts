@@ -912,6 +912,7 @@ export interface BackgroundJob {
 export const jobsApi = {
   list: () => invoke<BackgroundJob[]>("background_jobs"),
   stop: (id: string) => invoke<string>("background_job_stop", { id }),
+  tail: (id: string) => invoke<string>("background_job_tail", { id }),
 };
 
 export interface TerminalSnapshot {

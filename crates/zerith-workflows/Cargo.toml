@@ -11,6 +11,8 @@ serde_json.workspace = true
 rusqlite.workspace = true
 ureq.workspace = true
 thiserror.workspace = true
+# Already in Cargo.lock (tauri/serde_with): OS local UTC offset incl. DST.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [dev-dependencies]
 tempfile.workspace = true

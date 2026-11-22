@@ -42,8 +42,15 @@ pub fn import_jsonl_from(r: impl BufRead, profile: &str, store: &Store) -> Resul
     let mut report = ImportReport::default();
     // Sessions in first-seen order; a Vec keeps it without another dependency.
     let mut order: Vec<(String, Pending)> = Vec::new();
-    for (i, line) in r.lines().enumerate() {
+    // Raw bytes per line: one invalid UTF-8 line is reported, not fatal.
+    for (i, line) in r.split(b'\n').enumerate() {
         let line = line?;
+        let Ok(line) = String::from_utf8(line) else {
+            report
+                .failed
+                .push(format!("linha {}: UTF-8 inválido", i + 1));
+            continue;
+        };
         if line.trim().is_empty() {
             continue;
         }
@@ -110,7 +117,7 @@ pub fn import_jsonl_from(r: impl BufRead, profile: &str, store: &Store) -> Resul
             .into_iter()
             .filter(|m| m.get("active").is_none_or(|v| v.is_null() || truthy(v)))
             .collect();
-        let have = store.message_count(&local)? as usize;
+        let have = imported_count(store, &local)?;
         let mut n = 0;
         for obj in live.into_iter().skip(have) {
             store.append(&local, &to_message(obj))?;
@@ -120,6 +127,22 @@ pub fn import_jsonl_from(r: impl BufRead, profile: &str, store: &Store) -> Resul
         tally(&mut report, created_now, n);
     }
     Ok(report)
+}
+
+/// Messages this importer wrote: their `raw` is the Hermes object, which
+/// always carries `role`. Messages Zerith appended later (replies, hook
+/// notes) are not counted, so they cannot push the resume cursor forward.
+fn imported_count(store: &Store, session_id: &str) -> Result<usize> {
+    let n: i64 = store
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM messages WHERE session_id = ?1
+             AND raw IS NOT NULL AND json_valid(raw) AND json_extract(raw, '$.role') IS NOT NULL",
+            [session_id],
+            |r| r.get(0),
+        )
+        .map_err(zerith_sessions::store::StoreError::from)?;
+    Ok(n as usize)
 }
 
 fn to_message(obj: Map<String, Value>) -> NewMessage {

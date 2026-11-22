@@ -233,8 +233,11 @@ impl Library {
                 .filter(|f| f.severity >= Severity::Warn)
                 .map(|f| f.message.clone())
                 .collect();
-            let row = self.install(&stage, &format!("{AI_SOURCE}{session}"))?;
-            self.set_status(&row.name, Status::Disabled)?;
+            let row = self.install_with_status(
+                &stage,
+                &format!("{AI_SOURCE}{session}"),
+                Status::Disabled,
+            )?;
             Ok(Created {
                 name: row.name,
                 files: new.files.len() + 1,

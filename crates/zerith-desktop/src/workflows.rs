@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -16,9 +16,9 @@ use zerith_security::{Mode, ModeHandle, Policy};
 use zerith_sessions::{NewMessage, Role, SessionSource, Store as SessionStore};
 use zerith_tools::Registry;
 use zerith_workflows::{
-    channels, execute_workflow, now_ms, starter_templates, test_single_node, unix_secs, AiExecutor,
-    ChannelConfig, CronSchedule, LocalDateTime, NodeEvent, NodeKind, RunOptions, Store, Workflow,
-    WorkflowEdge, WorkflowError, WorkflowNode, WorkflowRun,
+    channels, execute_workflow, local_offset_minutes, now_ms, starter_templates, test_single_node,
+    unix_secs, AiExecutor, ChannelConfig, CronSchedule, LocalDateTime, NodeEvent, NodeKind,
+    RunOptions, Store, Workflow, WorkflowEdge, WorkflowError, WorkflowNode, WorkflowRun,
 };
 
 use crate::state::AppState;
@@ -292,17 +292,17 @@ fn notify_bot_chat(app: &AppHandle, root: &Path, wf: &Workflow, run: &WorkflowRu
     let Ok(st) = SessionStore::open(&db_path) else {
         return;
     };
-    let prefix = format!("@{bot_raw}");
+    // Exact title: a prefix match would post `@noc` reports into `@noc-engineer`.
+    let title = format!("@{bot_raw} · Automação");
     let sid = st
         .list_sessions(200)
         .ok()
         .and_then(|list| {
             list.into_iter()
-                .find(|s| !s.archived && s.title.starts_with(&prefix))
+                .find(|s| !s.archived && s.title == title)
                 .map(|s| s.id)
         })
         .or_else(|| {
-            let title = format!("@{bot_raw} · Automação");
             let created = st.create_session(&title, SessionSource::Native).ok()?;
             let ws = crate::turn::last_workspace(&db_path);
             let _ = st.set_workspace(&created.id, &ws.display().to_string());
@@ -353,6 +353,49 @@ fn notify_bot_chat(app: &AppHandle, root: &Path, wf: &Workflow, run: &WorkflowRu
             }),
         );
     }
+}
+
+/// Disables every workflow bound to `bot_name` (called when the bot is deleted
+/// or disabled), so its schedules and webhooks stop firing.
+pub fn disable_bot_workflows(root: &Path, bot_name: &str) -> Result<usize, String> {
+    let wanted = bot_name.trim();
+    let store = open_store(root)?;
+    let mut n = 0;
+    for wf in store.list_workflows().map_err(|e| e.to_string())? {
+        let bound = wf
+            .bot_name
+            .as_deref()
+            .is_some_and(|b| b.trim().eq_ignore_ascii_case(wanted));
+        if wf.enabled && bound {
+            store
+                .set_workflow_enabled(&wf.id, false)
+                .map_err(|e| e.to_string())?;
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+/// Workflow ids with a scheduled run in progress. The guard removes its id on
+/// drop, which also runs when the run thread panics.
+static IN_FLIGHT: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+struct InFlight(String);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        let mut g = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(set) = g.as_mut() {
+            set.remove(&self.0);
+        }
+    }
+}
+
+fn try_begin_run(id: &str) -> Option<InFlight> {
+    let mut g = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+    g.get_or_insert_with(HashSet::new)
+        .insert(id.to_string())
+        .then(|| InFlight(id.to_string()))
 }
 
 /// Runs a periodic background cron scheduler inside the desktop app and binds
@@ -567,7 +610,7 @@ async fn handle_webhook_conn(
                     data_root: &root,
                     ai: &ai,
                     trigger_source: "webhook",
-                    tz_offset_minutes: -180,
+                    tz_offset_minutes: local_offset_minutes(unix_secs()),
                     initial_input: if body_text.is_empty() {
                         None
                     } else {
@@ -585,6 +628,31 @@ async fn handle_webhook_conn(
     .await;
 }
 
+/// Constant-time equality (length still leaks, which is fine for random tokens).
+fn ct_eq(a: &str, b: &str) -> bool {
+    a.len() == b.len()
+        && a.bytes()
+            .zip(b.bytes())
+            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+            == 0
+}
+
+/// An empty secret never authorizes: webhooks always require a token.
+fn webhook_authorized(required: &str, bearer: &str, query: &str) -> bool {
+    !required.is_empty() && (ct_eq(bearer, required) || ct_eq(query, required))
+}
+
+/// Host header names the loopback interface (blocks DNS-rebinding requests).
+fn is_loopback_host(host: &str) -> bool {
+    let h = host.trim().to_ascii_lowercase();
+    let name = if let Some(rest) = h.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else {
+        h.rsplit_once(':').map_or(h.as_str(), |(n, _)| n)
+    };
+    matches!(name, "127.0.0.1" | "localhost" | "::1")
+}
+
 async fn process_webhook_conn<F>(
     mut stream: TcpStream,
     root: PathBuf,
@@ -593,17 +661,6 @@ async fn process_webhook_conn<F>(
 ) where
     F: FnOnce(Workflow, String, PathBuf, RunSlotGuard) + Send + 'static,
 {
-    let Some(slot_guard) = try_acquire_run_slot(&active_runs) else {
-        write_http_response(
-            &mut stream,
-            429,
-            "Too Many Requests",
-            r#"{"ok":false,"error":"too many concurrent webhook runs"}"#,
-        )
-        .await;
-        return;
-    };
-
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let mut raw = Vec::with_capacity(4096);
     let hdr_end = loop {
@@ -694,14 +751,23 @@ async fn process_webhook_conn<F>(
         return;
     }
 
-    let mut content_len: usize = 0;
+    let mut content_len_raw: Option<String> = None;
     let mut bearer_tok = String::new();
+    let mut host: Option<String> = None;
+    let mut has_origin = false;
+    let mut chunked = false;
     for line in lines {
         if let Some((k, v)) = line.split_once(':') {
             let kl = k.trim().to_ascii_lowercase();
             let vt = v.trim();
             if kl == "content-length" {
-                content_len = vt.parse::<usize>().unwrap_or(0).min(MAX_WEBHOOK_BODY_BYTES);
+                content_len_raw = Some(vt.to_string());
+            } else if kl == "host" {
+                host = Some(vt.to_string());
+            } else if kl == "origin" {
+                has_origin = true;
+            } else if kl == "transfer-encoding" {
+                chunked = !vt.eq_ignore_ascii_case("identity");
             } else if kl == "authorization" {
                 if let Some(tok) = vt
                     .strip_prefix("Bearer ")
@@ -713,20 +779,62 @@ async fn process_webhook_conn<F>(
         }
     }
 
-    let mut body_bytes = raw[hdr_end + 4..].to_vec();
-    while body_bytes.len() < content_len {
-        let rem = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if rem.is_zero() {
-            break;
-        }
-        let mut chunk = [0u8; 8192];
-        match tokio::time::timeout(rem, stream.read(&mut chunk)).await {
-            Ok(Ok(0)) | Err(_) | Ok(Err(_)) => break,
-            Ok(Ok(m)) => body_bytes.extend_from_slice(&chunk[..m]),
-        }
+    // Browsers always send Origin on cross-site POSTs; webhook callers do not.
+    if has_origin || !host.as_deref().is_some_and(is_loopback_host) {
+        write_http_response(
+            &mut stream,
+            403,
+            "Forbidden",
+            r#"{"ok":false,"error":"browser origins and non-loopback hosts are refused"}"#,
+        )
+        .await;
+        return;
     }
-    body_bytes.truncate(content_len.min(MAX_WEBHOOK_BODY_BYTES));
-    let body_text = String::from_utf8_lossy(&body_bytes).to_string();
+    if chunked {
+        write_http_response(
+            &mut stream,
+            501,
+            "Not Implemented",
+            r#"{"ok":false,"error":"chunked transfer encoding not supported; send Content-Length"}"#,
+        )
+        .await;
+        return;
+    }
+    let early_body = raw.len() - (hdr_end + 4);
+    let content_len = match content_len_raw.as_deref().map(str::parse::<usize>) {
+        None if early_body > 0 => {
+            write_http_response(
+                &mut stream,
+                411,
+                "Length Required",
+                r#"{"ok":false,"error":"Content-Length required for a request body"}"#,
+            )
+            .await;
+            return;
+        }
+        None => 0,
+        Some(Err(_)) => {
+            write_http_response(
+                &mut stream,
+                400,
+                "Bad Request",
+                r#"{"ok":false,"error":"invalid Content-Length"}"#,
+            )
+            .await;
+            return;
+        }
+        Some(Ok(n)) if n > MAX_WEBHOOK_BODY_BYTES => {
+            write_http_response(
+                &mut stream,
+                413,
+                "Payload Too Large",
+                r#"{"ok":false,"error":"body exceeds 256 KiB"}"#,
+            )
+            .await;
+            return;
+        }
+        Some(Ok(n)) => n,
+    };
 
     let query_token = query_str
         .split('&')
@@ -757,10 +865,17 @@ async fn process_webhook_conn<F>(
         return;
     };
 
-    if !required_secret.is_empty()
-        && bearer_tok != required_secret
-        && query_token != required_secret
-    {
+    if required_secret.is_empty() {
+        write_http_response(
+            &mut stream,
+            401,
+            "Unauthorized",
+            r#"{"ok":false,"error":"webhook has no secret; open and save the workflow to generate one"}"#,
+        )
+        .await;
+        return;
+    }
+    if !webhook_authorized(&required_secret, &bearer_tok, &query_token) {
         write_http_response(
             &mut stream,
             401,
@@ -770,6 +885,42 @@ async fn process_webhook_conn<F>(
         .await;
         return;
     }
+
+    let Some(slot_guard) = try_acquire_run_slot(&active_runs) else {
+        write_http_response(
+            &mut stream,
+            429,
+            "Too Many Requests",
+            r#"{"ok":false,"error":"too many concurrent webhook runs"}"#,
+        )
+        .await;
+        return;
+    };
+
+    let mut body_bytes = raw[hdr_end + 4..].to_vec();
+    while body_bytes.len() < content_len {
+        let rem = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if rem.is_zero() {
+            break;
+        }
+        let mut chunk = [0u8; 8192];
+        match tokio::time::timeout(rem, stream.read(&mut chunk)).await {
+            Ok(Ok(0)) | Err(_) | Ok(Err(_)) => break,
+            Ok(Ok(m)) => body_bytes.extend_from_slice(&chunk[..m]),
+        }
+    }
+    if body_bytes.len() < content_len {
+        write_http_response(
+            &mut stream,
+            400,
+            "Bad Request",
+            r#"{"ok":false,"error":"body shorter than Content-Length"}"#,
+        )
+        .await;
+        return;
+    }
+    body_bytes.truncate(content_len);
+    let body_text = String::from_utf8_lossy(&body_bytes).to_string();
 
     let wf_id = wf.id.clone();
     spawn_run(wf, body_text, root, slot_guard);
@@ -786,7 +937,7 @@ fn collect_due_workflows(
     now_secs: i64,
     last_fired: &Mutex<HashMap<String, i64>>,
     last_checked_utc_min: &Mutex<Option<i64>>,
-) -> Vec<(Workflow, i32)> {
+) -> Vec<(Workflow, Option<i32>)> {
     let now_utc_min = now_secs.div_euclid(60);
     let start_min = {
         let mut checked = last_checked_utc_min
@@ -800,14 +951,17 @@ fn collect_due_workflows(
         start
     };
 
+    // Catch-up collapses: each workflow fires at most once per tick even when
+    // several missed minutes match.
     let mut due = Vec::new();
+    let mut due_ids: HashSet<String> = HashSet::new();
     for utc_min in start_min..=now_utc_min {
         let check_secs = utc_min * 60;
         for wf in wfs {
-            if !wf.enabled {
+            if !wf.enabled || due_ids.contains(&wf.id) {
                 continue;
             }
-            let mut matched_tz: Option<i32> = None;
+            let mut matched_tz: Option<Option<i32>> = None;
             for node in &wf.nodes {
                 if node.kind != NodeKind::TriggerCron {
                     continue;
@@ -817,12 +971,13 @@ fn collect_due_workflows(
                     .get("cron")
                     .and_then(|v| v.as_str())
                     .unwrap_or("0 8 * * *");
-                let tz = node
+                // No stored offset: follow the OS local offset at that minute (DST-aware).
+                let explicit_tz = node
                     .config
                     .get("tz_offset_minutes")
                     .and_then(|v| v.as_i64())
-                    .map(|v| v as i32)
-                    .unwrap_or(-180);
+                    .map(|v| v as i32);
+                let tz = explicit_tz.unwrap_or_else(|| local_offset_minutes(check_secs));
                 if let Ok(sched) = CronSchedule::parse(expr) {
                     let dt = LocalDateTime::from_unix_secs(check_secs, tz);
                     if sched.matches_dt(&dt) {
@@ -831,13 +986,14 @@ fn collect_due_workflows(
                             break;
                         }
                         m.insert(wf.id.clone(), utc_min);
-                        matched_tz = Some(tz);
+                        matched_tz = Some(explicit_tz);
                         break;
                     }
                 }
             }
 
             if let Some(tz) = matched_tz {
+                due_ids.insert(wf.id.clone());
                 due.push((wf.clone(), tz));
             }
         }
@@ -860,9 +1016,15 @@ fn tick_due_workflows(
     let now_secs = unix_secs();
 
     for (wf, tz) in collect_due_workflows(&wfs, now_secs, last_fired, last_checked_utc_min) {
+        // Still running from an earlier tick: skip instead of overlapping.
+        let Some(in_flight) = try_begin_run(&wf.id) else {
+            continue;
+        };
+        let tz = tz.unwrap_or_else(|| local_offset_minutes(now_secs));
         let app_bg = app.clone();
         let root_bg = root.to_path_buf();
         std::thread::spawn(move || {
+            let _in_flight = in_flight;
             let Ok(st) = open_store(&root_bg) else {
                 return;
             };
@@ -952,7 +1114,7 @@ pub async fn workflow_run_now(
     tz_offset_minutes: Option<i32>,
 ) -> Result<WorkflowRun, String> {
     let root = state.root().to_path_buf();
-    let tz = tz_offset_minutes.unwrap_or(-180);
+    let tz = tz_offset_minutes.unwrap_or_else(|| local_offset_minutes(unix_secs()));
     tauri::async_runtime::spawn_blocking(move || {
         let store = open_store(&root)?;
         let wf = store
@@ -1005,7 +1167,9 @@ pub async fn workflow_generate_from_prompt(
     tz_offset_minutes: Option<i32>,
 ) -> Result<Workflow, String> {
     let root = state.root().to_path_buf();
-    let tz = tz_offset_minutes.unwrap_or(-180);
+    // Generated crons store no offset: the scheduler follows the OS local
+    // offset per tick (DST-aware). The argument stays for API compatibility.
+    let _ = tz_offset_minutes;
     tauri::async_runtime::spawn_blocking(move || {
         let store = open_store(&root)?;
         let channels = store.list_channels().unwrap_or_default();
@@ -1049,7 +1213,7 @@ Schema:
 }}
 
 Config shapes per kind:
-- trigger_cron: {{"cron": "0 8 * * *", "tz_offset_minutes": {tz}}}
+- trigger_cron: {{"cron": "0 8 * * *"}}
 - trigger_manual: {{}}
 - trigger_webhook: {{"slug": "short-slug", "secret": ""}}
 - shell: {{"command": "...", "timeout_secs": 30}}
@@ -1075,20 +1239,11 @@ Layout rules:
             .map_err(|e| format!("IA retornou JSON inválido: {e}"))?;
 
         let now = now_ms();
-        let mut nodes: Vec<WorkflowNode> = parsed
+        let nodes: Vec<WorkflowNode> = parsed
             .get("nodes")
             .cloned()
             .and_then(|v| serde_json::from_value(v).ok())
             .ok_or_else(|| "JSON gerado pela IA não contém lista válida de nós".to_string())?;
-
-        for node in &mut nodes {
-            if node.kind == NodeKind::TriggerCron {
-                if let Some(obj) = node.config.as_object_mut() {
-                    obj.entry("tz_offset_minutes")
-                        .or_insert_with(|| json!(tz));
-                }
-            }
-        }
 
         let edges: Vec<WorkflowEdge> = parsed
             .get("edges")
@@ -1236,7 +1391,7 @@ pub async fn workflow_test_node(
 ) -> Result<String, String> {
     let root = state.root().to_path_buf();
     let sample = sample_input.unwrap_or_default();
-    let tz = tz_offset_minutes.unwrap_or(-180);
+    let tz = tz_offset_minutes.unwrap_or_else(|| local_offset_minutes(unix_secs()));
     tauri::async_runtime::spawn_blocking(move || {
         let store = open_store(&root)?;
         let ai = DesktopAiExecutor { root: root.clone() };
@@ -1390,17 +1545,37 @@ mod webhook_tests {
             assert!(!resp.contains("Access-Control-Allow-"), "{resp}");
             assert!(body.is_none());
 
-            // 2. Saturated counter returns 429.
+            // 2. Saturated counter returns 429 (only after auth succeeds).
             counter.store(MAX_CONCURRENT_WEBHOOKS, Ordering::SeqCst);
             let (listener, resp429, _) = send_raw(
                 listener,
-                b"POST /webhook/deploy HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+                b"POST /webhook/deploy?token=my+secret%2B1 HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
                 Arc::clone(&counter),
                 scratch.clone(),
             )
             .await;
             assert!(resp429.starts_with("HTTP/1.1 429"), "{resp429}");
             counter.store(0, Ordering::SeqCst);
+
+            // 2b. Origin, foreign Host, missing token, bad lengths and chunked are refused.
+            let tok = "token=my+secret%2B1";
+            let cases: Vec<(String, &str)> = vec![
+                (format!("POST /webhook/deploy?{tok} HTTP/1.1\r\nHost: localhost\r\nOrigin: http://evil.example\r\n\r\n"), "403"),
+                (format!("POST /webhook/deploy?{tok} HTTP/1.1\r\nHost: evil.example:47891\r\n\r\n"), "403"),
+                ("POST /webhook/deploy HTTP/1.1\r\nHost: 127.0.0.1:47891\r\n\r\n".into(), "401"),
+                (format!("POST /webhook/deploy?{tok} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 999999\r\n\r\n"), "413"),
+                (format!("POST /webhook/deploy?{tok} HTTP/1.1\r\nHost: localhost\r\nContent-Length: x\r\n\r\n"), "400"),
+                (format!("POST /webhook/deploy?{tok} HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"), "501"),
+                (format!("POST /webhook/deploy?{tok} HTTP/1.1\r\nHost: localhost\r\n\r\nhello"), "411"),
+            ];
+            let mut listener = listener;
+            for (req, code) in cases {
+                let (l, resp, body) =
+                    send_raw(listener, req.into_bytes(), Arc::clone(&counter), scratch.clone()).await;
+                listener = l;
+                assert!(resp.starts_with(&format!("HTTP/1.1 {code}")), "{code}: {resp}");
+                assert!(body.is_none());
+            }
 
             // 3. POST with percent-encoded query token + trailing extra bytes truncates to content-length.
             let (listener, resp202, cap_body) = send_raw(
@@ -1528,12 +1703,56 @@ mod webhook_tests {
         );
         assert!(r3.is_empty());
 
-        // Large drift (10 minutes) is capped at 5 minutes back (+ current minute = 6 runs max).
+        // Large drift (10 minutes) is capped at 5 minutes back and collapsed.
         let wf_every = cron_wf("wf-every", vec![cron_node("c1", "* * * * *", 0)]);
         let fired2 = Mutex::new(HashMap::new());
         let checked2 = Mutex::new(Some(1000));
         let r4 = collect_due_workflows(&[wf_every], 1010 * 60 + 5, &fired2, &checked2);
-        assert_eq!(r4.len(), 6);
+        assert_eq!(r4.len(), 1, "catch-up collapses to one run per workflow");
+    }
+
+    #[test]
+    fn disabling_a_bot_disables_only_its_workflows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(dir.path()).unwrap();
+        for (id, bot) in [("a", Some("noc")), ("b", Some("noc-engineer")), ("c", None)] {
+            let mut wf = cron_wf(id, vec![]);
+            wf.bot_name = bot.map(str::to_string);
+            store.save_workflow(&wf).unwrap();
+        }
+        assert_eq!(disable_bot_workflows(dir.path(), "noc").unwrap(), 1);
+        let st = open_store(dir.path()).unwrap();
+        assert!(!st.get_workflow("a").unwrap().unwrap().enabled);
+        assert!(st.get_workflow("b").unwrap().unwrap().enabled);
+        assert!(st.get_workflow("c").unwrap().unwrap().enabled);
+    }
+
+    #[test]
+    fn auth_host_and_in_flight_helpers() {
+        assert!(ct_eq("abc", "abc") && !ct_eq("abc", "abd") && !ct_eq("abc", "ab"));
+        assert!(!webhook_authorized("", "", ""));
+        assert!(webhook_authorized("s3", "s3", ""));
+        assert!(webhook_authorized("s3", "", "s3"));
+        for ok in ["127.0.0.1:47891", "localhost", "LOCALHOST:1", "[::1]:80"] {
+            assert!(is_loopback_host(ok), "{ok}");
+        }
+        for bad in ["evil.example", "127.0.0.1.evil:80", "", "localhost.evil"] {
+            assert!(!is_loopback_host(bad), "{bad}");
+        }
+        let g = try_begin_run("wf-x").unwrap();
+        assert!(try_begin_run("wf-x").is_none());
+        drop(g);
+        assert!(try_begin_run("wf-x").is_some());
+        // Stored offset is passed through; absent offset defers to OS local time.
+        let wf = cron_wf(
+            "wf-local",
+            vec![WorkflowNode {
+                config: json!({"cron": "* * * * *"}),
+                ..cron_node("c", "* * * * *", 0)
+            }],
+        );
+        let due = collect_due_workflows(&[wf], 1_700_000_000, &Mutex::default(), &Mutex::default());
+        assert_eq!(due[0].1, None);
     }
 
     #[test]

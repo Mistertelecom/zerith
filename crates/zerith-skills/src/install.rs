@@ -6,6 +6,8 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 
@@ -75,6 +77,16 @@ pub enum InstallError {
 
 pub type Result<T> = std::result::Result<T, InstallError>;
 
+/// Serializes manifest read-modify-write cycles inside this process, so two
+/// concurrent installs never drop each other's row.
+// ponytail: process-wide only; add a file lock if two processes ever mutate the same library.
+static MANIFEST_LOCK: Mutex<()> = Mutex::new(());
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn manifest_lock() -> MutexGuard<'static, ()> {
+    MANIFEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// The skills root, its manifest, and the copies kept for rollback.
 #[derive(Clone)]
 pub struct Library {
@@ -120,7 +132,11 @@ impl Library {
     /// manifest.
     pub(crate) fn save(&self, m: &Manifest) -> Result<()> {
         let path = self.root.join("manifest.json");
-        let tmp = self.root.join("manifest.json.tmp");
+        let tmp = self.root.join(format!(
+            "manifest.json.{}.{}.tmp",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
         std::fs::write(&tmp, serde_json::to_vec_pretty(m)?)?;
         std::fs::rename(&tmp, &path).inspect_err(|_| {
             let _ = std::fs::remove_file(&tmp);
@@ -131,9 +147,21 @@ impl Library {
     /// Copies `from` into the root under `name`, after scanning it. The scan
     /// is what lets the install print findings *before* the files land.
     pub fn install(&self, from: &Path, source: &str) -> Result<Installed> {
+        self.install_with_status(from, source, Status::Enabled)
+    }
+
+    /// [`Library::install`] with the initial status written in the same save,
+    /// so a skill meant to start disabled is never visible as enabled.
+    pub fn install_with_status(
+        &self,
+        from: &Path,
+        source: &str,
+        status: Status,
+    ) -> Result<Installed> {
         let skill = scan(from)?;
         let name = skill.frontmatter.name.clone();
         validate_dir_name(&name)?;
+        let _g = manifest_lock();
         let mut m = self.manifest()?;
         if m.skills.iter().any(|s| s.name == name) {
             return Err(InstallError::NameConflict(name));
@@ -150,7 +178,7 @@ impl Library {
             description: skill.frontmatter.description.clone(),
             license: skill.frontmatter.license.clone().unwrap_or_default(),
             source: source.to_string(),
-            status: Status::Enabled,
+            status,
             dir: name,
             installed_at: crate::catalog::now_ms(),
             previous_dir: None,
@@ -164,6 +192,7 @@ impl Library {
     /// scan of the new version, so the caller can show the diff before the
     /// user accepts it (the copy is what makes that possible).
     pub fn update(&self, name: &str, from: &Path) -> Result<Skill> {
+        let _g = manifest_lock();
         let mut m = self.manifest()?;
         let idx = m
             .skills
@@ -194,6 +223,7 @@ impl Library {
     /// Puts the previous copy back. Without a stored copy the call fails
     /// loudly rather than reporting a rollback that did not happen.
     pub fn rollback(&self, name: &str) -> Result<()> {
+        let _g = manifest_lock();
         let mut m = self.manifest()?;
         let idx = m
             .skills
@@ -219,6 +249,7 @@ impl Library {
     }
 
     pub fn set_status(&self, name: &str, status: Status) -> Result<()> {
+        let _g = manifest_lock();
         let mut m = self.manifest()?;
         let row = m
             .skills
@@ -265,9 +296,8 @@ impl Library {
             if seen.contains(&folder) {
                 continue;
             }
-            match self.install(&dir, &format!("bundled:{folder}")) {
+            match self.install_with_status(&dir, &format!("bundled:{folder}"), Status::Disabled) {
                 Ok(row) => {
-                    self.set_status(&row.name, Status::Disabled)?;
                     added.push(row.name);
                     seen.push(folder);
                 }
@@ -283,6 +313,7 @@ impl Library {
     /// Removes the files and the row. The backup copies are left alone: a
     /// removal the user regrets is still recoverable from disk.
     pub fn remove(&self, name: &str) -> Result<()> {
+        let _g = manifest_lock();
         let mut m = self.manifest()?;
         let idx = m
             .skills
@@ -472,6 +503,32 @@ mod tests {
         assert_eq!(row.status, Status::Enabled);
         assert!(lib.root().join("demo/SKILL.md").exists());
         assert_eq!(lib.catalog().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn disabled_install_is_written_once_and_concurrent_installs_keep_all_rows() {
+        let tmp = tempfile::tempdir_in(scratch()).unwrap();
+        let lib = Library::open(tmp.path().join("skills")).unwrap();
+        let src = tmp.path().join("src-off");
+        write_skill(&src, "off", "corpo");
+        let row = lib
+            .install_with_status(&src, "x", Status::Disabled)
+            .unwrap();
+        assert_eq!(row.status, Status::Disabled);
+        assert!(lib.catalog().unwrap().is_empty());
+
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let lib = lib.clone();
+                let src = tmp.path().join(format!("src{i}"));
+                write_skill(&src, &format!("s{i}"), "corpo");
+                std::thread::spawn(move || lib.install(&src, "x").unwrap())
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(lib.manifest().unwrap().skills.len(), 9);
     }
 
     #[test]

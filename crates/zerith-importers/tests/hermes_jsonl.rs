@@ -68,3 +68,29 @@ fn a_missing_file_is_not_found() {
     let err = import_jsonl(std::path::Path::new("nao-existe.jsonl"), "default", &s).unwrap_err();
     assert!(matches!(err, ImportError::NotFound(_)));
 }
+
+#[test]
+fn resume_ignores_zerith_replies_and_bad_utf8_lines_are_reported() {
+    use zerith_sessions::{NewMessage, Role};
+    let s = store();
+    import_jsonl_from(EXPORT.as_bytes(), "default", &s).unwrap();
+    // The user continued the imported chat inside Zerith.
+    s.append(
+        "hermes-default-s2",
+        &NewMessage::new(Role::Assistant, "local reply".to_string()),
+    )
+    .unwrap();
+
+    let mut more = EXPORT.as_bytes().to_vec();
+    more.extend_from_slice(b"\xff\xfe broken\n");
+    more.extend_from_slice(br#"{"session_id":"s2","role":"assistant","content":"nova"}"#);
+    more.push(b'\n');
+    let r = import_jsonl_from(more.as_slice(), "default", &s).unwrap();
+    assert_eq!(r.messages_imported, 1, "new Hermes message is not skipped");
+    assert!(
+        r.failed.iter().any(|f| f.contains("UTF-8")),
+        "{:?}",
+        r.failed
+    );
+    assert_eq!(s.message_count("hermes-default-s2").unwrap(), 3);
+}

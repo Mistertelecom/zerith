@@ -344,6 +344,7 @@ pub async fn agent_delete(
         if path.exists() {
             std::fs::remove_file(&path).map_err(|e| format!("Não consegui excluir o bot: {e}"))?;
         }
+        crate::workflows::disable_bot_workflows(&root, &name)?;
         Ok::<_, String>(all(&root))
     })
     .await
@@ -359,6 +360,9 @@ pub async fn agent_toggle(
     let root = state.root().to_path_buf();
     tauri::async_runtime::spawn_blocking(move || {
         zerith_core::agents_write::set_disabled(&Paths::with_root(&root), &name, disabled)?;
+        if disabled {
+            crate::workflows::disable_bot_workflows(&root, &name)?;
+        }
         Ok::<_, String>(all(&root))
     })
     .await

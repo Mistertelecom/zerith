@@ -49,27 +49,22 @@ impl Frontmatter {
 
 /// Splits a document into its frontmatter lines and its body.
 fn split(text: &str) -> Result<(Vec<&str>, &str), FrontmatterError> {
-    let mut lines = text.lines();
+    // `split_inclusive` keeps each terminator, so offsets stay exact for LF and CRLF.
+    let mut lines = text.split_inclusive('\n');
     let first = lines.next().unwrap_or("");
     if first.trim_end() != "---" {
         return Err(FrontmatterError::NoFrontmatter);
     }
     let mut header = Vec::new();
-    let mut body_start = 0usize;
-    let mut consumed = first.len() + 1;
-    for line in lines {
-        if line.trim_end() == "---" {
-            body_start = consumed + line.len() + 1;
-            break;
+    let mut consumed = first.len();
+    for raw in lines {
+        consumed += raw.len();
+        if raw.trim_end() == "---" {
+            return Ok((header, text.get(consumed..).unwrap_or("")));
         }
-        header.push(line);
-        consumed += line.len() + 1;
+        header.push(raw.strip_suffix('\n').unwrap_or(raw).trim_end_matches('\r'));
     }
-    if body_start == 0 {
-        return Err(FrontmatterError::Unterminated);
-    }
-    let body = text.get(body_start..).unwrap_or("");
-    Ok((header, body))
+    Err(FrontmatterError::Unterminated)
 }
 
 /// Parses the frontmatter and returns it with the instruction body.
@@ -260,6 +255,14 @@ mod tests {
             Some(vec!["Bash(git:*)".to_string(), "Read".to_string()])
         );
         assert_eq!(parse(MINIMAL).unwrap().0.allowed_tools_list(), None);
+    }
+
+    #[test]
+    fn crlf_body_offset_is_exact() {
+        let doc = MINIMAL.replace('\n', "\r\n");
+        let (fm, body) = parse(&doc).unwrap();
+        assert_eq!(fm.description, "Extracts text from PDFs.");
+        assert_eq!(body, "# Steps\r\n1. Do it.\r\n");
     }
 
     #[test]

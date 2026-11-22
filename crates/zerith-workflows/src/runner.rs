@@ -87,7 +87,9 @@ pub fn execute_workflow(wf: &Workflow, opts: &mut RunOptions<'_>) -> Result<Work
         }
     }
 
-    // Roots: triggers first, then any node with indegree 0.
+    // Every indegree-0 node enters the queue (keeps the topological walk and
+    // cycle check intact), but only triggers matching this run's source are
+    // active. Workflows without trigger nodes keep the legacy "all roots" rule.
     let mut queue: VecDeque<&str> = VecDeque::new();
     let mut scheduled: HashSet<&str> = HashSet::new();
     for n in &wf.nodes {
@@ -96,9 +98,21 @@ pub fn execute_workflow(wf: &Workflow, opts: &mut RunOptions<'_>) -> Result<Work
             scheduled.insert(n.id.as_str());
         }
     }
+    let has_triggers = wf.nodes.iter().any(|n| is_trigger(n.kind));
 
     let mut outputs: HashMap<String, String> = HashMap::new();
-    let mut active_nodes: HashSet<String> = queue.iter().map(|s| (*s).to_string()).collect();
+    let mut active_nodes: HashSet<String> = queue
+        .iter()
+        .filter(|id| {
+            !has_triggers
+                || nodes_map
+                    .get(*id)
+                    .is_some_and(|n| trigger_fires(n.kind, opts.trigger_source))
+        })
+        .map(|s| (*s).to_string())
+        .collect();
+    // Dedup keys are committed only when the whole run succeeds.
+    let mut pending_seen: Vec<(String, Vec<String>)> = Vec::new();
     let mut last_incoming: HashMap<String, String> = HashMap::new();
     let mut logs: Vec<NodeRunLog> = Vec::new();
     let mut overall_status = "ok".to_string();
@@ -151,6 +165,9 @@ pub fn execute_workflow(wf: &Workflow, opts: &mut RunOptions<'_>) -> Result<Work
 
         match res {
             Ok((out, branch)) => {
+                if let Some(scope) = dedup_scope(node, &prev, &outputs, &now_dt) {
+                    pending_seen.push((scope, out.lines().map(str::to_string).collect()));
+                }
                 outputs.insert(node.id.clone(), out.clone());
                 if node.kind == NodeKind::Transform
                     && node.config.get("mode").and_then(|v| v.as_str()) == Some("dedup_lines")
@@ -229,6 +246,12 @@ pub fn execute_workflow(wf: &Workflow, opts: &mut RunOptions<'_>) -> Result<Work
         summary = "ciclo detectado no grafo do workflow".into();
     }
 
+    if overall_status == "ok" {
+        for (scope, items) in &pending_seen {
+            opts.store.mark_items_seen(scope, items)?;
+        }
+    }
+
     opts.store
         .record_run_finish(&run_id, &wf.id, &overall_status, &summary, &logs)?;
 
@@ -242,6 +265,45 @@ pub fn execute_workflow(wf: &Workflow, opts: &mut RunOptions<'_>) -> Result<Work
         summary,
         node_logs: logs,
     })
+}
+
+fn is_trigger(kind: NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::TriggerCron | NodeKind::TriggerManual | NodeKind::TriggerWebhook
+    )
+}
+
+/// Which trigger nodes a run started by `source` activates. Manual-like
+/// sources (manual, ai_tool, test) fire every trigger.
+fn trigger_fires(kind: NodeKind, source: &str) -> bool {
+    match source {
+        "cron" => kind == NodeKind::TriggerCron,
+        "webhook" => kind == NodeKind::TriggerWebhook,
+        _ => is_trigger(kind),
+    }
+}
+
+/// Scope of a non-pinned `dedup_lines` transform, or `None` for other nodes.
+fn dedup_scope(
+    node: &WorkflowNode,
+    prev: &str,
+    outputs: &HashMap<String, String>,
+    now_dt: &LocalDateTime,
+) -> Option<String> {
+    let cfg = &node.config;
+    if node.kind != NodeKind::Transform
+        || cfg_str(cfg, "mode") != Some("dedup_lines")
+        || cfg.get("pin_enabled").and_then(|v| v.as_bool()) == Some(true)
+    {
+        return None;
+    }
+    Some(
+        cfg_str(cfg, "pattern")
+            .map(|p| interpolate(p, prev, outputs, now_dt))
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| format!("node:{}", node.id)),
+    )
 }
 
 fn enqueue_children<'a>(
@@ -440,14 +502,15 @@ fn run_node(
             if raw_cmd.is_empty() {
                 return Err(WorkflowError::Exec("comando shell vazio".into()));
             }
-            let cmd = interpolate(raw_cmd, prev, outputs, now_dt);
+            let (cmd, env) = interpolate_for_shell(raw_cmd, prev, outputs, now_dt, None);
             let timeout = cfg
                 .get("timeout_secs")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(60)
                 .clamp(1, 600);
             let workdir = cfg_str(cfg, "cwd").map(PathBuf::from);
-            let out = run_shell_command(&cmd, workdir.as_deref(), Duration::from_secs(timeout))?;
+            let out =
+                run_shell_command(&cmd, workdir.as_deref(), Duration::from_secs(timeout), &env)?;
             Ok((out, None))
         }
         NodeKind::SshCommand => {
@@ -469,7 +532,8 @@ fn run_node(
                 .clamp(1, 65535);
             let raw_cmd = cfg_str(cfg, "command")
                 .ok_or_else(|| WorkflowError::Exec("comando SSH vazio".into()))?;
-            let cmd = interpolate(raw_cmd, prev, outputs, now_dt);
+            // The remote shell parses this string: dynamic values are POSIX-quoted.
+            let cmd = interpolate_inner(raw_cmd, prev, outputs, now_dt, None, &mut posix_quote);
             let timeout = cfg
                 .get("timeout_secs")
                 .and_then(|v| v.as_u64())
@@ -602,17 +666,14 @@ fn run_node(
                         .join("\n")
                 }
                 "dedup_lines" => {
-                    let scope = cfg_str(cfg, "pattern")
-                        .map(|p| interpolate(p, prev, outputs, now_dt))
-                        .filter(|s| !s.trim().is_empty())
-                        .unwrap_or_else(|| format!("node:{}", node.id));
+                    let scope = dedup_scope(node, prev, outputs, now_dt).unwrap_or_default();
                     let lines: Vec<String> = prev
                         .lines()
                         .map(str::trim)
                         .filter(|l| !l.is_empty())
                         .map(str::to_string)
                         .collect();
-                    opts.store.filter_unseen_items(&scope, &lines)?.join("\n")
+                    opts.store.unseen_items(&scope, &lines)?.join("\n")
                 }
                 _ => {
                     let tpl = cfg_str(cfg, "template").unwrap_or("{{prev}}");
@@ -646,14 +707,14 @@ fn run_node(
                 let res = match mode {
                     "shell" => {
                         let cmd_tpl = cfg_str(cfg, "command").unwrap_or("echo {{item}}");
-                        let cmd = interpolate_inner(
+                        let (cmd, env) = interpolate_for_shell(
                             cmd_tpl,
                             prev,
                             outputs,
                             now_dt,
                             Some((item, &idx_str)),
                         );
-                        let out = run_shell_command(&cmd, None, Duration::from_secs(30))?;
+                        let out = run_shell_command(&cmd, None, Duration::from_secs(30), &env)?;
                         format!("{item}: {out}")
                     }
                     "http" => {
@@ -667,6 +728,7 @@ fn run_node(
                             outputs,
                             now_dt,
                             Some((item, &idx_str)),
+                            &mut raw_value,
                         );
                         let method = cfg_str(cfg, "method").unwrap_or("GET").to_ascii_uppercase();
                         let body = interpolate_inner(
@@ -675,6 +737,7 @@ fn run_node(
                             outputs,
                             now_dt,
                             Some((item, &idx_str)),
+                            &mut raw_value,
                         );
                         let out = execute_http(HttpCall {
                             cfg,
@@ -690,7 +753,14 @@ fn run_node(
                     }
                     _ => {
                         let tpl = cfg_str(cfg, "template").unwrap_or("{{item}}");
-                        interpolate_inner(tpl, prev, outputs, now_dt, Some((item, &idx_str)))
+                        interpolate_inner(
+                            tpl,
+                            prev,
+                            outputs,
+                            now_dt,
+                            Some((item, &idx_str)),
+                            &mut raw_value,
+                        )
                     }
                 };
                 results.push(res);
@@ -714,7 +784,8 @@ fn run_node(
         }
         NodeKind::SaveFile => {
             let rel_raw = cfg_str(cfg, "path").unwrap_or("reports/workflow-{{date}}.md");
-            let rel = interpolate(rel_raw, prev, outputs, now_dt);
+            // Upstream values cannot inject separators or `..` into the path.
+            let rel = interpolate_inner(rel_raw, prev, outputs, now_dt, None, &mut path_segment);
             let content = cfg_str(cfg, "content")
                 .map(|c| interpolate(c, prev, outputs, now_dt))
                 .unwrap_or_else(|| prev.to_string());
@@ -755,6 +826,10 @@ pub fn test_single_node(
     let now_dt = LocalDateTime::from_unix_secs(unix_secs(), opts.tz_offset_minutes);
     let outputs = HashMap::new();
     let (out, branch) = run_node(node, sample_input, &outputs, &now_dt, opts)?;
+    if let Some(scope) = dedup_scope(node, sample_input, &outputs, &now_dt) {
+        let items: Vec<String> = out.lines().map(str::to_string).collect();
+        opts.store.mark_items_seen(&scope, &items)?;
+    }
     if let Some(b) = branch {
         Ok(format!("[branch={b}]\n{out}"))
     } else {
@@ -974,6 +1049,7 @@ fn interpolate_inner(
     outputs: &HashMap<String, String>,
     now_dt: &LocalDateTime,
     loop_vars: Option<(&str, &str)>,
+    esc: &mut dyn FnMut(&str) -> String,
 ) -> String {
     let mut out = String::with_capacity(tpl.len());
     let mut rest = tpl;
@@ -996,12 +1072,12 @@ fn interpolate_inner(
         }
         let token = &after_open[..end];
         match token {
-            "prev" => out.push_str(prev),
+            "prev" => out.push_str(&esc(prev)),
             "date" => out.push_str(&now_dt.date_string()),
             "time" => out.push_str(&now_dt.time_string()),
             "item" => {
                 if let Some((item, _)) = loop_vars {
-                    out.push_str(item);
+                    out.push_str(&esc(item));
                 } else {
                     out.push_str(&rest[start..start + 2 + end + 2]);
                 }
@@ -1018,7 +1094,7 @@ fn interpolate_inner(
                     .strip_prefix("node.")
                     .filter(|id| outputs.contains_key(*id))
                 {
-                    out.push_str(&outputs[id]);
+                    out.push_str(&esc(&outputs[id]));
                 } else {
                     out.push_str(&rest[start..start + 2 + end + 2]);
                 }
@@ -1036,7 +1112,60 @@ pub fn interpolate(
     outputs: &HashMap<String, String>,
     now_dt: &LocalDateTime,
 ) -> String {
-    interpolate_inner(tpl, prev, outputs, now_dt, None)
+    interpolate_inner(tpl, prev, outputs, now_dt, None, &mut raw_value)
+}
+
+fn raw_value(v: &str) -> String {
+    v.to_string()
+}
+
+/// POSIX single-quoting: safe inside `sh -c` / remote SSH command lines.
+fn posix_quote(v: &str) -> String {
+    format!("'{}'", v.replace('\'', r"'\''"))
+}
+
+/// Dynamic value used inside a file path: no separators, drive colons, `..`
+/// or control characters, so it cannot leave the directory the template chose.
+fn path_segment(v: &str) -> String {
+    let cleaned: String = v
+        .trim()
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    let cleaned = cleaned.trim_start_matches('.').replace("..", "_");
+    if cleaned.is_empty() {
+        "_".into()
+    } else {
+        cleaned
+    }
+}
+
+/// Interpolates a local shell command without splicing upstream data into it:
+/// each dynamic value goes into an env var (`ZERITH_V<n>`) and the command gets
+/// a reference (`"$ZERITH_V0"` on sh, `!ZERITH_V0!` with delayed expansion on
+/// cmd, which never re-parses the expanded value).
+fn interpolate_for_shell(
+    tpl: &str,
+    prev: &str,
+    outputs: &HashMap<String, String>,
+    now_dt: &LocalDateTime,
+    loop_vars: Option<(&str, &str)>,
+) -> (String, Vec<(String, String)>) {
+    let mut env: Vec<(String, String)> = Vec::new();
+    let cmd = interpolate_inner(tpl, prev, outputs, now_dt, loop_vars, &mut |v| {
+        let name = format!("ZERITH_V{}", env.len());
+        env.push((name.clone(), v.to_string()));
+        if cfg!(windows) {
+            format!("!{name}!")
+        } else {
+            format!("\"${name}\"")
+        }
+    });
+    (cmd, env)
 }
 
 fn cfg_str<'a>(cfg: &'a Value, key: &str) -> Option<&'a str> {
@@ -1056,13 +1185,21 @@ fn clip_text(s: &str, max: usize) -> String {
     }
 }
 
-fn run_shell_command(cmd: &str, cwd: Option<&Path>, timeout: Duration) -> Result<String> {
+fn run_shell_command(
+    cmd: &str,
+    cwd: Option<&Path>,
+    timeout: Duration,
+    env: &[(String, String)],
+) -> Result<String> {
     let mut c = if cfg!(windows) {
         let mut c = Command::new("cmd");
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
-            c.raw_arg(format!("/S /C \"{cmd}\""));
+            // Delayed expansion only when values travel by env var, so a
+            // literal `!` in a plain command keeps its old meaning.
+            let v = if env.is_empty() { "" } else { "/V:ON " };
+            c.raw_arg(format!("{v}/S /C \"{cmd}\""));
         }
         #[cfg(not(windows))]
         {
@@ -1079,6 +1216,7 @@ fn run_shell_command(cmd: &str, cwd: Option<&Path>, timeout: Duration) -> Result
             c.current_dir(dir);
         }
     }
+    c.envs(env.iter().map(|(k, v)| (k, v)));
     c.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -1429,6 +1567,161 @@ mod tests {
         assert!(ai_out.contains("Find videos"), "{ai_out}");
     }
 
+    fn node(id: &str, kind: NodeKind, config: Value) -> WorkflowNode {
+        WorkflowNode {
+            id: id.into(),
+            kind,
+            label: id.into(),
+            x: 0.0,
+            y: 0.0,
+            config,
+        }
+    }
+
+    fn edge(from: &str, to: &str) -> WorkflowEdge {
+        WorkflowEdge {
+            id: format!("{from}-{to}"),
+            from: from.into(),
+            to: to.into(),
+            branch: None,
+        }
+    }
+
+    fn wf_of(nodes: Vec<WorkflowNode>, edges: Vec<WorkflowEdge>) -> Workflow {
+        Workflow {
+            id: "wf".into(),
+            name: "wf".into(),
+            description: String::new(),
+            icon: "workflow".into(),
+            enabled: true,
+            bot_name: None,
+            nodes,
+            edges,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            last_run_at_ms: None,
+            last_status: None,
+        }
+    }
+
+    #[test]
+    fn only_triggers_matching_source_start_branches() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("w.db")).unwrap();
+        let wf = wf_of(
+            vec![
+                node("cron", NodeKind::TriggerCron, json!({})),
+                node("hook", NodeKind::TriggerWebhook, json!({})),
+                node("fc", NodeKind::SaveFile, json!({"path": "cron.txt"})),
+                node("fh", NodeKind::SaveFile, json!({"path": "hook.txt"})),
+                node("orphan", NodeKind::SaveFile, json!({"path": "orphan.txt"})),
+            ],
+            vec![edge("cron", "fc"), edge("hook", "fh")],
+        );
+        let mut opts = RunOptions {
+            store: &store,
+            data_root: dir.path(),
+            ai: &EchoAi,
+            trigger_source: "webhook",
+            tz_offset_minutes: 0,
+            initial_input: Some("payload"),
+            on_event: &mut |_| {},
+        };
+        let run = execute_workflow(&wf, &mut opts).unwrap();
+        assert_eq!(run.status, "ok", "{}", run.summary);
+        assert!(dir.path().join("hook.txt").is_file());
+        assert!(!dir.path().join("cron.txt").exists());
+        assert!(!dir.path().join("orphan.txt").exists());
+    }
+
+    #[test]
+    fn interpolated_values_cannot_inject_shell_or_escape_save_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("w.db")).unwrap();
+        let payload = if cfg!(windows) {
+            "a & echo INJECTED"
+        } else {
+            "a; echo INJECTED $(echo X) '"
+        };
+        let wf = wf_of(
+            vec![
+                node("hook", NodeKind::TriggerWebhook, json!({})),
+                node("sh", NodeKind::Shell, json!({"command": "echo {{prev}}"})),
+                node(
+                    "f",
+                    NodeKind::SaveFile,
+                    json!({"path": "out/{{node.hook}}.txt", "content": "x"}),
+                ),
+            ],
+            vec![edge("hook", "sh"), edge("sh", "f")],
+        );
+        let run_with = |input: &str| {
+            let mut opts = RunOptions {
+                store: &store,
+                data_root: dir.path(),
+                ai: &EchoAi,
+                trigger_source: "webhook",
+                tz_offset_minutes: 0,
+                initial_input: Some(input),
+                on_event: &mut |_| {},
+            };
+            execute_workflow(&wf, &mut opts).unwrap()
+        };
+        let run = run_with(payload);
+        assert_eq!(run.status, "ok", "{}", run.summary);
+        assert_eq!(run.node_logs[1].output, payload);
+
+        let run = run_with("../../evil");
+        assert_eq!(run.status, "ok", "{}", run.summary);
+        assert!(dir.path().join("out").join("___evil.txt").is_file());
+        assert_eq!(posix_quote("it's"), r"'it'\''s'");
+    }
+
+    #[test]
+    fn dedup_keys_commit_only_when_run_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("w.db")).unwrap();
+        let mk = |fail: bool| {
+            wf_of(
+                vec![
+                    node("t", NodeKind::TriggerManual, json!({})),
+                    node(
+                        "src",
+                        NodeKind::Transform,
+                        json!({"mode": "template", "template": "a\nb"}),
+                    ),
+                    node(
+                        "d",
+                        NodeKind::Transform,
+                        json!({"mode": "dedup_lines", "pattern": "s"}),
+                    ),
+                    node(
+                        "after",
+                        NodeKind::Shell,
+                        json!({"command": if fail { "exit 3" } else { "echo ok" }}),
+                    ),
+                ],
+                vec![edge("t", "src"), edge("src", "d"), edge("d", "after")],
+            )
+        };
+        let mut opts = RunOptions {
+            store: &store,
+            data_root: dir.path(),
+            ai: &EchoAi,
+            trigger_source: "manual",
+            tz_offset_minutes: 0,
+            initial_input: None,
+            on_event: &mut |_| {},
+        };
+        let failed = execute_workflow(&mk(true), &mut opts).unwrap();
+        assert_eq!(failed.status, "error");
+        let lines = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(store.unseen_items("s", &lines).unwrap(), lines);
+        let ok = execute_workflow(&mk(false), &mut opts).unwrap();
+        assert_eq!(ok.status, "ok", "{}", ok.summary);
+        assert!(store.unseen_items("s", &lines).unwrap().is_empty());
+    }
+
     #[test]
     fn large_output_over_100kib_does_not_deadlock_pipe() {
         let cmd = if cfg!(windows) {
@@ -1476,7 +1769,7 @@ mod tests {
             CommandWait::TimedOut(_, _) => panic!("command timed out while draining >100 KiB pipe"),
         }
 
-        let shell_out = run_shell_command(cmd, None, Duration::from_secs(10)).unwrap();
+        let shell_out = run_shell_command(cmd, None, Duration::from_secs(10), &[]).unwrap();
         assert!(shell_out.starts_with("BEGIN_LARGE"));
         assert!(shell_out.contains("...[truncado]"));
     }

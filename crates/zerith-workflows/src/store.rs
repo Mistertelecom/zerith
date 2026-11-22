@@ -129,7 +129,13 @@ impl Store {
         let rows = stmt.query_map([], row_to_workflow)?;
         let mut out = Vec::new();
         for row in rows {
-            out.push(row?);
+            match row {
+                Ok(w) => out.push(w),
+                // Corrupt graph JSON: hide the row (it cannot be saved over)
+                // instead of failing every list.
+                Err(rusqlite::Error::FromSqlConversionFailure(..)) => {}
+                Err(e) => return Err(e.into()),
+            }
         }
         Ok(out)
     }
@@ -301,26 +307,43 @@ impl Store {
         Ok(out)
     }
 
-    /// Persistent deduplication (`Seen Store`): returns only items not yet seen
-    /// under `scope`, recording newly observed items in `workflow_seen`.
-    pub fn filter_unseen_items(&self, scope: &str, items: &[String]) -> Result<Vec<String>> {
+    /// Persistent deduplication (`Seen Store`), read half: items not yet seen
+    /// under `scope` (also deduplicated within `items`). Records nothing; the
+    /// runner calls [`Store::mark_items_seen`] once the run succeeds.
+    pub fn unseen_items(&self, scope: &str, items: &[String]) -> Result<Vec<String>> {
+        let conn = self.conn.lock().map_err(|_| WorkflowError::Lock)?;
+        let mut stmt =
+            conn.prepare("SELECT 1 FROM workflow_seen WHERE scope = ?1 AND item_key = ?2")?;
+        let mut local = std::collections::HashSet::new();
+        let mut unseen = Vec::new();
+        for raw in items {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() || !local.insert(trimmed) {
+                continue;
+            }
+            if !stmt.exists(params![scope, trimmed])? {
+                unseen.push(trimmed.to_string());
+            }
+        }
+        Ok(unseen)
+    }
+
+    /// Commit half of the Seen Store: records `items` under `scope`.
+    pub fn mark_items_seen(&self, scope: &str, items: &[String]) -> Result<()> {
         let conn = self.conn.lock().map_err(|_| WorkflowError::Lock)?;
         let now = now_ms();
-        let mut unseen = Vec::new();
+        let mut inserted_any = false;
         for raw in items {
             let trimmed = raw.trim();
             if trimmed.is_empty() {
                 continue;
             }
-            let inserted = conn.execute(
+            inserted_any |= conn.execute(
                 "INSERT OR IGNORE INTO workflow_seen (scope, item_key, seen_at_ms) VALUES (?1, ?2, ?3)",
                 params![scope, trimmed, now],
-            )?;
-            if inserted > 0 {
-                unseen.push(trimmed.to_string());
-            }
+            )? > 0;
         }
-        if !unseen.is_empty() {
+        if inserted_any {
             let _ = conn.execute(
                 "DELETE FROM workflow_seen
                  WHERE scope = ?1 AND item_key NOT IN (
@@ -329,12 +352,52 @@ impl Store {
                 params![scope],
             );
         }
-        Ok(unseen)
+        Ok(())
+    }
+}
+
+/// 128-bit hex token from std's OS-seeded SipHash keys (no extra dependency).
+pub fn random_token() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let part = || {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u64(SEQ.fetch_add(1, Ordering::Relaxed));
+        h.write_i64(now_ms());
+        h.finish()
+    };
+    format!("{:016x}{:016x}", part(), part())
+}
+
+/// Webhook triggers always carry a secret: an empty one is replaced by a
+/// random token at save time, so no webhook is reachable unauthenticated.
+fn ensure_webhook_secrets(nodes: &mut [WorkflowNode]) {
+    for n in nodes
+        .iter_mut()
+        .filter(|n| n.kind == NodeKind::TriggerWebhook)
+    {
+        let empty = n
+            .config
+            .get("secret")
+            .and_then(|v| v.as_str())
+            .is_none_or(|s| s.trim().is_empty());
+        if !empty {
+            continue;
+        }
+        if !n.config.is_object() {
+            n.config = json!({});
+        }
+        if let Some(obj) = n.config.as_object_mut() {
+            obj.insert("secret".into(), json!(random_token()));
+        }
     }
 }
 
 fn upsert_workflow(conn: &Connection, wf: &Workflow) -> Result<()> {
-    let nodes_json = serde_json::to_string(&wf.nodes)?;
+    let mut nodes = wf.nodes.clone();
+    ensure_webhook_secrets(&mut nodes);
+    let nodes_json = serde_json::to_string(&nodes)?;
     let edges_json = serde_json::to_string(&wf.edges)?;
     let now = now_ms();
     let created = if wf.created_at_ms > 0 {
@@ -388,8 +451,13 @@ fn upsert_workflow(conn: &Connection, wf: &Workflow) -> Result<()> {
 fn row_to_workflow(row: &rusqlite::Row<'_>) -> rusqlite::Result<Workflow> {
     let nodes_raw: String = row.get(5)?;
     let edges_raw: String = row.get(6)?;
-    let nodes: Vec<WorkflowNode> = serde_json::from_str(&nodes_raw).unwrap_or_default();
-    let edges: Vec<WorkflowEdge> = serde_json::from_str(&edges_raw).unwrap_or_default();
+    // A corrupt row errors instead of loading as empty: an empty graph would be
+    // written back over the real data on the next save.
+    let bad = |col: usize, e: serde_json::Error| {
+        rusqlite::Error::FromSqlConversionFailure(col, rusqlite::types::Type::Text, Box::new(e))
+    };
+    let nodes: Vec<WorkflowNode> = serde_json::from_str(&nodes_raw).map_err(|e| bad(5, e))?;
+    let edges: Vec<WorkflowEdge> = serde_json::from_str(&edges_raw).map_err(|e| bad(6, e))?;
     let enabled_i: i32 = row.get(4)?;
     Ok(Workflow {
         id: row.get(0)?,
@@ -798,6 +866,24 @@ fn default_templates(now: i64) -> Vec<Workflow> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn corrupt_graph_json_errors_instead_of_loading_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("c.db")).unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO workflows (id, name, nodes_json, edges_json, created_at_ms, updated_at_ms)
+                 VALUES ('bad', 'bad', '{not json', '[]', 1, 1)",
+                [],
+            )
+            .unwrap();
+        assert!(store.get_workflow("bad").is_err());
+        assert!(store.list_workflows().unwrap().is_empty());
+    }
 
     #[test]
     fn seed_defaults_does_not_resurrect_after_user_deletes_all() {

@@ -6,10 +6,12 @@
 //! Failed jobs or agent responses starting with `"ALERTA:"` dispatch Telegram
 //! notifications when `gateway.telegram` is configured.
 
+use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use zerith_core::{Paths, Settings};
@@ -109,19 +111,29 @@ fn pid_alive(pid: u32) -> bool {
 
 /// Returns `true` when `schedule` is enabled, its cron matches the current
 /// UTC minute (`now_secs`), and it has not already executed in that minute.
+#[cfg(test)]
 pub fn is_schedule_due(schedule: &Schedule, now_secs: i64) -> bool {
+    let m = now_secs.div_euclid(60);
+    is_schedule_due_in(schedule, m, m)
+}
+
+/// Missed minutes the daemon replays after a stall/sleep; older ones are dropped.
+const MAX_CATCHUP_MINUTES: i64 = 15;
+
+/// Like [`is_schedule_due`] over every UTC minute in `from_min..=to_min`
+/// (epoch minutes): true once if any minute after the last run matches, so
+/// several missed slots collapse into one run.
+pub fn is_schedule_due_in(schedule: &Schedule, from_min: i64, to_min: i64) -> bool {
     if !schedule.enabled {
         return false;
     }
     let Ok(expr) = CronExpr::parse(&schedule.cron_expr) else {
         return false;
     };
-    if let Some(last_ms) = schedule.last_run_at {
-        if last_ms.div_euclid(60_000) == now_secs.div_euclid(60) {
-            return false;
-        }
-    }
-    expr.matches_unix_secs(now_secs)
+    let after_last = schedule
+        .last_run_at
+        .map_or(i64::MIN, |ms| ms.div_euclid(60_000) + 1);
+    (from_min.max(after_last)..=to_min).any(|m| expr.matches_unix_secs(m * 60))
 }
 
 pub fn schedule_cmd(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -380,11 +392,22 @@ pub fn daemon_cmd(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::err
         );
     }
 
+    // Jobs run on their own threads so one slow job cannot delay the others;
+    // `running` keeps a job from overlapping with itself.
+    let running: Arc<Mutex<HashSet<String>>> = Arc::default();
+    let mut handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
+    let mut last_min: Option<i64> = None;
     loop {
         let now_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
+        let now_min = now_secs.div_euclid(60);
+        let from_min = match last_min {
+            Some(prev) if prev < now_min => (prev + 1).max(now_min - MAX_CATCHUP_MINUTES),
+            _ => now_min,
+        };
+        last_min = Some(now_min);
 
         match store.schedule_list() {
             Ok(items) => {
@@ -392,21 +415,51 @@ pub fn daemon_cmd(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::err
                     if cancel.is_cancelled() {
                         break;
                     }
-                    if is_schedule_due(&s, now_secs) {
-                        eprintln!(
-                            "zerith: executando agendamento `{}` ({})",
-                            s.name, s.cron_expr
-                        );
-                        let (status, _) =
-                            run_one_schedule(paths, &store, &s, &cancel, timeout_secs);
-                        eprintln!("zerith: agendamento `{}` finalizado: {status}", s.name);
+                    if !is_schedule_due_in(&s, from_min, now_min) {
+                        continue;
                     }
+                    if !running
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(s.id.clone())
+                    {
+                        continue;
+                    }
+                    eprintln!(
+                        "zerith: executando agendamento `{}` ({})",
+                        s.name, s.cron_expr
+                    );
+                    let (paths, cancel, running) = (paths.clone(), cancel.clone(), running.clone());
+                    handles.push(std::thread::spawn(move || {
+                        struct Done(Arc<Mutex<HashSet<String>>>, String);
+                        impl Drop for Done {
+                            fn drop(&mut self) {
+                                self.0
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .remove(&self.1);
+                            }
+                        }
+                        let _done = Done(running, s.id.clone());
+                        let status = match Store::open(paths.db()) {
+                            Ok(st) => run_one_schedule(&paths, &st, &s, &cancel, timeout_secs).0,
+                            Err(e) => {
+                                eprintln!("zerith: erro ao abrir banco: {e}");
+                                "error"
+                            }
+                        };
+                        eprintln!("zerith: agendamento `{}` finalizado: {status}", s.name);
+                    }));
                 }
             }
             Err(e) => eprintln!("zerith: erro ao listar agendamentos: {e}"),
         }
+        handles.retain(|h| !h.is_finished());
 
         if once || cancel.is_cancelled() {
+            for h in handles {
+                let _ = h.join();
+            }
             break;
         }
         for _ in 0..poll_secs {
@@ -691,6 +744,23 @@ mod tests {
         assert!(!is_schedule_due(
             &mk_schedule("*/5 * * * *", true, None),
             ts + 60
+        ));
+    }
+
+    #[test]
+    fn missed_minutes_are_caught_up_once() {
+        // 2026-11-20 12:30:00 UTC matches */5; daemon stalled from 12:29 to 12:33.
+        let m = 1_795_177_800i64 / 60;
+        let s = mk_schedule("*/5 * * * *", true, None);
+        assert!(is_schedule_due_in(&s, m - 1, m + 3));
+        assert!(!is_schedule_due_in(&s, m + 1, m + 3));
+        // Already ran at 12:30: replaying the same window does not fire again.
+        let ran = mk_schedule("*/5 * * * *", true, Some(m * 60_000 + 5_000));
+        assert!(!is_schedule_due_in(&ran, m - 1, m + 3));
+        assert!(!is_schedule_due_in(
+            &mk_schedule("*/5 * * * *", false, None),
+            m,
+            m
         ));
     }
 

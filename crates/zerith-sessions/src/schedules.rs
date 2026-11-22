@@ -14,6 +14,10 @@ pub struct CronExpr {
     dom: [bool; 32],
     month: [bool; 13],
     dow: [bool; 7],
+    /// Standard cron: when both day-of-month and day-of-week are restricted,
+    /// a day matching either one fires.
+    dom_star: bool,
+    dow_star: bool,
 }
 
 impl CronExpr {
@@ -36,17 +40,25 @@ impl CronExpr {
             dom,
             month,
             dow,
+            dom_star: fields[2].starts_with('*'),
+            dow_star: fields[4].starts_with('*'),
         })
     }
 
     /// True if `epoch_secs` (UTC) matches this schedule's minute.
     pub fn matches_unix_secs(&self, epoch_secs: i64) -> bool {
         let (min, hour, dom, month, dow) = utc_components(epoch_secs);
+        let dom_ok = self.dom.get(dom as usize).copied().unwrap_or(false);
+        let dow_ok = self.dow.get(dow as usize).copied().unwrap_or(false);
+        let day_ok = if self.dom_star || self.dow_star {
+            dom_ok && dow_ok
+        } else {
+            dom_ok || dow_ok
+        };
         self.min.get(min as usize).copied().unwrap_or(false)
             && self.hour.get(hour as usize).copied().unwrap_or(false)
-            && self.dom.get(dom as usize).copied().unwrap_or(false)
             && self.month.get(month as usize).copied().unwrap_or(false)
-            && self.dow.get(dow as usize).copied().unwrap_or(false)
+            && day_ok
     }
 }
 
@@ -290,6 +302,11 @@ mod tests {
             .unwrap()
             .matches_unix_secs(259_200)); // 1970-01-04 Sunday
         assert!(CronExpr::parse("bad").is_err());
+        // dom=1 OR Monday: 1970-01-05 was a Monday (not the 1st), 1970-01-01 a Thursday.
+        let either = CronExpr::parse("0 0 1 * 1").unwrap();
+        assert!(either.matches_unix_secs(4 * 86_400));
+        assert!(either.matches_unix_secs(0));
+        assert!(!either.matches_unix_secs(86_400));
         assert!(CronExpr::parse("61 * * * *").is_err());
     }
 

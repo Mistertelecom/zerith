@@ -5115,6 +5115,7 @@ dependencies = [
 name = "zerith-workflows"
 version = "0.3.5"
 dependencies = [
+ "chrono",
  "rusqlite",
  "serde",
  "serde_json",

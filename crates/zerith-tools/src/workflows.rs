@@ -276,7 +276,8 @@ fn workflow_create_or_update(args: &Value, _: &CallCtx<'_>, _: &Exec<'_>) -> Res
 
     let mut nodes = Vec::with_capacity(raw_nodes.len());
     for (idx, rn) in raw_nodes.iter().enumerate() {
-        let mut node: WorkflowNode = serde_json::from_value(json!({
+        // Crons without `tz_offset_minutes` follow the OS local offset per tick.
+        let node: WorkflowNode = serde_json::from_value(json!({
             "id": rn.get("id").and_then(|v| v.as_str()).unwrap_or(&format!("n{}", idx + 1)),
             "kind": rn.get("kind").cloned().unwrap_or(Value::String("shell".into())),
             "label": rn.get("label").and_then(|v| v.as_str()).unwrap_or("Node"),
@@ -286,12 +287,6 @@ fn workflow_create_or_update(args: &Value, _: &CallCtx<'_>, _: &Exec<'_>) -> Res
         }))
         .map_err(|e| ToolError::BadArguments(format!("nó inválido no índice {idx}: {e}")))?;
 
-        if node.kind == NodeKind::TriggerCron {
-            if let Some(obj) = node.config.as_object_mut() {
-                obj.entry("tz_offset_minutes")
-                    .or_insert_with(|| json!(-180));
-            }
-        }
         nodes.push(node);
     }
 
@@ -522,7 +517,7 @@ fn workflow_run(args: &Value, ctx: &CallCtx<'_>, _: &Exec<'_>) -> Result<String>
         data_root: &root,
         ai: ai_ref,
         trigger_source: "ai_tool",
-        tz_offset_minutes: -180,
+        tz_offset_minutes: zerith_workflows::local_offset_minutes(zerith_workflows::unix_secs()),
         initial_input: None,
         on_event: &mut noop,
     };

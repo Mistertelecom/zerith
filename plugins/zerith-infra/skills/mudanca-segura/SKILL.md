@@ -1,5 +1,5 @@
 ---
-name: safe-change-window
+name: mudanca-segura
 description: "Use ao planejar ou executar janelas de manutenção (GMUD/MOP) em ativos de rede de produção: pré-check, comandos de alteração, plano de rollback imediato e pós-check."
 ---
 

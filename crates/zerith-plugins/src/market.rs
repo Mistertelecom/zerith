@@ -400,7 +400,7 @@ mod tests {
             .filter_map(|p| p["name"].as_str())
             .collect();
         for want in [
-            "zerith-netops",
+            "zerith-infra",
             "superpowers",
             "context7",
             "ast-grep",

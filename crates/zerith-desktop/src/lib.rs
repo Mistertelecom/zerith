@@ -77,8 +77,7 @@ fn seed_bundled_skills(root: &std::path::Path) {
     }
 }
 
-/// Official Zerith plugins (`zerith-netops`, `zerith-proxmox`, `zerith-noc-observability`,
-/// `zerith-ftth-olt`, `zerith-linux-devops`, `zerith-workflows`, `zerith-finance`) arrive installed
+/// Official Zerith plugins (`zerith-infra`, `zerith-workflows`, `zerith-finance`) arrive installed
 /// and enabled by default so their skills and agents are immediately active without manual setup.
 fn seed_bundled_plugins(root: &std::path::Path) {
     let bundle = zerith_core::Paths::with_root(root)
@@ -88,8 +87,20 @@ fn seed_bundled_plugins(root: &std::path::Path) {
             dev.is_dir().then_some(dev)
         });
     let Some(bundle) = bundle else { return };
-    match zerith_plugins::Library::open(&root.join("plugins")).and_then(|l| l.seed_enabled(&bundle))
-    {
+    let lib = zerith_plugins::Library::open(&root.join("plugins"));
+    // Merged into `zerith-infra` in 0.4; left installed they would duplicate its skills.
+    if let Ok(l) = &lib {
+        for old in [
+            "zerith-netops",
+            "zerith-proxmox",
+            "zerith-noc-observability",
+            "zerith-ftth-olt",
+            "zerith-linux-devops",
+        ] {
+            let _ = l.remove(old);
+        }
+    }
+    match lib.and_then(|l| l.seed_enabled(&bundle)) {
         Ok((_, failed)) => failed
             .iter()
             .for_each(|f| eprintln!("zerith-desktop: plugin embutido ignorado: {f}")),

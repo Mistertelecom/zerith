@@ -16,11 +16,11 @@ pub(crate) fn all(parallel: bool) -> Vec<Box<dyn Tool>> {
     vec![
         make(
             "agent",
-            "Delega uma tarefa a um subagente com contexto próprio; só o texto final dele volta para você. Use para executar tarefas operacionais completas (SSH/Telnet/Serial, Proxmox, VPN, shell, edições de código), explorar o código ou pesquisar sem encher seu contexto, e chame vários de uma vez para trabalho independente. Agentes built-in: executor (execução operacional completa com todas as ferramentas), explore (somente leitura), plan (somente leitura, devolve um plano), general (todas as ferramentas) ou agentes especialistas dos plugins (netops-architect, proxmox-architect, noc-incident-commander, ftth-gpon-architect, linux-devops-architect). O prompt precisa bastar sozinho: o subagente não vê esta conversa.",
+            "Delega uma tarefa a um subagente com contexto próprio; só o texto final dele volta para você. Use para executar tarefas operacionais completas (SSH/Telnet/Serial, Proxmox, VPN, shell, edições de código), explorar o código ou pesquisar sem encher seu contexto, e chame vários de uma vez para trabalho independente. Agentes built-in: executor (execução operacional completa com todas as ferramentas), explore (somente leitura), plan (somente leitura, devolve um plano), general (todas as ferramentas) ou agentes especialistas dos plugins (engenheiro-infra, workflow-architect). O prompt precisa bastar sozinho: o subagente não vê esta conversa.",
             json!({"type": "object", "properties": {
                 "description": {"type": "string", "description": "3 a 5 palavras"},
                 "prompt": {"type": "string", "description": "a tarefa completa e o formato esperado da resposta"},
-                "agent": {"type": "string", "description": "executor, explore, plan, general, netops-architect, proxmox-architect, noc-incident-commander, ftth-gpon-architect, linux-devops-architect ou outro agente definido (padrão: general)"},
+                "agent": {"type": "string", "description": "executor, explore, plan, general, engenheiro-infra, workflow-architect ou outro agente definido (padrão: general)"},
                 "model": {"type": "string"},
                 "isolation": {"type": "string", "enum": ["worktree"], "description": "use \"worktree\" para isolar alterações em um git worktree temporário"},
                 "run_in_background": {"type": "boolean", "description": "devolve um id na hora; busque o resultado com agent_result"}

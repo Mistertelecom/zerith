@@ -127,6 +127,7 @@ pub struct Checkpoint {
     snapped: Once,
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 fn normalize_windows_path_str(raw: &str) -> String {
     let normalized = raw.replace('/', "\\");
     let stripped = if let Some(unc) = normalized

@@ -93,7 +93,7 @@ usage:
   zerith accounts [list|add <id> <provider> ...|remove|enable|disable|reset-cooldown <id>]
   zerith routing [show|main|subagent|explore|plan|compact <model>|role <agent> <model>|combo <name> <m1,m2,...>]
   zerith tokensaver [show|ponytail <off|lite|full|ultra>|caveman <off|lite|full|ultra|wenyan>|rtk <on|off>]
-  zerith repl [--session <id>|--resume [id|name]|--continue] [--model <id>] [--mode <mode>] [--effort <off|low|medium|high>] [--remote <uri|alias>]
+  zerith repl [--session <id>|--resume [id|name]|--continue] [--model <id>] [--mode <mode>] [--effort <off|low|medium|high|xhigh|max>] [--remote <uri|alias>]
   zerith chat [--session <id>|--resume [id|name]|--continue] [--fork] [--model <id>] [--remote <uri|alias>] [<prompt>]
   zerith -p <prompt> [--output-format text|json|stream-json] [--model M]
         [--session ID | --resume [id|name] | --continue] [--fork]
@@ -1142,7 +1142,7 @@ fn repl(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>
             match cmd {
                 ReplSlash::Help => eprintln!(
                     "/help  /model <id>  /mode <default|acceptEdits|plan|bypass>  \
-                     /effort <off|low|medium|high>  /compact  /rewind [N]  \
+                     /effort <off|low|medium|high|xhigh|max>  /compact  /rewind [N]  \
                      /sessions [id]  /clear  /exit"
                 ),
                 ReplSlash::Exit => break,
@@ -1179,11 +1179,11 @@ fn repl(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>
                     if norm == "off" {
                         effort = None;
                         eprintln!("zerith: effort -> off");
-                    } else if matches!(norm.as_str(), "low" | "medium" | "high") {
+                    } else if matches!(norm.as_str(), "low" | "medium" | "high" | "xhigh" | "max") {
                         effort = Some(norm.clone());
                         eprintln!("zerith: effort -> {norm}");
                     } else {
-                        eprintln!("zerith: effort inválido `{e}` (use off, low, medium ou high)");
+                        eprintln!("zerith: effort inválido `{e}` (use off, low, medium, high, xhigh ou max)");
                     }
                 }
                 ReplSlash::Effort(None) => {

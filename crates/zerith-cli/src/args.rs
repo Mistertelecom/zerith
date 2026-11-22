@@ -179,9 +179,12 @@ pub fn parse_repl(args: &[String]) -> Result<ReplArgs, String> {
             }
             "--effort" => {
                 let v = next()?.trim().to_ascii_lowercase();
-                if !matches!(v.as_str(), "off" | "low" | "medium" | "high") {
+                if !matches!(
+                    v.as_str(),
+                    "off" | "low" | "medium" | "high" | "xhigh" | "max"
+                ) {
                     return Err(format!(
-                        "--effort inválido: {v} (use off, low, medium ou high)"
+                        "--effort inválido: {v} (use off, low, medium, high, xhigh ou max)"
                     ));
                 }
                 out.effort = Some(v);
@@ -868,6 +871,8 @@ mod tests {
         assert_eq!(parsed.effort.as_deref(), Some("high"));
         assert_eq!(parsed.session.target, Target::Latest);
         assert!(parse_repl(&v(&["repl", "--effort", "extreme"])).is_err());
+        let max = parse_repl(&v(&["repl", "--effort", "MAX"])).unwrap();
+        assert_eq!(max.effort.as_deref(), Some("max"));
     }
 
     #[test]

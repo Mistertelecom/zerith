@@ -52,6 +52,8 @@ pub enum McpError {
     Timeout(Duration),
     #[error("http: {0}")]
     Http(String),
+    #[error("cancelled")]
+    Cancelled,
 }
 
 pub type Result<T> = std::result::Result<T, McpError>;
@@ -230,6 +232,20 @@ impl Client {
     /// a server-initiated request in between is skipped, not mistaken for the
     /// answer. A server that stays silent past the timeout is killed.
     pub fn request(&mut self, method: &str, params: Option<Value>) -> Result<Value> {
+        self.request_until(method, params, &|| false)
+    }
+
+    /// [`Client::request`] that also gives up when `stop` turns true (the
+    /// turn was cancelled or its deadline passed). A stdio server is polled
+    /// in short slices and killed on stop, since its pipe now holds an answer
+    /// nobody will read. ponytail: an HTTP request still runs to the agent's
+    /// own timeout; interrupting ureq mid-read needs an async client.
+    pub fn request_until(
+        &mut self,
+        method: &str,
+        params: Option<Value>,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let req = serde_json::to_value(protocol::Request::new(id, method, params))?;
         let timeout = self.timeout;
@@ -244,22 +260,23 @@ impl Client {
                 loop {
                     let now = Instant::now();
                     if now >= deadline {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        kill_tree(child);
                         return Err(McpError::Timeout(timeout));
                     }
-                    let left = deadline.saturating_duration_since(now);
+                    if stop() {
+                        kill_tree(child);
+                        return Err(McpError::Cancelled);
+                    }
+                    let left = deadline
+                        .saturating_duration_since(now)
+                        .min(Duration::from_millis(100));
                     match lines.recv_timeout(left) {
                         Ok(line) => {
                             if let Some(r) = match_response(&line, id) {
                                 return r;
                             }
                         }
-                        Err(RecvTimeoutError::Timeout) => {
-                            let _ = child.kill();
-                            let _ = child.wait();
-                            return Err(McpError::Timeout(timeout));
-                        }
+                        Err(RecvTimeoutError::Timeout) => {}
                         Err(RecvTimeoutError::Disconnected) => return Err(McpError::Closed),
                     }
                 }
@@ -340,9 +357,20 @@ impl Client {
     }
 
     pub fn call(&mut self, tool: &str, arguments: Value) -> Result<CallResult> {
-        let result = self.request(
+        self.call_until(tool, arguments, &|| false)
+    }
+
+    /// [`Client::call`] that stops waiting once `stop` turns true.
+    pub fn call_until(
+        &mut self,
+        tool: &str,
+        arguments: Value,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<CallResult> {
+        let result = self.request_until(
             "tools/call",
             Some(json!({ "name": tool, "arguments": arguments })),
+            stop,
         )?;
         Ok(serde_json::from_value(result)?)
     }
@@ -385,10 +413,27 @@ impl Client {
 impl Drop for Client {
     fn drop(&mut self) {
         if let Transport::Stdio { child, .. } = &mut self.transport {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_tree(child);
         }
     }
+}
+
+/// Kills the server and everything it started. On Windows `npx` is
+/// `npx.cmd`: the child is `cmd.exe` and the real server a `node.exe`
+/// grandchild that `child.kill()` alone would orphan.
+fn kill_tree(child: &mut Child) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &child.id().to_string()])
+            .creation_flags(0x0800_0000)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Where `command` would run from: an existing path as is, else the first

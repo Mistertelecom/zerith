@@ -417,6 +417,47 @@ fn read_file(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String>
     Ok(out)
 }
 
+/// Writes a temp file beside `path`, syncs it, then renames it over `path`:
+/// a crash or full disk mid-write leaves the old file whole, never a
+/// truncated one. The old file's permissions carry over; a symlink is
+/// written through (its target replaced), as `fs::write` did.
+pub(crate) fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let target = match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => std::fs::canonicalize(path)?,
+        _ => path.to_path_buf(),
+    };
+    let dir = target
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
+    let name = target.file_name().unwrap_or_default().to_string_lossy();
+    let tmp = dir.join(format!(".{name}.{}.zerith-tmp", std::process::id()));
+    let result = (|| {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        f.write_all(bytes)?;
+        // A read-only target fails the rename below, as `fs::write` failed;
+        // copying the flag would only strand a read-only temp file.
+        if let Some(p) = std::fs::metadata(&target)
+            .ok()
+            .map(|m| m.permissions())
+            .filter(|p| !p.readonly())
+        {
+            f.set_permissions(p)?;
+        }
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, &target)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
 fn write_file(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
     let path = ctx.resolve(str_arg(args, "path")?);
     let content = str_arg(args, "content")?;
@@ -425,7 +466,7 @@ fn write_file(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&path, content)?;
+    write_atomic(&path, content.as_bytes())?;
     // The model knows what it just wrote; a follow-up edit needs no re-read.
     exec.host.note_read(&path);
     Ok(format!(
@@ -821,6 +862,18 @@ mod path_tests {
         let twice = path_with(Some(once.clone()), Path::new("/b"));
         assert_eq!(once, twice);
         assert!(!path_with(Some(OsString::new()), Path::new("/b")).is_empty());
+    }
+
+    #[test]
+    fn write_atomic_replaces_the_file_and_leaves_no_temp() {
+        let scratch = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let dir = tempfile::Builder::new().tempdir_in(scratch).unwrap();
+        let f = dir.path().join("a.txt");
+        std::fs::write(&f, "old content, longer").unwrap();
+        super::write_atomic(&f, b"new").unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "new");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }
 

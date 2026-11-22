@@ -1106,6 +1106,9 @@ fn spawn(command: &str, cwd: &std::path::Path) -> std::io::Result<Spawned> {
 struct OsProc {
     hpc: isize,
     process: windows_sys::Win32::Foundation::HANDLE,
+    /// Kill-on-close: closing the terminal ends everything the program
+    /// started (ssh's helpers, a REPL's children), not just the top process.
+    job: Option<zerith_security::jail::JobHandle>,
 }
 
 // SAFETY: the handles are plain kernel handles, used from one thread at a time
@@ -1125,6 +1128,9 @@ impl OsProc {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Console::ClosePseudoConsole;
         use windows_sys::Win32::System::Threading::TerminateProcess;
+        if let Some(job) = self.job.take() {
+            job.terminate();
+        }
         unsafe {
             if !self.process.is_null() {
                 TerminateProcess(self.process, 1);
@@ -1152,9 +1158,10 @@ fn spawn_os(command: &str, cwd: &std::path::Path) -> std::io::Result<Spawned> {
     use windows_sys::Win32::System::Pipes::CreatePipe;
     use windows_sys::Win32::System::Threading::{
         CreateProcessW, DeleteProcThreadAttributeList, InitializeProcThreadAttributeList,
-        UpdateProcThreadAttribute, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
-        LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
-        STARTF_USESTDHANDLES, STARTUPINFOEXW,
+        ResumeThread, TerminateProcess, UpdateProcThreadAttribute, CREATE_SUSPENDED,
+        CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST,
+        PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, STARTF_USESTDHANDLES,
+        STARTUPINFOEXW,
     };
     let last = std::io::Error::last_os_error;
     unsafe {
@@ -1225,7 +1232,7 @@ fn spawn_os(command: &str, cwd: &std::path::Path) -> std::io::Result<Spawned> {
             null(),
             null(),
             0,
-            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
             null(),
             dir.as_ptr(),
             &si.StartupInfo,
@@ -1237,11 +1244,24 @@ fn spawn_os(command: &str, cwd: &std::path::Path) -> std::io::Result<Spawned> {
             ClosePseudoConsole(hpc);
             return Err(fail(e));
         }
+        // Suspended until it sits in the job, so nothing it starts escapes.
+        let job = match zerith_security::jail::contain(pi.hProcess) {
+            Ok(j) => j,
+            Err(e) => {
+                TerminateProcess(pi.hProcess, 1);
+                CloseHandle(pi.hThread);
+                CloseHandle(pi.hProcess);
+                ClosePseudoConsole(hpc);
+                return Err(fail(e));
+            }
+        };
+        ResumeThread(pi.hThread);
         CloseHandle(pi.hThread);
         Ok((
             Proc::Os(OsProc {
                 hpc,
                 process: pi.hProcess,
+                job: Some(job),
             }),
             Box::new(File::from_raw_handle(in_w as _)),
             Box::new(File::from_raw_handle(out_r as _)),

@@ -482,6 +482,9 @@ pub fn bwrap_exec(level: Sandbox, workspace: &Path, inner: &Command) -> Command 
 }
 
 #[cfg(windows)]
+pub use win::{contain, JobHandle};
+
+#[cfg(windows)]
 mod win {
     use super::{Jail, Jailed};
     use crate::Sandbox;
@@ -582,6 +585,21 @@ mod win {
             }
             Ok(guard)
         }
+    }
+
+    /// A kill-on-close job (no other limits) holding `process`, which the
+    /// caller created suspended and resumes after this returns. Dropping the
+    /// handle kills every process of the tree.
+    ///
+    /// # Safety
+    /// `process` must be a valid process handle.
+    pub unsafe fn contain(process: HANDLE) -> std::io::Result<JobHandle> {
+        let guard = job(&Jail::new(Sandbox::DangerFullAccess, ""))?;
+        // SAFETY: both handles are valid for the duration of the call.
+        if unsafe { AssignProcessToJobObject(guard.0, process) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(guard)
     }
 
     pub fn spawn(mut cmd: Command, jail: &Jail) -> std::io::Result<Jailed> {

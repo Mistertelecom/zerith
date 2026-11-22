@@ -42,6 +42,30 @@ fn a_silent_server_times_out_and_is_killed() {
     let _ = std::fs::remove_file(&script);
 }
 
+/// A cancelled call returns at once instead of waiting out the server
+/// timeout, and kills the server.
+#[test]
+#[cfg(windows)]
+fn a_cancelled_call_returns_without_waiting_for_the_timeout() {
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let script = dir.join(format!("mcp-cancel-{}.ps1", std::process::id()));
+    std::fs::write(&script, SILENT).unwrap();
+    let args: Vec<String> = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]
+        .iter()
+        .map(|s| s.to_string())
+        .chain([script.display().to_string()])
+        .collect();
+    let mut c = Client::connect_with_timeout("t", "powershell", &args, Duration::from_secs(30))
+        .expect("connect");
+    let t = Instant::now();
+    let stop = move || t.elapsed() > Duration::from_millis(300);
+    let err = c.call_until("x", serde_json::json!({}), &stop).unwrap_err();
+    assert!(matches!(err, McpError::Cancelled), "{err}");
+    assert!(t.elapsed() < Duration::from_secs(5));
+    assert!(c.tools().is_err(), "the server was killed");
+    let _ = std::fs::remove_file(&script);
+}
+
 /// One HTTP exchange: returns the request head+body, writes `reply`.
 fn serve_one(listener: &TcpListener, reply: impl Fn(&str, &str) -> String) -> String {
     let (mut s, _) = listener.accept().unwrap();

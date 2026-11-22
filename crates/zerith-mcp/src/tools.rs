@@ -124,6 +124,7 @@ impl Server {
         if matches!(
             result,
             Err(McpError::Closed
+                | McpError::Cancelled
                 | McpError::Timeout(_)
                 | McpError::Io(_)
                 | McpError::Json(_)
@@ -183,10 +184,16 @@ impl Tool for McpTool {
             }
         };
         exec.check()?;
+        // Waits in slices so a cancelled turn frees the server (and its
+        // mutex) now, not when the server's own timeout fires.
+        let stop = || exec.check().is_err();
         let result = self
             .server
-            .with(|c| c.call(&self.remote, args))
-            .map_err(|e| ToolError::Failed(format!("MCP {}: {e}", self.server.cfg.name)))?;
+            .with(|c| c.call_until(&self.remote, args, &stop))
+            .map_err(|e| match e {
+                McpError::Cancelled => exec.check().err().unwrap_or(ToolError::Cancelled),
+                e => ToolError::Failed(format!("MCP {}: {e}", self.server.cfg.name)),
+            })?;
         let text = result.text();
         if result.is_error == Some(true) {
             return Err(ToolError::Failed(text));

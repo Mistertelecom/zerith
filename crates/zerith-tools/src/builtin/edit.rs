@@ -51,7 +51,7 @@ pub(super) fn edit_file(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Res
             path.display()
         ))),
         _ => {
-            std::fs::write(&path, text.replace(old, new))?;
+            super::write_atomic(&path, text.replace(old, new).as_bytes())?;
             exec.host.note_read(&path);
             let mut msg = format!("{n} ocorrência(s) substituída(s) em {}", path.display());
             if let Some(diags) = crate::lsp::warm_diagnostics_for_edit(ctx.workspace, &path) {
@@ -198,7 +198,7 @@ pub(super) fn multi_edit(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Re
         buf.into_bytes()
     };
     exec.host.before_write(&path)?;
-    std::fs::write(&path, out_bytes)?;
+    super::write_atomic(&path, &out_bytes)?;
     exec.host.note_read(&path);
     let mut msg = format!(
         "{} edição(ões) atômica(s) ({applied_count} substituição(ões)) em {}",

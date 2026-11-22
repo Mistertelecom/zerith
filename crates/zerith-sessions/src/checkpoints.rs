@@ -719,6 +719,56 @@ pub fn restore_turn(
     Ok(report)
 }
 
+/// Puts back one file of `turn` (matched like [`turn_files`] paths) and drops
+/// it from the turn's copies; the turn counts as undone once none are left.
+/// Other files of the turn stay as they are.
+pub fn restore_turn_file(
+    store: &Store,
+    data_root: &Path,
+    session: &str,
+    turn: i64,
+    path: &str,
+) -> Result<RestoreReport> {
+    let dir = turn_dir(data_root, session, turn);
+    let mut manifest = read_manifest(&dir)?;
+    // Same shape record_file stored: absolute, then case/slash-normalized.
+    let key_of = |p: &str| {
+        let p = Path::new(p);
+        path_key(&std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf()))
+    };
+    let key = key_of(path);
+    let Some(at) = manifest.entries.iter().position(|e| key_of(&e.path) == key) else {
+        return Err(CheckpointError::NoCheckpoint {
+            session: session.to_string(),
+            turn,
+        });
+    };
+    let mut report = RestoreReport::default();
+    match put_back(&dir, &manifest.entries[at]) {
+        Ok(Some(true)) => report.files_restored += 1,
+        Ok(Some(false)) => report.files_removed += 1,
+        Ok(None) => {}
+        Err(err) => {
+            report.errors.push(err);
+            return Ok(report);
+        }
+    }
+    let e = manifest.entries.remove(at);
+    if let Some(blob) = e.blob {
+        let _ = std::fs::remove_file(dir.join(blob));
+    }
+    let tmp = dir.join("manifest.json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec(&manifest)?)?;
+    std::fs::rename(&tmp, dir.join("manifest.json"))?;
+    if manifest.entries.is_empty() {
+        store.conn().execute(
+            "UPDATE checkpoints SET rewound = 1 WHERE session_id = ?1 AND turn = ?2",
+            params![session, turn],
+        )?;
+    }
+    Ok(report)
+}
+
 /// Hard-deletes the messages a conversation rewind set aside. Irreversible;
 /// the CLI gates it behind an explicit flag.
 pub fn purge_superseded(store: &Store, session: &str) -> Result<usize> {
@@ -863,6 +913,39 @@ mod tests {
             restore_turn(&st, &root, &s, 9),
             Err(CheckpointError::NoCheckpoint { .. })
         ));
+    }
+
+    #[test]
+    fn restore_turn_file_puts_back_only_that_file() {
+        let root = scratch("turnfile");
+        let work = root.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let (a, b) = (work.join("a.txt"), work.join("b.txt"));
+        std::fs::write(&a, "a0").unwrap();
+        std::fs::write(&b, "b0").unwrap();
+        let st = Store::open_in_memory().unwrap();
+        let s = st.create_session("t", SessionSource::Native).unwrap().id;
+        let t1 = Checkpoint::begin(&st, &root, &s, 1).unwrap();
+        t1.record_file(&a).unwrap();
+        t1.record_file(&b).unwrap();
+        std::fs::write(&a, "a1").unwrap();
+        std::fs::write(&b, "b1").unwrap();
+
+        let r = restore_turn_file(&st, &root, &s, 1, &a.to_string_lossy()).unwrap();
+        assert_eq!((r.files_restored, r.errors.len()), (1, 0));
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "a0");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "b1", "b fica");
+        let left = turn_files(&st, &root, &s, 1).unwrap();
+        assert_eq!(left.len(), 1);
+        assert!(left[0].path.ends_with("b.txt"));
+        assert!(!list(&st, &root, &s).unwrap()[0].code_restored);
+
+        restore_turn_file(&st, &root, &s, 1, &b.to_string_lossy()).unwrap();
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "b0");
+        assert!(
+            list(&st, &root, &s).unwrap()[0].code_restored,
+            "turno vazio conta como desfeito"
+        );
     }
 
     #[test]

@@ -267,8 +267,9 @@ pub struct UndoView {
     pub errors: Vec<String>,
 }
 
-/// Puts the answer's files back. Without `force` it refuses when a file
-/// changed after the answer, so later work is never overwritten silently.
+/// Puts the answer's files back, or only `path` when given. Without `force`
+/// it refuses when a file changed after the answer, so later work is never
+/// overwritten silently.
 pub fn undo_for(
     st: &Store,
     root: &Path,
@@ -276,6 +277,7 @@ pub fn undo_for(
     session: &str,
     message_id: i64,
     force: bool,
+    path: Option<&str>,
 ) -> Cmd<UndoView> {
     let Some((turn, _)) = turn_of(st, session, message_id)? else {
         return Err("esta resposta não tem alterações para desfazer".into());
@@ -284,6 +286,7 @@ pub fn undo_for(
         let conflicts: Vec<String> = changes_for(st, root, workspace, session, message_id)?
             .into_iter()
             .filter(|c| c.changed_since == Some(true))
+            .filter(|c| path.is_none_or(|p| c.path == p))
             .map(|c| c.rel)
             .collect();
         if !conflicts.is_empty() {
@@ -293,7 +296,11 @@ pub fn undo_for(
             });
         }
     }
-    let r = checkpoints::restore_turn(st, root, session, turn).map_err(|e| e.to_string())?;
+    let r = match path {
+        Some(p) => checkpoints::restore_turn_file(st, root, session, turn, p),
+        None => checkpoints::restore_turn(st, root, session, turn),
+    }
+    .map_err(|e| e.to_string())?;
     Ok(UndoView {
         done: true,
         conflicts: Vec::new(),
@@ -327,6 +334,7 @@ pub async fn turn_undo(
     session_id: String,
     message_id: i64,
     force: Option<bool>,
+    path: Option<String>,
 ) -> Cmd<UndoView> {
     let (db, root) = (state.db(), state.root().to_path_buf());
     tauri::async_runtime::spawn_blocking(move || {
@@ -339,6 +347,7 @@ pub async fn turn_undo(
             &session_id,
             message_id,
             force.unwrap_or(false),
+            path.as_deref(),
         )
     })
     .await
@@ -465,17 +474,33 @@ mod tests {
             (Some(true), 1, 1),
             "diff is what turn 1 left"
         );
-        let refused = undo_for(&st, &root, &ws, &s, answer, false).unwrap();
+        let refused = undo_for(&st, &root, &ws, &s, answer, false, None).unwrap();
         assert_eq!(
             (refused.done, refused.conflicts.clone()),
             (false, vec!["LEIA.txt".to_string()])
         );
         assert!(notas.exists(), "refusal touches nothing");
 
-        let done = undo_for(&st, &root, &ws, &s, answer, true).unwrap();
+        // one file: notas.txt goes, LEIA.txt (later edited) stays
+        let notas_abs = got
+            .iter()
+            .find(|c| c.rel == "notas.txt")
+            .unwrap()
+            .path
+            .clone();
+        let one = undo_for(&st, &root, &ws, &s, answer, false, Some(&notas_abs)).unwrap();
+        assert_eq!((one.done, one.files_removed), (true, 1));
+        assert!(!notas.exists());
+        assert_eq!(
+            std::fs::read_to_string(&leia).unwrap(),
+            "outra coisa
+"
+        );
+
+        let done = undo_for(&st, &root, &ws, &s, answer, true, None).unwrap();
         assert_eq!(
             (done.done, done.files_restored, done.files_removed),
-            (true, 1, 1)
+            (true, 1, 0)
         );
         assert_eq!(
             std::fs::read_to_string(&leia).unwrap(),
@@ -483,6 +508,6 @@ mod tests {
         );
         assert!(!notas.exists());
         assert!(changes_for(&st, &root, &ws, &s, answer).unwrap().is_empty());
-        assert!(undo_for(&st, &root, &ws, &s, answer + 99, false).is_err());
+        assert!(undo_for(&st, &root, &ws, &s, answer + 99, false, None).is_err());
     }
 }

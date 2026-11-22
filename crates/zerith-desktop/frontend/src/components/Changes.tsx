@@ -176,13 +176,15 @@ export function TurnChanges({ sessionId, messageId }: { sessionId: string; messa
   const added = files.reduce((s, f) => s + f.added, 0);
   const removed = files.reduce((s, f) => s + f.removed, 0);
 
-  const undo = async () => {
-    const list = files.map((f) => `• ${f.rel} — ${UNDO_EFFECT[f.status]}`).join("\n");
-    if (!window.confirm(`Desfazer as alterações desta resposta?\n\n${list}\n\nA conversa continua como está.`)) return;
+  const undo = async (only?: FileChange) => {
+    const pick = only ? [only] : files;
+    const list = pick.map((f) => `• ${f.rel} — ${UNDO_EFFECT[f.status]}`).join("\n");
+    const ask = only ? "Desfazer a alteração deste arquivo?" : "Desfazer as alterações desta resposta?";
+    if (!window.confirm(`${ask}\n\n${list}\n\nA conversa continua como está.`)) return;
     setBusy(true);
     setError(null);
     try {
-      let r = await changesApi.undo(sessionId, messageId);
+      let r = await changesApi.undo(sessionId, messageId, false, only?.path);
       if (!r.done) {
         const again = window.confirm(
           "Estes arquivos mudaram depois desta resposta:\n\n" +
@@ -193,12 +195,18 @@ export function TurnChanges({ sessionId, messageId }: { sessionId: string; messa
           setError("Nada foi desfeito: " + r.conflicts.join(", ") + " mudou depois desta resposta.");
           return;
         }
-        r = await changesApi.undo(sessionId, messageId, true);
+        r = await changesApi.undo(sessionId, messageId, true, only?.path);
       }
       const n = r.filesRestored + r.filesRemoved;
       const text = `Alterações desfeitas: ${n} arquivo(s)`;
       if (r.errors.length) {
         setError(r.errors.join("; "));
+      } else if (only && files.length > 1) {
+        // The rest of the answer stays: refresh the list instead of closing it.
+        const fresh = changesApi.list(sessionId, messageId);
+        cache.set(key, fresh);
+        setFiles(await fresh);
+        setShown(null);
       } else {
         undone.set(key, text);
         setDone(text);
@@ -263,6 +271,18 @@ export function TurnChanges({ sessionId, messageId }: { sessionId: string; messa
                   )}
                   <span className={"badge change-status " + STATUS_TONE[f.status]}>{f.status}</span>
                 </button>
+                {!done ? (
+                  <button
+                    type="button"
+                    className="tool-open"
+                    title={tr(lang, "Desfazer só este arquivo", "Undo this file only")}
+                    aria-label={tr(lang, `Desfazer ${f.rel}`, `Undo ${f.rel}`)}
+                    disabled={busy}
+                    onClick={() => void undo(f)}
+                  >
+                    <Undo2 size={13} strokeWidth={2} />
+                  </button>
+                ) : null}
                 {f.status !== "apagado" ? (
                   <button
                     type="button"

@@ -882,8 +882,8 @@ export interface UndoView {
 export const changesApi = {
   list: (sessionId: string, messageId: number) =>
     invoke<FileChange[]>("turn_changes", { sessionId, messageId }),
-  undo: (sessionId: string, messageId: number, force = false) =>
-    invoke<UndoView>("turn_undo", { sessionId, messageId, force }),
+  undo: (sessionId: string, messageId: number, force = false, path?: string) =>
+    invoke<UndoView>("turn_undo", { sessionId, messageId, force, path: path ?? null }),
 };
 
 /** What `update_check` found on GitHub's latest release. */

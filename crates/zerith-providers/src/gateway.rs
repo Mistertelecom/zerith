@@ -230,7 +230,10 @@ impl Gateway {
             }
             attempts += 1;
 
-            let client = match self.build_client(cand, idx + 1 < self.candidates.len()) {
+            // `has_more` only counts candidates `can_use` would actually try:
+            // a blocked tail must not strip the last real one of its retries.
+            let has_more = self.candidates[idx + 1..].iter().any(&mut can_use);
+            let client = match self.build_client(cand, has_more) {
                 Ok(c) => c,
                 Err(err) => {
                     if is_failover_error(&err) {
@@ -317,7 +320,10 @@ impl Gateway {
             }
             attempts += 1;
 
-            let client = match self.build_client(cand, idx + 1 < self.candidates.len()) {
+            // `has_more` only counts candidates `can_use` would actually try:
+            // a blocked tail must not strip the last real one of its retries.
+            let has_more = self.candidates[idx + 1..].iter().any(&mut can_use);
+            let client = match self.build_client(cand, has_more) {
                 Ok(c) => c,
                 Err(err) => {
                     if is_failover_error(&err) {
@@ -958,6 +964,33 @@ mod tests {
         assert!(s1.requests().is_empty());
         assert_eq!(s2.requests().len(), 1);
         assert_eq!(s3.requests().len(), 1);
+    }
+
+    #[test]
+    fn the_last_usable_candidate_keeps_the_final_retry_when_the_tail_is_blocked() {
+        let s1 = MockServer::start(vec![http_status(503, "", "busy"), sse_text("ok")]);
+        let mut gw = Gateway::new(vec![
+            candidate("acc-1", "openai", "m", &s1.url),
+            candidate("acc-2", "openai", "m", "http://127.0.0.1:9"),
+        ]);
+        gw.final_retry = Some(RetryPolicy {
+            max_retries: 1,
+            base_ms: 1,
+            max_ms: 1,
+            ..RetryPolicy::default()
+        });
+        let req = ChatRequest::new("m", vec![ChatMessage::user("oi")]);
+        let outcome = gw
+            .stream_with(
+                &req,
+                &Cancel::default(),
+                |c| c.account_id == "acc-1",
+                |_, _, _| {},
+                |_| {},
+            )
+            .unwrap();
+        assert_eq!(outcome.account_id, "acc-1");
+        assert_eq!(s1.requests().len(), 2, "503 retried on the last usable");
     }
 
     #[test]

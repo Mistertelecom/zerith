@@ -35,7 +35,7 @@ como antes.
 |---|---|---|---|
 | provider do settings | `anthropic` | `codex` | `antigravity` |
 | authorize | `claude.ai/oauth/authorize` | `auth.openai.com/oauth/authorize` | `accounts.google.com/o/oauth2/v2/auth` |
-| token | `api.anthropic.com/v1/oauth/token` | `auth.openai.com/oauth/token` | `oauth2.googleapis.com/token` |
+| token | `platform.claude.com/v1/oauth/token` | `auth.openai.com/oauth/token` | `oauth2.googleapis.com/token` |
 | PKCE | S256 | S256, porta fixa 1455 | S256 |
 | API depois do login | `api.anthropic.com/v1/messages` (`Authorization: Bearer` + `anthropic-beta: oauth-2025-04-20`) | `chatgpt.com/backend-api/codex/responses` | `daily-cloudcode-pa.googleapis.com/v1internal` |
 | import local | `~/.claude/.credentials.json` (`claudeAiOauth`) | `~/.codex/auth.json` (`tokens`) | não (token em DPAPI) |
@@ -45,6 +45,9 @@ como antes.
 - A credencial é renovada **antes** de expirar (margem de 300 s) na hora de montar a conta.
 - Se a renovação falhar, a credencial antiga é usada mesmo assim: o provedor responde 401 e o
   gateway faz failover para a próxima conta elegível — o mesmo caminho de qualquer conta morta.
+- Credencial importada do arquivo de um CLI (`~/.codex/auth.json`, `~/.claude/.credentials.json`)
+  nunca é renovada pelo Zerith (o refresh token rotaciona e deslogaria o CLI): o arquivo é relido e
+  só um token mais novo dele é usado. Login pelo navegador é do Zerith e é renovado normalmente.
 - Credencial sem `refresh_token` (Google/Anthropic só mandam na primeira autorização) mantém o
   token anterior quando a resposta de refresh não trouxer um novo.
 - Quando nada funciona: `zerith login <tool>` de novo, ou `zerith accounts remove <id>`.
@@ -56,7 +59,8 @@ como antes.
   pedaços). Um `zerith secret delete <id>.oauth` sozinho não limpa as partes — use o login seguinte
   (que reescreve tudo) ou remova `<id>.oauth.0…n` também.
 - **Antigravity** não tem client OAuth público: exporte `ZERITH_GOOGLE_CLIENT_ID` com o client id do
-  seu projeto Google antes de `zerith login antigravity`. O transporte da API (`v1internal`) ainda
-  não está implementado; só o login/refresh está.
+  seu projeto Google antes de `zerith login antigravity`. O transporte da API (`v1internal`, SSE no
+  formato Gemini) está em `crates/zerith-providers/src/antigravity.rs`; sem client secret, a
+  renovação relê a conexão salva pelo 9router.
 - **Codex** só responde na API Responses; o corpo e o SSE não são os do `chat/completions`
   (`crates/zerith-providers/src/codex.rs`).

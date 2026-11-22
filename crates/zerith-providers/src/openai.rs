@@ -456,6 +456,19 @@ pub(crate) fn body(req: &ChatRequest, stream: bool) -> Value {
 
 pub(crate) fn body_for(client: &Client, req: &ChatRequest, stream: bool) -> Value {
     let mut b = body(req, stream);
+    // OpenAI's reasoning models reject `max_tokens` and other OpenAI models
+    // reject `reasoning_effort`; compatible servers keep the classic names.
+    if client.cfg.kind == ProviderKind::OpenAi {
+        if let Some(obj) = b.as_object_mut() {
+            if is_openai_reasoning_model(&req.model) {
+                if let Some(n) = obj.remove("max_tokens") {
+                    obj.insert("max_completion_tokens".into(), n);
+                }
+            } else {
+                obj.remove("reasoning_effort");
+            }
+        }
+    }
     if let Some(key) = req.prompt_cache_key.as_deref().filter(|k| !k.is_empty()) {
         if matches!(client.cfg.kind, ProviderKind::OpenAi | ProviderKind::Codex) {
             b["prompt_cache_key"] = json!(key);
@@ -530,7 +543,7 @@ fn parse_completion(text: &str) -> Result<Completion> {
                 .iter()
                 .enumerate()
                 .map(|(i, c)| ToolCall {
-                    id: str_at(&c["id"]).unwrap_or_else(|| format!("call_{i}")),
+                    id: str_at(&c["id"]).unwrap_or_else(|| crate::stream::fallback_call_id(i)),
                     name: str_at(&c["function"]["name"]).unwrap_or_default(),
                     arguments: str_at(&c["function"]["arguments"]).unwrap_or_default(),
                 })
@@ -624,6 +637,7 @@ mod tests {
             expires_at: 4_000_000_000,
             account_id: None,
             tool: OAuthTool::ClaudeCode,
+            imported: Some(false),
         });
         let client = Client::new(cfg).unwrap();
         let h = client.headers();
@@ -659,6 +673,7 @@ mod tests {
             expires_at: 1,
             account_id: None,
             tool: OAuthTool::Codex,
+            imported: Some(false),
         };
         let dbg = format!("{cred:?}");
         assert!(!dbg.contains("secret-access"));
@@ -688,6 +703,30 @@ mod tests {
             orb["messages"][0]["content"][0]["cache_control"],
             json!({"type": "ephemeral"})
         );
+    }
+
+    #[test]
+    fn openai_reasoning_models_get_max_completion_tokens_and_effort_only_there() {
+        let openai = Client::new(ProviderConfig::new(ProviderKind::OpenAi)).unwrap();
+        let mut req = ChatRequest::new("o3-mini", vec![ChatMessage::user("hi")]);
+        req.max_tokens = Some(100);
+        req.reasoning_effort = Some("high".into());
+        let b = body_for(&openai, &req, false);
+        assert_eq!(b["max_completion_tokens"], 100);
+        assert!(b.get("max_tokens").is_none());
+        assert_eq!(b["reasoning_effort"], "high");
+
+        req.model = "gpt-4o".into();
+        let b = body_for(&openai, &req, false);
+        assert_eq!(b["max_tokens"], 100);
+        assert!(b.get("reasoning_effort").is_none());
+
+        // Other OpenAI-compatible servers keep the classic fields.
+        let ds = Client::new(ProviderConfig::new(ProviderKind::DeepSeek)).unwrap();
+        req.model = "o3-mini".into();
+        let b = body_for(&ds, &req, false);
+        assert_eq!(b["max_tokens"], 100);
+        assert_eq!(b["reasoning_effort"], "high");
     }
 
     #[test]

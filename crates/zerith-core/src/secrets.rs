@@ -435,6 +435,7 @@ mod tests {
             expires_at: 42,
             account_id: None,
             tool: zerith_providers::OAuthTool::ClaudeCode,
+            imported: None,
         };
         // Old layout (bare count, gen 0) is still read, then upgraded.
         let store = Dying(
@@ -495,6 +496,7 @@ mod tests {
             expires_at: 42,
             account_id: None,
             tool: zerith_providers::OAuthTool::Codex,
+            imported: None,
         };
         save_oauth(&store, "codex-work", &cred).unwrap();
         let back = load_oauth(&store, "codex-work").unwrap().unwrap();
@@ -530,6 +532,7 @@ mod tests {
             expires_at: 7,
             account_id: None,
             tool: zerith_providers::OAuthTool::Codex,
+            imported: None,
         };
         save_oauth(&store, "big", &cred).unwrap();
 

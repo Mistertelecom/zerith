@@ -174,6 +174,8 @@ pub enum MemoryError {
     Io(#[from] std::io::Error),
     #[error("linha {line}: {message}")]
     Import { line: usize, message: String },
+    #[error("supersede would form a cycle")]
+    Cycle,
 }
 
 pub type Result<T> = std::result::Result<T, MemoryError>;

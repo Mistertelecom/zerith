@@ -110,14 +110,17 @@ impl SqliteMemory {
     }
 
     /// Writes live facts (all scopes when `None`) as one JSON object per line.
+    /// Superseded facts are left out: import cannot restore the link (ids are
+    /// reassigned), so they would come back as live, contradicting facts.
     pub fn export_jsonl(&self, scope: Option<&Scope>, mut w: impl std::io::Write) -> Result<usize> {
-        let facts = match scope {
+        let mut facts = match scope {
             Some(s) => self.export(s)?,
             None => self.select_where(
                 &format!("SELECT {COLUMNS} FROM memory_facts WHERE deleted = 0 ORDER BY id"),
                 &[],
             )?,
         };
+        facts.retain(|f| f.superseded_by.is_none());
         for f in &facts {
             serde_json::to_writer(&mut w, f).map_err(std::io::Error::from)?;
             w.write_all(b"\n")?;
@@ -188,7 +191,7 @@ impl MemoryBackend for SqliteMemory {
             "INSERT INTO memory_facts(scope, kind, text, source, confidence, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
              ON CONFLICT(scope, text) WHERE deleted = 0
-             DO UPDATE SET updated_at = excluded.updated_at",
+             DO UPDATE SET updated_at = excluded.updated_at, superseded_by = NULL",
             params![scope.write_for(kind), kind.as_str(), text, source, confidence.as_str(), ts],
         )?;
         let id: i64 = self.conn.query_row(
@@ -304,6 +307,21 @@ impl MemoryBackend for SqliteMemory {
             .optional()?;
         if exists.is_none() {
             return Err(MemoryError::NotFound(by));
+        }
+        // `by` (or what replaced it, transitively) must not be `old_id`:
+        // a cycle would hide every fact in it from recall and list.
+        let cycle: bool = self.conn.query_row(
+            "WITH RECURSIVE chain(id) AS (
+                 SELECT ?1
+                 UNION SELECT f.superseded_by FROM memory_facts f JOIN chain ON f.id = chain.id
+                 WHERE f.superseded_by IS NOT NULL
+             )
+             SELECT EXISTS(SELECT 1 FROM chain WHERE id = ?2)",
+            params![by, old_id],
+            |r| r.get(0),
+        )?;
+        if cycle {
+            return Err(MemoryError::Cycle);
         }
         self.conn.execute(
             "UPDATE memory_facts SET superseded_by = ?1, updated_at = ?2 WHERE id = ?3",

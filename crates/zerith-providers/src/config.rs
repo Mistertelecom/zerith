@@ -95,6 +95,13 @@ pub struct OAuthCredential {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_id: Option<String>,
     pub tool: OAuthTool,
+    /// Copied from a CLI's own credential file (`~/.codex/auth.json`,
+    /// `~/.claude/.credentials.json`): that CLI owns the refresh token, so
+    /// Zerith re-reads the file instead of refreshing (which would rotate the
+    /// token and log the CLI out). `None` is a credential saved before this
+    /// field existed; see [`OAuthCredential::is_imported`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imported: Option<bool>,
 }
 
 impl std::fmt::Debug for OAuthCredential {
@@ -105,6 +112,7 @@ impl std::fmt::Debug for OAuthCredential {
             .field("expires_at", &self.expires_at)
             .field("account_id", &self.account_id)
             .field("tool", &self.tool)
+            .field("imported", &self.imported)
             .finish()
     }
 }
@@ -113,6 +121,12 @@ impl OAuthCredential {
     /// True when the token is worth sending. The skew keeps a token from
     /// expiring mid-stream; it never loops, because `expires_in` below the skew
     /// still yields exactly one refresh per call.
+    /// Whether a CLI owns this credential. Legacy entries keep their old
+    /// behaviour: Codex was never refreshed, Claude always was.
+    pub fn is_imported(&self) -> bool {
+        self.imported.unwrap_or(self.tool == OAuthTool::Codex)
+    }
+
     pub fn needs_refresh(&self, now: i64) -> bool {
         const SKEW: i64 = 300;
         self.expires_at - now < SKEW
@@ -215,7 +229,7 @@ impl ProviderKind {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub name: String,
     pub kind: ProviderKind,
@@ -237,6 +251,26 @@ pub struct ProviderConfig {
     pub timeout_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_id: Option<String>,
+}
+
+/// Hand-written so a `{:?}` never prints the API key.
+impl std::fmt::Debug for ProviderConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderConfig")
+            .field("name", &self.name)
+            .field("kind", &self.kind)
+            .field("protocol", &self.protocol)
+            .field("base_url", &self.base_url)
+            .field("api_key", &self.api_key.as_ref().map(|_| "***"))
+            .field("auth", &self.auth)
+            .field("oauth", &self.oauth)
+            .field("default_model", &self.default_model)
+            .field("known_models", &self.known_models)
+            .field("context_limit", &self.context_limit)
+            .field("timeout_ms", &self.timeout_ms)
+            .field("account_id", &self.account_id)
+            .finish()
+    }
 }
 
 impl Default for ProviderConfig {
@@ -356,6 +390,14 @@ impl ProviderConfig {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[test]
+    fn debug_of_a_provider_config_hides_the_api_key() {
+        let cfg = ProviderConfig::new(ProviderKind::OpenAi).with_key("sk-secret-123");
+        let dbg = format!("{cfg:?}");
+        assert!(!dbg.contains("sk-secret-123"), "{dbg}");
+        assert!(dbg.contains("***"));
+    }
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 

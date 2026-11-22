@@ -324,7 +324,9 @@ fn wait_for_code_within(
     loop {
         let mut stream = match listener.accept() {
             Ok((s, _)) => s,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            // WouldBlock, or one bad accept: neither ends the wait, but both
+            // honour the deadline and back off instead of spinning.
+            Err(_) => {
                 if std::time::Instant::now() >= deadline {
                     return Err(OAuthError::Io(format!(
                         "o login não voltou em {} min; tente de novo",
@@ -334,8 +336,6 @@ fn wait_for_code_within(
                 std::thread::sleep(Duration::from_millis(150));
                 continue;
             }
-            // one bad accept must not end the wait
-            Err(_) => continue,
         };
         let _ = stream.set_nonblocking(false);
         let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
@@ -602,8 +602,53 @@ fn parse_token(body: &str, enc: Encoding) -> Result<OAuthCredential> {
         access_token: access,
         refresh_token: refresh,
         expires_at: expires_in,
-        account_id: None,
+        account_id: parsed_json.as_ref().and_then(chatgpt_account_id),
         tool: OAuthTool::ClaudeCode,
+        imported: Some(false),
+    })
+}
+
+/// The ChatGPT account a Codex token response's `id_token` names. The JWT is
+/// only decoded, not verified: it came straight from the token endpoint over
+/// TLS, and the claim is only routing info for the `chatgpt-account-id` header.
+fn chatgpt_account_id(v: &serde_json::Value) -> Option<String> {
+    let payload = v["id_token"].as_str()?.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload.trim_end_matches('='))
+        .ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    claims
+        .pointer("/https:~1~1api.openai.com~1auth/chatgpt_account_id")
+        .or_else(|| claims.get("chatgpt_account_id"))
+        .and_then(|a| a.as_str())
+        .map(str::to_string)
+}
+
+/// For a credential imported from a CLI's file: that file again, when the CLI
+/// has since renewed it. Zerith never refreshes such a credential itself
+/// (that would rotate the CLI's refresh token and log the CLI out).
+pub fn reread(cred: &OAuthCredential) -> Option<OAuthCredential> {
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
+    reimport(cred, std::path::Path::new(&home))
+}
+
+/// Renews any credential: re-reads the CLI's file for an imported one,
+/// refreshes Zerith's own.
+pub fn renew(cred: &OAuthCredential) -> Result<OAuthCredential> {
+    if cred.is_imported() {
+        reread(cred).ok_or(OAuthError::NoRefreshToken)
+    } else {
+        refresh(cred.tool, cred)
+    }
+}
+
+/// The CLI's file, when it holds a different, not older token for the same
+/// account (Codex files carry no expiry, so the token itself must differ).
+fn reimport(cred: &OAuthCredential, home: &std::path::Path) -> Option<OAuthCredential> {
+    import_local(cred.tool, home).filter(|c| {
+        c.access_token != cred.access_token
+            && c.expires_at >= cred.expires_at
+            && c.account_id == cred.account_id
     })
 }
 
@@ -892,6 +937,7 @@ pub fn parse_9router_credentials(tool: OAuthTool, raw: &str) -> Option<OAuthCred
             .and_then(|t| t.as_str())
             .map(str::to_string),
         tool,
+        imported: Some(false),
     })
 }
 
@@ -1082,12 +1128,19 @@ pub fn parse_codex_credentials(raw: &str) -> Option<OAuthCredential> {
             .and_then(|t| t.as_str())
             .map(str::to_string),
         tool: OAuthTool::Codex,
+        // the `codex` CLI owns this rotating refresh token, file or pasted
+        imported: Some(true),
     })
 }
 
 fn import_claude(home: &std::path::Path) -> Option<OAuthCredential> {
     let raw = std::fs::read_to_string(home.join(".claude/.credentials.json")).ok()?;
-    parse_claude_credentials(&raw)
+    // Only the file import is marked: a pasted credential has no file to
+    // re-read, so it keeps being refreshed by Zerith.
+    parse_claude_credentials(&raw).map(|c| OAuthCredential {
+        imported: Some(true),
+        ..c
+    })
 }
 
 /// The same file, pasted by the user: that is how a second subscription gets
@@ -1114,6 +1167,7 @@ pub fn parse_claude_credentials(raw: &str) -> Option<OAuthCredential> {
         expires_at,
         account_id: None,
         tool: OAuthTool::ClaudeCode,
+        imported: Some(false),
     })
 }
 
@@ -1403,6 +1457,7 @@ mod tests {
             expires_at: 10,
             account_id: Some("acc".into()),
             tool: OAuthTool::Antigravity,
+            imported: Some(false),
         };
         let body = r#"{"access_token":"new","expires_in":3600}"#;
         let c = credential_from_body_keeping(body, Encoding::Json, &old, 0).unwrap();
@@ -1426,6 +1481,43 @@ mod tests {
         assert_eq!(c.refresh_token.as_deref(), Some("RT"));
         assert_eq!(c.account_id.as_deref(), Some("acc_1"));
         assert_eq!(c.tool, OAuthTool::Codex);
+        assert!(c.is_imported());
+    }
+
+    #[test]
+    fn a_codex_browser_login_reads_the_account_from_the_id_token() {
+        let claims = r#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acc_jwt"}}"#;
+        let jwt = format!("h.{}.sig", b64url(claims.as_bytes()));
+        let body = format!(r#"{{"access_token":"AT","refresh_token":"RT","id_token":"{jwt}"}}"#);
+        let c = credential_from_body(&body, Encoding::Form, OAuthTool::Codex, 0).unwrap();
+        assert_eq!(c.account_id.as_deref(), Some("acc_jwt"));
+        assert!(
+            !c.is_imported(),
+            "a browser login is Zerith's own: refreshable"
+        );
+    }
+
+    #[test]
+    fn an_imported_claude_credential_is_re_read_not_refreshed() {
+        let dir = scratch("claude-reread");
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        let write = |ms: i64| {
+            std::fs::write(
+                dir.join(".claude/.credentials.json"),
+                format!(r#"{{"claudeAiOauth":{{"accessToken":"T{ms}","refreshToken":"R","expiresAt":{ms}}}}}"#),
+            )
+            .unwrap()
+        };
+        write(1_000_000);
+        let old = import_local(OAuthTool::ClaudeCode, &dir).unwrap();
+        assert!(old.is_imported());
+        assert!(
+            parse_claude_credentials(r#"{"claudeAiOauth":{"accessToken":"x"}}"#)
+                .is_some_and(|c| !c.is_imported())
+        );
+        assert!(reimport(&old, &dir).is_none(), "same token is not newer");
+        write(2_000_000);
+        assert_eq!(reimport(&old, &dir).unwrap().access_token, "T2000000");
     }
 
     #[test]

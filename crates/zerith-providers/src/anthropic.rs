@@ -128,7 +128,17 @@ pub(crate) fn body(req: &ChatRequest, stream: bool) -> Value {
     // Anthropic rejects `thinking: enabled` with HTTP 400 if any assistant
     // message carrying `tool_use` lacks signed thinking/redacted_thinking blocks
     // (e.g., SQLite-replayed sessions or turns from non-Anthropic providers).
-    let has_unsigned_tool_turn = req.messages.iter().any(|m| {
+    // Only the current tool loop matters (assistant turns after the last real
+    // user message): earlier turns' thinking is not required by the API, and
+    // thinking blocks are not persisted, so checking all history would turn
+    // thinking off for good after the first tool use. Synthetic user messages
+    // may sit inside a loop, so they do not end it.
+    let loop_start = req
+        .messages
+        .iter()
+        .rposition(|m| m.role == Role::User && !m.synthetic)
+        .map_or(0, |i| i + 1);
+    let has_unsigned_tool_turn = req.messages[loop_start..].iter().any(|m| {
         m.role == Role::Assistant && !m.tool_calls.is_empty() && m.thinking_blocks.is_empty()
     });
     if !has_unsigned_tool_turn {
@@ -502,6 +512,7 @@ mod tests {
             expires_at: 4_000_000_000,
             account_id: None,
             tool: crate::OAuthTool::ClaudeCode,
+            imported: Some(false),
         });
         let oauth = Client::new(cfg).unwrap();
         let req = ChatRequest::new(
@@ -822,6 +833,29 @@ mod tests {
             json!(0.4_f32),
             "temperature stays intact when thinking is omitted"
         );
+    }
+
+    #[test]
+    fn unsigned_tool_turns_from_earlier_loops_do_not_disable_thinking() {
+        let req = ChatRequest::new(
+            "claude-sonnet-4-5",
+            vec![
+                ChatMessage::user("oi"),
+                ChatMessage::assistant(
+                    "",
+                    vec![ToolCall {
+                        id: "c1".into(),
+                        name: "read_file".into(),
+                        arguments: r#"{"path":"a"}"#.into(),
+                    }],
+                ),
+                ChatMessage::tool("c1", "conteudo"),
+                ChatMessage::assistant("pronto", vec![]),
+                ChatMessage::user("e agora?"),
+            ],
+        )
+        .reasoning_effort("high");
+        assert!(body(&req, true).get("thinking").is_some());
     }
 
     #[test]

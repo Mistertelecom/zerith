@@ -53,6 +53,7 @@ fn credential(expires_at: i64) -> OAuthCredential {
         expires_at,
         account_id: None,
         tool: OAuthTool::ClaudeCode,
+        imported: None,
     }
 }
 
@@ -149,6 +150,7 @@ fn expired(tool: OAuthTool) -> OAuthCredential {
         expires_at: 0,
         account_id: None,
         tool,
+        imported: None,
     }
 }
 
@@ -189,8 +191,24 @@ fn a_codex_token_is_never_refreshed_by_zerith() {
     let store = Shared(Default::default());
     let mut acc = oauth_account();
     acc.id = "codex-x".into();
+    // Legacy (pre-`imported`) Codex entries count as imported: the renewer
+    // only re-reads the CLI's file, and a miss keeps the stored token.
+    assert!(expired(OAuthTool::Codex).is_imported());
+    assert!(!expired(OAuthTool::ClaudeCode).is_imported());
     secrets::save_oauth(&store, &acc.id, &expired(OAuthTool::Codex)).unwrap();
     let out =
-        zerith_runtime::hydrate_oauth_with(&acc, &store, &|_| panic!("codex refreshed")).unwrap();
+        zerith_runtime::hydrate_oauth_with(&acc, &store, &|_| Err("not renewed".into())).unwrap();
     assert_eq!(out.access_token, "old");
+    // A Codex browser login is Zerith's own and does get refreshed.
+    let mut own = expired(OAuthTool::Codex);
+    own.imported = Some(false);
+    secrets::save_oauth(&store, &acc.id, &own).unwrap();
+    let out = zerith_runtime::hydrate_oauth_with(&acc, &store, &|c| {
+        let mut f = c.clone();
+        f.access_token = "fresh".into();
+        f.expires_at = i64::MAX / 2;
+        Ok(f)
+    })
+    .unwrap();
+    assert_eq!(out.access_token, "fresh");
 }

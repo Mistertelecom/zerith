@@ -108,7 +108,7 @@ impl Store {
                         " AND (s.title LIKE ?{like_at} ESCAPE '\\' OR s.id IN (
                             SELECT m.session_id FROM messages_fts
                             JOIN messages m ON m.id = messages_fts.rowid
-                            WHERE messages_fts MATCH ?{}))",
+                            WHERE messages_fts MATCH ?{} AND m.superseded = 0))",
                         args.len()
                     ));
                 }

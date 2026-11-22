@@ -234,3 +234,20 @@ fn sessions_resolve_by_id_title_or_unique_prefix_and_rename_keeps_order() {
     assert!(s.rename_session("nao-existe", "x").is_err());
     assert!(s.latest_session().unwrap().is_some());
 }
+
+#[test]
+fn a_rewound_message_does_not_match_the_session_list_search() {
+    let (s, id, ids) = seeded();
+    s.conn()
+        .execute("UPDATE messages SET superseded = 1 WHERE id = ?1", [ids[1]])
+        .unwrap();
+    let q = |text: &str| {
+        s.list_sessions_filtered(&SessionFilter {
+            query: Some(text.into()),
+            ..Default::default()
+        })
+        .unwrap()
+    };
+    assert!(q("publicacao").is_empty(), "superseded row must not match");
+    assert_eq!(q("obrigado")[0].id, id);
+}

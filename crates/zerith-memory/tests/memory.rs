@@ -421,3 +421,36 @@ fn update_rejects_empty_and_secrets_and_recall_list_skip_superseded() {
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].fact.id, id2);
 }
+
+#[test]
+fn remembering_a_superseded_text_revives_it_and_cycles_are_rejected() {
+    let m = mem();
+    let s = Scope::user("joao");
+    let r = |t: &str| {
+        m.remember(&s, FactKind::Preference, t, Confidence::Confirmed, None)
+            .unwrap()
+    };
+    let (a, b) = (r("usa vim"), r("usa neovim"));
+    m.supersede(a, b).unwrap();
+    assert!(matches!(m.supersede(b, a), Err(MemoryError::Cycle)));
+    assert!(matches!(m.supersede(a, a), Err(MemoryError::Cycle)));
+    // saying it again makes it live again, not a hidden id
+    assert_eq!(r("usa vim"), a);
+    assert_eq!(m.get(a).unwrap().superseded_by, None);
+    assert_eq!(m.list(&s, 10).unwrap().len(), 2);
+}
+
+#[test]
+fn jsonl_export_leaves_superseded_facts_out() {
+    let m = mem();
+    let s = Scope::user("joao");
+    let r = |t: &str| {
+        m.remember(&s, FactKind::Preference, t, Confidence::Confirmed, None)
+            .unwrap()
+    };
+    let (a, b) = (r("usa vim"), r("usa neovim"));
+    m.supersede(a, b).unwrap();
+    let mut buf = Vec::new();
+    assert_eq!(m.export_jsonl(Some(&s), &mut buf).unwrap(), 1);
+    assert!(!String::from_utf8(buf).unwrap().contains("\"usa vim\""));
+}

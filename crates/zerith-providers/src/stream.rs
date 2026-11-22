@@ -110,6 +110,17 @@ pub(crate) struct OpenAiStream {
 }
 
 /// The message a stream that ended before its completion event fails with.
+/// Id for a tool call the server sent without one. Unique per process, not
+/// just per step: `call_{i}` alone repeats every step, so history would hold
+/// duplicate ids and per-call spill files would overwrite each other. The
+/// process id keeps ids from a previous run (stored in sessions) distinct too.
+pub(crate) fn fallback_call_id(i: usize) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    format!("call_{i}_{}_{n}", std::process::id())
+}
+
 pub(crate) const CUT: &str = "a resposta foi cortada antes do fim";
 
 /// An error the server sent inside a 200 stream, typed like the HTTP error it
@@ -250,7 +261,7 @@ impl OpenAiStream {
             .filter(|(_, c)| !c.name.is_empty())
             .map(|(i, mut c)| {
                 if c.id.is_empty() {
-                    c.id = format!("call_{i}");
+                    c.id = fallback_call_id(i);
                 }
                 c
             })
@@ -464,5 +475,13 @@ mod tests {
             matches!(r, Err(ProviderError::Transport(ref m)) if m == CUT),
             "{r:?}"
         );
+    }
+
+    #[test]
+    fn fallback_call_ids_never_repeat_across_steps() {
+        let a = fallback_call_id(0);
+        let b = fallback_call_id(0);
+        assert_ne!(a, b);
+        assert!(a.starts_with("call_0_"), "{a}");
     }
 }

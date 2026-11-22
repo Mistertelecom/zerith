@@ -133,6 +133,7 @@ mod tests {
             expires_at: 0,
             account_id: None,
             tool: OAuthTool::ClaudeCode,
+            imported: Some(false),
         });
         assert!(!routable(&sub), "Claude subscription stays direct");
         let mut gem = ProviderConfig::new(ProviderKind::Gemini);

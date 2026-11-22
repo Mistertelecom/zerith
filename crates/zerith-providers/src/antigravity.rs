@@ -304,7 +304,7 @@ impl GeminiStream {
                     id: f["id"]
                         .as_str()
                         .map(str::to_string)
-                        .unwrap_or_else(|| format!("call_{n}")),
+                        .unwrap_or_else(|| crate::stream::fallback_call_id(n)),
                     name: f["name"].as_str().unwrap_or_default().to_string(),
                     arguments: f.get("args").unwrap_or(&json!({})).to_string(),
                 });

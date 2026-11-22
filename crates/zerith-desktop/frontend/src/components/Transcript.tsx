@@ -310,8 +310,31 @@ const USER_IMG = /^!\[([^\]\n]*)\]\(<([^>\n]+)>\)\s*$/gm;
 
 /** Full-window view of one image; Esc or a click outside closes it. */
 function Lightbox({ src, url, alt, onClose }: { src: string; url: string; alt: string; onClose: () => void }) {
+  const root = useRef<HTMLDivElement>(null);
+  const closeBtn = useRef<HTMLButtonElement>(null);
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
+    const back = document.activeElement as HTMLElement | null;
+    closeBtn.current?.focus();
+    return () => back?.focus?.();
+  }, []);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") return onClose();
+      if (e.key !== "Tab" || !root.current) return;
+      // Keep Tab inside the dialog.
+      const items = [...root.current.querySelectorAll<HTMLElement>("button")];
+      if (!items.length) return;
+      const first = items[0];
+      const last = items[items.length - 1];
+      const at = document.activeElement;
+      if (e.shiftKey && (at === first || !root.current.contains(at))) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && (at === last || !root.current.contains(at))) {
+        e.preventDefault();
+        first.focus();
+      }
+    };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
@@ -319,7 +342,7 @@ function Lightbox({ src, url, alt, onClose }: { src: string; url: string; alt: s
   const canOpenExternally = isHttp || !isWeb(src);
   const open = () => (isHttp ? void api.openUrl(src) : void api.openImage(src));
   return (
-    <div className="lightbox" role="dialog" aria-label={alt || "Imagem"} onClick={onClose}>
+    <div ref={root} className="lightbox" role="dialog" aria-modal="true" aria-label={alt || "Imagem"} onClick={onClose}>
       <img src={url} alt={alt} onClick={(e) => e.stopPropagation()} />
       <div className="lightbox-bar" onClick={(e) => e.stopPropagation()}>
         <span className="lightbox-name">{alt || (src.startsWith("data:") ? "Imagem" : src.split(/[\\/]/).pop())}</span>
@@ -329,7 +352,7 @@ function Lightbox({ src, url, alt, onClose }: { src: string; url: string; alt: s
             Abrir fora
           </button>
         ) : null}
-        <button className="icon-btn sm" onClick={onClose} aria-label="Fechar" title="Fechar (Esc)">
+        <button ref={closeBtn} className="icon-btn sm" onClick={onClose} aria-label="Fechar" title="Fechar (Esc)">
           <X size={16} strokeWidth={2} />
         </button>
       </div>
@@ -1022,6 +1045,8 @@ const AssistantBlock = memo(function AssistantBlock(props: {
   block: Block & { kind: "assistant" };
   sessionId?: string | null;
   onBranch?: (id: number) => void;
+  /** Resends the last prompt (only on the newest failed answer). */
+  onRetry?: () => void;
 }) {
   const [showReasoning, setShowReasoning] = useState(false);
   const b = props.block;
@@ -1064,6 +1089,11 @@ const AssistantBlock = memo(function AssistantBlock(props: {
             <div>
               <strong>A resposta não terminou</strong>
               <p>{b.error}</p>
+              {props.onRetry ? (
+                <button type="button" className="btn btn-sm" onClick={props.onRetry}>
+                  Tentar de novo
+                </button>
+              ) : null}
             </div>
           </div>
         ) : null}
@@ -1140,21 +1170,41 @@ export function Transcript(props: {
   busy?: boolean;
   onEdit?: (id: number, text: string) => void;
   onBranch?: (id: number) => void;
+  /** "Tentar de novo" on the newest failed answer. */
+  onRetry?: () => void;
+  /** Above the first block: history paging / load error. */
+  head?: React.ReactNode;
 }) {
   const box = useRef<HTMLDivElement>(null);
   const pinned = useRef(true);
+  const [away, setAway] = useState(false);
   const onEdit = props.busy ? undefined : props.onEdit;
   const onBranch = props.busy ? undefined : props.onBranch;
+  const onRetry = props.busy ? undefined : props.onRetry;
+  let lastAssistant = -1;
+  for (let i = props.blocks.length - 1; i >= 0; i--) {
+    if (props.blocks[i].kind === "assistant") {
+      lastAssistant = i;
+      break;
+    }
+  }
 
   useEffect(() => {
     const el = box.current;
     if (!el) return;
     const onScroll = () => {
       pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+      setAway(!pinned.current);
     };
     el.addEventListener("scroll", onScroll);
     return () => el.removeEventListener("scroll", onScroll);
   }, []);
+
+  // A prompt just sent: follow it even when the view was scrolled up.
+  const userCount = props.blocks.reduce((n, b) => n + (b.kind === "user" ? 1 : 0), 0);
+  const lastUserCount = useRef(userCount);
+  if (userCount > lastUserCount.current) pinned.current = true;
+  lastUserCount.current = userCount;
 
   // Scroll only the transcript: scrollIntoView would also move every
   // overflow:hidden ancestor (the sheet, the shell) and shift the layout.
@@ -1177,7 +1227,8 @@ export function Transcript(props: {
   return (
     <div className="transcript" ref={box}>
       <div className="stack">
-        {props.blocks.length === 0 ? (
+        {props.head}
+        {props.blocks.length === 0 && !props.head ? (
           <div className="convo-empty">
             <ZerithMark size={32} />
             <p>Conversa vazia. Escreva abaixo para começar; use / para comandos e @ para citar arquivos.</p>
@@ -1187,7 +1238,7 @@ export function Transcript(props: {
           let aOrd = 0;
           let uOrd = 0;
           let nOrd = 0;
-          const rendered = props.blocks.map((b) => {
+          const rendered = props.blocks.map((b, i) => {
             // A block the event did not touch keeps its reference, so `memo`
             // skips it: only the answer being written is re-rendered. Keying
             // by per-kind ordinal keeps keys stable across streaming→stored
@@ -1215,6 +1266,7 @@ export function Transcript(props: {
                 block={b}
                 sessionId={props.sessionId}
                 onBranch={onBranch}
+                onRetry={i === lastAssistant && b.error ? onRetry : undefined}
               />
             );
           });
@@ -1237,6 +1289,22 @@ export function Transcript(props: {
         })()}
         {props.tail}
       </div>
+      {away ? (
+        <button
+          type="button"
+          className="btn btn-sm"
+          style={{ position: "sticky", bottom: 8, marginLeft: "auto", display: "block" }}
+          onClick={() => {
+            const el = box.current;
+            if (!el) return;
+            pinned.current = true;
+            setAway(false);
+            el.scrollTop = el.scrollHeight;
+          }}
+        >
+          Ir para o fim
+        </button>
+      ) : null}
     </div>
   );
 }

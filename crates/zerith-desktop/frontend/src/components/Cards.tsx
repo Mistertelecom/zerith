@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Check, CircleAlert, HelpCircle, ShieldAlert, ShieldCheck } from "lucide-react";
 import type { Question } from "../lib/api";
 import { toolIcon } from "./Transcript";
@@ -11,6 +11,11 @@ export function ApprovalCard(props: {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const Icon = toolIcon(props.tool);
+  // Focus "Negar" once, when the card appears (keyed by approval id in App).
+  const deny = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    deny.current?.focus();
+  }, []);
 
   const submit = async (d: "once" | "session" | "deny") => {
     if (busy) return;
@@ -48,7 +53,7 @@ export function ApprovalCard(props: {
         </div>
       ) : null}
       <div className="ask-actions">
-        <button className="btn btn-ghost" disabled={busy} onClick={() => void submit("deny")}>
+        <button ref={deny} className="btn btn-ghost" disabled={busy} onClick={() => void submit("deny")}>
           Negar
         </button>
         <span className="spacer" />

@@ -230,12 +230,13 @@ export function HistoryTab() {
                     className="icon-btn sm danger"
                     title="Excluir"
                     aria-label={`Excluir ${r.title}`}
-                    onClick={() =>
+                    onClick={() => {
+                      if (!window.confirm(`Excluir a conversa "${r.title}"? Isso não pode ser desfeito.`)) return;
                       void api
                         .deleteSession(r.id)
                         .then(() => load())
-                        .catch((e) => setError(String(e)))
-                    }
+                        .catch((e) => setError(String(e)));
+                    }}
                   >
                     <Trash2 size={14} strokeWidth={2} />
                   </button>

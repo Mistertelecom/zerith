@@ -215,7 +215,7 @@ function resetsAt(w: QuotaWindow): string {
 export function AccountsTab(p: {
   accounts: Account[];
   presets: Preset[];
-  onSave: (a: AccountForm) => void;
+  onSave: (a: AccountForm) => Promise<boolean>;
   onDelete: (id: string) => void;
   onLogin: (tool: string, account: string) => void;
   onImport: (tool: string, account: string) => void;
@@ -392,7 +392,7 @@ export function AccountsTab(p: {
                     label={(a.enabled ? "Pausar " : "Ativar ") + a.id}
                     checked={a.enabled}
                     onChange={(v) =>
-                      p.onSave({ ...accountForm(a), enabled: v })
+                      void p.onSave({ ...accountForm(a), enabled: v })
                     }
                   />
                   <span className="item-actions">
@@ -408,7 +408,10 @@ export function AccountsTab(p: {
                       className="icon-btn sm danger"
                       title="Excluir conta"
                       aria-label={"Excluir " + a.id}
-                      onClick={() => p.onDelete(a.id)}
+                      onClick={() => {
+                        if (window.confirm(`Excluir a conta ${a.label ?? a.id}? A chave salva dela também é apagada.`))
+                          p.onDelete(a.id);
+                      }}
                     >
                       <Trash2 size={14} strokeWidth={2} />
                     </button>
@@ -593,7 +596,7 @@ function ConnectSheet(p: {
   accounts: Account[];
   presets: Preset[];
   oauth: Record<string, OAuthState>;
-  onSave: (a: AccountForm) => void;
+  onSave: (a: AccountForm) => Promise<boolean>;
   onLogin: (tool: string, account: string) => void;
   onImport: (tool: string, account: string) => void;
   onImportPasted: (tool: string, account: string, raw: string) => void;
@@ -678,9 +681,16 @@ function ConnectSheet(p: {
     if (tool) p.onLogin(tool, id);
     close();
   };
-  const save = () => {
-    p.onSave(form);
-    close();
+  const [saving, setSaving] = useState(false);
+  const [saveErr, setSaveErr] = useState(false);
+  // close only once the backend accepted it, so a failure keeps the typed key
+  const save = async () => {
+    setSaving(true);
+    setSaveErr(false);
+    const ok = await p.onSave(form);
+    setSaving(false);
+    if (ok) close();
+    else setSaveErr(true);
   };
 
   return (
@@ -1004,6 +1014,11 @@ function ConnectSheet(p: {
           )}
         </div>
 
+        {saveErr ? (
+          <div className="sheet-probe" role="alert">
+            Não foi possível salvar a conta. Confira os dados e tente de novo.
+          </div>
+        ) : null}
         {probe ? (
           <div className="sheet-probe">
             <ProbeResult probe={probe} />
@@ -1046,8 +1061,8 @@ function ConnectSheet(p: {
           {oauthNew ? null : (
             <button
               className="btn btn-primary"
-              disabled={!ready}
-              onClick={save}
+              disabled={!ready || saving}
+              onClick={() => void save()}
             >
               {p.edit ? (
                 <Save size={16} strokeWidth={1.75} />
@@ -1301,14 +1316,18 @@ export function UsageTab(p: { usage: UsageSummary | null; presets: Preset[] }) {
       <p className="saver-split">
         {(
           [
-            ["Saídas resumidas", "RTK", u.total_saved_rtk_tokens],
-            ["Código enxuto", "Ponytail", u.total_saved_ponytail_tokens],
-            ["Respostas curtas", "Caveman", u.total_saved_caveman_tokens],
+            ["Saídas resumidas", "RTK", u.total_saved_rtk_tokens, false],
+            ["Código enxuto", "Ponytail", u.total_saved_ponytail_tokens, true],
+            ["Respostas curtas", "Caveman", u.total_saved_caveman_tokens, true],
           ] as const
-        ).map(([what, tech, n]) => (
-          <span key={tech}>
+        ).map(([what, tech, n, est]) => (
+          <span
+            key={tech}
+            title={est ? "Estimativa: não há resposta sem esta opção para comparar." : "Medido: bytes cortados da saída das ferramentas."}
+          >
             {what} <span className="setting-tech">({tech})</span>{" "}
-            <strong>{fmt(n)}</strong>
+            <strong>{est ? `~${fmt(n)}` : fmt(n)}</strong>
+            {est ? " (estimado)" : null}
           </span>
         ))}
       </p>

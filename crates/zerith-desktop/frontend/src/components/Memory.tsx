@@ -280,7 +280,12 @@ export function MemoryTab(props: { paused?: boolean; onPause?: (paused: boolean)
               onChange={(e) => setNewText(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === "Enter") void addFact();
-                if (e.key === "Escape") setAdding(false);
+                if (e.key === "Escape") {
+                  // only this input, not the whole Settings (window keydown)
+                  e.stopPropagation();
+                  e.nativeEvent.stopImmediatePropagation();
+                  setAdding(false);
+                }
               }}
             />
             <button className="btn btn-primary btn-sm" onClick={() => void addFact()}>
@@ -324,7 +329,11 @@ export function MemoryTab(props: { paused?: boolean; onPause?: (paused: boolean)
                     onChange={(e) => setEditing({ id: f.id, text: e.target.value })}
                     onKeyDown={(e) => {
                       if (e.key === "Enter") void save();
-                      if (e.key === "Escape") setEditing(null);
+                      if (e.key === "Escape") {
+                        e.stopPropagation();
+                        e.nativeEvent.stopImmediatePropagation();
+                        setEditing(null);
+                      }
                     }}
                   />
                   <button className="btn btn-primary btn-sm" onClick={() => void save()}>
@@ -361,7 +370,11 @@ export function MemoryTab(props: { paused?: boolean; onPause?: (paused: boolean)
                       className="icon-btn sm danger"
                       title="Apagar"
                       aria-label="Apagar fato"
-                      onClick={() => void forget(f.id)}
+                      onClick={() => {
+                        if (window.confirm(`Apagar este fato da memória?
+
+"${f.text}"`)) void forget(f.id);
+                      }}
                     >
                       <Trash2 size={14} strokeWidth={2} />
                     </button>

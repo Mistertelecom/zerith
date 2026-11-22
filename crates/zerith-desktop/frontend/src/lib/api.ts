@@ -136,7 +136,8 @@ export type TurnEvent =
       savedTokens: number;
       modelUsed: string | null;
     }
-  | { type: "failed"; message: string };
+  | { type: "failed"; message: string }
+  | { type: "modeChanged"; mode: string };
 
 /** A provider preset: only the defaults that save typing. */
 export interface Preset {

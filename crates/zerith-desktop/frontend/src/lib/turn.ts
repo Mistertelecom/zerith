@@ -55,6 +55,8 @@ export interface TurnState {
     ttftMs?: number;
   } | null;
   saved: number;
+  /** The measured part of `saved`: bytes RTK cut, at 4 bytes per token. */
+  savedRtk: number;
   route: { provider: string; model: string } | null;
   /** Children the turn delegated to, live: who runs on which model. */
   subagents: SubagentRun[];
@@ -79,6 +81,7 @@ export const emptyTurn: TurnState = {
   question: null,
   usage: null,
   saved: 0,
+  savedRtk: 0,
   route: null,
   subagents: [],
   busy: false,
@@ -196,7 +199,11 @@ export function applyEvent(prev: TurnState, ev: TurnEvent): TurnState {
       return state;
     case "saved":
       // RTK reports bytes; the runtime counts 4 bytes per token
-      state.saved += Math.floor(Math.max(0, ev.before - ev.after) / 4);
+      {
+        const t = Math.floor(Math.max(0, ev.before - ev.after) / 4);
+        state.saved += t;
+        state.savedRtk += t;
+      }
       return state;
     case "compacted":
       state.blocks = [...state.blocks, { kind: "note", text: "Contexto compactado" }];
@@ -281,9 +288,15 @@ export function applyEvent(prev: TurnState, ev: TurnEvent): TurnState {
 /** `turn:done`: the turn is over, whatever it said. Nothing is left to answer,
  * and a turn that ended without its own `done`/`failed` says so instead of
  * leaving a silent or still-"typing" answer behind. */
-export function finishTurn(prev: TurnState): TurnState {
+export function finishTurn(prev: TurnState, cancelled = false): TurnState {
   const state = { ...prev, busy: false, approvals: [], question: null };
   const last = [...state.blocks].reverse().find((b) => b.kind === "assistant");
+  // Stop pressed: not a failure. Close the partial answer and say so neutrally.
+  if (cancelled) {
+    if (last?.streaming) assistant(state).streaming = false;
+    state.blocks = [...state.blocks, { kind: "note", text: "Interrompido" }];
+    return state;
+  }
   if (!last || (last.streaming && !last.error)) {
     const a = assistant(state);
     a.streaming = false;

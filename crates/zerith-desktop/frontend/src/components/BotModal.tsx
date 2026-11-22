@@ -99,10 +99,27 @@ export function BotModal(props: {
 
   const handleDelete = async () => {
     if (!props.editing) return;
+    const botName = props.editing.name;
+    if (
+      !window.confirm(
+        tr(lang, `Excluir o bot @${botName}? Isso não pode ser desfeito.`, `Delete bot @${botName}? This cannot be undone.`),
+      )
+    )
+      return;
     setSaving(true);
     setError(null);
     try {
-      const updated = await api.agentDelete(props.editing.name);
+      const updated = await api.agentDelete(botName);
+      try {
+        const raw = localStorage.getItem("zerith.botSessions");
+        if (raw) {
+          const map = JSON.parse(raw) as Record<string, string>;
+          delete map[botName];
+          localStorage.setItem("zerith.botSessions", JSON.stringify(map));
+        }
+      } catch {
+        // ignore storage errors
+      }
       props.onSaved(updated);
       props.onClose();
     } catch (err) {
@@ -138,7 +155,7 @@ export function BotModal(props: {
               </p>
             </div>
           </div>
-          <button type="button" className="icon-btn" onClick={props.onClose} aria-label="Fechar">
+          <button type="button" className="icon-btn" onClick={props.onClose} aria-label={tr(lang, "Fechar", "Close")}>
             <X size={16} />
           </button>
         </header>
@@ -150,6 +167,7 @@ export function BotModal(props: {
               <input
                 value={name}
                 disabled={isEdit}
+                autoFocus={!isEdit}
                 onChange={(e) => setName(e.target.value.replace(/[^a-zA-Z0-9_-]/g, "-"))}
                 placeholder="ex: mikrotik-ops"
                 required
@@ -193,6 +211,8 @@ export function BotModal(props: {
                   className={"bot-emblem-opt" + (icon === em.id ? " on" : "")}
                   onClick={() => setIcon(em.id)}
                   title={em.label}
+                  aria-label={em.label}
+                  aria-pressed={icon === em.id}
                 >
                   <BotEmblem icon={em.id} size={28} />
                 </button>

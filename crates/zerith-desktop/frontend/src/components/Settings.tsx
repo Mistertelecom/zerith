@@ -41,6 +41,7 @@ import {
 import { Card, EmptyState, Logo, ZerithMark, Field, ProbeResult } from "./ui";
 import { nameOf, host, domain, isOauth } from "./settingsFmt";
 import { GeneralTab, type GeneralProps } from "./General";
+import { InlineBoundary } from "./InlineBoundary";
 import { translateText, tr, useLang } from "../lib/i18n";
 
 const AgentsTab = lazy(() => import("./Agents").then((m) => ({ default: m.AgentsTab })));
@@ -383,12 +384,14 @@ export function Settings({
     }
   };
 
-  const saveAccount = async (a: AccountForm) => {
+  const saveAccount = async (a: AccountForm): Promise<boolean> => {
     try {
       setAccounts(await api.accountSave(a));
       setNotice({ ok: true, text: "Conta salva." });
+      return true;
     } catch (e) {
       setNotice({ ok: false, text: String(e) });
+      return false;
     }
   };
 
@@ -514,6 +517,7 @@ export function Settings({
           <div className="settings-body">
             <div className="settings-col">
               <Notice notice={notice} onClose={() => setNotice(null)} />
+              <InlineBoundary key={tab}>
               <Suspense
                 fallback={
                   <div className="settings-loading">
@@ -600,6 +604,7 @@ export function Settings({
                 <UsageTab usage={usage} presets={presets} />
               ) : null}
               </Suspense>
+              </InlineBoundary>
             </div>
           </div>
         </div>

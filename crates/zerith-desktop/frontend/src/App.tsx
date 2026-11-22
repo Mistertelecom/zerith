@@ -69,6 +69,7 @@ import { FolderPill } from "./components/FolderPill";
 import { BackgroundJobs } from "./components/BackgroundJobs";
 import { ActiveTerminals } from "./components/ActiveTerminals";
 import { translateText, tr, useDomTranslator, useLang } from "./lib/i18n";
+import { InlineBoundary } from "./components/InlineBoundary";
 
 const Settings = lazy(() =>
   import("./components/Settings").then((m) => ({ default: m.Settings })),
@@ -82,6 +83,18 @@ const EXECUTOR_MODEL_KEY = "zerith.executorModel";
 const ORCHESTRATOR_KEY = "zerith.orchestrator";
 const EFFORT_KEY = "zerith.effort";
 const MAX_CACHED_TURNS = 8;
+// Stored rows read per page; "carregar anteriores" asks for one more page.
+const HISTORY_PAGE = 400;
+
+/** Bypass asks nothing at all: stepping into it takes an explicit yes. */
+const confirmBypass = (lang: Parameters<typeof tr>[0]) =>
+  window.confirm(
+    tr(
+      lang,
+      "Ativar Bypass? O assistente vai rodar ferramentas sem pedir aprovação.",
+      "Enable Bypass? The assistant will run tools without asking.",
+    ),
+  );
 
 function estimateContextWindow(model: string): number {
   const m = model.toLowerCase();
@@ -217,7 +230,14 @@ export default function App() {
     },
     [updateTurn],
   );
-  const [draft, setDraft] = useState("");
+  // One draft per conversation ("__new__" for the one not created yet).
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const draft = drafts[selected ?? "__new__"] ?? "";
+  const setDraft = useCallback(
+    (v: string, key: string = selectedRef.current ?? "__new__") =>
+      setDrafts((d) => (d[key] === v ? d : { ...d, [key]: v })),
+    [],
+  );
   const [query, setQuery] = useState("");
   // The last pick survives a restart; settings.toml's routing.main_model is the fallback.
   const [model, setModel] = useState(
@@ -296,6 +316,29 @@ export default function App() {
   const [workflowsList, setWorkflowsList] = useState<Workflow[]>([]);
   const [runningWfId, setRunningWfId] = useState<string | null>(null);
   const [status, setStatus] = useState("");
+  // A status line is transient; an error wins over it and clears it.
+  useEffect(() => {
+    if (!status) return;
+    const t = setTimeout(() => setStatus(""), 4000);
+    return () => clearTimeout(t);
+  }, [status]);
+  useEffect(() => {
+    if (error) setStatus("");
+  }, [error]);
+  // Sessions whose Stop the user pressed: their end is "Interrompido", not a failure.
+  const cancelRequestedRef = useRef<Set<string>>(new Set());
+  const workflowsDirtyRef = useRef(false);
+  // History of the open conversation: loading, failed (with retry), and how
+  // many rows were asked for (`more`: the store may hold older ones).
+  const [hist, setHist] = useState<{
+    sid: string;
+    state: "loading" | "ok" | "error";
+    error?: string;
+    limit: number;
+    more: boolean;
+  } | null>(null);
+  const histLimitRef = useRef(HISTORY_PAGE);
+  const loadSeqRef = useRef(0);
   const [inspector, setInspector] = useState(true);
   // Folders used before (newest first, from the store) and the one picked for
   // a conversation that does not exist yet.
@@ -435,43 +478,74 @@ export default function App() {
   }, [accounts]);
 
   const fresh = useRef<string | null>(null);
+  // Reads the stored rows of `sid`. While its turn still runs, the rows of
+  // that turn (after the last prompt) are left out: the live blocks draw them.
+  const loadHistory = useCallback(
+    (sid: string, limit: number, tries = 3): void => {
+      const seq = ++loadSeqRef.current;
+      const epoch = bumpSessionEpoch(sid);
+      histLimitRef.current = limit;
+      setHist((h) => ({
+        sid,
+        state: "loading",
+        limit,
+        more: h?.sid === sid ? h.more : false,
+      }));
+      api
+        .sessionMessages(sid, limit)
+        .then((list) => {
+          if (seq !== loadSeqRef.current || selectedRef.current !== sid) return;
+          // A send or a turn end raced this read: read again.
+          if (epoch !== sessionEpochRef.current[sid]) {
+            if (tries > 1) loadHistory(sid, limit, tries - 1);
+            return;
+          }
+          const busy = turnsRef.current[sid]?.busy;
+          let rows = list;
+          if (busy) {
+            let k = list.length - 1;
+            while (k >= 0 && list[k].role !== "user") k--;
+            rows = list.slice(0, k + 1);
+          }
+          const blocks = toBlocks(rows);
+          setMessages((prev) => {
+            // A prompt sent while this read ran may not be stored yet: keep it.
+            const sent = prev[prev.length - 1];
+            return busy && sent?.kind === "user" && sent.id == null &&
+              !rows.some((m) => m.role === "user" && m.content === sent.text)
+              ? [...blocks, sent]
+              : blocks;
+          });
+          if (!busy) clearTurnBlocksIfIdle(sid);
+          setHist({ sid, state: "ok", limit, more: list.length >= limit });
+        })
+        .catch((e) => {
+          if (seq !== loadSeqRef.current || selectedRef.current !== sid) return;
+          setMessages([]);
+          setHist({ sid, state: "error", error: String(e), limit, more: false });
+        });
+    },
+    [bumpSessionEpoch, clearTurnBlocksIfIdle],
+  );
   // Transcript of the conversation that is open.
   useEffect(() => {
     if (!selected) {
       setMessages([]);
       setTurn(emptyTurn);
+      setHist(null);
       return;
     }
     // A conversation `send` just created already holds its first message and
     // turn; reading the (still empty) store here would wipe both.
     if (fresh.current === selected) {
       fresh.current = null;
+      setHist(null);
       return;
     }
-    const sid = selected;
-    const epoch = bumpSessionEpoch(sid);
-    let live = true;
-    api
-      .sessionMessages(sid)
-      .then((list) => {
-        if (!live || selectedRef.current !== sid) return;
-        if (epoch !== sessionEpochRef.current[sid] || turnsRef.current[sid]?.busy) {
-          return;
-        }
-        setMessages(toBlocks(list));
-        clearTurnBlocksIfIdle(sid);
-      })
-      .catch(() => {
-        if (!live || selectedRef.current !== sid) return;
-        if (epoch !== sessionEpochRef.current[sid] || turnsRef.current[sid]?.busy) {
-          return;
-        }
-        setMessages([]);
-      });
-    return () => {
-      live = false;
-    };
-  }, [selected, setTurn, clearTurnBlocksIfIdle, bumpSessionEpoch]);
+    // Never show the previous chat's rows under this one while it loads.
+    setMessages([]);
+    loadHistory(selected, HISTORY_PAGE);
+  }, [selected, setTurn, loadHistory]);
 
   useEffect(() => {
     let cancelled = false;
@@ -502,23 +576,7 @@ export default function App() {
         })
         .catch(() => undefined);
       if (selectedRef.current === report.sessionId) {
-        const sid = report.sessionId;
-        const epoch = bumpSessionEpoch(sid);
-        void api
-          .sessionMessages(sid)
-          .then((list) => {
-            if (
-              cancelled ||
-              selectedRef.current !== sid ||
-              epoch !== sessionEpochRef.current[sid] ||
-              turnsRef.current[sid]?.busy
-            ) {
-              return;
-            }
-            setMessages(toBlocks(list));
-            clearTurnBlocksIfIdle(sid);
-          })
-          .catch(() => undefined);
+        loadHistory(report.sessionId, histLimitRef.current);
       }
     }).then((fn) => {
       if (cancelled) {
@@ -532,7 +590,7 @@ export default function App() {
       u1?.();
       u2?.();
     };
-  }, [clearTurnBlocksIfIdle, bumpSessionEpoch]);
+  }, [loadHistory]);
 
   useEffect(() => {
     if (!selected) {
@@ -613,6 +671,12 @@ export default function App() {
         return;
       }
       flushDeltas();
+      // An approved plan switches mode in the backend; keep the picker in step
+      // so the next turn is not sent back into plan mode.
+      if (event.type === "modeChanged") {
+        if (id === selectedRef.current) setMode(event.mode);
+        return;
+      }
       if (event.type === "route") {
         setSessions((list) =>
           list.map((s) =>
@@ -629,7 +693,8 @@ export default function App() {
       if (isSelected) {
         setPendingUsage((m) => ({ ...m, [id]: true }));
       }
-      updateTurn(id, finishTurn);
+      const cancelled = cancelRequestedRef.current.delete(id);
+      updateTurn(id, (prev) => finishTurn(prev, cancelled));
       // The open conversation gets its stored rows back (with their ids, which
       // "Editar" needs); a closed one rereads them when it is opened.
       if (!isSelected) return;
@@ -817,6 +882,8 @@ export default function App() {
         selectedRef.current = id;
         setSelected(id);
         setMessages([]);
+        // The composer remounts for the new conversation: keep the caret there.
+        requestAnimationFrame(() => draftRef.current?.focus());
         if (activeAgent) {
           try {
             const raw = localStorage.getItem("zerith.botSessions");
@@ -842,6 +909,7 @@ export default function App() {
         { kind: "user", text: prompt },
       ]);
       bumpSessionEpoch(id);
+      cancelRequestedRef.current.delete(id);
       markedBusy = true;
       const busyTurn: TurnState = { ...emptyTurn, busy: true };
       turnsRef.current = { ...turnsRef.current, [id]: busyTurn };
@@ -884,6 +952,7 @@ export default function App() {
     folder,
     updateTurn,
     bumpSessionEpoch,
+    setDraft,
   ]);
 
   const steer = useCallback(
@@ -904,7 +973,7 @@ export default function App() {
         setError(String(e));
       }
     },
-    [selected],
+    [selected, setDraft],
   );
 
   // "Editar" / "Ramificar daqui": a copy of the conversation up to `upto`
@@ -920,14 +989,14 @@ export default function App() {
           setSessions((prev) => [s, ...prev]);
           setSelected(s.id);
           if (text == null) return;
-          setDraft(text);
+          setDraft(text, s.id);
           requestAnimationFrame(() =>
             document.querySelector<HTMLTextAreaElement>(".composer textarea")?.focus(),
           );
         })
         .catch((e) => setStatus(`Não consegui copiar a conversa: ${e}`));
     },
-    [selected, current],
+    [selected, current, setDraft],
   );
 
   // A provider saved in Ajustes changes the models the composer can offer, so
@@ -1012,6 +1081,16 @@ export default function App() {
             }
             if (!cps.length)
               return setStatus("Nenhum ponto de restauração nesta conversa");
+            if (
+              !window.confirm(
+                tr(
+                  lang,
+                  "Rebobinar para o último ponto de restauração? Arquivos e mensagens depois dele serão desfeitos.",
+                  "Rewind to the last checkpoint? Files and messages after it will be undone.",
+                ),
+              )
+            )
+              return;
             return api.rewind(sid).then((r) => {
               if (
                 selectedRef.current !== sid ||
@@ -1034,7 +1113,7 @@ export default function App() {
                   },
                 };
               });
-              return api.sessionMessages(sid).then((list) => {
+              return api.sessionMessages(sid, histLimitRef.current).then((list) => {
                 if (
                   selectedRef.current !== sid ||
                   epoch !== sessionEpochRef.current[sid] ||
@@ -1044,7 +1123,7 @@ export default function App() {
                 }
                 setMessages([
                   ...toBlocks(list),
-                  { kind: "note", text: `Rebobinado para o turno ${r.turn}` },
+                  { kind: "note", text: `${r.text || "Rebobinado"} (turno ${r.turn})` },
                 ]);
               });
             });
@@ -1055,7 +1134,9 @@ export default function App() {
       if (name === "plan") return setMode("plan");
       if (name === "mode") {
         const i = MODES.findIndex(([v]) => v === mode);
-        setMode(MODES[(i + 1) % MODES.length][0]);
+        const next = MODES[(i + 1) % MODES.length][0];
+        if (next === "bypass" && !confirmBypass(lang)) return;
+        setMode(next);
         return;
       }
       if (name === "model") {
@@ -1073,7 +1154,7 @@ export default function App() {
       if (name === "skills") return setSettings("Skills");
       if (name === "memory") return setSettings("Memória");
     },
-    [selected, turn.busy, turn.usage, model, mode, note, bumpSessionEpoch],
+    [selected, turn.busy, turn.usage, model, mode, note, bumpSessionEpoch, lang],
   );
 
   const closeSettings = useCallback(() => {
@@ -1084,6 +1165,12 @@ export default function App() {
         setBoot(b);
         setSessions(b.sessions);
         setMemoryPaused(b.memory_paused);
+        // The open chat was deleted in Histórico: stop showing it.
+        const sel = selectedRef.current;
+        if (sel && !b.sessions.some((s) => s.id === sel)) {
+          setSelected(null);
+          setMessages([]);
+        }
         void api
           .pinnedSessions()
           .then(setPinnedSessions)
@@ -1203,23 +1290,10 @@ export default function App() {
         setPaletteOpen(false);
         return;
       }
-      if (
-        e.key === "Tab" &&
-        e.shiftKey &&
-        !settings &&
-        !paletteOpen &&
-        !(e.target as HTMLElement | null)?.closest?.("textarea")
-      ) {
-        e.preventDefault();
-        const i = MODES.findIndex(([v]) => v === mode);
-        const next = MODES[(i + 1) % MODES.length];
-        setMode(next[0]);
-        setStatus(`Modo: ${next[1]}`);
-      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [paletteOpen, settings, mode]);
+  }, [paletteOpen]);
 
   const exportCurrentReport = useCallback(() => {
     if (!selected) {
@@ -1227,8 +1301,18 @@ export default function App() {
       return;
     }
     const title = current?.title ?? "Relatório Zerith";
+    const sid = selected;
+    // A long chat shows only its last page: the copy reads every stored row.
+    const full: Promise<Block[]> =
+      hist?.sid === sid && hist.more
+        ? api
+            .sessionMessages(sid, 1_000_000_000)
+            .then((list) => [...toBlocks(list), ...(turnsRef.current[sid]?.blocks ?? [])])
+            .catch(() => surface)
+        : Promise.resolve(surface);
+    void full.then((blocks) => {
     const mdLines: string[] = [`# ${title}\n`];
-    for (const b of surface) {
+    for (const b of blocks) {
       if (b.kind === "user") {
         mdLines.push(`## Solicitação\n\n${b.text}\n`);
       } else if (b.kind === "assistant") {
@@ -1246,6 +1330,7 @@ export default function App() {
     }
     const reportMd = mdLines.join("\n");
     void navigator.clipboard?.writeText(reportMd).catch(() => undefined);
+    });
     api
       .exportSession(selected)
       .then((path) => {
@@ -1266,7 +1351,48 @@ export default function App() {
           ),
         );
       });
-  }, [selected, current?.title, surface, lang]);
+  }, [selected, current?.title, surface, lang, hist]);
+
+  const shownHist = hist && hist.sid === selected ? hist : null;
+  const historyHead = !shownHist ? null : shownHist.state === "loading" &&
+    messages.length === 0 ? (
+    <div className="msg-note" role="status">
+      <span className="spinner" />
+      <span>{tr(lang, "Carregando conversa…", "Loading chat…")}</span>
+    </div>
+  ) : shownHist.state === "error" ? (
+    <div className="callout danger" role="alert">
+      <div>
+        <strong>{tr(lang, "Não consegui abrir o histórico", "Could not load the history")}</strong>
+        <p>{shownHist.error}</p>
+        <button
+          type="button"
+          className="btn btn-sm"
+          onClick={() => loadHistory(shownHist.sid, shownHist.limit)}
+        >
+          {tr(lang, "Tentar de novo", "Try again")}
+        </button>
+      </div>
+    </div>
+  ) : shownHist.more ? (
+    <div className="msg-note">
+      <span>
+        {tr(
+          lang,
+          `Mostrando as últimas ${shownHist.limit} mensagens.`,
+          `Showing the last ${shownHist.limit} messages.`,
+        )}
+      </span>
+      <button
+        type="button"
+        className="btn btn-sm"
+        disabled={shownHist.state === "loading"}
+        onClick={() => loadHistory(shownHist.sid, shownHist.limit + HISTORY_PAGE)}
+      >
+        {tr(lang, "Carregar anteriores", "Load earlier")}
+      </button>
+    </div>
+  ) : null;
 
   const pendingApproval = turn.approvals[0] ?? null;
   const tail = (
@@ -1357,6 +1483,20 @@ export default function App() {
   );
 
   const handleSwitchView = useCallback((v: AppView) => {
+    if (
+      activeView === "workflows" &&
+      v !== "workflows" &&
+      workflowsDirtyRef.current &&
+      !window.confirm(
+        tr(
+          lang,
+          "Há alterações não salvas no workflow. Sair mesmo assim?",
+          "The workflow has unsaved changes. Leave anyway?",
+        ),
+      )
+    )
+      return;
+    if (v !== "workflows") workflowsDirtyRef.current = false;
     setActiveView(v);
     if (v === "bots") {
       void api.agentsList().then(setAgents).catch(() => undefined);
@@ -1364,7 +1504,7 @@ export default function App() {
     } else if (v === "chat") {
       void workflowsApi.list().then(setWorkflowsList).catch(() => undefined);
     }
-  }, []);
+  }, [activeView, lang]);
 
   const runBotWorkflow = useCallback(async (wf: Workflow) => {
     setRunningWfId(wf.id);
@@ -1507,13 +1647,21 @@ export default function App() {
       <TitleBar view={activeView} onView={handleSwitchView} />
       <div className="shell">
         {activeView === "workflows" ? (
-          <Suspense fallback={null}>
-            <WorkflowsStudio
-              inline
-              models={models}
-              onClose={() => setActiveView("chat")}
-            />
-          </Suspense>
+          <InlineBoundary>
+            <Suspense fallback={null}>
+              <WorkflowsStudio
+                inline
+                models={models}
+                onClose={() => {
+                  workflowsDirtyRef.current = false;
+                  setActiveView("chat");
+                }}
+                onDirtyChange={(d) => {
+                  workflowsDirtyRef.current = d;
+                }}
+              />
+            </Suspense>
+          </InlineBoundary>
         ) : (
         <>
         <Sidebar
@@ -1587,6 +1735,19 @@ export default function App() {
               .catch((e) => setStatus(String(e)));
           }}
           onDelete={(id) => {
+            const title =
+              sessionsRef.current.find((s) => s.id === id)?.title ||
+              tr(lang, "esta conversa", "this chat");
+            if (
+              !window.confirm(
+                tr(
+                  lang,
+                  `Excluir "${title}"? Não dá para desfazer.`,
+                  `Delete "${title}"? This cannot be undone.`,
+                ),
+              )
+            )
+              return;
             void api
               .deleteSession(id)
               .then(() => {
@@ -1805,9 +1966,14 @@ export default function App() {
                   busy={turn.busy}
                   onEdit={(id, text) => fork(id - 1, "editada", text)}
                   onBranch={(id) => fork(id, "ramo")}
+                  onRetry={
+                    lastUserText ? () => void send(lastUserText) : undefined
+                  }
+                  head={historyHead}
                 />
               )}
               <Composer
+                key={selected ?? "new"}
                 textareaRef={draftRef}
                 draft={draft}
                 onDraft={setDraft}
@@ -1815,7 +1981,11 @@ export default function App() {
                 onSteer={(t) => void steer(t)}
                 onRun={runCommand}
                 busy={turn.busy}
-                onCancel={() => selected && void api.cancelTurn(selected)}
+                onCancel={() => {
+                  if (!selected) return;
+                  cancelRequestedRef.current.add(selected);
+                  void api.cancelTurn(selected).catch(() => undefined);
+                }}
                 mode={mode}
                 modes={MODES.map(([k, v]) => [k, translateText(v, lang)] as const)}
                 onMode={setMode}
@@ -1832,7 +2002,7 @@ export default function App() {
                 onExecutorModel={setExecutorModel}
                 hidden={hidden}
                 onToggleHidden={toggleHidden}
-                hint={status || error || "/ comandos  ·  @ arquivos"}
+                hint={error || status || "/ comandos  ·  @ arquivos"}
                 files={fetchFiles}
                 folder={
                   <FolderPill
@@ -2024,6 +2194,7 @@ export default function App() {
                   const persistedOut = sessionUsage?.completionTokens ?? 0;
                   const persistedCache = sessionUsage?.cacheReadTokens ?? 0;
                   const persistedSaved = sessionUsage?.savedTokens ?? 0;
+                  const persistedRtk = sessionUsage?.savedRtkTokens ?? 0;
                   const liveIn = turn.usage?.input ?? 0;
                   const liveOut = turn.usage?.output ?? 0;
                   const liveCache = turn.usage?.cacheRead ?? 0;
@@ -2038,6 +2209,9 @@ export default function App() {
                     persistedCache + (useLive ? liveCache : 0);
                   const totalSaved =
                     persistedSaved + (useLive ? liveSaved : 0);
+                  // RTK is measured (bytes cut); Ponytail/Caveman are estimates.
+                  const totalRtk = persistedRtk + (useLive ? turn.savedRtk : 0);
+                  const totalEstimated = Math.max(0, totalSaved - totalRtk);
                   const cacheDenom = Math.max(totalIn, totalCache);
                   const cachePct =
                     totalCache > 0 && cacheDenom > 0
@@ -2071,10 +2245,22 @@ export default function App() {
                             <dd>{turn.usage!.ttftMs} ms</dd>
                           </div>
                         ) : null}
-                        {totalSaved > 0 ? (
+                        {totalRtk > 0 ? (
                           <div className="saved">
-                            <dt>{tr(lang, "Economizados", "Saved")}</dt>
-                            <dd>{num(totalSaved)}</dd>
+                            <dt>{tr(lang, "Economizados (RTK)", "Saved (RTK)")}</dt>
+                            <dd>{num(totalRtk)}</dd>
+                          </div>
+                        ) : null}
+                        {totalEstimated > 0 ? (
+                          <div
+                            title={tr(
+                              lang,
+                              "Estimativa de Ponytail/Caveman: não há resposta sem eles para comparar.",
+                              "Ponytail/Caveman estimate: there is no answer without them to compare.",
+                            )}
+                          >
+                            <dt>{tr(lang, "Estimado (Ponytail/Caveman)", "Estimated (Ponytail/Caveman)")}</dt>
+                            <dd>~{num(totalEstimated)}</dd>
                           </div>
                         ) : null}
                       </dl>

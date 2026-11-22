@@ -629,7 +629,19 @@ export function Composer(props: {
               if (e.key === "Tab" && e.shiftKey) {
                 e.preventDefault();
                 const i = props.modes.findIndex(([v]) => v === props.mode);
-                props.onMode(props.modes[(i + 1) % props.modes.length][0]);
+                const next = props.modes[(i + 1) % props.modes.length][0];
+                if (
+                  next === "bypass" &&
+                  !window.confirm(
+                    tr(
+                      lang,
+                      "Ativar Bypass? O assistente vai rodar ferramentas sem pedir aprovação.",
+                      "Enable Bypass? The assistant will run tools without asking.",
+                    ),
+                  )
+                )
+                  return;
+                props.onMode(next);
                 return;
               }
               if (

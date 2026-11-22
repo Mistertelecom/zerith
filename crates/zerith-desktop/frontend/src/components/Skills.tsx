@@ -455,13 +455,14 @@ export function SkillsTab() {
                 skill={current}
                 busy={busy}
                 onToggle={(v) => void act(() => api.skillToggle(current.installed.name, v))}
-                onRemove={() =>
+                onRemove={() => {
+                  if (!window.confirm(`Remover a skill ${current.installed.name}?`)) return;
                   void act(async () => {
                     const list = await api.skillRemove(current.installed.name);
                     setSelected(null);
                     return list;
-                  })
-                }
+                  });
+                }}
               />
             </section>
           ) : null}
@@ -812,7 +813,10 @@ export function SkillsTab() {
                         aria-label={`Remover ${p.name}`}
                         title="Remover"
                         disabled={pluginBusy !== null}
-                        onClick={() => void plugin("remove", p.name, `${p.name} removido.`)}
+                        onClick={() => {
+                          if (window.confirm(`Remover o plugin ${p.name}?`))
+                            void plugin("remove", p.name, `${p.name} removido.`);
+                        }}
                       >
                         <Trash2 size={14} strokeWidth={2} />
                       </button>

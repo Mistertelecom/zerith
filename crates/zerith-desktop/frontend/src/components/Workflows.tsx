@@ -73,7 +73,8 @@ const NODE_META: Record<
     cat: "trigger",
     color: "#fbbf24",
     icon: Clock,
-    defaultCfg: () => ({ cron: "0 8 * * *", tz_offset_minutes: -new Date().getTimezoneOffset() }),
+    // No tz_offset_minutes: the scheduler follows the OS local offset (DST-aware) per tick.
+    defaultCfg: () => ({ cron: "0 8 * * *" }),
   },
   trigger_manual: {
     pt: "Manual",
@@ -317,6 +318,7 @@ export function WorkflowsStudio(props: {
   models: { value: string; label: string }[];
   onClose: () => void;
   inline?: boolean;
+  onDirtyChange?: (dirty: boolean) => void;
 }) {
   const lang = useLang();
   const [workflows, setWorkflows] = useState<Workflow[]>([]);
@@ -326,6 +328,13 @@ export function WorkflowsStudio(props: {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [draft, setDraft] = useState<Workflow | null>(null);
   const [dirty, setDirty] = useState(false);
+  const onDirtyChangeRef = useRef(props.onDirtyChange);
+  onDirtyChangeRef.current = props.onDirtyChange;
+  useEffect(() => {
+    onDirtyChangeRef.current?.(dirty);
+  }, [dirty]);
+  useEffect(() => () => onDirtyChangeRef.current?.(false), []);
+  const lastTextPatchRef = useRef<{ key: string; at: number } | null>(null);
   const pastRef = useRef<Workflow[]>([]);
   const futureRef = useRef<Workflow[]>([]);
   const [histLen, setHistLen] = useState({ undo: 0, redo: 0 });
@@ -602,10 +611,21 @@ export function WorkflowsStudio(props: {
     [draft, selectedNodeId],
   );
 
-  const patchDraft = (fn: (w: Workflow) => Workflow, recordHistory = true) => {
+  // recordHistory as string = coalesce key: consecutive text edits to the same
+  // field within 800ms share one undo step.
+  const patchDraft = (fn: (w: Workflow) => Workflow, recordHistory: boolean | string = true) => {
+    let snapshot = recordHistory !== false;
+    if (typeof recordHistory === "string") {
+      const now = Date.now();
+      const last = lastTextPatchRef.current;
+      if (last && last.key === recordHistory && now - last.at < 800) snapshot = false;
+      lastTextPatchRef.current = { key: recordHistory, at: now };
+    } else {
+      lastTextPatchRef.current = null;
+    }
     setDraft((prev) => {
       if (!prev) return prev;
-      if (recordHistory) {
+      if (snapshot) {
         pastRef.current = [...pastRef.current.slice(-39), structuredClone(prev)];
         futureRef.current = [];
         setHistLen({ undo: pastRef.current.length, redo: 0 });
@@ -1067,22 +1087,33 @@ export function WorkflowsStudio(props: {
                 : w.enabled
                   ? "on"
                   : "idle";
+            const select = () => {
+              if (
+                dirty &&
+                !window.confirm(
+                  tr(lang, "Descartar alterações não salvas?", "Discard unsaved changes?"),
+                )
+              ) {
+                return;
+              }
+              setDirty(false);
+              setLiveNodes({});
+              setSelectedId(w.id);
+            };
             return (
               <div
                 key={w.id}
                 className={"wf-roster-card" + (selectedId === w.id ? " on" : "")}
-                onClick={() => {
-                  if (
-                    dirty &&
-                    !window.confirm(
-                      tr(lang, "Descartar alterações não salvas?", "Discard unsaved changes?"),
-                    )
-                  ) {
-                    return;
+                role="button"
+                tabIndex={0}
+                aria-pressed={selectedId === w.id}
+                onClick={select}
+                onKeyDown={(e) => {
+                  if (e.target !== e.currentTarget) return;
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    select();
                   }
-                  setDirty(false);
-                  setLiveNodes({});
-                  setSelectedId(w.id);
                 }}
               >
                 <BotEmblem icon={w.icon} size={34} status={status} />
@@ -1090,7 +1121,7 @@ export function WorkflowsStudio(props: {
                   <span className="wf-roster-name">{w.name}</span>
                   <span className="wf-roster-sub">
                     <span>{workflowScheduleLabel(w, lang)}</span>
-                    <span>· {w.nodes.length} nós</span>
+                    <span>· {w.nodes.length} {tr(lang, "nós", "nodes")}</span>
                   </span>
                 </div>
                 <input
@@ -1191,7 +1222,7 @@ export function WorkflowsStudio(props: {
               <input
                 className="wf-name-input"
                 value={draft.name}
-                onChange={(e) => patchDraft((w) => ({ ...w, name: e.target.value }))}
+                onChange={(e) => patchDraft((w) => ({ ...w, name: e.target.value }), "name")}
                 aria-label={tr(lang, "Nome do workflow", "Workflow name")}
               />
               <select
@@ -1836,10 +1867,13 @@ export function WorkflowsStudio(props: {
                   lang={lang}
                   onOpenChannels={() => setChannelsOpen(true)}
                   onChange={(next) =>
-                    patchDraft((w) => ({
-                      ...w,
-                      nodes: w.nodes.map((x) => (x.id === next.id ? next : x)),
-                    }))
+                    patchDraft(
+                      (w) => ({
+                        ...w,
+                        nodes: w.nodes.map((x) => (x.id === next.id ? next : x)),
+                      }),
+                      `node:${next.id}`,
+                    )
                   }
                   onDelete={() => deleteNode(selectedNode.id)}
                   testInput={nodeTestInput}
@@ -2055,7 +2089,7 @@ function NodeInspector(props: {
       {node.kind === "trigger_cron" ? (
         <CronEditor
           cron={String(cfg.cron ?? "0 8 * * *")}
-          tz={Number(cfg.tz_offset_minutes ?? -new Date().getTimezoneOffset())}
+          tz={typeof cfg.tz_offset_minutes === "number" ? cfg.tz_offset_minutes : undefined}
           lang={lang}
           onChange={(cron, tz) => setCfg({ cron, tz_offset_minutes: tz })}
         />
@@ -2072,7 +2106,7 @@ function NodeInspector(props: {
             />
           </div>
           <div className="wf-field">
-            <label>{tr(lang, "Token secreto opcional (?token= / Bearer)", "Optional secret token (?token= / Bearer)")}</label>
+            <label>{tr(lang, "Token secreto (gerado ao salvar se vazio; ?token= / Bearer)", "Secret token (generated on save if empty; ?token= / Bearer)")}</label>
             <input
               type="password"
               value={String(cfg.secret ?? "")}
@@ -2568,13 +2602,12 @@ function NodeInspector(props: {
 
 function CronEditor(props: {
   cron: string;
-  tz: number;
+  tz: number | undefined;
   lang: Lang;
-  onChange: (cron: string, tz: number) => void;
+  onChange: (cron: string, tz: number | undefined) => void;
 }) {
   const { lang } = props;
-  const applyPreset = (expr: string) =>
-    props.onChange(expr, -new Date().getTimezoneOffset());
+  const applyPreset = (expr: string) => props.onChange(expr, props.tz);
 
   return (
     <>
@@ -2607,8 +2640,11 @@ function CronEditor(props: {
         <label>{tr(lang, "Fuso UTC (minutos)", "UTC Offset (minutes)")}</label>
         <input
           type="number"
-          value={props.tz}
-          onChange={(e) => props.onChange(props.cron, Number(e.target.value) || 0)}
+          value={props.tz ?? ""}
+          placeholder={tr(lang, "vazio = fuso do sistema", "empty = system timezone")}
+          onChange={(e) =>
+            props.onChange(props.cron, e.target.value === "" ? undefined : Number(e.target.value))
+          }
         />
       </div>
     </>

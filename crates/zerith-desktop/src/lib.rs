@@ -322,6 +322,7 @@ pub fn run() {
             workspace::open_url,
             attachments::save_attachment,
             attachments::save_file_attachment,
+            attachments::attach_dropped_path,
             changes::turn_changes,
             changes::turn_undo,
             learn::learning,

@@ -148,6 +148,12 @@ impl TurnDigest {
                     clip(&zerith_security::redact(output_preview), 200)
                 },
             }),
+            RunEvent::Steered { text } if !text.trim().is_empty() => {
+                if !self.user.is_empty() {
+                    self.user.push('\n');
+                }
+                self.user.push_str(text);
+            }
             _ => {}
         }
     }
@@ -253,20 +259,44 @@ impl Reviewer for ClientReviewer<'_> {
 }
 
 /// The client and model the review uses: `[learning].model` when set, else
-/// the model the turn was routed to (first candidate of its gateway).
+/// the model the turn was routed to (first available candidate of its gateway,
+/// falling back to the first candidate).
 pub fn route(
     settings: &Settings,
     turn_model: &str,
     fallback: &ProviderConfig,
 ) -> Option<(Client, String)> {
+    route_with_store(settings, turn_model, fallback, None)
+}
+
+/// Same as [`route`], preferring the first candidate whose account is available
+/// according to `store` (quotas and cooldowns).
+pub fn route_with_store(
+    settings: &Settings,
+    turn_model: &str,
+    fallback: &ProviderConfig,
+    store: Option<&Store>,
+) -> Option<(Client, String)> {
     let own = settings.learning.model.trim();
     let wanted = if own.is_empty() { turn_model } else { own };
-    let first = crate::resolve_gateway(settings, wanted, fallback)
+    let candidates = crate::resolve_gateway(settings, wanted, fallback)
         .0
-        .candidates
-        .into_iter()
-        .next()?;
-    Client::new(first.config).ok().map(|c| (c, first.model))
+        .candidates;
+    let chosen = store
+        .and_then(|st| {
+            candidates.iter().find(|c| {
+                st.is_account_available(
+                    &c.account_id,
+                    c.window_hours,
+                    c.quota_tokens,
+                    c.quota_requests,
+                )
+                .unwrap_or(true)
+            })
+        })
+        .or_else(|| candidates.first())?
+        .clone();
+    Client::new(chosen.config).ok().map(|c| (c, chosen.model))
 }
 
 /// The fixed instruction of the review call.
@@ -1089,5 +1119,53 @@ mod tests {
         );
         assert!(out.reviewed && out.learned.is_empty() && out.error.is_some());
         assert!(mem.list(&scope, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn steered_messages_append_to_digest_user_and_open_gate() {
+        let mut d = TurnDigest::new("rode o build");
+        assert!(gate(&d).is_empty());
+        d.observe(&RunEvent::Steered {
+            text: "na verdade prefiro tabs".into(),
+        });
+        assert_eq!(d.user, "rode o build\nna verdade prefiro tabs");
+        assert!(
+            !gate(&d).is_empty(),
+            "steered correction must open the gate"
+        );
+    }
+
+    #[test]
+    fn route_with_store_skips_cooled_down_or_exhausted_account() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .set_account_cooldown(
+                "acc-1",
+                zerith_sessions::migrations::now_ms() + 60_000,
+                Some("429"),
+            )
+            .unwrap();
+        let mut settings = Settings::default();
+        settings.accounts.push(zerith_core::settings::AccountEntry {
+            id: "acc-1".into(),
+            provider: "openai".into(),
+            base_url: Some("https://acc1.example/v1".into()),
+            priority: 0,
+            enabled: true,
+            ..Default::default()
+        });
+        settings.accounts.push(zerith_core::settings::AccountEntry {
+            id: "acc-2".into(),
+            provider: "openai".into(),
+            base_url: Some("https://acc2.example/v1".into()),
+            priority: 1,
+            enabled: true,
+            ..Default::default()
+        });
+        let fb = ProviderConfig::new(zerith_providers::ProviderKind::OpenAi).with_key("k");
+        let (client, model) = route_with_store(&settings, "gpt-4o", &fb, Some(&store)).unwrap();
+        assert_eq!(model, "gpt-4o");
+        assert_eq!(client.config().account_id.as_deref(), Some("acc-2"));
+        assert_eq!(client.config().base_url, "https://acc2.example/v1");
     }
 }

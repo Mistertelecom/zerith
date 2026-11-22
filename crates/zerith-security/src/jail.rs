@@ -416,6 +416,7 @@ pub fn sandbox_exec(profile: &str, inner: &Command) -> Command {
 pub fn linux_bwrap_args(
     level: Sandbox,
     workspace: &Path,
+    chdir: &Path,
     program: &std::ffi::OsStr,
     args: &[std::ffi::OsString],
 ) -> Vec<std::ffi::OsString> {
@@ -446,7 +447,7 @@ pub fn linux_bwrap_args(
         Sandbox::DangerFullAccess => {}
     }
     out.push("--chdir".into());
-    out.push(workspace.as_os_str().to_os_string());
+    out.push(chdir.as_os_str().to_os_string());
     out.push("--".into());
     out.push(program.to_os_string());
     out.extend(args.iter().cloned());
@@ -458,11 +459,13 @@ pub fn bwrap_exec(level: Sandbox, workspace: &Path, inner: &Command) -> Command 
     let ws = workspace
         .canonicalize()
         .unwrap_or_else(|_| workspace.to_path_buf());
+    let chdir = inner.get_current_dir().unwrap_or(&ws);
     let inner_args: Vec<std::ffi::OsString> = inner.get_args().map(|a| a.to_os_string()).collect();
     let mut c = Command::new("bwrap");
     c.args(linux_bwrap_args(
         level,
         &ws,
+        chdir,
         inner.get_program(),
         &inner_args,
     ));
@@ -672,10 +675,11 @@ mod tests {
     fn linux_bwrap_args_differentiates_read_only_and_workspace_write() {
         use std::ffi::{OsStr, OsString};
         let ws = Path::new("/home/dev/project");
+        let sub = Path::new("/home/dev/project/sub");
         let prog = OsStr::new("sh");
         let args = vec![OsString::from("-c"), OsString::from("ls")];
 
-        let ro: Vec<String> = linux_bwrap_args(Sandbox::ReadOnly, ws, prog, &args)
+        let ro: Vec<String> = linux_bwrap_args(Sandbox::ReadOnly, ws, ws, prog, &args)
             .into_iter()
             .map(|s| s.to_string_lossy().into_owned())
             .collect();
@@ -684,7 +688,7 @@ mod tests {
         assert!(!ro.contains(&"--bind".to_string()));
         assert_eq!(&ro[ro.len() - 4..], ["--", "sh", "-c", "ls"]);
 
-        let rw: Vec<String> = linux_bwrap_args(Sandbox::WorkspaceWrite, ws, prog, &args)
+        let rw: Vec<String> = linux_bwrap_args(Sandbox::WorkspaceWrite, ws, sub, prog, &args)
             .into_iter()
             .map(|s| s.to_string_lossy().into_owned())
             .collect();
@@ -694,6 +698,18 @@ mod tests {
         let bind_idx = rw.iter().position(|a| a == "--bind").unwrap();
         assert_eq!(rw[bind_idx + 1], "/home/dev/project");
         assert_eq!(rw[bind_idx + 2], "/home/dev/project");
+        let chdir_idx = rw.iter().position(|a| a == "--chdir").unwrap();
+        assert_eq!(rw[chdir_idx + 1], "/home/dev/project/sub");
+
+        let mut inner = Command::new("sh");
+        inner.arg("-c").arg("pwd").current_dir(sub);
+        let wrapped = bwrap_exec(Sandbox::WorkspaceWrite, ws, &inner);
+        let w_args: Vec<String> = wrapped
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let w_chdir_idx = w_args.iter().position(|a| a == "--chdir").unwrap();
+        assert_eq!(w_args[w_chdir_idx + 1], "/home/dev/project/sub");
     }
 
     #[test]

@@ -175,6 +175,17 @@ impl Client {
         headers: &[(String, String)],
         auth: Option<oauth::Auth>,
     ) -> Result<Self> {
+        Self::connect_http_auth_with_timeout(name, url, headers, auth, DEFAULT_TIMEOUT)
+    }
+
+    /// Streamable HTTP with an OAuth bearer token and explicit request timeout.
+    pub fn connect_http_auth_with_timeout(
+        name: &str,
+        url: &str,
+        headers: &[(String, String)],
+        auth: Option<oauth::Auth>,
+        timeout: Duration,
+    ) -> Result<Self> {
         Self::handshake(Self {
             transport: Transport::Http {
                 agent: ureq::AgentBuilder::new().build(),
@@ -184,7 +195,7 @@ impl Client {
                 auth,
             },
             next_id: AtomicU64::new(1),
-            timeout: DEFAULT_TIMEOUT,
+            timeout,
             name: name.to_string(),
         })
     }
@@ -231,7 +242,13 @@ impl Client {
                 write_line(stdin, &req)?;
                 let deadline = Instant::now() + timeout;
                 loop {
-                    let left = deadline.saturating_duration_since(Instant::now());
+                    let now = Instant::now();
+                    if now >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(McpError::Timeout(timeout));
+                    }
+                    let left = deadline.saturating_duration_since(now);
                     match lines.recv_timeout(left) {
                         Ok(line) => {
                             if let Some(r) = match_response(&line, id) {
@@ -416,6 +433,9 @@ pub fn match_response(line: &str, id: u64) -> Option<Result<Value>> {
     if v.get("id").and_then(Value::as_u64) != Some(id) {
         return None;
     }
+    if v.get("method").is_some() || (v.get("result").is_none() && v.get("error").is_none()) {
+        return None;
+    }
     let resp: protocol::Response = match serde_json::from_value(v) {
         Ok(r) => r,
         Err(e) => return Some(Err(e.into())),
@@ -465,6 +485,8 @@ mod tests {
         assert!(match_response("", 1).is_none());
         assert!(match_response("starting server...", 1).is_none());
         assert!(match_response(r#"{"jsonrpc":"2.0","method":"notifications/x"}"#, 1).is_none());
+        assert!(match_response(r#"{"jsonrpc":"2.0","id":1,"method":"roots/list"}"#, 1).is_none());
+        assert!(match_response(r#"{"jsonrpc":"2.0","id":1}"#, 1).is_none());
         assert!(match_response(r#"{"jsonrpc":"2.0","id":2,"result":{}}"#, 1).is_none());
         let ok = match_response(r#"{"jsonrpc":"2.0","id":1,"result":{"a":1}}"#, 1).unwrap();
         assert_eq!(ok.unwrap()["a"], 1);

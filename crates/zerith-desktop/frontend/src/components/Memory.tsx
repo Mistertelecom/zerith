@@ -11,6 +11,7 @@ import {
   ListChecks,
   Pencil,
   Plus,
+  RefreshCw,
   Scale,
   Search,
   SearchX,
@@ -48,6 +49,7 @@ export function MemoryTab(props: { paused?: boolean; onPause?: (paused: boolean)
   const [ownPaused, setOwnPaused] = useState(false);
 
   const load = useCallback(() => {
+    setError(null);
     api
       .memoryFacts()
       .then((list) => {
@@ -155,12 +157,15 @@ export function MemoryTab(props: { paused?: boolean; onPause?: (paused: boolean)
     }
   };
 
-  if (error)
+  if (!facts && error)
     return (
       <div className="page pn">
         <div className="toast bad" role="alert">
           <CircleAlert size={16} strokeWidth={1.75} />
           <span>{error}</span>
+          <button className="btn btn-sm" onClick={load}>
+            <RefreshCw size={14} strokeWidth={2} /> Tentar de novo
+          </button>
         </div>
       </div>
     );
@@ -175,6 +180,15 @@ export function MemoryTab(props: { paused?: boolean; onPause?: (paused: boolean)
 
   return (
     <div className="page pn">
+      {error ? (
+        <div className="toast bad" role="alert">
+          <CircleAlert size={16} strokeWidth={1.75} />
+          <span>{error}</span>
+          <button className="icon-btn" aria-label="Fechar aviso" onClick={() => setError(null)}>
+            <X size={14} strokeWidth={2} />
+          </button>
+        </div>
+      ) : null}
       <div className="pn-stats">
         <Stat icon={Brain} value={String(facts.length)} label="Fatos guardados" tone="accent" />
         <Stat icon={CircleCheck} value={String(confirmed)} label="Confirmados por você" />

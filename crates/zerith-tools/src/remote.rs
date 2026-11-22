@@ -178,7 +178,6 @@ pub fn wrap_remote_command(target: &RemoteTarget, command: &str) -> (String, Vec
 struct RemoteShellTool {
     spec: crate::ToolSpec,
     target: RemoteTarget,
-    label: String,
 }
 
 impl crate::Tool for RemoteShellTool {
@@ -195,10 +194,7 @@ impl crate::Tool for RemoteShellTool {
         if cmd.is_empty() {
             return Err(crate::ToolError::BadArguments("command está vazio".into()));
         }
-        Ok(Some(zerith_security::Action::Shell(format!(
-            "remote({}): {cmd}",
-            self.label
-        ))))
+        Ok(Some(zerith_security::Action::Shell(cmd.to_string())))
     }
 
     fn run(
@@ -316,7 +312,6 @@ pub fn remote_shell_tool(target: RemoteTarget, label: String) -> Box<dyn crate::
             source: "built-in".into(),
         },
         target,
-        label,
     })
 }
 
@@ -408,9 +403,23 @@ mod tests {
         assert_eq!(
             act,
             Some(zerith_security::Action::Shell(
-                "remote(lab-r1): vtysh -c 'show bgp summary'".into()
+                "vtysh -c 'show bgp summary'".into()
             ))
         );
+        let mut deny_pol = pol.clone();
+        deny_pol.rules = vec![zerith_security::Rule::parse(
+            zerith_security::RuleKind::Deny,
+            "remote_shell(rm *)",
+        )
+        .unwrap()];
+        let rm_act = tool
+            .action(&serde_json::json!({"command": "rm -rf /"}), &ctx)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            deny_pol.check_tool("remote_shell", &rm_act),
+            zerith_security::Verdict::Deny(_)
+        ));
         assert!(tool
             .action(&serde_json::json!({"command": "   "}), &ctx)
             .is_err());

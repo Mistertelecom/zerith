@@ -276,9 +276,23 @@ pub fn close_all_terminals() {
         let mut t = lock();
         t.drain().map(|(_, term)| term).collect()
     };
-    let had_any = !drained.is_empty();
+    let had_drained = !drained.is_empty();
     drop(drained);
-    if had_any {
+
+    let in_flight: Vec<TermMeta> = meta_table()
+        .lock()
+        .map(|m| m.values().cloned().collect())
+        .unwrap_or_default();
+    let had_in_flight = !in_flight.is_empty();
+    for meta in in_flight {
+        meta.alive.store(false, Ordering::SeqCst);
+        if let Ok(mut w) = meta.input.lock() {
+            let _ = w.write_all(b"\x03\nexit\n");
+            let _ = w.flush();
+        }
+    }
+
+    if had_drained || had_in_flight {
         notify_changed();
     }
 }
@@ -384,17 +398,16 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
     ]
 }
 
-/// What the approval shows: the session's program and the text typed into
-/// it. Reading only (no input) needs no approval.
+/// What the approval shows: the text typed into the terminal (raw when
+/// non-empty so shell policy rules see the real command). Reading only (no
+/// input) needs no approval.
 fn send_action(args: &Value, _: &CallCtx<'_>) -> Result<Option<Action>> {
-    let id = args["id"].as_str().unwrap_or("");
     let what = match (opt_str(args, "secret"), args["input"].as_str()) {
         (Some(n), _) => format!("[digita o segredo `{n}` do cofre]"),
-        (None, Some(i)) => i.escape_debug().to_string(),
-        (None, None) => return Ok(None),
+        (None, Some(i)) if !i.trim().is_empty() => i.to_string(),
+        _ => return Ok(None),
     };
-    let prog = terminal_program(id).unwrap_or_default();
-    Ok(Some(Action::Shell(format!("[{id}: {prog}] {what}"))))
+    Ok(Some(Action::Shell(what)))
 }
 
 fn timeout(args: &Value, default: u64, max: u64) -> Duration {
@@ -425,7 +438,8 @@ fn reap() {
                     .lock()
                     .map(|lu| lu.elapsed() >= IDLE_REAP)
                     .unwrap_or(false);
-                (expired || !term.proc.alive()).then(|| id.clone())
+                (expired || !term.proc.alive() || !term.meta.alive.load(Ordering::SeqCst))
+                    .then(|| id.clone())
             })
             .collect();
         for id in dead {
@@ -549,7 +563,13 @@ pub(crate) fn open_with_meta(
 }
 
 fn open(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
+    if ctx.policy.preset.sandbox == zerith_security::Sandbox::ReadOnly {
+        return Err(ToolError::Denied(
+            "terminal bloqueado no sandbox somente-leitura".into(),
+        ));
+    }
     let command = str_arg(args, "command")?;
+    exec.host.before_shell(command, ctx.workspace);
     let re = expect(args)?;
     let auto_page = args["auto_page"].as_bool().unwrap_or(true);
     let (id, text, alive) = open_with_meta(
@@ -1230,22 +1250,19 @@ fn spawn_os(command: &str, cwd: &std::path::Path) -> std::io::Result<Spawned> {
 }
 
 #[cfg(not(windows))]
-struct OsProc(std::process::Child);
+struct OsProc(Mutex<std::process::Child>);
 
 #[cfg(not(windows))]
 impl OsProc {
     fn alive(&self) -> bool {
-        // try_wait needs &mut; a zero-signal kill answers "still there?".
-        std::process::Command::new("kill")
-            .args(["-0", &self.0.id().to_string()])
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
+        let mut child = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        matches!(child.try_wait(), Ok(None))
     }
 
     fn kill(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        let mut child = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
@@ -1273,7 +1290,11 @@ fn spawn_os(command: &str, cwd: &std::path::Path) -> std::io::Result<Spawned> {
         .stdout
         .take()
         .ok_or_else(|| std::io::Error::other("sem stdout"))?;
-    Ok((Proc::Os(OsProc(child)), Box::new(input), Box::new(output)))
+    Ok((
+        Proc::Os(OsProc(Mutex::new(child))),
+        Box::new(input),
+        Box::new(output),
+    ))
 }
 
 #[cfg(test)]
@@ -1342,6 +1363,66 @@ mod tests {
             close(&json!({"id": id}), ctx, exec).unwrap();
             assert!(terminal_program(&id).is_none());
         });
+    }
+
+    #[test]
+    fn send_action_passes_raw_command_and_open_enforces_readonly_and_before_shell() {
+        let ws = std::env::current_dir().unwrap();
+        let ro = zerith_security::Policy::new(
+            zerith_security::preset("read-only").unwrap(),
+            zerith_security::Mode::Bypass,
+            &ws,
+        );
+        let ctx = CallCtx {
+            workspace: &ws,
+            policy: &ro,
+            memory: None,
+            scope: None,
+        };
+        assert_eq!(
+            send_action(&json!({"id": "term-1", "input": "rm -rf /\n"}), &ctx).unwrap(),
+            Some(Action::Shell("rm -rf /\n".into()))
+        );
+        assert_eq!(
+            send_action(&json!({"id": "term-1", "input": "   "}), &ctx).unwrap(),
+            None
+        );
+        let cancel = zerith_providers::Cancel::default();
+        let host = crate::Host::default();
+        let exec = Exec {
+            cancel: &cancel,
+            deadline: Instant::now() + Duration::from_secs(5),
+            timeout: Duration::from_secs(5),
+            host: &host,
+        };
+        assert!(matches!(
+            open(&json!({"command": "sh"}), &ctx, &exec),
+            Err(ToolError::Denied(_))
+        ));
+
+        let hook_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook_flag = hook_called.clone();
+        host.on_before_shell(move |_| {
+            hook_flag.store(true, Ordering::SeqCst);
+        });
+        let rw = zerith_security::Policy::new(
+            zerith_security::preset("workspace-write").unwrap(),
+            zerith_security::Mode::Bypass,
+            &ws,
+        );
+        let rw_ctx = CallCtx {
+            workspace: &ws,
+            policy: &rw,
+            memory: None,
+            scope: None,
+        };
+        // Call open with an immediately failing command (or invalid binary) after checking before_shell:
+        let _ = open(
+            &json!({"command": "nonexistent_cmd_for_hook_check"}),
+            &rw_ctx,
+            &exec,
+        );
+        assert!(hook_called.load(Ordering::SeqCst));
     }
 
     /// Live check of `zerith chat` asking s/n on a real console. Needs the

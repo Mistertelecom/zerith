@@ -329,6 +329,9 @@ pub struct ChildSpec {
     pub title: String,
     pub prompt: String,
     pub model: String,
+    /// Unstripped model spec (`provider/model`, `account:model`, or combo)
+    /// preserved for `resolve_gateway` inside `run_agent_turn`.
+    pub raw_model: Option<String>,
     pub def: Option<AgentDef>,
     /// The parent's skills, plugin folders included.
     pub skills_root: Option<zerith_skills::Library>,
@@ -569,6 +572,15 @@ pub(crate) fn run_child_with(
         ..TurnContext::default()
     };
     let mut step = 0usize;
+    let turn_model = if spec.settings.is_some() {
+        spec.raw_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&spec.model)
+    } else {
+        &spec.model
+    };
     let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::run_agent_turn(
             &store,
@@ -576,7 +588,7 @@ pub(crate) fn run_child_with(
             ctx,
             opts,
             &session.id,
-            &spec.model,
+            turn_model,
             &spec.prompt,
             &cancel,
             |e| {
@@ -957,6 +969,28 @@ impl Runtime {
     }
 }
 
+fn mode_strictness(m: Mode) -> u8 {
+    match m {
+        Mode::Plan => 4,
+        Mode::DontAsk => 3,
+        Mode::Default => 2,
+        Mode::AcceptEdits => 1,
+        Mode::Bypass => 0,
+    }
+}
+
+fn child_policy(parent: &Policy, permission_mode: Option<&str>) -> Policy {
+    let mut policy = parent.clone();
+    if let Some(m) = permission_mode.and_then(Mode::parse) {
+        if mode_strictness(m) > mode_strictness(parent.mode()) {
+            // A definition may only make a child stricter, never looser. Its
+            // own handle: the parent's live one would win over `mode`.
+            policy = policy.with_handle(ModeHandle::new(m));
+        }
+    }
+    policy
+}
+
 impl Services for Runtime {
     fn agent(
         &self,
@@ -975,18 +1009,7 @@ impl Services for Runtime {
         }
         let resolved = resolve_agent(&self.policy.workspace, req.agent.as_deref())?;
         let registry = child_registry(&self.base, &resolved, depth);
-        let mut policy = self.policy.clone();
-        if resolved
-            .def
-            .permission_mode
-            .as_deref()
-            .and_then(Mode::parse)
-            .is_some_and(|m| m == Mode::Plan)
-        {
-            // A definition may only make a child stricter, never looser. Its
-            // own handle: the parent's live one would win over `mode`.
-            policy = policy.with_handle(ModeHandle::new(Mode::Plan));
-        }
+        let policy = child_policy(&self.policy, resolved.def.permission_mode.as_deref());
         let id = format!("sub-{}", NEXT_ID.fetch_add(1, Ordering::Relaxed));
         let settings = self.settings.clone().unwrap_or_else(|| {
             zerith_core::Settings::load(
@@ -1027,6 +1050,7 @@ impl Services for Runtime {
             title: format!("subagente: {}", req.description),
             prompt: req.prompt.clone(),
             model,
+            raw_model: Some(raw_model),
             def: Some(resolved.def),
             skills_root: self.skills_root.clone(),
             scope: None,
@@ -1287,5 +1311,228 @@ mod worktree_tests {
             ],
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn child_policy_only_tightens_never_loosens() {
+        let ws = std::path::Path::new(".");
+        let p_bypass = Policy::new(
+            zerith_security::preset("workspace-write").unwrap(),
+            Mode::Bypass,
+            ws,
+        )
+        .with_handle(ModeHandle::new(Mode::Bypass));
+        let p_accept = Policy::new(
+            zerith_security::preset("workspace-write").unwrap(),
+            Mode::AcceptEdits,
+            ws,
+        )
+        .with_handle(ModeHandle::new(Mode::AcceptEdits));
+        let p_plan = Policy::new(
+            zerith_security::preset("workspace-write").unwrap(),
+            Mode::Plan,
+            ws,
+        )
+        .with_handle(ModeHandle::new(Mode::Plan));
+
+        assert_eq!(
+            child_policy(&p_bypass, Some("dontAsk")).mode(),
+            Mode::DontAsk
+        );
+        assert_eq!(
+            child_policy(&p_accept, Some("dontAsk")).mode(),
+            Mode::DontAsk
+        );
+        assert_eq!(
+            child_policy(&p_bypass, Some("default")).mode(),
+            Mode::Default
+        );
+        assert_eq!(child_policy(&p_bypass, Some("plan")).mode(), Mode::Plan);
+
+        // Parent's live handle must stay unaffected.
+        assert_eq!(p_bypass.mode(), Mode::Bypass);
+        assert_eq!(p_accept.mode(), Mode::AcceptEdits);
+
+        // Looser child mode never weakens parent.
+        assert_eq!(child_policy(&p_plan, Some("dontAsk")).mode(), Mode::Plan);
+        assert_eq!(
+            child_policy(&p_plan, Some("bypassPermissions")).mode(),
+            Mode::Plan
+        );
+        let p_dont_ask = Policy::new(
+            zerith_security::preset("workspace-write").unwrap(),
+            Mode::DontAsk,
+            ws,
+        );
+        assert_eq!(
+            child_policy(&p_dont_ask, Some("acceptEdits")).mode(),
+            Mode::DontAsk
+        );
+    }
+
+    #[test]
+    fn subagent_raw_model_keeps_openrouter_route_without_double_parsing() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+        use zerith_core::settings::{AccountEntry, ProviderEntry, WireProtocol};
+        use zerith_providers::{Protocol, ProviderKind};
+        use zerith_sessions::SessionSource;
+
+        fn spawn_mock(reply_text: &str) -> (String, Arc<Mutex<Vec<Value>>>) {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/v1", listener.local_addr().unwrap());
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let log = seen.clone();
+            let body_text = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\
+                 data: {}\n\n\
+                 data: [DONE]\n\n",
+                serde_json::json!({"choices":[{"delta":{"content": reply_text}}]})
+            );
+            std::thread::spawn(move || {
+                for _ in 0..2 {
+                    let Ok((mut sock, _)) = listener.accept() else {
+                        return;
+                    };
+                    let mut r = BufReader::new(sock.try_clone().unwrap());
+                    let mut first = String::new();
+                    if r.read_line(&mut first).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let mut len = 0usize;
+                    loop {
+                        let mut h = String::new();
+                        r.read_line(&mut h).unwrap();
+                        if h.trim().is_empty() {
+                            break;
+                        }
+                        if let Some(v) = h.to_ascii_lowercase().strip_prefix("content-length:") {
+                            len = v.trim().parse().unwrap();
+                        }
+                    }
+                    let mut body = vec![0; len];
+                    r.read_exact(&mut body).unwrap();
+                    log.lock()
+                        .unwrap()
+                        .push(serde_json::from_slice(&body).unwrap_or(Value::Null));
+                    let _ = sock.write_all(body_text.as_bytes());
+                }
+            });
+            (url, seen)
+        }
+
+        let (or_url, or_seen) = spawn_mock("ok from openrouter");
+        let (ant_url, ant_seen) = spawn_mock("wrong anthropic route");
+
+        let scratch = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let dir = tempfile::Builder::new().tempdir_in(&scratch).unwrap();
+        let db = dir.path().join("z.db");
+        let store = Store::open(&db).unwrap();
+        let parent = store
+            .create_session("parent", SessionSource::Native)
+            .unwrap();
+
+        let mut settings = zerith_core::Settings::default();
+        settings.providers.push(ProviderEntry {
+            name: "openrouter".into(),
+            protocol: Some(WireProtocol::OpenAi),
+            base_url: Some(or_url.clone()),
+            ..Default::default()
+        });
+        settings.providers.push(ProviderEntry {
+            name: "anthropic".into(),
+            protocol: Some(WireProtocol::OpenAi),
+            base_url: Some(ant_url.clone()),
+            ..Default::default()
+        });
+        settings.accounts.push(AccountEntry {
+            id: "or-acc".into(),
+            provider: "openrouter".into(),
+            base_url: Some(or_url),
+            protocol: Some(WireProtocol::OpenAi),
+            enabled: true,
+            ..Default::default()
+        });
+        settings.accounts.push(AccountEntry {
+            id: "ant-acc".into(),
+            provider: "anthropic".into(),
+            base_url: Some(ant_url),
+            protocol: Some(WireProtocol::OpenAi),
+            enabled: true,
+            ..Default::default()
+        });
+
+        let mut fallback_cfg = ProviderConfig::new(ProviderKind::OpenAi).with_key("k");
+        fallback_cfg.base_url = "http://127.0.0.1:9/v1".into();
+        fallback_cfg.protocol = Protocol::OpenAi;
+
+        let rt = Runtime {
+            db: Some(db.clone()),
+            cfg: fallback_cfg,
+            policy: Policy::new(
+                zerith_security::preset("workspace-write").unwrap(),
+                Mode::Bypass,
+                dir.path(),
+            ),
+            base: Registry::new(),
+            skills_root: None,
+            model: "gpt-4o".into(),
+            executor_model: Some("openrouter/anthropic/claude-sonnet-4".into()),
+            depth: 0,
+            gate: Gate::new(),
+            limit: Some(2),
+            settings: Some(settings),
+            approvals: None,
+            middleware: Vec::new(),
+            saved: SavedTotals::default(),
+            parent_checkpoint: None,
+        };
+
+        let sink = rt.base.host().sink();
+        let out = rt
+            .agent(
+                &parent.id,
+                AgentRequest {
+                    description: "exec".into(),
+                    prompt: "diga oi".into(),
+                    agent: Some("explore".into()),
+                    model: None,
+                    background: false,
+                    isolation: None,
+                },
+                &Cancel::default(),
+                Instant::now() + Duration::from_secs(10),
+                sink,
+            )
+            .unwrap();
+        assert_eq!(out, "ok from openrouter");
+
+        assert!(
+            ant_seen.lock().unwrap().is_empty(),
+            "child must NOT re-parse anthropic/claude-sonnet-4 onto anthropic provider"
+        );
+        let or_reqs = or_seen.lock().unwrap();
+        assert_eq!(or_reqs.len(), 1);
+        assert_eq!(or_reqs[0]["model"], "anthropic/claude-sonnet-4");
+
+        let events = rt.base.host().take_events();
+        assert!(events.iter().any(|ev| matches!(
+            ev,
+            HostEvent::Subagent { model, state, .. }
+                if state == "done" && model == "anthropic/claude-sonnet-4"
+        )));
+
+        let children = store
+            .list_sessions_filtered(&zerith_sessions::SessionFilter {
+                source: Some(SessionSource::Subagent),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(
+            children[0].model.as_deref(),
+            Some("anthropic/claude-sonnet-4")
+        );
     }
 }

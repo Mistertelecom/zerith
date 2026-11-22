@@ -125,6 +125,7 @@ export function GeneralTab(props: GeneralProps) {
         description={tr(lang, "Como a janela se apresenta.", "How the window looks and feels.")}
       >
         <Row
+          stacked
           label={tr(lang, "Idioma", "Language")}
           hint={tr(
             lang,

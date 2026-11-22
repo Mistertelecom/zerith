@@ -228,7 +228,8 @@ impl MediaTool {
         };
         if !inside_media
             && !matches!(
-                ctx.policy.check(&Action::Read(path.clone())),
+                ctx.policy
+                    .check_tool("read_file", &Action::Read(path.clone())),
                 Verdict::Allow
             )
         {

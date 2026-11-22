@@ -10,7 +10,7 @@ use tauri::{AppHandle, Emitter, State};
 use zerith_core::{Paths, Settings};
 use zerith_memory::{MemoryBackend, SqliteMemory};
 use zerith_providers::{Cancel, ProviderConfig};
-use zerith_runtime::learn::{self, ClientReviewer, Pass, TurnDigest};
+use zerith_runtime::learn::{self, ClientReviewer, Outcome, Pass, Reviewer, TurnDigest};
 use zerith_sessions::Store;
 
 use crate::state::AppState;
@@ -51,25 +51,22 @@ pub fn spawn(job: Job) {
         let Ok(store) = Store::open(&job.db) else {
             return;
         };
-        let Some((client, model)) = learn::route(&job.settings, &job.model, &job.fallback) else {
+        if store.session(&job.session_id).ok().flatten().is_none() {
             return;
-        };
-        let memory = (!job.memory_paused)
-            .then(|| SqliteMemory::open(&job.db).ok())
-            .flatten();
-        let scope = job.scope.clone();
-        let skills = zerith_skills::Library::open(job.root.join("skills")).ok();
-        let pass = Pass {
-            memory: memory.as_ref().map(|m| (m as &dyn MemoryBackend, &scope)),
-            skills: skills.as_ref(),
-            session_id: &job.session_id,
+        }
+        let Some((client, model)) =
+            learn::route_with_store(&job.settings, &job.model, &job.fallback, Some(&store))
+        else {
+            return;
         };
         let reviewer = ClientReviewer {
             client: &client,
             model: &model,
             record: Some((&store, &job.session_id)),
         };
-        let out = learn::after_turn(&job.digest, &pass, &reviewer, &Cancel::default());
+        let Some(out) = run_for_existing_session(&store, &job, &reviewer) else {
+            return;
+        };
         eprintln!(
             "zerith-desktop: aprender: sinais {:?}, {} aprendido(s), recusado(s) {:?}{}",
             out.signals,
@@ -82,11 +79,50 @@ pub fn spawn(job: Job) {
         if out.learned.is_empty() {
             return;
         }
+        if store.session(&job.session_id).ok().flatten().is_none() {
+            return;
+        }
         let items: Vec<_> = out.learned.iter().map(|l| l.to_json()).collect();
         if let Some(app) = APP.get() {
             let _ = app.emit("turn:learned", (&job.session_id, items));
         }
     });
+}
+
+fn run_for_existing_session(store: &Store, job: &Job, reviewer: &dyn Reviewer) -> Option<Outcome> {
+    store.session(&job.session_id).ok().flatten()?;
+    struct GuardedReviewer<'a> {
+        store: &'a Store,
+        session_id: &'a str,
+        inner: &'a dyn Reviewer,
+    }
+    impl Reviewer for GuardedReviewer<'_> {
+        fn review(&self, system: &str, digest: &str, cancel: &Cancel) -> Result<String, String> {
+            let res = self.inner.review(system, digest, cancel)?;
+            if self.store.session(self.session_id).ok().flatten().is_none() {
+                return Err("sessão removida".into());
+            }
+            Ok(res)
+        }
+    }
+    let memory = (!job.memory_paused)
+        .then(|| SqliteMemory::open(&job.db).ok())
+        .flatten();
+    let scope = job.scope.clone();
+    let skills = zerith_skills::Library::open(job.root.join("skills")).ok();
+    let pass = Pass {
+        memory: memory.as_ref().map(|m| (m as &dyn MemoryBackend, &scope)),
+        skills: skills.as_ref(),
+        session_id: &job.session_id,
+    };
+    let guarded = GuardedReviewer {
+        store,
+        session_id: &job.session_id,
+        inner: reviewer,
+    };
+    let out = learn::after_turn(&job.digest, &pass, &guarded, &Cancel::default());
+    store.session(&job.session_id).ok().flatten()?;
+    Some(out)
 }
 
 #[derive(Serialize)]
@@ -162,4 +198,74 @@ pub async fn learn_undo(state: State<'_, AppState>, item: UndoItem) -> Result<()
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use zerith_sessions::SessionSource;
+
+    #[test]
+    fn deleted_session_prevents_learning_writes_before_and_during_review() {
+        let scratch = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-scratch/desktop-learn-deleted");
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).unwrap();
+        let db = scratch.join("zerith.db");
+        let store = Store::open(&db).unwrap();
+        let sess = store.create_session("temp", SessionSource::Native).unwrap();
+
+        struct DeleteDuringReview {
+            db: PathBuf,
+            sid: String,
+            delete_inside: bool,
+            calls: Cell<usize>,
+        }
+        impl Reviewer for DeleteDuringReview {
+            fn review(&self, _: &str, _: &str, _: &Cancel) -> Result<String, String> {
+                self.calls.set(self.calls.get() + 1);
+                if self.delete_inside {
+                    let s2 = Store::open(&self.db).unwrap();
+                    s2.delete_session(&self.sid).unwrap();
+                }
+                Ok(r##"{"memory":[{"op":"add","kind":"preference","text":"O usuário prefere tabs"}],"skill":{"op":"create","name":"deleted-sess-skill","description":"Use when testing","instructions":"body"}}"##.into())
+            }
+        }
+
+        let job = Job {
+            root: scratch.clone(),
+            db: db.clone(),
+            settings: Settings::default(),
+            fallback: ProviderConfig::default(),
+            session_id: sess.id.clone(),
+            model: "m".into(),
+            memory_paused: false,
+            scope: zerith_memory::Scope::user("u"),
+            digest: TurnDigest::new("prefiro tabs"),
+        };
+
+        // Case 1: Session deleted while review is in flight -> must not write skill or memory.
+        let r1 = DeleteDuringReview {
+            db: db.clone(),
+            sid: sess.id.clone(),
+            delete_inside: true,
+            calls: Cell::new(0),
+        };
+        assert!(run_for_existing_session(&store, &job, &r1).is_none());
+        assert_eq!(r1.calls.get(), 1);
+        let mem = SqliteMemory::open(&db).unwrap();
+        assert!(mem.list(&job.scope, 10).unwrap().is_empty());
+        assert!(!scratch.join("skills/deleted-sess-skill").exists());
+
+        // Case 2: Session already deleted before review -> reviewer never called.
+        let r2 = DeleteDuringReview {
+            db: db.clone(),
+            sid: sess.id.clone(),
+            delete_inside: false,
+            calls: Cell::new(0),
+        };
+        assert!(run_for_existing_session(&store, &job, &r2).is_none());
+        assert_eq!(r2.calls.get(), 0);
+    }
 }

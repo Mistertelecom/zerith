@@ -28,8 +28,9 @@ const RULE = /^ {0,3}([-*_])(?:\s*\1){2,}\s*$/;
 const QUOTE = /^ {0,3}>/;
 const ITEM = /^(\s*)([-*+]|\d{1,9}[.)])\s+(.*)$/;
 const SAFE_HREF = /^(https?:|mailto:)/i;
-// Web, inline data, or an absolute local path (C:\x, C:/x, /x, file:///x).
-const SAFE_SRC = /^(https?:\/\/|data:image\/|file:\/\/\/|[a-z]:[\\/]|\/)/i;
+// Web, inline data, or an absolute local path (C:\x, C:/x, /x, file:///x),
+// rejecting UNC / protocol-relative paths (`//host/share`, `/\host`).
+const SAFE_SRC = /^(https?:\/\/|data:image\/|file:\/\/\/|[a-z]:[\\/]|\/(?![/\\]))/i;
 const TABLE_RULE = /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/;
 
 const indentOf = (line: string) => line.length - line.trimStart().length;
@@ -91,7 +92,7 @@ export function parseBlocks(src: string): MdBlock[] {
         // Short rows are padded and long ones cut, so every row has the header's columns.
         rows.push(head.map((_, k) => parseInline(r[k] ?? "")));
       }
-      out.push({ t: "table", align: head.map((_, k) => align[k] ?? null), head: head.map(parseInline), rows });
+      out.push({ t: "table", align: head.map((_, k) => align[k] ?? null), head: head.map((c) => parseInline(c)), rows });
       continue;
     }
 
@@ -170,9 +171,9 @@ export function parseBlocks(src: string): MdBlock[] {
 // The image is last in the regex but its leading `!` makes it match before
 // the link alternative could start one character later.
 const INLINE =
-  /`([^`\n]+)`|\*\*(.+?)\*\*|~~(.+?)~~|\*(?![\s*])(.+?)(?<![\s*])\*|(?<![\w])_(?![\s_])(.+?)(?<![\s_])_(?![\w])|(?<!!)\[([^\]\n]+)\]\(([^)\s]+)(?:\s+"[^"]*")?\)|(https?:\/\/[^\s<>()[\]`]*[^\s<>()[\]`.,;:!?'"*_])|!\[([^\]\n]*)\]\(<?([^)>\n]+?)>?(?:\s+"[^"]*")?\)/g;
+  /``([^\n]+?)``|`([^`\n]+)`|\*\*(.+?)\*\*|~~(.+?)~~|\*(?![\s*])(.+?)(?<![\s*])\*|(?<![\w])_(?![\s_])(.+?)(?<![\s_])_(?![\w])|(?<!!)\[([^\]\n]+)\]\(([^)\s]+)(?:\s+"[^"]*")?\)|(https?:\/\/[^\s<>()[\]`]*[^\s<>()[\]`.,;:!?'"*_])|!\[([^\]\n]*)\]\(<?([^)>\n]+?)>?(?:\s+"[^"]*")?\)/g;
 
-export function parseInline(src: string): Inline[] {
+export function parseInline(src: string, inLink = false): Inline[] {
   const out: Inline[] = [];
   let last = 0;
   for (const m of src.matchAll(INLINE)) {
@@ -180,14 +181,31 @@ export function parseInline(src: string): Inline[] {
     if (at > last) out.push(src.slice(last, at));
     last = at + m[0].length;
     if (m[1] !== undefined) out.push({ t: "code", v: m[1] });
-    else if (m[2] !== undefined) out.push({ t: "b", c: parseInline(m[2]) });
-    else if (m[3] !== undefined) out.push({ t: "s", c: parseInline(m[3]) });
-    else if (m[4] !== undefined || m[5] !== undefined) out.push({ t: "i", c: parseInline((m[4] ?? m[5])!) });
-    else if (m[6] !== undefined) {
-      // A javascript: or relative link stays text; only web and mail open.
-      out.push(SAFE_HREF.test(m[7]) ? { t: "a", href: m[7], c: parseInline(m[6]) } : m[0]);
-    } else if (m[8] !== undefined) out.push({ t: "a", href: m[8], c: [m[8]] });
-    else out.push(SAFE_SRC.test(m[10]) ? { t: "img", src: m[10].trim(), alt: m[9] } : m[0]);
+    else if (m[2] !== undefined) out.push({ t: "code", v: m[2] });
+    else if (m[3] !== undefined) out.push({ t: "b", c: parseInline(m[3], inLink) });
+    else if (m[4] !== undefined) out.push({ t: "s", c: parseInline(m[4], inLink) });
+    else if (m[5] !== undefined || m[6] !== undefined)
+      out.push({ t: "i", c: parseInline((m[5] ?? m[6])!, inLink) });
+    else if (m[7] !== undefined) {
+      if (inLink) {
+        out.push(m[0]);
+      } else {
+        // A javascript: or relative link stays text; only web and mail open.
+        out.push(
+          SAFE_HREF.test(m[8])
+            ? { t: "a", href: m[8], c: parseInline(m[7], true) }
+            : m[0],
+        );
+      }
+    } else if (m[9] !== undefined) {
+      out.push(inLink ? m[9] : { t: "a", href: m[9], c: [m[9]] });
+    } else {
+      out.push(
+        SAFE_SRC.test(m[11])
+          ? { t: "img", src: m[11].trim(), alt: m[10] }
+          : m[0],
+      );
+    }
   }
   if (last < src.length) out.push(src.slice(last));
   return out;

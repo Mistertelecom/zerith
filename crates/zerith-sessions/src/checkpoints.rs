@@ -127,6 +127,33 @@ pub struct Checkpoint {
     snapped: Once,
 }
 
+fn normalize_windows_path_str(raw: &str) -> String {
+    let normalized = raw.replace('/', "\\");
+    let stripped = if let Some(unc) = normalized
+        .strip_prefix(r"\\?\UNC\")
+        .or_else(|| normalized.strip_prefix(r"\\?\unc\"))
+    {
+        format!(r"\\{unc}")
+    } else if let Some(local) = normalized.strip_prefix(r"\\?\") {
+        local.to_string()
+    } else {
+        normalized
+    };
+    stripped.to_ascii_lowercase()
+}
+
+fn path_key(p: &Path) -> String {
+    let raw = p.to_string_lossy();
+    #[cfg(windows)]
+    {
+        normalize_windows_path_str(&raw)
+    }
+    #[cfg(not(windows))]
+    {
+        raw.into_owned()
+    }
+}
+
 fn session_dir(data_root: &Path, session: &str) -> PathBuf {
     let safe: String = session
         .chars()
@@ -216,9 +243,10 @@ impl Checkpoint {
             .to_str()
             .ok_or_else(|| CheckpointError::BadPath(abs.display().to_string()))?
             .to_string();
+        let dedup_key = path_key(&abs);
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let (manifest, seen) = &mut *guard;
-        if seen.contains(&key) {
+        if seen.contains(&dedup_key) {
             return Ok(());
         }
         let entry = match std::fs::metadata(&abs) {
@@ -262,7 +290,7 @@ impl Checkpoint {
         let tmp = self.dir.join("manifest.json.tmp");
         std::fs::write(&tmp, serde_json::to_vec(&*manifest)?)?;
         std::fs::rename(&tmp, self.dir.join("manifest.json"))?;
-        seen.insert(key);
+        seen.insert(dedup_key);
         Ok(())
     }
 
@@ -633,9 +661,10 @@ pub fn turn_files(
     for t in later {
         let dir = turn_dir(data_root, session, t);
         for e in read_manifest(&dir)?.entries {
+            let e_key = path_key(Path::new(&e.path));
             if let Some(f) = out
                 .iter_mut()
-                .find(|f| f.path == e.path && f.after.is_none())
+                .find(|f| path_key(Path::new(&f.path)) == e_key && f.after.is_none())
             {
                 f.after = Some(e.blob.filter(|_| e.existed).map(|b| dir.join(b)));
             }
@@ -833,5 +862,76 @@ mod tests {
             restore_turn(&st, &root, &s, 9),
             Err(CheckpointError::NoCheckpoint { .. })
         ));
+    }
+
+    #[test]
+    fn windows_path_normalization_handles_case_slashes_and_verbatim_prefix() {
+        assert_eq!(
+            normalize_windows_path_str(r"C:\Proj\Src\Main.rs"),
+            r"c:\proj\src\main.rs"
+        );
+        assert_eq!(
+            normalize_windows_path_str("c:/proj/src/main.rs"),
+            r"c:\proj\src\main.rs"
+        );
+        assert_eq!(
+            normalize_windows_path_str(r"\\?\C:\Proj\Src\Main.rs"),
+            r"c:\proj\src\main.rs"
+        );
+        assert_eq!(
+            normalize_windows_path_str(r"\\?\UNC\Server\Share\Main.rs"),
+            r"\\server\share\main.rs"
+        );
+        assert_eq!(
+            normalize_windows_path_str(r"\\server\share\main.rs"),
+            r"\\server\share\main.rs"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_checkpoint_dedup_and_turn_files_match_ignore_case_and_slashes() {
+        assert_eq!(
+            path_key(Path::new(r"C:\Proj\Src\Main.rs")),
+            path_key(Path::new("c:/proj/src/main.rs"))
+        );
+
+        let root = scratch("wincase");
+        let work = root.join("Work");
+        std::fs::create_dir_all(&work).unwrap();
+        let upper_file = work.join("Main.rs");
+        std::fs::write(&upper_file, "v0").unwrap();
+
+        let st = Store::open_in_memory().unwrap();
+        let s = st.create_session("win", SessionSource::Native).unwrap().id;
+        let t1 = Checkpoint::begin(&st, &root, &s, 1).unwrap();
+        t1.record_file(&upper_file).unwrap();
+        std::fs::write(&upper_file, "v1").unwrap();
+
+        // Call record_file again in the same turn with lowercase + forward slashes.
+        let lower_slash = PathBuf::from(
+            upper_file
+                .to_string_lossy()
+                .replace('\\', "/")
+                .to_ascii_lowercase(),
+        );
+        t1.record_file(&lower_slash).unwrap();
+        assert_eq!(
+            t1.recorded(),
+            1,
+            "same file in different casing/slashes must dedup"
+        );
+
+        // Turn 2 records using the opposite casing/slash form and turn_files must match it.
+        let t2 = Checkpoint::begin(&st, &root, &s, 2).unwrap();
+        t2.record_file(&lower_slash).unwrap();
+        let files = turn_files(&st, &root, &s, 1).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(files[0].before.as_ref().unwrap()).unwrap(),
+            "v0"
+        );
+        let after = files[0].after.clone().unwrap().unwrap();
+        assert_eq!(std::fs::read_to_string(after).unwrap(), "v1");
     }
 }

@@ -405,7 +405,7 @@ fn read_file(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String>
         .take(limit)
         .map(|(i, l)| format!("{}\t{l}\n", i + 1))
         .collect();
-    let last = (offset - 1 + limit).min(total);
+    let last = (offset - 1).saturating_add(limit).min(total);
     if last < total {
         out.push_str(&format!(
             "[linhas {offset}-{last} de {total}; use offset para continuar]\n"
@@ -1027,7 +1027,9 @@ mod ondav4_tests {
     fn detached_launch_detector_catches_gui_wrappers_only() {
         use super::looks_like_detached_launch;
         assert!(looks_like_detached_launch("start python calc.py"));
-        assert!(looks_like_detached_launch("cd app && Start-Process calc.exe"));
+        assert!(looks_like_detached_launch(
+            "cd app && Start-Process calc.exe"
+        ));
         assert!(looks_like_detached_launch("pythonw app.py"));
         assert!(looks_like_detached_launch("nohup server &"));
         assert!(looks_like_detached_launch("cmd /c start app.exe"));

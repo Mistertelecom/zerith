@@ -74,6 +74,9 @@ pub(crate) fn settle(
     let Some(gate) = gate else {
         return (false, format!("erro: {NO_ANSWER} (não há quem responda)"));
     };
+    if cancel.is_cancelled() {
+        return (false, format!("erro: {NO_ANSWER}"));
+    }
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
     on_event(RunEvent::Question {
         id,
@@ -144,8 +147,13 @@ mod tests {
         let (_tx, gate) = question_channel();
         let cancel = Cancel::default();
         cancel.cancel();
-        let (ok, text) = settle(Some(&gate), &args(), &cancel, &mut |_| {});
+        let mut emitted = false;
+        let (ok, text) = settle(Some(&gate), &args(), &cancel, &mut |_| emitted = true);
         assert!(!ok && text.contains("o usuário não respondeu"), "{text}");
+        assert!(
+            !emitted,
+            "must not emit Question event when already cancelled"
+        );
         let (ok, text) = settle(None, &args(), &Cancel::default(), &mut |_| {});
         assert!(!ok && text.contains("o usuário não respondeu"), "{text}");
         // A sender that went away is not a yes.

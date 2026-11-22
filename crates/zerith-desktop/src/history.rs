@@ -156,17 +156,12 @@ pub async fn hermes_detect() -> Result<Vec<SourceView>, String> {
     .map_err(|e| e.to_string())?
 }
 
-/// Previews a database the person picked, without writing to it.
+/// Previews a Hermes source (`.db` or `.jsonl`) the person picked, without writing to it.
 #[tauri::command]
 pub async fn hermes_preview(path: String) -> Result<SourceView, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let p = PathBuf::from(&path);
-        if !p.is_file() {
-            return Err(format!("arquivo não encontrado: {path}"));
-        }
-        zerith_importers::preview(&p)
-            .map(SourceView::of)
-            .map_err(|e| e.to_string())
+        crate::wire::preview_hermes(&p).map(SourceView::of)
     })
     .await
     .map_err(|e| e.to_string())?

@@ -55,10 +55,12 @@ fn canonical_provider_name(lhs: &str) -> Option<&'static str> {
         "openai" => Some("openai"),
         "anthropic" | "claude" => Some("anthropic"),
         "deepseek" => Some("deepseek"),
-        "gemini" => Some("gemini"),
+        "gemini" | "google" => Some("gemini"),
         "openrouter" => Some("openrouter"),
         "ollama" => Some("ollama"),
-        "lmstudio" => Some("lmstudio"),
+        "lmstudio" | "lm-studio" => Some("lmstudio"),
+        "codex" => Some("codex"),
+        "antigravity" => Some("antigravity"),
         "custom" => Some("custom"),
         _ => None,
     }
@@ -368,6 +370,9 @@ fn emit_completion_events(completion: Completion, on_event: &mut impl FnMut(Stre
     if !completion.text.is_empty() {
         on_event(StreamEvent::Delta(completion.text));
     }
+    if !completion.thinking_blocks.is_empty() {
+        on_event(StreamEvent::ThinkingBlocks(completion.thinking_blocks));
+    }
     if !completion.tool_calls.is_empty() {
         on_event(StreamEvent::ToolCalls(completion.tool_calls));
     }
@@ -609,6 +614,39 @@ mod tests {
                 account_id: None,
                 provider: Some("openrouter".into()),
                 model: "meta-llama/llama-3.3-70b".into(),
+            }
+        );
+
+        assert_eq!(
+            ModelSpec::parse("codex/gpt-5-codex"),
+            ModelSpec {
+                account_id: None,
+                provider: Some("codex".into()),
+                model: "gpt-5-codex".into(),
+            }
+        );
+        assert_eq!(
+            ModelSpec::parse("antigravity/gemini-4-hydrogen-medium"),
+            ModelSpec {
+                account_id: None,
+                provider: Some("antigravity".into()),
+                model: "gemini-4-hydrogen-medium".into(),
+            }
+        );
+        assert_eq!(
+            ModelSpec::parse("google/gemini-2.5-pro"),
+            ModelSpec {
+                account_id: None,
+                provider: Some("gemini".into()),
+                model: "gemini-2.5-pro".into(),
+            }
+        );
+        assert_eq!(
+            ModelSpec::parse("lm-studio/qwen2.5"),
+            ModelSpec {
+                account_id: None,
+                provider: Some("lmstudio".into()),
+                model: "qwen2.5".into(),
             }
         );
 

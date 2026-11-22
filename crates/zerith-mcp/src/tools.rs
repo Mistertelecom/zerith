@@ -94,14 +94,13 @@ impl Server {
                     .cfg
                     .is_oauth()
                     .then(|| crate::oauth::Auth::os(&self.cfg.name));
-                let mut c = Client::connect_http_auth(
+                Client::connect_http_auth_with_timeout(
                     &self.cfg.name,
                     url,
                     &pairs(&self.extra.headers),
                     auth,
-                )?;
-                c.set_timeout(timeout);
-                Ok(c)
+                    timeout,
+                )
             }
             (None, None) => Err(McpError::Protocol("servidor sem command nem url".into())),
         }

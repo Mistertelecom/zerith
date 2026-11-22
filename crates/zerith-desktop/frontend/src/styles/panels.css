@@ -23,7 +23,7 @@
   flex-wrap: wrap;
 }
 .pn-gap-top {
-  margin-top: var(--s-3);
+  margin-top: 12px;
 }
 .pn-warn {
   color: var(--warn-text);

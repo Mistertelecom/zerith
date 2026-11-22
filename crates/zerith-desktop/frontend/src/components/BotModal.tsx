@@ -76,7 +76,7 @@ export function BotModal(props: {
         .split("\n")
         .map((s) => s.trim())
         .filter(Boolean);
-      const updated = await api.agentSave({
+      const form = {
         name: cleanName,
         description: description.trim(),
         instructions: instructions.trim(),
@@ -84,7 +84,10 @@ export function BotModal(props: {
         model: model.trim(),
         icon,
         quickPrompts,
-      });
+      };
+      const updated = isEdit
+        ? await api.agentSave(form)
+        : await api.agentCreate(form);
       props.onSaved(updated, cleanName);
       props.onClose();
     } catch (err) {
@@ -261,7 +264,7 @@ export function BotModal(props: {
               <button type="button" className="btn" onClick={props.onClose} disabled={saving}>
                 {tr(lang, "Cancelar", "Cancel")}
               </button>
-              <button type="submit" className="btn primary" disabled={saving}>
+              <button type="submit" className="btn btn-primary" disabled={saving}>
                 <Save size={14} />
                 <span>
                   {saving

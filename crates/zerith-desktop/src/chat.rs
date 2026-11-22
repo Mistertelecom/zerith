@@ -4,9 +4,11 @@
 //! The turn itself runs on its own thread; the window only ever sees
 //! `turn:event` payloads, so a slow model never freezes a frame.
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use serde::Deserialize;
 use tauri::{AppHandle, Emitter, Manager};
@@ -17,33 +19,66 @@ use zerith_runtime::{
 };
 
 use crate::state::AppState;
-use crate::turn::{self, Setup, TurnEvent};
+use crate::turn::{self, Setup, TurnEvent, TurnOutcome};
 use crate::types::Decision;
+
+static NEXT_TURN_ID: AtomicU64 = AtomicU64::new(1);
 
 /// The handles of one running turn. Dropped when it finishes, which closes the
 /// gates and lets a blocked call fail closed.
 pub struct Running {
+    pub turn_id: u64,
     pub cancel: Cancel,
     pub approvals: ApprovalSender,
     pub questions: QuestionSender,
     pub inbox: InboxSender,
 }
 
-/// Every turn currently running, by session, plus per-session `AllowSession` grants.
+/// Every turn currently running, by session, plus per-session `AllowSession` grants
+/// and active background pre-compaction cancel tokens.
 #[derive(Default)]
 pub struct Turns {
     running: Mutex<HashMap<String, Running>>,
     grants: Mutex<HashMap<String, SharedGrants>>,
+    precompacts: Arc<Mutex<HashMap<String, Cancel>>>,
+}
+
+fn start_precompact_in(precompacts: &Mutex<HashMap<String, Cancel>>, id: &str) -> Cancel {
+    let cancel = Cancel::default();
+    if let Ok(mut map) = precompacts.lock() {
+        if let Some(prev) = map.insert(id.to_string(), cancel.clone()) {
+            prev.cancel();
+        }
+    }
+    cancel
 }
 
 impl Turns {
-    /// Replaces whatever ran for this session before: one turn per conversation.
-    pub fn start(&self, id: &str, run: Running) -> Option<Running> {
-        self.running.lock().ok()?.insert(id.to_string(), run)
+    /// Atomically registers a turn for `id` only if no turn is currently active.
+    pub fn try_start(&self, id: &str, run: Running) -> bool {
+        let Ok(mut map) = self.running.lock() else {
+            return false;
+        };
+        match map.entry(id.to_string()) {
+            Entry::Vacant(slot) => {
+                slot.insert(run);
+                true
+            }
+            Entry::Occupied(_) => false,
+        }
     }
 
     pub fn take(&self, id: &str) -> Option<Running> {
         self.running.lock().ok()?.remove(id)
+    }
+
+    /// Removes the running turn for `id` only if its `turn_id` matches.
+    pub fn take_if(&self, id: &str, turn_id: u64) -> Option<Running> {
+        let mut map = self.running.lock().ok()?;
+        match map.entry(id.to_string()) {
+            Entry::Occupied(entry) if entry.get().turn_id == turn_id => Some(entry.remove()),
+            _ => None,
+        }
     }
 
     /// Reads without removing, so an approval can be answered mid-turn.
@@ -58,6 +93,28 @@ impl Turns {
             return SharedGrants::default();
         };
         map.entry(id.to_string()).or_default().clone()
+    }
+
+    /// Removes stored session-level approval grants for `id` (e.g., on delete).
+    pub fn remove_grants(&self, id: &str) {
+        if let Ok(mut map) = self.grants.lock() {
+            map.remove(id);
+        }
+    }
+
+    /// Registers a `Cancel` token for `id`'s background pre-compaction,
+    /// cancelling any prior token registered for the same session.
+    pub fn start_precompact(&self, id: &str) -> Cancel {
+        start_precompact_in(&self.precompacts, id)
+    }
+
+    /// Cancels and removes any active background pre-compaction token for `id`.
+    pub fn cancel_precompact(&self, id: &str) {
+        if let Ok(mut map) = self.precompacts.lock() {
+            if let Some(prev) = map.remove(id) {
+                prev.cancel();
+            }
+        }
     }
 }
 
@@ -91,38 +148,33 @@ pub fn send_turn(
     if prompt.is_empty() {
         return Err("Escreva uma mensagem".into());
     }
-    if turns.with(&args.session_id, |_| ()).is_some() {
-        return Err("Esta conversa já está respondendo".into());
-    }
 
-    let setup = Setup {
-        root: state.root().to_path_buf(),
-        db: state.db(),
-        workspace: turn::session_workspace(&state.db(), &args.session_id),
-        mode: turn::parse_mode(&args.mode),
-        memory_paused: crate::wire::memory_paused(&state.db()),
-        agent: args.agent.clone(),
-        reasoning_effort: args.reasoning_effort.clone(),
-        orchestrator: args.orchestrator,
-        executor_model: args.executor_model.clone(),
-        mcp_cache: Some(state.mcp_cache()),
-    };
-
+    let turn_id = NEXT_TURN_ID.fetch_add(1, Ordering::Relaxed);
     let cancel = Cancel::default();
     let (approvals, approval_gate) =
         approval_channel_with_grants(turns.grants_for(&args.session_id));
     let (questions, question_gate) = question_channel();
     let (inbox, inbox_rx) = inbox_channel();
     let session = args.session_id.clone();
-    turns.start(
+    if !turns.try_start(
         &session,
         Running {
+            turn_id,
             cancel: cancel.clone(),
             approvals: approvals.clone(),
             questions: questions.clone(),
             inbox,
         },
-    );
+    ) {
+        return Err("Esta conversa já está respondendo".into());
+    }
+    turns.cancel_precompact(&session);
+    let precompacts = Arc::clone(&turns.precompacts);
+
+    let root = state.root().to_path_buf();
+    let db = state.db();
+    let mcp_cache = state.mcp_cache();
+    let mode = turn::parse_mode(&args.mode);
 
     // The event channel is per turn: a stale thread can never write into the
     // next turn's transcript.
@@ -144,16 +196,38 @@ pub fn send_turn(
         let _ = emit_app.emit("turn:event", (&emit_session, ev));
     };
 
-    std::thread::spawn(move || {
+    let spawned = std::thread::Builder::new().spawn(move || {
         // Whatever happens below, even a panic, the turn ends: the slot frees
         // (else every later message is refused) and the spinner stops.
         let end_app = app.clone();
         let end_session = session.clone();
         let end = OnDrop(Some(move || {
-            end_app.state::<Turns>().take(&end_session);
-            let _ = end_app.emit("turn:done", &end_session);
+            if end_app
+                .state::<Turns>()
+                .take_if(&end_session, turn_id)
+                .is_some()
+            {
+                let _ = end_app.emit("turn:done", &end_session);
+            }
         }));
         let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let setup = Setup {
+                root,
+                db: db.clone(),
+                workspace: turn::session_workspace(&db, &session),
+                mode,
+                memory_paused: crate::wire::memory_paused(&db),
+                agent: args.agent.clone(),
+                reasoning_effort: args.reasoning_effort.clone(),
+                orchestrator: args.orchestrator,
+                executor_model: args.executor_model.clone(),
+                mcp_cache: Some(mcp_cache),
+                register_precompact: Some(Arc::new({
+                    let precompacts = Arc::clone(&precompacts);
+                    let sid = session.clone();
+                    move || start_precompact_in(&precompacts, &sid)
+                })),
+            };
             turn::run(
                 &setup,
                 &session,
@@ -167,13 +241,16 @@ pub fn send_turn(
             )
         }));
         // A setup error or a panic reaches the chat before `turn:done`.
-        let failed = outcome(result, &mut emit);
+        let final_outcome = outcome(result, &mut emit);
         drop(end);
-        match failed {
-            None => crate::notify::ping(&app, "Zerith respondeu", "A resposta está pronta."),
-            Some(e) => crate::notify::ping(&app, "A conversa parou com erro", &e),
+        if let Some((title, body)) = notification_for(&final_outcome) {
+            crate::notify::ping(&app, title, &body);
         }
     });
+    if let Err(e) = spawned {
+        turns.take_if(&args.session_id, turn_id);
+        return Err(format!("não foi possível iniciar o turno: {e}"));
+    }
 
     Ok(())
 }
@@ -189,15 +266,26 @@ impl<F: FnOnce()> Drop for OnDrop<F> {
     }
 }
 
+/// Classifies the final desktop notification (if any) for a [`TurnOutcome`].
+fn notification_for(outcome: &TurnOutcome) -> Option<(&'static str, String)> {
+    match outcome {
+        TurnOutcome::Done => Some(("Zerith respondeu", "A resposta está pronta.".into())),
+        TurnOutcome::Failed(e) => Some(("A conversa parou com erro", e.clone())),
+        TurnOutcome::Cancelled => None,
+    }
+}
+
 /// Tells the chat how a turn ended when `turn::run` itself could not: an
 /// error before the turn started (no provider, store) or a panic becomes a
-/// `Failed` event, so a turn never ends silently. Returns that message.
+/// `Failed` event, so a turn never ends silently. Returns the classified outcome.
 fn outcome(
-    result: std::thread::Result<Result<(), String>>,
+    result: std::thread::Result<Result<TurnOutcome, String>>,
     emit: &mut dyn FnMut(TurnEvent),
-) -> Option<String> {
+) -> TurnOutcome {
     let message = match result {
-        Ok(Ok(())) => return None,
+        Ok(Ok(TurnOutcome::Done)) => return TurnOutcome::Done,
+        Ok(Ok(TurnOutcome::Cancelled)) => return TurnOutcome::Cancelled,
+        Ok(Ok(TurnOutcome::Failed(e))) => return TurnOutcome::Failed(e),
         Ok(Err(e)) => e,
         Err(p) => {
             let why = p
@@ -211,7 +299,7 @@ fn outcome(
     emit(TurnEvent::Failed {
         message: message.clone(),
     });
-    Some(message)
+    TurnOutcome::Failed(message)
 }
 
 /// Stops the turn at the next network read.
@@ -283,19 +371,52 @@ mod tests {
     }
 
     /// A setup error and a panic both reach the chat as `Failed`, and the end
-    /// guard runs even while unwinding; a clean turn adds nothing.
+    /// guard runs even while unwinding; a clean turn adds nothing, and a
+    /// cancelled turn stays silent.
     #[test]
     fn a_turn_never_ends_silently() {
         let mut evs = Vec::new();
-        let ok = outcome(Ok(Ok(())), &mut |e| evs.push(e));
-        assert_eq!(ok, None);
+        let ok = outcome(Ok(Ok(TurnOutcome::Done)), &mut |e| evs.push(e));
+        assert_eq!(ok, TurnOutcome::Done);
         assert!(evs.is_empty());
+        assert_eq!(
+            notification_for(&ok),
+            Some(("Zerith respondeu", "A resposta está pronta.".into()))
+        );
+
+        let cancelled = outcome(Ok(Ok(TurnOutcome::Cancelled)), &mut |e| evs.push(e));
+        assert_eq!(cancelled, TurnOutcome::Cancelled);
+        assert!(evs.is_empty());
+        assert_eq!(notification_for(&cancelled), None);
+
+        let turn_failed = outcome(Ok(Ok(TurnOutcome::Failed("429".into()))), &mut |e| {
+            evs.push(e)
+        });
+        assert_eq!(turn_failed, TurnOutcome::Failed("429".into()));
+        assert!(
+            evs.is_empty(),
+            "turn::run already emitted TurnEvent::Failed"
+        );
+        assert_eq!(
+            notification_for(&turn_failed),
+            Some(("A conversa parou com erro", "429".into()))
+        );
 
         let err = outcome(Ok(Err("Nenhum provedor configurado".into())), &mut |e| {
             evs.push(e)
         });
-        assert_eq!(err.as_deref(), Some("Nenhum provedor configurado"));
+        assert_eq!(
+            err,
+            TurnOutcome::Failed("Nenhum provedor configurado".into())
+        );
         assert_eq!(failed(&evs), ["Nenhum provedor configurado"]);
+        assert_eq!(
+            notification_for(&err),
+            Some((
+                "A conversa parou com erro",
+                "Nenhum provedor configurado".into()
+            ))
+        );
 
         let ended = std::cell::Cell::new(false);
         let caught = std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -304,15 +425,42 @@ mod tests {
         }));
         assert!(ended.get(), "the guard ran while unwinding");
         let mut evs = Vec::new();
-        outcome(caught.map(|()| Ok(())), &mut |e| evs.push(e));
+        let panicked = outcome(caught.map(|()| Ok(TurnOutcome::Done)), &mut |e| evs.push(e));
         assert_eq!(failed(&evs), ["erro interno: ferramenta quebrou"]);
+        assert_eq!(
+            notification_for(&panicked),
+            Some((
+                "A conversa parou com erro",
+                "erro interno: ferramenta quebrou".into()
+            ))
+        );
 
-        let caught = std::panic::catch_unwind(|| -> Result<(), String> {
+        let caught = std::panic::catch_unwind(|| -> Result<TurnOutcome, String> {
             panic!("{} de {}", 3, 4);
         });
         let mut evs = Vec::new();
         outcome(caught, &mut |e| evs.push(e));
         assert_eq!(failed(&evs), ["erro interno: 3 de 4"]);
+    }
+
+    #[test]
+    fn remove_grants_and_precompact_tokens_manage_session_lifecycle() {
+        let turns = Turns::default();
+        turns
+            .grants_for("s1")
+            .lock()
+            .unwrap()
+            .insert("write_file".into());
+        turns.remove_grants("s1");
+        assert!(turns.grants_for("s1").lock().unwrap().is_empty());
+
+        let c1 = turns.start_precompact("s1");
+        assert!(!c1.is_cancelled());
+        let c2 = turns.start_precompact("s1");
+        assert!(c1.is_cancelled(), "new precompact cancels previous token");
+        assert!(!c2.is_cancelled());
+        turns.cancel_precompact("s1");
+        assert!(c2.is_cancelled());
     }
 
     #[test]
@@ -336,5 +484,35 @@ mod tests {
             &serde_json::json!({"command": "git status && rm -rf x"}),
         );
         assert!(!s1_turn2.lock().unwrap().contains(&chained));
+    }
+
+    #[test]
+    fn try_start_and_take_if_prevent_toctou_and_stale_clear() {
+        let turns = Turns::default();
+        let make_run = |turn_id: u64| {
+            let (approvals, _) = approval_channel_with_grants(turns.grants_for("s1"));
+            let (questions, _) = question_channel();
+            let (inbox, _) = inbox_channel();
+            Running {
+                turn_id,
+                cancel: Cancel::default(),
+                approvals,
+                questions,
+                inbox,
+            }
+        };
+
+        assert!(turns.try_start("s1", make_run(10)));
+        assert!(!turns.try_start("s1", make_run(11)));
+        assert_eq!(turns.with("s1", |r| r.turn_id), Some(10));
+
+        // Stale turn_id must not clear the active turn.
+        assert!(turns.take_if("s1", 999).is_none());
+        assert_eq!(turns.with("s1", |r| r.turn_id), Some(10));
+
+        // Matching turn_id frees the slot so a new turn can start.
+        assert_eq!(turns.take_if("s1", 10).map(|r| r.turn_id), Some(10));
+        assert!(turns.try_start("s1", make_run(12)));
+        assert_eq!(turns.with("s1", |r| r.turn_id), Some(12));
     }
 }

@@ -278,8 +278,17 @@ pub async fn rename_session(
 }
 
 #[tauri::command]
-pub async fn delete_session(state: tauri::State<'_, AppState>, id: String) -> Cmd<()> {
-    state.with_store(|st| st.delete_session(&id).map_err(|e| e.to_string()))
+pub async fn delete_session(
+    state: tauri::State<'_, AppState>,
+    turns: tauri::State<'_, crate::chat::Turns>,
+    id: String,
+) -> Cmd<()> {
+    turns.with(&id, |r| r.cancel.cancel());
+    turns.remove_grants(&id);
+    turns.cancel_precompact(&id);
+    state.with_store(|st| st.delete_session(&id).map_err(|e| e.to_string()))?;
+    let _ = zerith_sessions::checkpoints::delete_all(state.root(), &id);
+    Ok(())
 }
 
 #[tauri::command]

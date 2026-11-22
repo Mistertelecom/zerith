@@ -348,6 +348,37 @@ fn local_references_outside_the_workspace_are_not_uploaded() {
     )
     .unwrap_err();
     assert!(matches!(e, ToolError::Denied(_)), "{e:?}");
+
+    let secret_png = root.join("secret.png");
+    std::fs::write(&secret_png, b"\x89PNG").unwrap();
+    let mut deny_pol = Policy::new(preset("workspace-write").unwrap(), Mode::Bypass, &root);
+    deny_pol.rules =
+        vec![
+            zerith_security::Rule::parse(zerith_security::RuleKind::Deny, "read_file(*.png)")
+                .unwrap(),
+        ];
+    let deny_ctx = CallCtx {
+        workspace: &root,
+        policy: &deny_pol,
+        memory: None,
+        scope: None,
+    };
+    let cancel = zerith_providers::Cancel::default();
+    let host = crate::Host::default();
+    let exec = Exec {
+        cancel: &cancel,
+        deadline: std::time::Instant::now() + Duration::from_secs(5),
+        timeout: Duration::from_secs(5),
+        host: &host,
+    };
+    let err = tool
+        .run(
+            &json!({"prompt": LONG, "reference_images": ["secret.png"]}),
+            &deny_ctx,
+            &exec,
+        )
+        .unwrap_err();
+    assert!(matches!(err, ToolError::Denied(_)), "{err:?}");
 }
 
 #[test]

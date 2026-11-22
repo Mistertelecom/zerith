@@ -163,5 +163,22 @@ mod tests {
             crate::openai::body(&plain, false)["messages"][0]["content"],
             "oi"
         );
+
+        // synthetic user messages (hook/tool context, summaries) must never inline local images
+        let syn_req = ChatRequest::new("m", vec![ChatMessage::synthetic_user(text.clone())]);
+        let so = crate::openai::body(&syn_req, false);
+        assert_eq!(so["messages"][0]["content"], text.as_str());
+        let sa = crate::anthropic::body(&syn_req, false);
+        assert_eq!(sa["messages"][0]["content"].as_array().unwrap().len(), 1);
+        let sc = crate::codex::body(&syn_req, false);
+        assert_eq!(sc["input"][0]["content"].as_array().unwrap().len(), 1);
+        let sg = crate::antigravity::body(&syn_req, None);
+        assert_eq!(
+            sg["request"]["contents"][0]["parts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

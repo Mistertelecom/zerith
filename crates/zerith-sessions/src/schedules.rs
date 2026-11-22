@@ -105,7 +105,10 @@ fn parse_field<const N: usize>(
         let mut cur = start;
         while cur <= end {
             out[cur] = true;
-            cur += step;
+            match cur.checked_add(step) {
+                Some(next) if next <= max => cur = next,
+                _ => break,
+            }
         }
     }
     Ok(out)
@@ -288,6 +291,14 @@ mod tests {
             .matches_unix_secs(259_200)); // 1970-01-04 Sunday
         assert!(CronExpr::parse("bad").is_err());
         assert!(CronExpr::parse("61 * * * *").is_err());
+    }
+
+    #[test]
+    fn cron_parser_handles_large_step_without_overflow() {
+        let c = CronExpr::parse("1/18446744073709551615 * * * *").unwrap();
+        assert!(c.matches_unix_secs(60));
+        assert!(!c.matches_unix_secs(0));
+        assert!(!c.matches_unix_secs(120));
     }
 
     #[test]

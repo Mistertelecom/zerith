@@ -639,7 +639,7 @@ export function RoutingTab(p: {
           <div className="dg-stem bus" />
           <div className="dg-fan">
             {node("subagent_model")}
-            {node("explore_model")}
+            {node("explore_model", "dg-end-md")}
             {node("plan_model")}
             {node("compact_model", "", true)}
           </div>

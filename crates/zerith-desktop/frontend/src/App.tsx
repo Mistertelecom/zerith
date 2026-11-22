@@ -146,8 +146,17 @@ export default function App() {
   const [turns, setTurns] = useState<Record<string, TurnState>>({});
   const turnsRef = useRef<Record<string, TurnState>>(turns);
   turnsRef.current = turns;
+  const sessionsRef = useRef<Session[]>(sessions);
+  sessionsRef.current = sessions;
   const selectedRef = useRef<string | null>(null);
   selectedRef.current = selected;
+  const sendingSessionsRef = useRef<Set<string>>(new Set());
+  const sessionEpochRef = useRef<Record<string, number>>({});
+  const bumpSessionEpoch = useCallback((id: string) => {
+    const next = (sessionEpochRef.current[id] ?? 0) + 1;
+    sessionEpochRef.current[id] = next;
+    return next;
+  }, []);
   const [sessionUsage, setSessionUsage] = useState<SessionUsageTotals | null>(
     null,
   );
@@ -161,7 +170,7 @@ export default function App() {
           k !== selectedRef.current &&
           k !== keepId &&
           !v.busy &&
-          !v.approval &&
+          v.approvals.length === 0 &&
           !v.question,
       );
       if (inactive.length <= MAX_CACHED_TURNS) return all;
@@ -187,6 +196,18 @@ export default function App() {
       ),
     [pruneTurns],
   );
+  const clearTurnBlocksIfIdle = useCallback((id: string) => {
+    if (turnsRef.current[id]?.busy) return;
+    setTurns((prev) => {
+      const cur = prev[id];
+      if (!cur || cur.busy || cur.blocks.length === 0) return prev;
+      const kept = cur.blocks.filter(
+        (b) => b.kind === "note" && Boolean(b.learned?.length),
+      );
+      if (kept.length === cur.blocks.length) return prev;
+      return { ...prev, [id]: { ...cur, blocks: kept } };
+    });
+  }, []);
   const turn: TurnState = (selected && turns[selected]) || emptyTurn;
   const setTurn = useCallback(
     (next: TurnState | ((prev: TurnState) => TurnState)) => {
@@ -300,6 +321,11 @@ export default function App() {
     [selected],
   );
   const draftRef = useRef<HTMLTextAreaElement>(null);
+  const creatingSessionRef = useRef(false);
+  const fetchFiles = useCallback(
+    () => api.workspaceFiles(folder || undefined),
+    [folder],
+  );
 
   // First frame: one call decides everything the window needs.
   useEffect(() => {
@@ -360,6 +386,9 @@ export default function App() {
               : window.matchMedia("(prefers-color-scheme: light)").matches
                 ? "light"
                 : "dark";
+        document.documentElement.dataset.motion = b.reduce_motion
+          ? "reduced"
+          : "full";
       })
       .catch((e) => setError(String(e)));
   }, []);
@@ -398,7 +427,9 @@ export default function App() {
             (list) =>
               list.length && setLiveModels((m) => ({ ...m, [a.id]: list })),
           )
-          .catch(() => undefined);
+          .catch(() => {
+            fetchedLiveModels.current.delete(a.id);
+          });
       }
     }
   }, [accounts]);
@@ -417,44 +448,91 @@ export default function App() {
       fresh.current = null;
       return;
     }
+    const sid = selected;
+    const epoch = bumpSessionEpoch(sid);
     let live = true;
     api
-      .sessionMessages(selected)
-      .then((list) => live && setMessages(toBlocks(list)))
-      .catch(() => live && setMessages([]));
+      .sessionMessages(sid)
+      .then((list) => {
+        if (!live || selectedRef.current !== sid) return;
+        if (epoch !== sessionEpochRef.current[sid] || turnsRef.current[sid]?.busy) {
+          return;
+        }
+        setMessages(toBlocks(list));
+        clearTurnBlocksIfIdle(sid);
+      })
+      .catch(() => {
+        if (!live || selectedRef.current !== sid) return;
+        if (epoch !== sessionEpochRef.current[sid] || turnsRef.current[sid]?.busy) {
+          return;
+        }
+        setMessages([]);
+      });
     return () => {
       live = false;
     };
-  }, [selected, setTurn]);
+  }, [selected, setTurn, clearTurnBlocksIfIdle, bumpSessionEpoch]);
 
   useEffect(() => {
+    let cancelled = false;
     let u1: (() => void) | undefined;
     let u2: (() => void) | undefined;
     void onWorkflowsChanged(() => {
-      void workflowsApi.list().then(setWorkflowsList).catch(() => undefined);
+      if (cancelled) return;
+      void workflowsApi
+        .list()
+        .then((list) => {
+          if (!cancelled) setWorkflowsList(list);
+        })
+        .catch(() => undefined);
     }).then((fn) => {
-      u1 = fn;
+      if (cancelled) {
+        fn();
+      } else {
+        u1 = fn;
+      }
     });
     void onBotWorkflowReport((report) => {
+      if (cancelled) return;
       setStatus(`Workflow "${report.workflowName}" concluído (${report.status})`);
       void api
         .boot()
-        .then((b) => setSessions(b.sessions))
+        .then((b) => {
+          if (!cancelled) setSessions(b.sessions);
+        })
         .catch(() => undefined);
       if (selectedRef.current === report.sessionId) {
+        const sid = report.sessionId;
+        const epoch = bumpSessionEpoch(sid);
         void api
-          .sessionMessages(report.sessionId)
-          .then((list) => setMessages(toBlocks(list)))
+          .sessionMessages(sid)
+          .then((list) => {
+            if (
+              cancelled ||
+              selectedRef.current !== sid ||
+              epoch !== sessionEpochRef.current[sid] ||
+              turnsRef.current[sid]?.busy
+            ) {
+              return;
+            }
+            setMessages(toBlocks(list));
+            clearTurnBlocksIfIdle(sid);
+          })
           .catch(() => undefined);
       }
     }).then((fn) => {
-      u2 = fn;
+      if (cancelled) {
+        fn();
+      } else {
+        u2 = fn;
+      }
     });
     return () => {
+      cancelled = true;
       u1?.();
       u2?.();
     };
-  }, []);
+  }, [clearTurnBlocksIfIdle, bumpSessionEpoch]);
 
   useEffect(() => {
     if (!selected) {
@@ -500,6 +578,22 @@ export default function App() {
     });
   }, [pruneTurns]);
 
+  const cleanupSessionState = useCallback(
+    (id: string) => {
+      void api.cancelTurn(id).catch(() => undefined);
+      pendingDeltasRef.current.delete(id);
+      turnTouchedRef.current.delete(id);
+      bumpSessionEpoch(id);
+      setTurns((prev) => {
+        if (!(id in prev)) return prev;
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
+    },
+    [bumpSessionEpoch],
+  );
+
   // Turn events, for every conversation at once. The state of a chat that is
   // not open is kept here, so switching away and back shows the same stream,
   // the Stop button and any approval that arrived while away.
@@ -525,12 +619,12 @@ export default function App() {
             s.id === id ? { ...s, provider: event.provider, model: event.model } : s,
           ),
         );
-        return;
       }
       updateTurn(id, (prev) => applyEvent(prev, event));
     });
     const done = onTurnDone((id) => {
       flushDeltas();
+      const epoch = bumpSessionEpoch(id);
       const isSelected = id === selectedRef.current;
       if (isSelected) {
         setPendingUsage((m) => ({ ...m, [id]: true }));
@@ -543,9 +637,16 @@ export default function App() {
         .sessionMessages(id)
         .then((list) => {
           if (id !== selectedRef.current) return;
+          if (
+            epoch !== sessionEpochRef.current[id] ||
+            turnsRef.current[id]?.busy
+          ) {
+            return;
+          }
           setMessages((prev) => {
-            const last = turnsRef.current[id]?.blocks.at(-1);
-            const stored = last?.kind === "assistant" ? last.stored : undefined;
+            const stored = [...(turnsRef.current[id]?.blocks ?? [])]
+              .reverse()
+              .find((b) => b.kind === "assistant")?.stored;
             return borrowIds(prev, list, stored);
           });
         })
@@ -567,15 +668,33 @@ export default function App() {
     });
     const learned = onTurnLearned((id, items) => {
       if (!items.length) return;
+      if (!sessionsRef.current.some((s) => s.id === id)) return;
       const text =
         "Aprendi: " +
         items
           .map((i) => (i.kind === "skill" ? `skill ${i.name}` : i.text))
           .join(" · ");
-      updateTurn(id, (prev) => ({
-        ...prev,
-        blocks: [...prev.blocks, { kind: "note", text, learned: items }],
-      }));
+      const noteBlock: Block = { kind: "note", text, learned: items };
+      if (turnsRef.current[id]?.busy) {
+        if (id === selectedRef.current) {
+          setMessages((prev) => {
+            let insertAt = prev.length;
+            while (
+              insertAt > 0 &&
+              prev[insertAt - 1].kind === "user" &&
+              (prev[insertAt - 1] as Extract<Block, { kind: "user" }>).id ==
+                null
+            ) {
+              insertAt--;
+            }
+            return [...prev.slice(0, insertAt), noteBlock, ...prev.slice(insertAt)];
+          });
+        }
+        return;
+      }
+      updateTurn(id, (prev) =>
+        prev.busy ? prev : { ...prev, blocks: [...prev.blocks, noteBlock] },
+      );
     });
     return () => {
       flushDeltas();
@@ -584,80 +703,118 @@ export default function App() {
       void learned.then((u) => u());
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [updateTurn, flushDeltas]);
+  }, [updateTurn, flushDeltas, bumpSessionEpoch]);
 
   const send = useCallback(async (overridePrompt?: string) => {
     const prompt = (overridePrompt ?? draft).trim();
     if (!prompt) return;
-    // Intercept /workflows and /run <id|name> slash shortcuts cleanly without an LLM round-trip.
-    if (prompt === "/workflows") {
-      if (!overridePrompt) setDraft("");
-      const wfs = workflowsList.length ? workflowsList : await workflowsApi.list().catch(() => []);
-      setMessages((prev) => [
-        ...prev,
-        {
-          kind: "note",
-          text: wfs.length
-            ? "Workflows disponíveis (`/run <nome>`):\n" +
-              wfs.map((w) => `• ${w.name} (${w.id})`).join("\n")
-            : "Nenhum workflow cadastrado.",
-        },
-      ]);
-      return;
-    }
-    if (prompt.startsWith("/run ")) {
-      const q = prompt.slice(5).trim().toLowerCase();
-      if (!q) return;
-      if (!overridePrompt) setDraft("");
-      const wfs = workflowsList.length ? workflowsList : await workflowsApi.list().catch(() => []);
-      const match =
-        wfs.find((w) => w.id.toLowerCase() === q) ??
-        wfs.find((w) => w.name.toLowerCase().includes(q));
-      if (!match) {
-        setStatus(`Workflow não encontrado para "/run ${q}"`);
-        return;
-      }
-      setRunningWfId(match.id);
-      setStatus(`Executando "${match.name}"…`);
-      try {
-        const run = await workflowsApi.runNow(match.id);
-        setStatus(`"${match.name}" finalizado (${run.status})`);
+    const curSelected = selectedRef.current;
+    const sendKey = curSelected ?? "__new__";
+    if (sendingSessionsRef.current.has(sendKey)) return;
+    sendingSessionsRef.current.add(sendKey);
+    let extraSendKey: string | null = null;
+    let createdLock = false;
+    let markedBusy = false;
+    let id = curSelected;
+    try {
+      // Intercept /workflows and /run <id|name> slash shortcuts cleanly without an LLM round-trip.
+      if (prompt === "/workflows") {
+        if (!overridePrompt) setDraft("");
+        const sid = curSelected;
+        const wfs = workflowsList.length
+          ? workflowsList
+          : await workflowsApi.list().catch(() => []);
+        if (sid === null) {
+          setStatus(
+            wfs.length
+              ? `Workflows (${wfs.length}): ${wfs.map((w) => w.name).join(", ")}`
+              : "Nenhum workflow cadastrado.",
+          );
+          return;
+        }
+        if (selectedRef.current !== sid) return;
         setMessages((prev) => [
           ...prev,
           {
             kind: "note",
-            text: `⚡ **${match.name}** (${run.status}):\n${run.summary || "Concluído sem saída textual."}`,
+            text: wfs.length
+              ? "Workflows disponíveis (/run <nome>):\n" +
+                wfs.map((w) => `• ${w.name} (${w.id})`).join("\n")
+              : "Nenhum workflow cadastrado.",
           },
         ]);
-      } catch (e) {
-        setStatus(`Erro ao executar "${match.name}": ${e}`);
-      } finally {
-        setRunningWfId(null);
+        return;
       }
-      return;
-    }
-    // Enter while the answer streams: the backend would refuse the second
-    // turn and the transcript would split. Keep the draft and say why.
-    if (selected && (turns[selected]?.busy ?? false)) {
-      setStatus("Espere a resposta terminar (ou pare) para enviar outra");
-      return;
-    }
-    if (!model) {
-      setError("Escolha um modelo antes de enviar");
-      return;
-    }
-    setError(null);
-    if (!overridePrompt) setDraft("");
-    let id = selected;
-    try {
+      if (prompt.startsWith("/run ")) {
+        const q = prompt.slice(5).trim().toLowerCase();
+        if (!q) return;
+        if (!overridePrompt) setDraft("");
+        const sid = curSelected;
+        const wfs = workflowsList.length
+          ? workflowsList
+          : await workflowsApi.list().catch(() => []);
+        const match =
+          wfs.find((w) => w.id.toLowerCase() === q) ??
+          wfs.find((w) => w.name.toLowerCase().includes(q));
+        if (!match) {
+          setStatus(`Workflow não encontrado para "/run ${q}"`);
+          return;
+        }
+        setRunningWfId(match.id);
+        setStatus(`Executando "${match.name}"…`);
+        try {
+          const run = await workflowsApi.runNow(match.id);
+          if (sid === null) {
+            const summary = run.summary ? ` — ${run.summary.slice(0, 120)}` : "";
+            setStatus(`"${match.name}" finalizado (${run.status})${summary}`);
+            return;
+          }
+          setStatus(`"${match.name}" finalizado (${run.status})`);
+          if (selectedRef.current !== sid) return;
+          setMessages((prev) => [
+            ...prev,
+            {
+              kind: "note",
+              text: `⚡ ${match.name} (${run.status}):\n${run.summary || "Concluído sem saída textual."}`,
+            },
+          ]);
+        } catch (e) {
+          setStatus(`Erro ao executar "${match.name}": ${e}`);
+        } finally {
+          setRunningWfId(null);
+        }
+        return;
+      }
+      // Enter while the answer streams: the backend would refuse the second
+      // turn and the transcript would split. Keep the draft and say why.
+      if (id && (turnsRef.current[id]?.busy ?? false)) {
+        setStatus("Espere a resposta terminar (ou pare) para enviar outra");
+        return;
+      }
+      if (!model) {
+        setError("Escolha um modelo antes de enviar");
+        return;
+      }
+      if (!id) {
+        if (creatingSessionRef.current) return;
+        creatingSessionRef.current = true;
+        createdLock = true;
+      }
+      setError(null);
+      if (!overridePrompt) setDraft("");
       if (!id) {
         const sessionTitle = activeAgent
           ? `@${activeAgent} · ${titleOf(prompt)}`
           : titleOf(prompt);
         const created = await api.createSession(sessionTitle, folder);
+        sessionsRef.current = [created, ...sessionsRef.current];
         setSessions((prev) => [created, ...prev]);
         id = created.id;
+        if (sendingSessionsRef.current.has(id)) return;
+        sendingSessionsRef.current.add(id);
+        extraSendKey = id;
         fresh.current = id;
+        selectedRef.current = id;
         setSelected(id);
         setMessages([]);
         if (activeAgent) {
@@ -673,7 +830,10 @@ export default function App() {
       }
       // The previous answer lives only in `turn` until the session is reloaded:
       // keep it in the transcript before the new turn resets that state.
-      const done = turn.blocks.map((b) =>
+      const prevBlocks = curSelected
+        ? (turnsRef.current[curSelected]?.blocks ?? [])
+        : [];
+      const done = prevBlocks.map((b) =>
         b.kind === "assistant" ? { ...b, streaming: false } : b,
       );
       setMessages((prev) => [
@@ -681,7 +841,11 @@ export default function App() {
         ...done,
         { kind: "user", text: prompt },
       ]);
-      updateTurn(id, () => ({ ...emptyTurn, busy: true }));
+      bumpSessionEpoch(id);
+      markedBusy = true;
+      const busyTurn: TurnState = { ...emptyTurn, busy: true };
+      turnsRef.current = { ...turnsRef.current, [id]: busyTurn };
+      updateTurn(id, () => busyTurn);
       // `history: 0` = the execution profile's window, decided by the core.
       await api.sendTurn({
         sessionId: id,
@@ -696,7 +860,17 @@ export default function App() {
       });
     } catch (e) {
       setError(String(e));
-      if (id) updateTurn(id, (prev) => ({ ...prev, busy: false }));
+      if (markedBusy && id && !String(e).includes("já está respondendo")) {
+        turnsRef.current = {
+          ...turnsRef.current,
+          [id]: { ...(turnsRef.current[id] ?? emptyTurn), busy: false },
+        };
+        updateTurn(id, (prev) => ({ ...prev, busy: false }));
+      }
+    } finally {
+      sendingSessionsRef.current.delete(sendKey);
+      if (extraSendKey) sendingSessionsRef.current.delete(extraSendKey);
+      if (createdLock) creatingSessionRef.current = false;
     }
   }, [
     draft,
@@ -705,12 +879,11 @@ export default function App() {
     orchestrator,
     mode,
     effort,
-    selected,
     activeAgent,
     workflowsList,
-    turns,
     folder,
     updateTurn,
+    bumpSessionEpoch,
   ]);
 
   const steer = useCallback(
@@ -719,7 +892,12 @@ export default function App() {
       const trimmed = text.trim();
       setDraft("");
       try {
-        await api.steerTurn(selected, trimmed);
+        const ok = await api.steerTurn(selected, trimmed);
+        if (!ok) {
+          setDraft(trimmed);
+          setStatus("O turno já encerrou; envie novamente como nova mensagem");
+          return;
+        }
         setStatus("Instrução enviada ao turno em andamento");
       } catch (e) {
         setDraft(trimmed);
@@ -791,16 +969,21 @@ export default function App() {
         if (turn.busy)
           return setStatus("Espere o turno terminar para compactar");
         if (!model) return setStatus("Escolha um modelo antes de compactar");
+        const sid = selected;
         setStatus("compactando…");
         api
-          .compact(selected, model)
+          .compact(sid, model)
           .then((n) => {
-            setStatus("");
-            note(
+            const msg =
               n === 0
                 ? "Nada para compactar ainda"
-                : `Contexto compactado: ${n} mensagens resumidas`,
-            );
+                : `Contexto compactado: ${n} mensagens resumidas`;
+            if (selectedRef.current !== sid) {
+              setStatus(msg);
+              return;
+            }
+            setStatus("");
+            note(msg);
           })
           .catch((e) => setStatus(`Não consegui compactar: ${e}`));
         return;
@@ -815,18 +998,56 @@ export default function App() {
         if (!selected) return setStatus("Nada para rebobinar");
         if (turn.busy)
           return setStatus("Espere o turno terminar para rebobinar");
+        const sid = selected;
+        const epoch = bumpSessionEpoch(sid);
         api
-          .checkpoints(selected)
-          .then((turns) => {
-            if (!turns.length)
+          .checkpoints(sid)
+          .then((cps) => {
+            if (
+              selectedRef.current !== sid ||
+              epoch !== sessionEpochRef.current[sid] ||
+              turnsRef.current[sid]?.busy
+            ) {
+              return;
+            }
+            if (!cps.length)
               return setStatus("Nenhum ponto de restauração nesta conversa");
-            return api
-              .rewind(selected)
-              .then((r) => {
-                note(`Rebobinado para o turno ${r.turn}`);
-                return api.sessionMessages(selected);
-              })
-              .then((list) => list && setMessages(toBlocks(list)));
+            return api.rewind(sid).then((r) => {
+              if (
+                selectedRef.current !== sid ||
+                epoch !== sessionEpochRef.current[sid] ||
+                turnsRef.current[sid]?.busy
+              ) {
+                return;
+              }
+              setTurns((prev) => {
+                const cur = prev[sid];
+                if (!cur) return prev;
+                return {
+                  ...prev,
+                  [sid]: {
+                    ...cur,
+                    blocks: [],
+                    busy: false,
+                    approvals: [],
+                    question: null,
+                  },
+                };
+              });
+              return api.sessionMessages(sid).then((list) => {
+                if (
+                  selectedRef.current !== sid ||
+                  epoch !== sessionEpochRef.current[sid] ||
+                  turnsRef.current[sid]?.busy
+                ) {
+                  return;
+                }
+                setMessages([
+                  ...toBlocks(list),
+                  { kind: "note", text: `Rebobinado para o turno ${r.turn}` },
+                ]);
+              });
+            });
           })
           .catch((e) => setStatus(`Não consegui rebobinar: ${e}`));
         return;
@@ -844,7 +1065,6 @@ export default function App() {
       if (name === "clear") {
         setSelected(null);
         setMessages([]);
-        setTurn(emptyTurn);
         draftRef.current?.focus();
         return;
       }
@@ -853,7 +1073,7 @@ export default function App() {
       if (name === "skills") return setSettings("Skills");
       if (name === "memory") return setSettings("Memória");
     },
-    [selected, turn.busy, turn.usage, model, mode, note],
+    [selected, turn.busy, turn.usage, model, mode, note, bumpSessionEpoch],
   );
 
   const closeSettings = useCallback(() => {
@@ -872,14 +1092,18 @@ export default function App() {
           api.accounts(),
           api.routing().catch(() => ({}) as Routing),
         ]).then(([list, r]) => {
+          fetchedLiveModels.current.clear();
           setAccounts(list);
           loadProfiles(r);
           // an `account:model` pick survives while its account is still on,
           // a profile while it still exists
           setModel((prev) =>
-            (prev && b.providers.some((p) => p.default_model === prev)) ||
-            list.some((a) => a.enabled && prev.startsWith(a.id + ":")) ||
-            (r.combos ?? []).some((c) => c.name === prev)
+            prev &&
+            (b.providers.some(
+              (p) => p.default_model === prev || p.known_models.includes(prev),
+            ) ||
+              list.some((a) => a.enabled && prev.startsWith(a.id + ":")) ||
+              (r.combos ?? []).some((c) => c.name === prev))
               ? prev
               : (b.providers[0]?.default_model ?? ""),
           );
@@ -1044,26 +1268,62 @@ export default function App() {
       });
   }, [selected, current?.title, surface, lang]);
 
+  const pendingApproval = turn.approvals[0] ?? null;
   const tail = (
     <>
-      {turn.approval ? (
+      {pendingApproval ? (
         <ApprovalCard
-          tool={turn.approval.tool}
-          summary={turn.approval.summary}
+          key={pendingApproval.id}
+          tool={pendingApproval.tool}
+          summary={pendingApproval.summary}
           onAnswer={(d) => {
-            if (selected)
-              void api.answerApproval(selected, turn.approval!.id, d);
-            setTurn((prev) => ({ ...prev, approval: null }));
+            if (!selected) return;
+            const sid = selected;
+            const pending = pendingApproval;
+            return api
+              .answerApproval(sid, pending.id, d)
+              .then(() => {
+                updateTurn(sid, (prev) => ({
+                  ...prev,
+                  approvals: prev.approvals.filter((a) => a.id !== pending.id),
+                }));
+              })
+              .catch((e) => {
+                setStatus(`Erro ao responder permissão: ${String(e)}`);
+                updateTurn(sid, (prev) =>
+                  prev.approvals.some((a) => a.id === pending.id)
+                    ? prev
+                    : { ...prev, approvals: [pending, ...prev.approvals] },
+                );
+                throw e;
+              });
           }}
         />
       ) : null}
       {turn.question ? (
         <QuestionCard
+          key={turn.question.id}
           questions={turn.question.questions}
           onAnswer={(answers) => {
-            if (selected)
-              void api.answerQuestion(selected, turn.question!.id, answers);
-            setTurn((prev) => ({ ...prev, question: null }));
+            if (!selected || !turn.question) return;
+            const sid = selected;
+            const pending = turn.question;
+            return api
+              .answerQuestion(sid, pending.id, answers)
+              .then(() => {
+                updateTurn(sid, (prev) =>
+                  prev.question?.id === pending.id
+                    ? { ...prev, question: null }
+                    : prev,
+                );
+              })
+              .catch((e) => {
+                setStatus(`Erro ao enviar resposta: ${String(e)}`);
+                updateTurn(sid, (prev) =>
+                  prev.question ? prev : { ...prev, question: pending },
+                );
+                throw e;
+              });
           }}
         />
       ) : null}
@@ -1314,8 +1574,12 @@ export default function App() {
             void api
               .setArchived(id, true)
               .then(() => {
+                cleanupSessionState(id);
+                sessionsRef.current = sessionsRef.current.filter(
+                  (s) => s.id !== id,
+                );
                 setSessions((prev) => prev.filter((s) => s.id !== id));
-                if (selected === id) {
+                if (selectedRef.current === id) {
                   setSelected(null);
                   setMessages([]);
                 }
@@ -1326,9 +1590,13 @@ export default function App() {
             void api
               .deleteSession(id)
               .then(() => {
+                cleanupSessionState(id);
+                sessionsRef.current = sessionsRef.current.filter(
+                  (s) => s.id !== id,
+                );
                 setSessions((prev) => prev.filter((s) => s.id !== id));
                 setPinnedSessions((prev) => prev.filter((x) => x !== id));
-                if (selected === id) {
+                if (selectedRef.current === id) {
                   setSelected(null);
                   setMessages([]);
                 }
@@ -1338,7 +1606,7 @@ export default function App() {
           status={(id) => {
             const t = turns[id];
             if (!t?.busy) return null;
-            return t.approval || t.question ? "waiting" : "busy";
+            return t.approvals.length > 0 || t.question ? "waiting" : "busy";
           }}
           onSettings={() => setSettings("Geral")}
           onQuotas={() => setSettings("Cotas")}
@@ -1352,7 +1620,7 @@ export default function App() {
         />
         <main className="main">
           <header className="topbar">
-            <h1 className="topbar-title" style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <h1 className="topbar-title">
               {activeAgent ? (
                 <BotEmblem
                   icon={activeBotSpec?.icon || emblemForAgent(activeAgent)}
@@ -1360,7 +1628,7 @@ export default function App() {
                   status="on"
                 />
               ) : null}
-              <span>
+              <span className="topbar-title-text">
                 {current?.title ??
                   (activeAgent ? `@${activeAgent}` : tr(lang, "Nova conversa", "New chat"))}
               </span>
@@ -1540,6 +1808,7 @@ export default function App() {
                 />
               )}
               <Composer
+                textareaRef={draftRef}
                 draft={draft}
                 onDraft={setDraft}
                 onSend={() => void send()}
@@ -1564,7 +1833,7 @@ export default function App() {
                 hidden={hidden}
                 onToggleHidden={toggleHidden}
                 hint={status || error || "/ comandos  ·  @ arquivos"}
-                files={() => api.workspaceFiles(folder || undefined)}
+                files={fetchFiles}
                 folder={
                   <FolderPill
                     value={folder}
@@ -1584,7 +1853,7 @@ export default function App() {
                   />
                 }
               />
-              {hero ? (
+              {hero && !activeBotSpec ? (
                 <div className="hero-grid">
                   {SUGGESTIONS.map(([Icon, title, text, prompt]) => (
                     <button
@@ -1720,7 +1989,19 @@ export default function App() {
                       </div>
                       {orchestrator ? (
                         <div className="insp-route" style={{ marginTop: 6 }}>
-                          <Bot size={20} strokeWidth={1.75} />
+                          <span
+                            className="logo logo-mark"
+                            style={{
+                              width: 28,
+                              height: 28,
+                              borderRadius: 7,
+                              display: "grid",
+                              placeItems: "center",
+                            }}
+                            aria-hidden
+                          >
+                            <Bot size={15} strokeWidth={1.75} style={{ width: 15, height: 15 }} />
+                          </span>
                           <div>
                             <strong>{tr(lang, "Executor", "Executor")}</strong>
                             <span>{tr(lang, "Subagentes / Tools", "Subagents / Tools")}</span>
@@ -1757,7 +2038,7 @@ export default function App() {
                     persistedCache + (useLive ? liveCache : 0);
                   const totalSaved =
                     persistedSaved + (useLive ? liveSaved : 0);
-                  const cacheDenom = totalIn + totalCache;
+                  const cacheDenom = Math.max(totalIn, totalCache);
                   const cachePct =
                     totalCache > 0 && cacheDenom > 0
                       ? `${num(totalCache)} (${Math.round((100 * totalCache) / cacheDenom)}%)`
@@ -1838,6 +2119,7 @@ export default function App() {
                 label: "Nova conversa",
                 hint: "Começar do zero",
                 run: () => {
+                  setActiveAgent(null);
                   setSelected(null);
                   setMessages([]);
                   draftRef.current?.focus();
@@ -1894,7 +2176,10 @@ export default function App() {
               ...sessions.slice(0, 8).map((s) => ({
                 label: `Conversa: ${s.title}`,
                 hint: s.model ?? "sessão",
-                run: () => setSelected(s.id),
+                run: () => {
+                  setActiveAgent(null);
+                  setSelected(s.id);
+                },
               })),
             ]}
           />
@@ -1958,6 +2243,7 @@ function CommandPalette(props: {
             value={props.query}
             onChange={(e) => props.onQuery(e.target.value)}
             onKeyDown={(e) => {
+              if (e.nativeEvent.isComposing || e.keyCode === 229) return;
               if (e.key === "ArrowDown") {
                 e.preventDefault();
                 setCursor((i) => (filtered.length ? (i + 1) % filtered.length : 0));

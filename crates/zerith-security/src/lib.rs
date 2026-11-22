@@ -740,18 +740,54 @@ impl Policy {
             return None;
         }
         let allows = |t: &str| allow.iter().any(|r| r.text_matches(t));
+        let mut read_only_deny: Option<Verdict> = None;
+        let mut read_only_ask: Option<Verdict> = None;
+        let mut other_denied_allow = false;
         let allowed = match (subject, &shell) {
             (Subject::Path(p), _) => allow.iter().any(|r| r.path_matches(p)),
             (Subject::Shell(_), Some(a)) => {
-                allow.iter().any(|r| r.pattern.is_none())
-                    || (!a.raw.is_empty()
-                        && a.raw.iter().zip(&a.inner).all(|(raw, inner)| {
-                            shellparse::is_read_only(inner) || allows(raw) || allows(inner)
-                        }))
+                if allow.iter().any(|r| r.pattern.is_none()) {
+                    true
+                } else if a.raw.is_empty() {
+                    false
+                } else {
+                    let mut all_ok = true;
+                    for (raw, inner) in a.raw.iter().zip(&a.inner) {
+                        if allows(raw) || allows(inner) {
+                            continue;
+                        }
+                        if !shellparse::has_env_mutation(raw) && shellparse::is_read_only(inner) {
+                            match self.read_only_verdict(inner) {
+                                Verdict::Allow => {}
+                                v @ Verdict::Deny(_) => {
+                                    read_only_deny = Some(v);
+                                    all_ok = false;
+                                    break;
+                                }
+                                v @ Verdict::Ask(_) => {
+                                    read_only_ask.get_or_insert(v);
+                                    all_ok = false;
+                                }
+                            }
+                        } else {
+                            other_denied_allow = true;
+                            all_ok = false;
+                        }
+                    }
+                    all_ok
+                }
             }
             (Subject::Text(t), _) => allows(t),
             (Subject::Shell(_), None) => false,
         };
+        if let Some(v) = read_only_deny {
+            return Some(v);
+        }
+        if !other_denied_allow {
+            if let Some(v) = read_only_ask {
+                return Some(v);
+            }
+        }
         allowed.then_some(Verdict::Allow)
     }
 
@@ -779,7 +815,7 @@ impl Policy {
             "read_file" | "list_dir" | "glob" | "grep" | "repo_map" => {
                 Some(Action::Read(path(s("path").unwrap_or("."))))
             }
-            "write_file" | "edit_file" => Some(Action::Write(path(s("path")?))),
+            "write_file" | "edit_file" | "multi_edit" => Some(Action::Write(path(s("path")?))),
             "shell" => Some(Action::Shell(s("command")?.to_string())),
             _ => None,
         }
@@ -801,9 +837,14 @@ impl Policy {
     }
 
     /// `..` and `.` resolved lexically, then symlinks resolved on the longest
-    /// prefix that exists, then the missing tail re-appended. A missing
-    /// directory must not turn into "outside".
-    fn resolve(&self, path: &Path) -> PathBuf {
+    /// prefix that exists (including dangling symlinks), then the missing tail
+    /// re-appended. A missing directory must not turn into "outside".
+    pub fn resolve(&self, path: &Path) -> PathBuf {
+        self.resolve_hops(path, 0).0
+    }
+
+    fn resolve_hops(&self, path: &Path, hops: usize) -> (PathBuf, bool) {
+        const MAX_SYMLINK_HOPS: usize = 16;
         let path = if path.is_absolute() {
             path.to_path_buf()
         } else {
@@ -818,12 +859,24 @@ impl Policy {
                 Component::ParentDir => {
                     if let Ok(real) = clean.canonicalize() {
                         clean = real;
+                    } else if hops < MAX_SYMLINK_HOPS
+                        && std::fs::symlink_metadata(&clean)
+                            .is_ok_and(|m| m.file_type().is_symlink())
+                    {
+                        let (resolved, ok) = self.resolve_hops(&clean, hops + 1);
+                        if !ok {
+                            return (resolved, false);
+                        }
+                        clean = resolved;
                     }
                     clean.pop();
                 }
                 Component::CurDir => {}
                 other => clean.push(other.as_os_str()),
             }
+        }
+        if hops >= MAX_SYMLINK_HOPS {
+            return (clean, false);
         }
         let mut tail = Vec::new();
         let mut probe = clean.as_path();
@@ -832,29 +885,45 @@ impl Policy {
                 for part in tail.iter().rev() {
                     p.push(part);
                 }
-                return p;
+                return (p, true);
+            }
+            if let Ok(meta) = std::fs::symlink_metadata(probe) {
+                if meta.file_type().is_symlink() {
+                    if let Ok(target) = std::fs::read_link(probe) {
+                        let mut next = if target.is_absolute() {
+                            target
+                        } else {
+                            probe.parent().map(|p| p.join(&target)).unwrap_or(target)
+                        };
+                        for part in tail.iter().rev() {
+                            next.push(part);
+                        }
+                        return self.resolve_hops(&next, hops + 1);
+                    }
+                }
             }
             match (probe.file_name(), probe.parent()) {
                 (Some(name), Some(parent)) => {
                     tail.push(name.to_os_string());
                     probe = parent;
                 }
-                _ => return clean,
+                _ => return (clean, true),
             }
         }
     }
 
-    fn inside_workspace(&self, path: &Path) -> bool {
+    pub fn inside_workspace(&self, path: &Path) -> bool {
         let Ok(base) = self.workspace.canonicalize() else {
             return false;
         };
-        self.resolve(path).starts_with(&base)
+        let (resolved, ok) = self.resolve_hops(path, 0);
+        ok && resolved.starts_with(&base)
     }
 
     /// Files that decide the agent's own limits: the project's `.zerith/`
     /// settings, the git hooks that run on the next commit, `.git/config`
     /// (which can point git at other hooks) and `.mcp.json`.
-    fn is_own_control(&self, path: &Path) -> bool {
+    pub fn is_own_control(&self, path: &Path) -> bool {
         let abs = self.resolve(path);
         let Ok(base) = self.workspace.canonicalize() else {
             return false;
@@ -1317,5 +1386,85 @@ mod tests {
         let err = Policy::from_env(".").unwrap_err();
         std::env::remove_var("ZERITH_SANDBOX");
         assert!(err.contains("unknown sandbox preset"));
+    }
+
+    #[test]
+    fn compound_allow_rule_does_not_bypass_readonly_file_guards() {
+        let dir = scratch_dir();
+        let mut p = Policy::new(
+            preset("workspace-write").unwrap(),
+            Mode::Default,
+            dir.path(),
+        );
+        p.rules = vec![
+            Rule::parse(RuleKind::Allow, "shell(cargo test *)").unwrap(),
+            Rule::parse(RuleKind::Deny, "read_file(*.env)").unwrap(),
+        ];
+        let sh = |c: &str| p.check_tool("shell", &Action::Shell(c.into()));
+        let outside_file = outside("passwd");
+        assert!(
+            matches!(
+                sh(&format!("cargo test && cat {}", outside_file.display())),
+                Verdict::Ask(_)
+            ),
+            "compound read outside workspace must not be auto-allowed"
+        );
+        assert!(
+            matches!(sh("cargo test && cat .env"), Verdict::Deny(_)),
+            "compound read hitting read_file deny rule must be denied"
+        );
+        assert!(
+            matches!(
+                sh("cargo test && timeout 5 env LD_PRELOAD=/tmp/x.so ls"),
+                Verdict::Ask(_)
+            ),
+            "compound env wrapper must not match read-only allow"
+        );
+        assert_eq!(sh("cargo test && ls"), Verdict::Allow);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_outside_workspace_resolves_outside() {
+        let ws = scratch_dir();
+        let outside_dir = scratch_dir();
+        let target = outside_dir.path().join("newfile");
+        let link = ws.path().join("out");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let policy = Policy::new(
+            preset("workspace-write").unwrap(),
+            Mode::AcceptEdits,
+            ws.path(),
+        );
+        let resolved = policy.resolve(&link);
+        assert!(!policy.inside_workspace(&resolved), "resolved={resolved:?}");
+        assert!(!policy.inside_workspace(&link));
+        assert!(matches!(
+            policy.check(&Action::Write(link.clone())),
+            Verdict::Ask(_)
+        ));
+
+        // Symlink loop fails closed in inside_workspace.
+        let loop_a = ws.path().join("loop_a");
+        let loop_b = ws.path().join("loop_b");
+        std::os::unix::fs::symlink(&loop_b, &loop_a).unwrap();
+        std::os::unix::fs::symlink(&loop_a, &loop_b).unwrap();
+        assert!(!policy.inside_workspace(&loop_a));
+    }
+
+    #[test]
+    fn action_for_maps_multi_edit_to_write() {
+        let dir = scratch_dir();
+        let p = Policy::new(preset("workspace-write").unwrap(), Mode::Plan, dir.path());
+        let args = serde_json::json!({"path": "src/lib.rs"});
+        assert_eq!(
+            p.action_for("multi_edit", &args),
+            Some(Action::Write(dir.path().join("src/lib.rs")))
+        );
+        assert!(matches!(
+            p.check_call("multi_edit", &args),
+            Some(Verdict::Deny(_))
+        ));
     }
 }

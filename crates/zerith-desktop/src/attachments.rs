@@ -15,6 +15,8 @@ use crate::state::AppState;
 const CAP: usize = 20 * 1024 * 1024;
 /// Ceiling for general file/video/log/config attachments.
 const FILE_CAP: usize = 50 * 1024 * 1024;
+/// Maximum length of a sanitized filename (preserving its extension).
+const MAX_FILENAME_LEN: usize = 120;
 
 fn sanitize_filename(raw: &str) -> String {
     let base = raw.rsplit(['/', '\\']).next().unwrap_or("anexo").trim();
@@ -30,10 +32,25 @@ fn sanitize_filename(raw: &str) -> String {
         .collect();
     let trimmed = clean.trim_matches(['.', '_']);
     if trimmed.is_empty() {
-        "anexo.bin".into()
-    } else {
-        trimmed.to_string()
+        return "anexo.bin".into();
     }
+    if trimmed.len() <= MAX_FILENAME_LEN {
+        return trimmed.to_string();
+    }
+    if let Some((stem, ext)) = trimmed.rsplit_once('.') {
+        if !stem.is_empty() && !ext.is_empty() && ext.len() + 1 < MAX_FILENAME_LEN {
+            let keep = MAX_FILENAME_LEN - 1 - ext.len();
+            let stem_prefix: String = stem.chars().take(keep).collect();
+            let stem_clean = stem_prefix.trim_end_matches(['.', '_']);
+            let stem_out = if stem_clean.is_empty() {
+                stem_prefix.as_str()
+            } else {
+                stem_clean
+            };
+            return format!("{stem_out}.{ext}");
+        }
+    }
+    trimmed.chars().take(MAX_FILENAME_LEN).collect()
 }
 
 /// Decodes `data` (bare base64 or a `data:` URL) for any file (configs, logs,
@@ -112,6 +129,101 @@ pub async fn save_attachment(state: State<'_, AppState>, data: String) -> Result
     .map_err(|e| e.to_string())?
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DroppedAttachment {
+    pub path: String,
+    pub data_url: Option<String>,
+}
+
+fn attach_dropped_path_in(root: &Path, raw_path: &str) -> Result<DroppedAttachment, String> {
+    let trimmed = raw_path.trim();
+    if trimmed.is_empty() {
+        return Err("caminho vazio".into());
+    }
+    if trimmed.starts_with("\\\\")
+        || trimmed.starts_with("//")
+        || trimmed.starts_with("/\\")
+        || trimmed.to_ascii_lowercase().starts_with("file://\\\\")
+    {
+        return Err("caminhos UNC não são permitidos".into());
+    }
+    let src = Path::new(trimmed);
+    let meta = std::fs::metadata(src).map_err(|e| format!("{}: {e}", src.display()))?;
+    if !meta.is_file() {
+        return Err(format!("{} não é um arquivo", src.display()));
+    }
+    if meta.len() > CAP as u64 {
+        return Err("arquivo maior que 20 MB".into());
+    }
+    let ext_lower = src
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .ok_or_else(|| {
+            "só anexo imagens (png, jpg, webp, gif) ou vídeos (mp4, m4v, webm, mov)".to_string()
+        })?;
+    let is_image = matches!(ext_lower.as_str(), "png" | "jpg" | "jpeg" | "webp" | "gif");
+    let is_video = matches!(ext_lower.as_str(), "mp4" | "m4v" | "webm" | "mov");
+    if !is_image && !is_video {
+        return Err(
+            "só anexo imagens (png, jpg, webp, gif) ou vídeos (mp4, m4v, webm, mov)".into(),
+        );
+    }
+    let bytes = std::fs::read(src).map_err(|e| format!("{}: {e}", src.display()))?;
+    if bytes.len() > CAP {
+        return Err("arquivo maior que 20 MB".into());
+    }
+    let dir = root.join("attachments");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    let hash = h.finish();
+
+    if is_image {
+        let mime = zerith_providers::images::sniff_mime(&bytes)
+            .ok_or("só anexo imagens png, jpg, webp ou gif")?;
+        let ext = mime.trim_start_matches("image/").replace("jpeg", "jpg");
+        let dest = dir.join(format!("{hash:016x}.{ext}"));
+        if !dest.is_file() {
+            std::fs::write(&dest, &bytes).map_err(|e| format!("{}: {e}", dest.display()))?;
+        }
+        let data_url = format!(
+            "data:{mime};base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(&bytes)
+        );
+        Ok(DroppedAttachment {
+            path: dest.to_string_lossy().replace('\\', "/"),
+            data_url: Some(data_url),
+        })
+    } else {
+        if bytes.is_empty() {
+            return Err("vídeo vazio".into());
+        }
+        let safe_name = sanitize_filename(trimmed);
+        let dest = dir.join(format!("{hash:016x}-{safe_name}"));
+        if !dest.is_file() {
+            std::fs::write(&dest, &bytes).map_err(|e| format!("{}: {e}", dest.display()))?;
+        }
+        Ok(DroppedAttachment {
+            path: dest.to_string_lossy().replace('\\', "/"),
+            data_url: None,
+        })
+    }
+}
+
+/// Copies a user-dropped local image or video into `<root>/attachments`,
+/// validating size <= 20 MB and magic bytes for images.
+#[tauri::command]
+pub async fn attach_dropped_path(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<DroppedAttachment, String> {
+    let root = state.root().to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || attach_dropped_path_in(&root, &path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// Saves any attached file (config, log, video, capture, PDF, archive); returns
 /// its normalized absolute path.
 #[tauri::command]
@@ -174,5 +286,63 @@ mod tests {
             .to_string_lossy()
             .ends_with("-wg-cliente__1_.conf"));
         assert_eq!(std::fs::read(&saved).unwrap(), wg);
+    }
+
+    #[test]
+    fn sanitize_filename_caps_length_at_120_and_preserves_extension() {
+        let long = format!("{}.conf", "a".repeat(300));
+        let sanitized = sanitize_filename(&long);
+        assert!(sanitized.len() <= MAX_FILENAME_LEN, "{sanitized}");
+        assert!(sanitized.ends_with(".conf"), "{sanitized}");
+
+        let no_ext = "x".repeat(300);
+        let sanitized_no_ext = sanitize_filename(&no_ext);
+        assert_eq!(sanitized_no_ext.len(), MAX_FILENAME_LEN);
+    }
+
+    #[test]
+    fn attach_dropped_path_validates_and_copies_media_to_attachments() {
+        let base =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-scratch/attach-drop");
+        let _ = std::fs::remove_dir_all(&base);
+        let src_dir = base.join("src");
+        let root = base.join("root");
+        std::fs::create_dir_all(&src_dir).unwrap();
+
+        let png = src_dir.join("shot.png");
+        let png_bytes = b"\x89PNG\r\n\x1a\npayload";
+        std::fs::write(&png, png_bytes).unwrap();
+        let res = attach_dropped_path_in(&root, &png.to_string_lossy()).unwrap();
+        assert!(res.path.contains("/attachments/"));
+        assert!(res.path.ends_with(".png"));
+        assert_eq!(std::fs::read(&res.path).unwrap(), png_bytes);
+        assert!(res
+            .data_url
+            .as_deref()
+            .is_some_and(|u| u.starts_with("data:image/png;base64,")));
+
+        let mp4 = src_dir.join("clip.mp4");
+        let mp4_bytes = [0, 0, 0, 0x18, b'f', b't', b'y', b'p'];
+        std::fs::write(&mp4, mp4_bytes).unwrap();
+        let vres = attach_dropped_path_in(&root, &mp4.to_string_lossy()).unwrap();
+        assert!(vres.path.contains("/attachments/"));
+        assert!(vres.path.ends_with("-clip.mp4"));
+        assert_eq!(std::fs::read(&vres.path).unwrap(), mp4_bytes);
+        assert_eq!(vres.data_url, None);
+
+        // Spoofed PNG bytes must fail sniff_mime.
+        let fake = src_dir.join("fake.png");
+        std::fs::write(&fake, b"not a png").unwrap();
+        assert!(attach_dropped_path_in(&root, &fake.to_string_lossy()).is_err());
+
+        // Non-media extension must be rejected.
+        let txt = src_dir.join("note.txt");
+        std::fs::write(&txt, b"hello").unwrap();
+        assert!(attach_dropped_path_in(&root, &txt.to_string_lossy()).is_err());
+
+        // UNC paths and directories must be rejected.
+        assert!(attach_dropped_path_in(&root, r"\\server\share\a.png").is_err());
+        assert!(attach_dropped_path_in(&root, "//server/share/a.png").is_err());
+        assert!(attach_dropped_path_in(&root, &src_dir.to_string_lossy()).is_err());
     }
 }

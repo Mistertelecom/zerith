@@ -483,29 +483,14 @@ pub fn oauth_import_9router(root: &Path, tool: OAuthTool, account: &str) -> Resu
 
 /// Plan quota for an OAuth account, refreshing the token when it went stale.
 pub fn account_quota(account: &str) -> Result<zerith_providers::oauth::Quota, String> {
-    let cred = fresh_oauth(account)?;
+    let cred = zerith_runtime::fresh_oauth(account)?;
     zerith_providers::oauth::fetch_quota(cred.tool, &cred.access_token).map_err(|e| e.to_string())
 }
 
 /// The live model list of an OAuth account (Antigravity publishes one).
 pub fn account_models(account: &str) -> Result<Vec<zerith_providers::oauth::ModelInfo>, String> {
-    let cred = fresh_oauth(account)?;
+    let cred = zerith_runtime::fresh_oauth(account)?;
     zerith_providers::oauth::fetch_models(cred.tool, &cred.access_token).map_err(|e| e.to_string())
-}
-
-/// The account's credential, renewed when it went stale.
-fn fresh_oauth(account: &str) -> Result<zerith_providers::OAuthCredential, String> {
-    let mut cred = zerith_core::secrets::load_oauth(&zerith_core::secrets::OsKeyring, account)
-        .map_err(|e| e.to_string())?
-        .ok_or("sem credencial no cofre para esta conta")?;
-    // Codex is never refreshed here: its refresh token rotates on use, so
-    // renewing it from the app would log the user's `codex` CLI out.
-    if cred.tool != OAuthTool::Codex && cred.expires_at <= zerith_providers::oauth::now_secs() {
-        cred = zerith_providers::oauth::refresh(cred.tool, &cred).map_err(|e| e.to_string())?;
-        zerith_core::secrets::save_oauth(&zerith_core::secrets::OsKeyring, account, &cred)
-            .map_err(|e| e.to_string())?;
-    }
-    Ok(cred)
 }
 
 /// Where an account's credential stands, for the pill: which tool and how many
@@ -846,15 +831,15 @@ pub fn checkpoint_turns(db: &Path, session: &str) -> Vec<i64> {
         .unwrap_or_default()
 }
 
-/// Restores the newest checkpoint: files and conversation. Returns a one-line
-/// report for the status text.
-pub fn rewind_latest(db: &Path, session: &str) -> Result<String, String> {
+/// Restores the newest checkpoint: files and conversation. Returns `(turn, text)`
+/// for the status text.
+pub fn rewind_latest_turn(db: &Path, session: &str) -> Result<(i64, String), String> {
     use zerith_sessions::checkpoints::{self, Mode};
     let root = db.parent().unwrap_or(Path::new("."));
     let st = Store::open(db).map_err(|e| e.to_string())?;
     let turn = *checkpoint_turns(db, session)
         .last()
-        .ok_or("nenhum ponto de restauração")?;
+        .ok_or("nenhum ponto de restauração nesta conversa")?;
     let r =
         checkpoints::restore(&st, root, session, turn, Mode::Both).map_err(|e| e.to_string())?;
     let mut text = format!(
@@ -865,7 +850,13 @@ pub fn rewind_latest(db: &Path, session: &str) -> Result<String, String> {
         text.push_str(". ");
         text.push_str(n);
     }
-    Ok(text)
+    Ok((turn, text))
+}
+
+/// Restores the newest checkpoint: files and conversation. Returns a one-line
+/// report for the status text.
+pub fn rewind_latest(db: &Path, session: &str) -> Result<String, String> {
+    rewind_latest_turn(db, session).map(|(_, text)| text)
 }
 
 /// Hands the answers of an `ask_user` card to the runtime.

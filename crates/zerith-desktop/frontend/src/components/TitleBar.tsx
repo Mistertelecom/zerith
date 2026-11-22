@@ -91,7 +91,14 @@ export function TitleBar({
         <button
           type="button"
           className="pill"
-          style={{ height: 22, padding: "0 8px", fontSize: 11, marginRight: 6 }}
+          style={{
+            height: 22,
+            padding: "0 8px",
+            fontSize: 11,
+            marginRight: 6,
+            flex: "none",
+            whiteSpace: "nowrap",
+          }}
           title={tr(
             lang,
             "Trocar idioma (English, Português, Español, Français, Deutsch, 中文)",

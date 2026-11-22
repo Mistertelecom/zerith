@@ -38,8 +38,8 @@ class ErrorBoundary extends Component<{ children: ReactNode }, { error: string |
           style={{
             padding: "32px",
             fontFamily: "system-ui, sans-serif",
-            color: "var(--fg, #e5e5e5)",
-            background: "var(--bg, #111)",
+            color: "var(--label-primary, #e5e5e5)",
+            background: "var(--bg-base, #111)",
             height: "100vh",
             boxSizing: "border-box",
           }}

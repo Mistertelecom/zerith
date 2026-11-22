@@ -522,9 +522,10 @@ fn validate_ssh_token(field: &str, value: &str) -> std::result::Result<(), Strin
     if t.starts_with('-') {
         return Err(format!("{field} inválido (não pode começar com `-`): {t}"));
     }
-    if t.chars()
-        .any(|c| c.is_control() || c.is_whitespace() || matches!(c, ';' | '&' | '|' | '`' | '$'))
-    {
+    if !t.chars().all(|c| {
+        c.is_ascii_alphanumeric()
+            || matches!(c, '.' | '_' | '-' | ':' | '@' | '[' | ']' | '%' | ',')
+    }) {
         return Err(format!("{field} contém caractere inválido: {t}"));
     }
     Ok(())
@@ -2301,6 +2302,26 @@ fn load_config_input(raw: &str, workspace: &Path) -> String {
     raw.to_string()
 }
 
+fn load_config_input_checked(raw: &str, ctx: &CallCtx<'_>) -> Result<String> {
+    if !raw.contains('\n') && raw.len() < 512 {
+        let candidate = ctx.resolve(raw);
+        match ctx
+            .policy
+            .check_tool("read_file", &Action::Read(candidate.clone()))
+        {
+            zerith_security::Verdict::Allow => {}
+            zerith_security::Verdict::Deny(r) => return Err(ToolError::Denied(r)),
+            zerith_security::Verdict::Ask(r) => {
+                return Err(ToolError::Denied(format!("aprovação necessária: {r}")))
+            }
+        }
+        if let Ok(text) = std::fs::read_to_string(&candidate) {
+            return Ok(text);
+        }
+    }
+    Ok(raw.to_string())
+}
+
 fn detect_config_vendor(before: &str, after: &str) -> Vendor {
     let sample = format!("{before}\n{after}");
     let lower = sample.to_ascii_lowercase();
@@ -2601,8 +2622,8 @@ pub fn compute_hierarchical_net_diff(
 fn net_diff(args: &Value, ctx: &CallCtx<'_>, _exec: &Exec<'_>) -> Result<String> {
     let before_arg = str_arg(args, "before")?;
     let after_arg = str_arg(args, "after")?;
-    let before = load_config_input(before_arg, ctx.workspace);
-    let after = load_config_input(after_arg, ctx.workspace);
+    let before = load_config_input_checked(before_arg, ctx)?;
+    let after = load_config_input_checked(after_arg, ctx)?;
     let vendor_override = opt_str(args, "vendor").and_then(Vendor::parse);
     let sanitize_secrets = args["sanitize_secrets"].as_bool().unwrap_or(false);
     Ok(compute_hierarchical_net_diff(
@@ -3425,11 +3446,43 @@ pub fn build_scp_args(
     }
 }
 
-fn net_transfer(args: &Value, ctx: &CallCtx<'_>, _exec: &Exec<'_>) -> Result<String> {
+fn net_transfer(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
     let direction = str_arg(args, "direction")?;
     let local_raw = str_arg(args, "local_path")?;
     let remote_raw = str_arg(args, "remote_path")?;
     let local_path = ctx.resolve(local_raw);
+
+    let dir_lower = direction.trim().to_ascii_lowercase();
+    let is_download = matches!(dir_lower.as_str(), "download" | "down" | "get" | "pull");
+    let is_upload = matches!(dir_lower.as_str(), "upload" | "up" | "put" | "push");
+    if is_download {
+        match ctx
+            .policy
+            .check_tool("write_file", &Action::Write(local_path.clone()))
+        {
+            zerith_security::Verdict::Allow => {}
+            zerith_security::Verdict::Deny(r) => return Err(ToolError::Denied(r)),
+            zerith_security::Verdict::Ask(r) => {
+                return Err(ToolError::Denied(format!("aprovação necessária: {r}")))
+            }
+        }
+        exec.host.before_write(&local_path)?;
+    } else if is_upload {
+        match ctx
+            .policy
+            .check_tool("read_file", &Action::Read(local_path.clone()))
+        {
+            zerith_security::Verdict::Allow => {}
+            zerith_security::Verdict::Deny(r) => return Err(ToolError::Denied(r)),
+            zerith_security::Verdict::Ask(r) => {
+                return Err(ToolError::Denied(format!("aprovação necessária: {r}")))
+            }
+        }
+    } else {
+        return Err(ToolError::BadArguments(format!(
+            "direction inválido `{direction}` (use `upload` ou `download`)"
+        )));
+    }
 
     let dev = resolve_connect_device(args, ctx)?;
     let root = zerith_core::Paths::resolve().root().to_path_buf();
@@ -3443,10 +3496,7 @@ fn net_transfer(args: &Value, ctx: &CallCtx<'_>, _exec: &Exec<'_>) -> Result<Str
         }
     }
 
-    if matches!(
-        direction.trim().to_ascii_lowercase().as_str(),
-        "download" | "down" | "get" | "pull"
-    ) {
+    if is_download {
         if let Some(parent) = local_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -3753,8 +3803,21 @@ tags = ["bgp"]
             ..Default::default()
         };
         assert!(build_ssh_command(&dev).is_err());
-        dev.host = "10.0.0.1;id".into();
-        assert!(build_ssh_command(&dev).is_err());
+        for bad in [
+            "10.0.0.1;id",
+            "host > /tmp/pwned",
+            "host</etc/passwd",
+            "host$(id)",
+            "host`id`",
+            "host(1)",
+            "host'x",
+            "host\"x",
+            "host\\x",
+            "host*",
+        ] {
+            dev.host = bad.into();
+            assert!(build_ssh_command(&dev).is_err(), "{bad}");
+        }
     }
 
     #[test]
@@ -4218,5 +4281,96 @@ Endpoint = vpn.telecomsul.com.br:51820
         assert!((stats.max_ms - 14.0).abs() < 0.01);
         assert!((stats.avg_ms - 12.0).abs() < 0.01);
         assert!((stats.jitter_ms - 3.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn net_diff_and_net_transfer_enforce_read_and_write_policy() {
+        let scratch =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let ws = tempfile::Builder::new().tempdir_in(&scratch).unwrap();
+        let outside = tempfile::Builder::new().tempdir_in(&scratch).unwrap();
+        let outside_cfg = outside.path().join("outside.cfg");
+        std::fs::write(&outside_cfg, "hostname OUTSIDE\n").unwrap();
+        std::fs::write(ws.path().join("a.cfg"), "hostname A\n").unwrap();
+        std::fs::write(ws.path().join("b.cfg"), "hostname B\n").unwrap();
+        std::fs::write(ws.path().join(".env"), "SECRET=123\n").unwrap();
+
+        let mut policy = zerith_security::Policy::new(
+            zerith_security::preset("workspace-write").unwrap(),
+            zerith_security::Mode::Default,
+            ws.path(),
+        );
+        policy.rules =
+            vec![
+                zerith_security::Rule::parse(zerith_security::RuleKind::Deny, "read_file(*.env)")
+                    .unwrap(),
+            ];
+
+        let ctx = CallCtx {
+            workspace: ws.path(),
+            policy: &policy,
+            memory: None,
+            scope: None,
+        };
+        let cancel = zerith_providers::Cancel::default();
+        let host = crate::Host::default();
+        let exec = Exec {
+            cancel: &cancel,
+            deadline: std::time::Instant::now() + Duration::from_secs(5),
+            timeout: Duration::from_secs(5),
+            host: &host,
+        };
+
+        // In-workspace files and inline configs work.
+        let ok = net_diff(&json!({"before": "a.cfg", "after": "b.cfg"}), &ctx, &exec).unwrap();
+        assert!(ok.contains("hostname B"), "{ok}");
+        let inline = net_diff(
+            &json!({"before": "hostname A\ninterface Gi0/1\n ip address 1.1.1.1 255.255.255.0", "after": "hostname B\ninterface Gi0/1\n ip address 1.1.1.1 255.255.255.0"}),
+            &ctx,
+            &exec,
+        )
+        .unwrap();
+        assert!(inline.contains("hostname B"), "{inline}");
+
+        // Outside-workspace and denied `.env` files are rejected before reading.
+        assert!(matches!(
+            net_diff(
+                &json!({"before": outside_cfg.to_string_lossy(), "after": "b.cfg"}),
+                &ctx,
+                &exec
+            ),
+            Err(ToolError::Denied(_))
+        ));
+        assert!(matches!(
+            net_diff(&json!({"before": ".env", "after": "b.cfg"}), &ctx, &exec),
+            Err(ToolError::Denied(_))
+        ));
+
+        // net_transfer enforces write_file on download and read_file on upload.
+        assert!(matches!(
+            net_transfer(
+                &json!({"direction": "download", "host": "10.0.0.1", "local_path": "out.bin", "remote_path": "/tmp/a"}),
+                &ctx,
+                &exec
+            ),
+            Err(ToolError::Denied(_))
+        ));
+        assert!(matches!(
+            net_transfer(
+                &json!({"direction": "upload", "host": "10.0.0.1", "local_path": outside_cfg.to_string_lossy(), "remote_path": "/tmp/a"}),
+                &ctx,
+                &exec
+            ),
+            Err(ToolError::Denied(_))
+        ));
+        assert!(matches!(
+            net_transfer(
+                &json!({"direction": "upload", "host": "10.0.0.1", "local_path": ".env", "remote_path": "/tmp/a"}),
+                &ctx,
+                &exec
+            ),
+            Err(ToolError::Denied(_))
+        ));
     }
 }

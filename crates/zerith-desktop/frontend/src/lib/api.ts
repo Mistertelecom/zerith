@@ -679,6 +679,10 @@ export const api = {
     invoke<string[]>("workspace_files", { root: root ?? null }),
   /** A local image from the transcript (`![](C:/x.png)`) as a data URL. */
   readImage: (path: string) => invoke<string>("read_image", { path }),
+  attachDroppedPath: (path: string) =>
+    invoke<{ path: string; data_url: string | null }>("attach_dropped_path", {
+      path,
+    }),
   openImage: (path: string) => invoke<void>("open_image", { path }),
   /** An http(s)/mailto link, in the system browser (the webview opens none). */
   openUrl: (url: string) => invoke<void>("open_url", { url }),

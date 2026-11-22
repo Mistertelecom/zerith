@@ -27,6 +27,7 @@ function rows(diff: string): Row[] {
       out.push({ kind: "hunk", text: line });
     } else if (line[0] === "+") out.push({ kind: "add", text: line.slice(1), now: n++ });
     else if (line[0] === "-") out.push({ kind: "del", text: line.slice(1), old: o++ });
+    else if (line.startsWith("\\")) out.push({ kind: "ctx", text: line });
     else out.push({ kind: "ctx", text: line.slice(1), old: o++, now: n++ });
   }
   return out;
@@ -105,9 +106,9 @@ function Diff({ file, mode }: { file: FileChange; mode: DiffMode }) {
               </div>
             ) : (
               <div key={i} className="diff-split-row">
-                <span className="diff-ln">{r.left.ln ?? ""}</span>
+                <span className={"diff-ln " + r.left.kind}>{r.left.ln ?? ""}</span>
                 <span className={"diff-split-cell " + r.left.kind}>{r.left.text}</span>
-                <span className="diff-ln">{r.right.ln ?? ""}</span>
+                <span className={"diff-ln " + r.right.kind}>{r.right.ln ?? ""}</span>
                 <span className={"diff-split-cell " + r.right.kind}>{r.right.text}</span>
               </div>
             ),
@@ -150,6 +151,11 @@ export function TurnChanges({ sessionId, messageId }: { sessionId: string; messa
 
   useEffect(() => {
     let live = true;
+    setFiles(null);
+    setDone(undone.get(key) ?? null);
+    setError(null);
+    setOpen(false);
+    setShown(null);
     let req = cache.get(key);
     if (!req) {
       req = changesApi.list(sessionId, messageId);
@@ -191,9 +197,12 @@ export function TurnChanges({ sessionId, messageId }: { sessionId: string; messa
       }
       const n = r.filesRestored + r.filesRemoved;
       const text = `Alterações desfeitas: ${n} arquivo(s)`;
-      if (r.errors.length) setError(r.errors.join("; "));
-      undone.set(key, text);
-      setDone(text);
+      if (r.errors.length) {
+        setError(r.errors.join("; "));
+      } else {
+        undone.set(key, text);
+        setDone(text);
+      }
     } catch (e) {
       setError(String(e));
     } finally {
@@ -240,7 +249,11 @@ export function TurnChanges({ sessionId, messageId }: { sessionId: string; messa
                     </span>
                   ) : null}
                   {f.diff == null ? (
-                    <span className="changes-count bin">{tr(lang, "binário", "binary")}</span>
+                    <span className="changes-count bin">
+                      {f.note?.toLowerCase().includes("grande")
+                        ? tr(lang, "grande", "large")
+                        : tr(lang, "binário", "binary")}
+                    </span>
                   ) : (
                     <>
                       <span className={"changes-count add" + (f.added ? "" : " zero")}>+{f.added}</span>

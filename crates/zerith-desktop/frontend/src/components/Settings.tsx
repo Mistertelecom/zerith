@@ -252,6 +252,7 @@ export function Settings({
 }) {
   const lang = useLang();
   const [tab, setTab] = useState<Tab>(open);
+  useEffect(() => setTab(open), [open]);
   const [quotas, setQuotas] = useState<Record<string, Quota | string>>({});
   const [quotaBusy, setQuotaBusy] = useState(false);
   const [providers, setProviders] = useState<ProviderView[]>([]);
@@ -273,7 +274,11 @@ export function Settings({
   const loadProviders = useCallback(async () => {
     const list = await api.providers();
     setProviders(list);
-    if (list.length) setForm(formOf(list[0]));
+    if (list.length) {
+      setForm((prev) =>
+        prev.name && list.some((p) => p.name === prev.name) ? prev : formOf(list[0]),
+      );
+    }
   }, []);
 
   useEffect(() => {
@@ -583,7 +588,9 @@ export function Settings({
                 />
               ) : null}
               {tab === "Geral" ? <GeneralTab {...general} /> : null}
-              {tab === "Memória" ? <MemoryTab /> : null}
+              {tab === "Memória" ? (
+                <MemoryTab paused={general.memoryPaused} onPause={general.onMemory} />
+              ) : null}
               {tab === "Skills" ? <SkillsTab /> : null}
               {tab === "MCP" ? <McpTab /> : null}
               {tab === "Mídia" ? <MediaTab /> : null}

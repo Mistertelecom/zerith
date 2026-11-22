@@ -118,6 +118,15 @@ pub struct ChatMessage {
     /// Tool only: the call this message answers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// True for runtime-injected user messages (hook/tool context,
+    /// compaction summaries, subagent reports) so local image refs are never
+    /// loaded from untrusted content.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub synthetic: bool,
+    /// Provider-signed extended thinking blocks (e.g. Anthropic `thinking` /
+    /// `redacted_thinking`), kept so multi-step tool loops replay them verbatim.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub thinking_blocks: Vec<serde_json::Value>,
 }
 
 impl ChatMessage {
@@ -127,11 +136,25 @@ impl ChatMessage {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            synthetic: false,
+            thinking_blocks: Vec::new(),
         }
+    }
+
+    pub fn with_thinking_blocks(mut self, blocks: Vec<serde_json::Value>) -> Self {
+        self.thinking_blocks = blocks;
+        self
     }
 
     pub fn user(content: impl Into<String>) -> Self {
         Self::new(Role::User, content)
+    }
+
+    pub fn synthetic_user(content: impl Into<String>) -> Self {
+        Self {
+            synthetic: true,
+            ..Self::new(Role::User, content)
+        }
     }
 
     pub fn system(content: impl Into<String>) -> Self {
@@ -222,6 +245,9 @@ pub enum StreamEvent {
     Delta(String),
     /// Reasoning/thinking text, when the provider sends it separately.
     Reasoning(String),
+    /// Provider-signed thinking blocks emitted once before `Done` when present
+    /// (e.g. Anthropic `thinking` with `signature` and `redacted_thinking`).
+    ThinkingBlocks(Vec<serde_json::Value>),
     /// The complete tool calls of this answer, emitted once before `Done`:
     /// fragments are assembled in the client so no caller sees half an
     /// argument.

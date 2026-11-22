@@ -247,18 +247,22 @@ export function AccountsTab(p: {
   // The pill reads the cofre, so it refreshes whenever the list changes
   // (a login just landed, an account was saved).
   useEffect(() => {
+    let live = true;
     for (const a of p.accounts)
       if (isOauth(a)) {
         void api
           .oauthStatus(a.id)
-          .then((s) => setOauth((o) => ({ ...o, [a.id]: s })))
-          .catch(() => undefined);
+          .then((s) => live && setOauth((o) => ({ ...o, [a.id]: s })))
+          .catch(() => live && setOauth((o) => ({ ...o, [a.id]: null })));
         // the plan answers with how much of the window is gone (9router's usage page)
         void api
           .accountQuota(a.id)
-          .then((q) => setQuotas((m) => ({ ...m, [a.id]: q })))
+          .then((q) => live && setQuotas((m) => ({ ...m, [a.id]: q })))
           .catch(() => undefined);
       }
+    return () => {
+      live = false;
+    };
   }, [p.accounts]);
 
   return (

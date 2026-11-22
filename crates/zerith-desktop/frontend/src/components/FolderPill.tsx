@@ -5,6 +5,22 @@ import { Check, ChevronDown, ExternalLink, Folder, FolderOpen } from "lucide-rea
 export const folderName = (p: string) =>
   p.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || p;
 
+/** Compute available vertical room above a composer pill and whether its
+ * upward popover should right-align (`align-end`) to avoid viewport clipping. */
+export function measurePillPopover(
+  button: HTMLElement,
+  wide = true,
+): { room: number; alignEnd: boolean } {
+  const rect = button.getBoundingClientRect();
+  const pane = button.closest(".convo") ?? document.body;
+  const room = Math.max(160, rect.top - pane.getBoundingClientRect().top - 96);
+  const clampedW = Math.min(wide ? 420 : 260, window.innerWidth - 32);
+  const alignEnd =
+    rect.left + 420 > window.innerWidth - 16 &&
+    (rect.right - clampedW >= 16 || rect.right > window.innerWidth - rect.left);
+  return { room, alignEnd };
+}
+
 /** The conversation's folder: recent folders, the OS picker, and Explorer.
  * Same look as the composer's other pills (PillMenu classes). */
 export function FolderPill(props: {
@@ -15,6 +31,8 @@ export function FolderPill(props: {
   onReveal: () => void;
 }) {
   const [open, setOpen] = useState(false);
+  const [room, setRoom] = useState<number | undefined>();
+  const [alignEnd, setAlignEnd] = useState(false);
   const root = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (!open) return;
@@ -40,15 +58,33 @@ export function FolderPill(props: {
         aria-label={"Pasta da conversa: " + (props.value || "nenhuma")}
         aria-haspopup="menu"
         aria-expanded={open}
-        onClick={() => setOpen((o) => !o)}
+        onClick={(e) => {
+          if (!open) {
+            const layout = measurePillPopover(e.currentTarget, true);
+            setRoom(layout.room);
+            setAlignEnd(layout.alignEnd);
+          }
+          setOpen((o) => !o);
+        }}
       >
         <Folder size={14} strokeWidth={2} />
         <span className="pill-text">{props.value ? folderName(props.value) : "Pasta"}</span>
         <ChevronDown size={14} strokeWidth={2} className="pill-chev" />
       </button>
       {open ? (
-        <div className="popover pill-list wide" role="menu" aria-label="Pasta da conversa">
-          <div className="pill-options">
+        <div
+          className={"popover pill-list wide" + (alignEnd ? " align-end" : "")}
+          role="menu"
+          aria-label="Pasta da conversa"
+        >
+          <div
+            className="pill-options"
+            style={
+              room !== undefined
+                ? { maxHeight: `min(360px, 55vh, ${room}px)` }
+                : undefined
+            }
+          >
             {list.map((p) => (
               <button
                 key={p}

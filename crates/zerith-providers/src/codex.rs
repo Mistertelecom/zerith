@@ -21,11 +21,13 @@ pub(crate) fn body(req: &ChatRequest, stream: bool) -> Value {
             Role::System => instructions.push(m.content.clone()),
             Role::User => {
                 let mut content = vec![json!({"type": "input_text", "text": m.content})];
-                content.extend(
-                    crate::images::local_images(&m.content)
-                        .iter()
-                        .map(|i| json!({"type": "input_image", "image_url": i.data_url()})),
-                );
+                if !m.synthetic {
+                    content.extend(
+                        crate::images::local_images(&m.content)
+                            .iter()
+                            .map(|i| json!({"type": "input_image", "image_url": i.data_url()})),
+                    );
+                }
                 input.push(json!({"type": "message", "role": "user", "content": content}));
             }
             Role::Assistant => {
@@ -76,9 +78,6 @@ pub(crate) fn body(req: &ChatRequest, stream: bool) -> Value {
             })
             .collect();
     }
-    if let Some(t) = req.temperature {
-        b["temperature"] = json!(t);
-    }
     if let Some(e) = crate::normalize_reasoning_effort(req.reasoning_effort.as_deref()) {
         b["reasoning"] = json!({"effort": e});
     }
@@ -88,12 +87,28 @@ pub(crate) fn body(req: &ChatRequest, stream: bool) -> Value {
     b
 }
 
+/// Codex Responses backend rejects `stream: false`, so blocking completion
+/// collects the SSE stream just like `antigravity::complete`.
 pub(crate) fn complete(client: &Client, req: &ChatRequest, cancel: &Cancel) -> Result<Completion> {
-    let resp = client.post(PATH, &body(req, false), cancel)?;
-    let text = resp
-        .into_string()
-        .map_err(|e| ProviderError::Transport(e.to_string()))?;
-    parse_completion(&text)
+    let mut out = Completion {
+        text: String::new(),
+        reasoning: None,
+        usage: None,
+        finish_reason: None,
+        tool_calls: Vec::new(),
+        thinking_blocks: Vec::new(),
+    };
+    stream(client, req, cancel, &mut |e| match e {
+        StreamEvent::Delta(d) => out.text.push_str(&d),
+        StreamEvent::Reasoning(r) => out.reasoning.get_or_insert_with(String::new).push_str(&r),
+        StreamEvent::ThinkingBlocks(b) => out.thinking_blocks = b,
+        StreamEvent::ToolCalls(c) => out.tool_calls = c,
+        StreamEvent::Done { usage, stop_reason } => {
+            out.usage = usage;
+            out.finish_reason = stop_reason;
+        }
+    })?;
+    Ok(out)
 }
 
 pub(crate) fn stream(
@@ -108,6 +123,7 @@ pub(crate) fn stream(
     state.finish(on_event)
 }
 
+#[cfg(test)]
 fn parse_completion(text: &str) -> Result<Completion> {
     let v: Value = serde_json::from_str(text)?;
     if let Some(e) = v.get("error") {
@@ -119,6 +135,7 @@ fn parse_completion(text: &str) -> Result<Completion> {
         usage: usage(&v["usage"]),
         finish_reason: None,
         tool_calls: Vec::new(),
+        thinking_blocks: Vec::new(),
     };
     for item in v["output"].as_array().into_iter().flatten() {
         match item["type"].as_str().unwrap_or("") {
@@ -366,5 +383,63 @@ mod tests {
             parse_completion(r#"{"output":[]}"#),
             Err(ProviderError::Malformed(_))
         ));
+    }
+
+    #[test]
+    fn body_omits_temperature_and_complete_collects_sse_stream() {
+        let req = ChatRequest::new("gpt-5-codex", vec![ChatMessage::user("oi")]).temperature(0.7);
+        let b = body(&req, true);
+        assert!(
+            b.get("temperature").is_none(),
+            "codex body must omit temperature: {b}"
+        );
+
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sse = include_str!("../tests/fixtures/codex.sse");
+        let handle = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(sock.try_clone().unwrap());
+            let mut len = 0usize;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                if let Some((k, v)) = line.split_once(':') {
+                    if k.eq_ignore_ascii_case("content-length") {
+                        len = v.trim().parse().unwrap_or(0);
+                    }
+                }
+            }
+            let mut raw = vec![0u8; len];
+            reader.read_exact(&mut raw).unwrap();
+            let req_json: Value = serde_json::from_slice(&raw).unwrap();
+            assert_eq!(req_json["stream"], true);
+            assert!(req_json.get("temperature").is_none());
+
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                sse.len(),
+                sse
+            );
+            sock.write_all(resp.as_bytes()).unwrap();
+        });
+
+        let mut cfg = crate::ProviderConfig::new(crate::ProviderKind::Codex).with_key("test-key");
+        cfg.base_url = format!("http://{addr}");
+        let client = Client::new(cfg)
+            .unwrap()
+            .with_retry(crate::RetryPolicy::none());
+        let completion = complete(&client, &req, &Cancel::default()).unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(completion.text, "Olá mundo");
+        assert_eq!(completion.tool_calls.len(), 1);
+        assert_eq!(completion.tool_calls[0].name, "read_file");
+        assert_eq!(completion.usage.unwrap().total_tokens, 13);
     }
 }

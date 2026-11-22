@@ -31,11 +31,15 @@ assert.equal(applyEvent(after, { type: "step", n: 1 }), after, "ignored event = 
 assert.equal(run(emptyTurn, [{ type: "autoCompacted", before: 1000, after: 10 }]).blocks[0].kind, "note");
 
 // turn:done clears the cards and never leaves a silent, still-typing answer
-const waiting = run({ ...emptyTurn, busy: true }, [{ type: "approval", id: 7, tool: "web_fetch", summary: "x" }]);
-assert.equal(waiting.approval?.id, 7);
+const waiting = run({ ...emptyTurn, busy: true }, [
+  { type: "approval", id: 7, tool: "web_fetch", summary: "x" },
+  { type: "approval", id: 8, tool: "shell", summary: "y" },
+]);
+assert.equal(waiting.approvals[0]?.id, 7);
+assert.equal(waiting.approvals.length, 2);
 const ended = finishTurn(waiting);
 assert.equal(ended.busy, false);
-assert.equal(ended.approval, null);
+assert.deepEqual(ended.approvals, []);
 assert.match(asst(ended.blocks[0]).error ?? "", /sem resposta/);
 const answered = finishTurn(run({ ...emptyTurn, busy: true }, [{ type: "delta", text: "oi" }, { type: "done", stored: 9, text: "oi", promptTokens: 0, completionTokens: 0, savedTokens: 0, modelUsed: null }]));
 assert.equal(asst(answered.blocks[0]).error, undefined);

@@ -11,10 +11,10 @@
 use std::io::Read;
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use zerith_security::jail::{Jail, Jailed};
@@ -39,10 +39,38 @@ struct Output {
     truncated: bool,
 }
 
+struct Reader {
+    done: Arc<AtomicBool>,
+    handle: JoinHandle<()>,
+}
+
+struct DoneOnDrop(Arc<AtomicBool>);
+
+impl Drop for DoneOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+fn join_readers_with_grace(readers: Vec<Reader>, grace: Duration) {
+    if readers.is_empty() {
+        return;
+    }
+    let deadline = Instant::now() + grace;
+    for r in readers {
+        while !r.done.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if r.done.load(Ordering::Acquire) {
+            let _ = r.handle.join();
+        }
+    }
+}
+
 struct Job {
     jailed: Jailed,
     out: Arc<Mutex<Output>>,
-    readers: Vec<JoinHandle<()>>,
+    readers: Vec<Reader>,
     command: String,
     exit: Option<String>,
     /// The session whose turn started it.
@@ -97,8 +125,8 @@ fn tables() -> Vec<Arc<Table>> {
 /// Jobs still running, from every live registry of this process.
 pub fn background_jobs() -> Vec<BackgroundJob> {
     let mut out = Vec::new();
+    let mut to_join = Vec::new();
     for table in tables() {
-        let mut to_join = Vec::new();
         if let Ok(mut jobs) = table.lock() {
             for (id, j) in jobs.iter_mut() {
                 to_join.extend(refresh(j));
@@ -112,10 +140,8 @@ pub fn background_jobs() -> Vec<BackgroundJob> {
                 }
             }
         }
-        for r in to_join {
-            let _ = r.join();
-        }
     }
+    join_readers_with_grace(to_join, Duration::from_millis(150));
     out
 }
 
@@ -206,24 +232,20 @@ impl Jobs {
                 keep.push(self.jobs.clone());
             }
         }
-        for r in to_join {
-            let _ = r.join();
-        }
+        join_readers_with_grace(to_join, Duration::from_millis(150));
         Ok(id)
     }
 
     /// New output since the last call, plus the state.
     pub fn read(&self, id: &str) -> Result<String> {
-        // Reap and release the lock before joining reader threads so a
-        // grandchild holding a pipe never deadlocks other job operations.
+        // Reap and release the lock before waiting briefly on reader threads so a
+        // grandchild holding a pipe never deadlocks or hangs other job operations.
         let to_join = {
             let mut jobs = self.jobs.lock().map_err(|_| poisoned())?;
             let j = find(&mut jobs, id)?;
             refresh(j)
         };
-        for r in to_join {
-            let _ = r.join();
-        }
+        join_readers_with_grace(to_join, Duration::from_millis(150));
         let mut jobs = self.jobs.lock().map_err(|_| poisoned())?;
         let j = find(&mut jobs, id)?;
         let mut o = j.out.lock().map_err(|_| poisoned())?;
@@ -268,9 +290,7 @@ fn kill_in(table: &Table, id: &str) -> Result<String> {
         j.exit = Some("encerrado".into());
         (format!("{id} encerrado: {}", j.command), readers)
     };
-    for r in to_join {
-        let _ = r.join();
-    }
+    join_readers_with_grace(to_join, Duration::from_secs(1));
     Ok(msg)
 }
 
@@ -302,9 +322,9 @@ impl Drop for Jobs {
     }
 }
 
-/// Notes the exit once and returns the reader handles for the caller to join
+/// Notes the exit once and returns the reader handles for the caller to wait on
 /// outside the `Jobs` mutex.
-fn refresh(j: &mut Job) -> Vec<JoinHandle<()>> {
+fn refresh(j: &mut Job) -> Vec<Reader> {
     if j.exit.is_some() {
         return Vec::new();
     }
@@ -318,9 +338,12 @@ fn refresh(j: &mut Job) -> Vec<JoinHandle<()>> {
     Vec::new()
 }
 
-fn pump(r: Option<Box<dyn Read + Send>>, out: &Arc<Mutex<Output>>) -> JoinHandle<()> {
+fn pump(r: Option<Box<dyn Read + Send>>, out: &Arc<Mutex<Output>>) -> Reader {
     let out = out.clone();
-    std::thread::spawn(move || {
+    let done = Arc::new(AtomicBool::new(false));
+    let done_flag = done.clone();
+    let handle = std::thread::spawn(move || {
+        let _done = DoneOnDrop(done_flag);
         let Some(mut r) = r else { return };
         // Fixed-size chunks: a process printing gigabytes without newlines
         // cannot grow a single line buffer unboundedly in RAM.
@@ -343,7 +366,8 @@ fn pump(r: Option<Box<dyn Read + Send>>, out: &Arc<Mutex<Output>>) -> JoinHandle
                 o.truncated = true;
             }
         }
-    })
+    });
+    Reader { done, handle }
 }
 
 pub(crate) fn all() -> Vec<Box<dyn Tool>> {
@@ -426,5 +450,35 @@ mod tests {
         );
         kill_all_jobs();
         assert!(listed(&b).is_none(), "closing the app stops the jobs");
+    }
+
+    #[test]
+    fn join_readers_with_grace_does_not_hang_on_open_pipe() {
+        struct BlockingReader(std::sync::mpsc::Receiver<()>);
+        impl Read for BlockingReader {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                let _ = self.0.recv();
+                Ok(0)
+            }
+        }
+
+        let out = Arc::new(Mutex::new(Output::default()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = pump(Some(Box::new(BlockingReader(rx))), &out);
+        let done_flag = reader.done.clone();
+
+        let started = Instant::now();
+        join_readers_with_grace(vec![reader], Duration::from_millis(60));
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(!done_flag.load(Ordering::Acquire));
+
+        drop(tx);
+        for _ in 0..40 {
+            if done_flag.load(Ordering::Acquire) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(done_flag.load(Ordering::Acquire));
     }
 }

@@ -80,8 +80,21 @@ pub struct ProviderForm {
 
 impl ProviderForm {
     /// Reads the form back into a config, keeping what the saved endpoint knew
-    /// (its model cache and context limit) so a rename does not lose it.
-    fn config(&self, root: &std::path::Path) -> Cmd<ProviderConfig> {
+    /// (its model cache, context limit, and stored key) so editing or testing
+    /// without retyping the key does not lose it. Also returns any newly typed key.
+    fn config(&self, root: &std::path::Path) -> Cmd<(ProviderConfig, Option<String>)> {
+        let name = self.name.trim();
+        let existing = (!name.is_empty())
+            .then(|| {
+                wire::configured_providers(root)
+                    .into_iter()
+                    .find(|p| p.name.eq_ignore_ascii_case(name))
+            })
+            .flatten();
+        self.apply(existing)
+    }
+
+    fn apply(&self, existing: Option<ProviderConfig>) -> Cmd<(ProviderConfig, Option<String>)> {
         let name = self.name.trim();
         if name.is_empty() {
             return Err("Dê um nome ao provedor".into());
@@ -93,10 +106,7 @@ impl ProviderForm {
         if !(1_000..=600_000).contains(&self.timeout_ms) {
             return Err("Timeout entre 1000 e 600000 ms".into());
         }
-        let mut cfg = wire::configured_providers(root)
-            .into_iter()
-            .find(|p| p.name.eq_ignore_ascii_case(name))
-            .unwrap_or_else(|| ProviderConfig::new(ProviderKind::parse(name)));
+        let mut cfg = existing.unwrap_or_else(|| ProviderConfig::new(ProviderKind::parse(name)));
         cfg.name = name.to_string();
         cfg.kind = ProviderKind::parse(name);
         cfg.protocol = match self.protocol.as_str() {
@@ -113,13 +123,9 @@ impl ProviderForm {
             .filter(|m| !m.is_empty())
             .map(str::to_string);
         cfg.timeout_ms = self.timeout_ms;
-        cfg.api_key = self
-            .key
-            .as_deref()
-            .map(str::trim)
-            .filter(|k| !k.is_empty())
-            .map(str::to_string);
-        Ok(cfg)
+        let typed_key = trimmed(&self.key);
+        cfg.api_key = typed_key.clone().or(cfg.api_key);
+        Ok((cfg, typed_key))
     }
 }
 
@@ -129,9 +135,9 @@ pub async fn provider_save(
     form: ProviderForm,
 ) -> Cmd<ProviderView> {
     let root = state.root().to_path_buf();
-    let cfg = form.config(&root)?;
+    let (cfg, typed_key) = form.config(&root)?;
     wire::save_provider(&root, &cfg)?;
-    if let Some(key) = cfg.api_key.as_deref() {
+    if let Some(key) = typed_key.as_deref() {
         wire::store_key(&cfg.name, key)?;
     }
     Ok(ProviderView::of(&cfg))
@@ -144,7 +150,7 @@ pub async fn provider_test(
     form: ProviderForm,
 ) -> Cmd<ProbeView> {
     let root = state.root().to_path_buf();
-    let cfg = form.config(&root)?;
+    let (cfg, _) = form.config(&root)?;
     tauri::async_runtime::spawn_blocking(move || {
         Client::new(cfg)
             .map(|c| ProbeView::of(&c.probe()))
@@ -446,4 +452,50 @@ pub async fn usage(state: tauri::State<'_, AppState>, hours: Option<u32>) -> Cmd
 pub async fn clear_cooldown(state: tauri::State<'_, AppState>, account_id: String) -> Cmd<()> {
     let db = state.db();
     wire::clear_account_cooldown(&db, &account_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn form(key: Option<&str>) -> ProviderForm {
+        ProviderForm {
+            name: "openai".into(),
+            base_url: "https://api.openai.com/v1".into(),
+            protocol: "openai".into(),
+            model: Some("gpt-4o".into()),
+            timeout_ms: 30_000,
+            key: key.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn provider_form_preserves_saved_key_when_blank_and_tracks_typed_key() {
+        let mut existing = ProviderConfig::new(ProviderKind::OpenAi);
+        existing.api_key = Some("sk-saved".into());
+
+        // Blank / None form key preserves existing key for testing and ProviderView::has_key,
+        // while typed_key stays None so provider_save does not rewrite the keyring.
+        let (cfg_none, typed_none) = form(None).apply(Some(existing.clone())).unwrap();
+        assert_eq!(cfg_none.api_key.as_deref(), Some("sk-saved"));
+        assert_eq!(typed_none, None);
+        assert!(ProviderView::of(&cfg_none).has_key);
+
+        let (cfg_blank, typed_blank) = form(Some("   ")).apply(Some(existing.clone())).unwrap();
+        assert_eq!(cfg_blank.api_key.as_deref(), Some("sk-saved"));
+        assert_eq!(typed_blank, None);
+        assert!(ProviderView::of(&cfg_blank).has_key);
+
+        // Typing a new key overrides the saved key and marks typed_key for store_key.
+        let (cfg_new, typed_new) = form(Some("  sk-new  ")).apply(Some(existing)).unwrap();
+        assert_eq!(cfg_new.api_key.as_deref(), Some("sk-new"));
+        assert_eq!(typed_new.as_deref(), Some("sk-new"));
+        assert!(ProviderView::of(&cfg_new).has_key);
+
+        // New provider with no saved key and blank input keeps api_key = None.
+        let (cfg_empty, typed_empty) = form(None).apply(None).unwrap();
+        assert_eq!(cfg_empty.api_key, None);
+        assert_eq!(typed_empty, None);
+        assert!(!ProviderView::of(&cfg_empty).has_key);
+    }
 }

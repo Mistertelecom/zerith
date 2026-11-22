@@ -326,11 +326,26 @@ fn skip_flags<'a>(mut t: &'a [String], takes_value: &[&str]) -> &'a [String] {
 /// In cmd the command name is normalised the way cmd reads it: `@del`,
 /// `del,x` and `del/q x` all run `del`.
 pub fn strip_wrappers(part: &str, d: Dialect) -> String {
+    strip_wrappers_inner(part, d).0
+}
+
+/// True if `part` strips an `env` wrapper or `VAR=val` assignment anywhere in
+/// its wrapper chain (e.g. `timeout 5 env -S ... ls` or `timeout 5 X=1 ls`).
+pub fn has_env_mutation(part: &str) -> bool {
+    has_env_mutation_in(part, Dialect::NATIVE())
+}
+
+pub fn has_env_mutation_in(part: &str, d: Dialect) -> bool {
+    strip_wrappers_inner(part, d).1
+}
+
+fn strip_wrappers_inner(part: &str, d: Dialect) -> (String, bool) {
     let mut all = tokens(part, d);
     if d == Dialect::Cmd {
         cmd_name(&mut all);
     }
     let mut t: &[String] = &all;
+    let mut saw_env = false;
     while let Some(first) = t.first() {
         let rest = &t[1..];
         match base_name(first).as_str() {
@@ -347,21 +362,26 @@ pub fn strip_wrappers(part: &str, d: Dialect) -> String {
                 )
             }
             "env" => {
+                saw_env = true;
                 let mut r = skip_flags(rest, &["-u", "-C", "-S", "--unset", "--chdir"]);
                 while r.first().is_some_and(|x| is_assignment(x)) {
                     r = &r[1..];
                 }
                 t = r;
             }
-            _ if is_assignment(first) => t = rest,
+            _ if is_assignment(first) => {
+                saw_env = true;
+                t = rest;
+            }
             _ => break,
         }
     }
-    if t.is_empty() {
+    let stripped = if t.is_empty() {
         part.trim().to_string()
     } else {
         t.join(" ")
-    }
+    };
+    (stripped, saw_env)
 }
 
 /// The script an interpreter would run (`bash -c "..."`, `cmd /c ...`,
@@ -582,17 +602,6 @@ pub fn all_read_only(cmd: &str) -> bool {
     all_read_only_in(cmd, Dialect::NATIVE())
 }
 
-/// True if `part` begins with an environment mutation (`VAR=val ...` or
-/// `env ...`), which can hijack execution (`LD_PRELOAD`, `PATH`, `GIT_PAGER`,
-/// `env -S`) even when the wrapped command looks read-only.
-fn mutates_env(part: &str, d: Dialect) -> bool {
-    let t = tokens(part, d);
-    let Some(first) = t.first() else {
-        return false;
-    };
-    is_assignment(first) || base_name(first) == "env"
-}
-
 /// Same, read with `d`'s grammar: the shell the command will really run in.
 pub fn all_read_only_in(cmd: &str, d: Dialect) -> bool {
     // Command substitutions in POSIX sh can execute arbitrary nested commands
@@ -602,7 +611,7 @@ pub fn all_read_only_in(cmd: &str, d: Dialect) -> bool {
     }
     let a = analyze_in(cmd, d);
     !a.inner.is_empty()
-        && !a.raw.iter().any(|p| mutates_env(p, d))
+        && !a.raw.iter().any(|p| has_env_mutation_in(p, d))
         && a.inner.iter().all(|p| is_read_only_in(p, d))
 }
 
@@ -741,9 +750,14 @@ mod tests {
             "GIT_PAGER=sh git log",
             "env -S sh ls",
             "env PATH=/tmp ls",
+            "timeout 5 env -S 'sh -c \"rm -rf /\"' ls",
+            "timeout 5 env LD_PRELOAD=/tmp/x.so ls",
+            "timeout 5 FOO=bar ls",
+            "nohup nice -n 5 env X=1 cat a.txt",
             "",
         ] {
             assert!(!all_read_only(bad), "{bad}");
+            assert!(!all_read_only_in(bad, Dialect::Sh), "sh: {bad}");
         }
         assert!(
             !all_read_only_in("echo \"$(echo ')'; rm -rf /)\"", Dialect::Sh),

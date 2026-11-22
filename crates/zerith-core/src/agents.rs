@@ -355,7 +355,7 @@ pub fn parse(name: String, text: &str, path: PathBuf, layer: &'static str) -> Ag
         let mut block = Vec::new();
         if raw.is_empty() {
             while i < lines.len() && lines[i].trim_start().starts_with('-') {
-                block.push(lines[i].trim_start()[1..].trim().to_string());
+                block.push(unquote(lines[i].trim_start()[1..].trim()));
                 i += 1;
             }
         }
@@ -647,5 +647,19 @@ mod tests {
 
         assert!(find_with_extra(&paths, Some(&project), &extra, DEFAULT).is_none());
         assert!(find_with_extra(&paths, Some(&project), &extra, "").is_none());
+    }
+
+    #[test]
+    fn block_list_items_unquote_cleanly() {
+        let a = def("---\ntools:\n  - \"read_file\"\n  - 'list_dir'\n  - grep\n\
+             quickPrompts:\n  - \"prompt \\\"com\\\" aspas\"\n  - 'single quoted'\n---\ncorpo");
+        assert_eq!(
+            a.tools.as_deref().unwrap(),
+            ["read_file", "list_dir", "grep"]
+        );
+        assert_eq!(
+            a.quick_prompts,
+            [r#"prompt \"com\" aspas"#, "single quoted"]
+        );
     }
 }

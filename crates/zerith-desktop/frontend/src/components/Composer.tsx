@@ -1,10 +1,13 @@
 import {
+  useCallback,
   useEffect,
   useLayoutEffect,
   useMemo,
   useRef,
   useState,
+  type MutableRefObject,
   type ReactNode,
+  type RefObject,
 } from "react";
 import {
   ArrowUp,
@@ -33,6 +36,7 @@ import {
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { api } from "../lib/api";
 import { tr, useLang } from "../lib/i18n";
+import { measurePillPopover } from "./FolderPill";
 import { Logo } from "./ui";
 
 /// An attachment waiting to go with the next message: images, videos, or any
@@ -46,7 +50,7 @@ type Attached = {
 const IMAGE_CAP = 20 * 1024 * 1024;
 const FILE_CAP = 50 * 1024 * 1024;
 const isImagePath = (p: string) => /\.(png|jpe?g|webp|gif)$/i.test(p);
-const isVideoPath = (p: string) => /\.(mp4|m4v|webm|mov|mkv)$/i.test(p);
+const isVideoPath = (p: string) => /\.(mp4|m4v|webm|mov)$/i.test(p);
 
 /// What `/` offers. The names are the old window's, so muscle memory carries
 /// over; `run` is handled by App, which owns the state each one touches.
@@ -90,20 +94,18 @@ type Trigger = {
 /// The token under the caret, if it is something a popup should offer: a
 /// leading `/word` at the start of the draft, or an `@word` anywhere.
 function tokenAt(draft: string, caret: number): Trigger | null {
-  const before = draft.slice(0, caret);
-  const at = before.lastIndexOf(" ");
-  const start = at + 1;
-  const word = before.slice(start);
-  if (word.startsWith("/") && start === 0) {
+  let start = caret;
+  while (start > 0 && !/\s/.test(draft[start - 1])) start--;
+  const word = draft.slice(start, caret);
+  if (word.startsWith("/") && (start === 0 || draft[start - 1] === "\n")) {
     return { kind: "slash", start, end: caret, text: word.slice(1) };
   }
-  const atSign = word.lastIndexOf("@");
-  if (atSign >= 0) {
+  if (word.startsWith("@")) {
     return {
       kind: "file",
-      start: start + atSign,
+      start,
       end: caret,
-      text: word.slice(atSign + 1),
+      text: word.slice(1),
     };
   }
   return null;
@@ -137,9 +139,20 @@ export function Composer(props: {
   files: () => Promise<string[]>;
   /** Extra pill at the head of the toolbar (the conversation's folder). */
   folder?: ReactNode;
+  /** Optional ref forwarded to the underlying draft textarea. */
+  textareaRef?: RefObject<HTMLTextAreaElement | null>;
 }) {
   const lang = useLang();
-  const box = useRef<HTMLTextAreaElement>(null);
+  const box = useRef<HTMLTextAreaElement | null>(null);
+  const attachTextareaRef = useCallback(
+    (el: HTMLTextAreaElement | null) => {
+      box.current = el;
+      if (props.textareaRef) {
+        (props.textareaRef as MutableRefObject<HTMLTextAreaElement | null>).current = el;
+      }
+    },
+    [props.textareaRef],
+  );
   const [caret, setCaret] = useState(0);
   const [list, setList] = useState<string[] | null>(null);
   const [active, setActive] = useState(0);
@@ -249,16 +262,50 @@ export function Composer(props: {
       void getCurrentWebview()
         .onDragDropEvent(({ payload: p }) => {
           if (p.type === "leave") return setDropping(false);
+          if (document.querySelector('[role="dialog"]')) {
+            setDropping(false);
+            return;
+          }
           if (p.type !== "drop") return setDropping(true);
           setDropping(false);
           for (const path of p.paths) {
-            if (isImagePath(path)) {
+            if (isImagePath(path) || isVideoPath(path)) {
               api
-                .readImage(path)
-                .then((url) =>
-                  attachImage(path.split(/[\\/]/).pop() ?? "imagem", url),
-                )
-                .catch(() => attachExistingPath(path));
+                .attachDroppedPath(path)
+                .then(({ path: savedPath, data_url }) => {
+                  const name =
+                    savedPath.split(/[\\/]/).pop() ??
+                    (isImagePath(savedPath) ? "imagem" : "vídeo");
+                  const kind: Attached["kind"] = isImagePath(savedPath)
+                    ? "image"
+                    : "video";
+                  setNote(null);
+                  setImages((l) =>
+                    l.some((i) => i.path === savedPath)
+                      ? l
+                      : [
+                          ...l,
+                          {
+                            name,
+                            path: savedPath,
+                            kind,
+                            url: data_url ?? undefined,
+                          },
+                        ],
+                  );
+                })
+                .catch(() => {
+                  if (isImagePath(path)) {
+                    api
+                      .readImage(path)
+                      .then((url) =>
+                        attachImage(path.split(/[\\/]/).pop() ?? "imagem", url),
+                      )
+                      .catch(() => attachExistingPath(path));
+                  } else {
+                    attachExistingPath(path);
+                  }
+                });
             } else {
               attachExistingPath(path);
             }
@@ -310,17 +357,40 @@ export function Composer(props: {
 
   // The file list is asked once, on the first `@`; the workspace walk is
   // cheap but not free, and the popup closes and reopens constantly.
+  const prevFilesRef = useRef(props.files);
+  const fetchingFilesRef = useRef(false);
+  useEffect(() => {
+    if (prevFilesRef.current !== props.files) {
+      prevFilesRef.current = props.files;
+      setList(null);
+    }
+  }, [props.files]);
   useEffect(() => {
     if (trigger?.kind !== "file") {
       setList(null);
+      fetchingFilesRef.current = false;
       return;
     }
-    if (list) return;
+    if (list || fetchingFilesRef.current) return;
+    let live = true;
+    fetchingFilesRef.current = true;
     void props
       .files()
-      .then(setList)
-      .catch(() => setList([]));
-  }, [trigger?.kind, list, props]);
+      .then((res) => {
+        if (!live) return;
+        fetchingFilesRef.current = false;
+        setList(res);
+      })
+      .catch(() => {
+        if (!live) return;
+        fetchingFilesRef.current = false;
+        setList([]);
+      });
+    return () => {
+      live = false;
+      fetchingFilesRef.current = false;
+    };
+  }, [trigger?.kind, list, props.files]);
 
   useEffect(() => {
     setActive(0);
@@ -356,9 +426,13 @@ export function Composer(props: {
       name +
       " " +
       props.draft.slice(trigger.end);
+    const nextCaret = trigger.start + name.length + 2;
     props.onDraft(next);
-    setCaret(trigger.start + name.length + 2);
+    setCaret(nextCaret);
     box.current?.focus();
+    requestAnimationFrame(() =>
+      box.current?.setSelectionRange(nextCaret, nextCaret),
+    );
   };
 
   // The draft grows with its text up to the CSS max-height, then scrolls.
@@ -390,12 +464,14 @@ export function Composer(props: {
         <div
           className={"draft" + (dropping ? " dropping" : "")}
           onDragOver={(e) => {
+            if (document.querySelector('[role="dialog"]')) return;
             if (!e.dataTransfer.types.includes("Files")) return;
             e.preventDefault();
             setDropping(true);
           }}
           onDragLeave={() => setDropping(false)}
           onDrop={(e) => {
+            if (document.querySelector('[role="dialog"]')) return;
             if (!e.dataTransfer.files.length) return;
             e.preventDefault();
             setDropping(false);
@@ -404,29 +480,36 @@ export function Composer(props: {
         >
           {images.length ? (
             <div className="attach-row" aria-label="Anexos">
-              {images.map((im, i) => (
-                <div className="attach-chip" key={im.path} title={`${im.name} (${im.path})`}>
-                  {im.kind === "image" && im.url ? (
-                    <img src={im.url} alt={im.name} />
-                  ) : (
-                    <span className="attach-file-label">
-                      <FileText size={14} strokeWidth={2} />
-                      <span>{im.name}</span>
-                    </span>
-                  )}
-                  <button
-                    type="button"
-                    className="attach-x"
-                    aria-label={`Remover ${im.name}`}
-                    title="Remover"
-                    onClick={() =>
-                      setImages((l) => l.filter((_, j) => j !== i))
-                    }
+              {images.map((im, i) => {
+                const isImage = im.kind === "image" && Boolean(im.url);
+                return (
+                  <div
+                    className={"attach-chip" + (isImage ? "" : " is-file")}
+                    key={im.path}
+                    title={`${im.name} (${im.path})`}
                   >
-                    <X size={12} strokeWidth={2.25} />
-                  </button>
-                </div>
-              ))}
+                    {isImage ? (
+                      <img src={im.url} alt={im.name} />
+                    ) : (
+                      <span className="attach-file-label">
+                        <FileText size={14} strokeWidth={2} />
+                        <span>{im.name}</span>
+                      </span>
+                    )}
+                    <button
+                      type="button"
+                      className="attach-x"
+                      aria-label={`Remover ${im.name}`}
+                      title="Remover"
+                      onClick={() =>
+                        setImages((l) => l.filter((_, j) => j !== i))
+                      }
+                    >
+                      <X size={12} strokeWidth={2.25} />
+                    </button>
+                  </div>
+                );
+              })}
             </div>
           ) : null}
           {trigger && rows.length > 0 ? (
@@ -487,7 +570,7 @@ export function Composer(props: {
             </div>
           ) : null}
           <textarea
-            ref={box}
+            ref={attachTextareaRef}
             rows={1}
             value={props.draft}
             aria-label={tr(lang, "Mensagem", "Message")}
@@ -497,6 +580,21 @@ export function Composer(props: {
               setCaret(e.target.selectionStart ?? e.target.value.length);
               setDismissed(null);
             }}
+            onSelect={(e) =>
+              setCaret(
+                e.currentTarget.selectionStart ?? e.currentTarget.value.length,
+              )
+            }
+            onClick={(e) =>
+              setCaret(
+                e.currentTarget.selectionStart ?? e.currentTarget.value.length,
+              )
+            }
+            onKeyUp={(e) =>
+              setCaret(
+                e.currentTarget.selectionStart ?? e.currentTarget.value.length,
+              )
+            }
             onPaste={(e) => {
               // Word/Excel put a picture of the copied text beside it: text wins
               const data = e.clipboardData;
@@ -505,6 +603,7 @@ export function Composer(props: {
               pasteFiles(data.files);
             }}
             onKeyDown={(e) => {
+              if (e.nativeEvent.isComposing || e.keyCode === 229) return;
               if (rows.length && trigger) {
                 if (e.key === "ArrowDown") {
                   e.preventDefault();
@@ -787,6 +886,7 @@ function PillMenu(props: {
   // The list opens upward; on the empty-chat screen the composer sits mid
   // window, so its height is capped by the room above the pill.
   const [room, setRoom] = useState<number | undefined>();
+  const [alignEnd, setAlignEnd] = useState(false);
   const hidden = props.hidden ?? [];
   const hiddenCount = props.options.filter(
     (o) => hidden.includes(o.value) && o.value !== props.value,
@@ -823,14 +923,13 @@ function PillMenu(props: {
         onClick={(e) => {
           // the conversation pane clips the popup at its own top (under the
           // top bar); 96px is the search field, the footer and the gap
-          const pane = e.currentTarget.closest(".convo") ?? document.body;
-          setRoom(
-            e.currentTarget.getBoundingClientRect().top -
-              pane.getBoundingClientRect().top -
-              96,
-          );
+          if (!open) {
+            const layout = measurePillPopover(e.currentTarget, Boolean(props.wide));
+            setRoom(layout.room);
+            setAlignEnd(layout.alignEnd);
+            setQ("");
+          }
           setOpen((o) => !o);
-          setQ("");
         }}
       >
         {props.icon}
@@ -839,7 +938,11 @@ function PillMenu(props: {
       </button>
       {open ? (
         <div
-          className={"popover pill-list" + (props.wide ? " wide" : "")}
+          className={
+            "popover pill-list" +
+            (props.wide ? " wide" : "") +
+            (alignEnd ? " align-end" : "")
+          }
           role="listbox"
           aria-label={props.label}
         >
@@ -854,7 +957,11 @@ function PillMenu(props: {
           ) : null}
           <div
             className="pill-options"
-            style={room ? { maxHeight: `min(360px, 55vh, ${room}px)` } : undefined}
+            style={
+              room !== undefined
+                ? { maxHeight: `min(360px, 55vh, ${room}px)` }
+                : undefined
+            }
           >
             {shown.length === 0 ? (
               <div className="pill-empty">Nada encontrado</div>

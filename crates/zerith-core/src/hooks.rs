@@ -377,7 +377,7 @@ fn shell(command: &str) -> Command {
     use std::os::windows::process::CommandExt;
     let mut c = Command::new("cmd");
     // raw_arg: std's quoting is for C runtimes, and cmd parses quotes its own way.
-    c.arg("/C").raw_arg(command);
+    c.raw_arg(format!("/S /C \"{command}\""));
     c
 }
 

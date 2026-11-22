@@ -16,7 +16,7 @@ use std::collections::HashSet;
 use serde_json::json;
 use zerith_providers::ToolCall;
 use zerith_providers::{Cancel, ChatMessage, ChatRequest, Client, ProviderError, Role as PRole};
-use zerith_sessions::{Message, NewMessage, Role, Store};
+use zerith_sessions::{Message, Role, Store};
 
 use crate::events::TurnLog;
 use crate::{Result, RunError};
@@ -67,7 +67,7 @@ impl Summarizer for ClientSummarizer<'_> {
             self.model,
             vec![
                 ChatMessage::system(SUMMARY_PROMPT),
-                ChatMessage::user(transcript),
+                ChatMessage::synthetic_user(transcript),
             ],
         )
         .max_tokens(1500);
@@ -237,7 +237,7 @@ impl History {
         self.items.splice(
             ..b,
             [Item {
-                msg: ChatMessage::user(content),
+                msg: ChatMessage::synthetic_user(content),
                 lo,
                 hi,
                 summary_row: Some(row),
@@ -321,6 +321,16 @@ pub(crate) fn summarize_into(
         return Ok(None);
     };
     let supersedes: Vec<i64> = span.iter().filter_map(|i| i.summary_row).collect();
+    let snapshot_max_id = hist
+        .items
+        .iter()
+        .map(|i| i.hi.max(i.summary_row.unwrap_or(0)))
+        .max()
+        .unwrap_or(hi);
+    let expected_ids: Vec<i64> = ids
+        .iter()
+        .map(|it| it.summary_row.unwrap_or(it.lo))
+        .collect();
     let tokens_before = hist.tokens();
     log.emit(
         "compaction/start",
@@ -336,16 +346,159 @@ pub(crate) fn summarize_into(
         Ok(_) => return fail("resumo vazio".into()),
         Err(e) => return fail(e),
     };
+    if cancel.is_cancelled() {
+        log.emit(
+            "compaction/end",
+            json!({"ok": false, "skipped": true, "reason": "cancelled"}),
+        );
+        return Ok(None);
+    }
     let content = format!("{SUMMARY_HEADER}\n{text}");
-    let row = match store.append(
-        session_id,
-        &NewMessage {
-            raw: Some(json!({"summary": {"start_id": lo, "end_id": hi, "supersedes": supersedes}})),
-            ..NewMessage::new(Role::User, content.clone())
-        },
-    ) {
-        Ok(id) => id,
-        Err(e) => return fail(e.to_string()),
+    let raw_json =
+        json!({"summary": {"start_id": lo, "end_id": hi, "supersedes": supersedes}}).to_string();
+
+    struct ImmediateTx<'a>(&'a Store, bool);
+    impl<'a> ImmediateTx<'a> {
+        fn begin(store: &'a Store) -> std::result::Result<Self, String> {
+            store
+                .conn()
+                .execute_batch("BEGIN IMMEDIATE")
+                .map_err(|e| e.to_string())?;
+            Ok(Self(store, false))
+        }
+        fn commit(mut self) -> std::result::Result<(), String> {
+            self.0
+                .conn()
+                .execute_batch("COMMIT")
+                .map_err(|e| e.to_string())?;
+            self.1 = true;
+            Ok(())
+        }
+    }
+    impl Drop for ImmediateTx<'_> {
+        fn drop(&mut self) {
+            if !self.1 {
+                let _ = self.0.conn().execute_batch("ROLLBACK");
+            }
+        }
+    }
+
+    enum TxOutcome {
+        Inserted(i64),
+        Skipped(&'static str),
+    }
+
+    let tx_outcome = {
+        let tx = match ImmediateTx::begin(store) {
+            Ok(t) => t,
+            Err(e) => return fail(e),
+        };
+        let check = (|| -> std::result::Result<TxOutcome, String> {
+            let conn = store.conn();
+            let session_exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sessions WHERE id = ?1",
+                    (session_id,),
+                    |r| r.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            if session_exists == 0 {
+                return Ok(TxOutcome::Skipped("session_deleted"));
+            }
+            let db_max_id: i64 = conn
+                .query_row(
+                    "SELECT COALESCE(MAX(id), 0) FROM messages WHERE session_id = ?1",
+                    (session_id,),
+                    |r| r.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            if db_max_id > snapshot_max_id {
+                return Ok(TxOutcome::Skipped("stale_snapshot"));
+            }
+            {
+                let mut sup_stmt = conn
+                    .prepare("SELECT superseded FROM messages WHERE id = ?1 AND session_id = ?2")
+                    .map_err(|e| e.to_string())?;
+                for &row_id in &expected_ids {
+                    let sup: std::result::Result<i64, _> =
+                        sup_stmt.query_row((row_id, session_id), |r| r.get(0));
+                    if sup.ok() != Some(0) {
+                        return Ok(TxOutcome::Skipped("superseded_or_missing"));
+                    }
+                }
+            }
+            let existing_summaries: Vec<(i64, String)> = {
+                let mut sum_stmt = conn
+                    .prepare(
+                        "SELECT id, raw FROM messages WHERE session_id = ?1 AND superseded = 0
+                         AND CASE WHEN raw IS NULL OR NOT json_valid(raw) THEN 0
+                             ELSE json_type(raw, '$.summary.start_id') IS NOT NULL END",
+                    )
+                    .map_err(|e| e.to_string())?;
+                let rows = sum_stmt
+                    .query_map((session_id,), |r| Ok((r.get(0)?, r.get(1)?)))
+                    .map_err(|e| e.to_string())?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(|e| e.to_string())?
+            };
+            let already_covered = existing_summaries.into_iter().any(|(sum_id, raw_str)| {
+                if supersedes.contains(&sum_id) {
+                    return false;
+                }
+                serde_json::from_str::<serde_json::Value>(&raw_str)
+                    .ok()
+                    .and_then(|v| {
+                        let s = v.get("summary")?;
+                        let s_lo = s.get("start_id")?.as_i64()?;
+                        let s_hi = s.get("end_id")?.as_i64()?;
+                        Some(s_lo <= hi && s_hi >= lo)
+                    })
+                    .unwrap_or(false)
+            });
+            if already_covered {
+                return Ok(TxOutcome::Skipped("already_summarized"));
+            }
+            let ts = zerith_sessions::migrations::now_ms();
+            conn.execute(
+                "INSERT INTO messages(session_id, role, content, tool_name, tool_calls, reasoning, token_count, created_at, raw)
+                 VALUES (?1, ?2, ?3, NULL, NULL, NULL, NULL, ?4, ?5)",
+                (session_id, "user", &content, ts, &raw_json),
+            )
+            .map_err(|e| e.to_string())?;
+            let id = conn.last_insert_rowid();
+            conn.execute(
+                "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
+                (ts, session_id),
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(TxOutcome::Inserted(id))
+        })();
+        match check {
+            Ok(TxOutcome::Inserted(id)) => {
+                if let Err(e) = tx.commit() {
+                    return fail(e);
+                }
+                TxOutcome::Inserted(id)
+            }
+            Ok(TxOutcome::Skipped(reason)) => {
+                drop(tx);
+                TxOutcome::Skipped(reason)
+            }
+            Err(e) => {
+                drop(tx);
+                return fail(e);
+            }
+        }
+    };
+    let row = match tx_outcome {
+        TxOutcome::Inserted(id) => id,
+        TxOutcome::Skipped(reason) => {
+            log.emit(
+                "compaction/end",
+                json!({"ok": false, "skipped": true, "reason": reason}),
+            );
+            return Ok(None);
+        }
     };
     log.emit(
         "compaction/summary",
@@ -620,7 +773,7 @@ pub fn replay_items(rows: &[Message]) -> Vec<Item> {
             out.push((
                 lo * 2 - 1,
                 Item {
-                    msg: ChatMessage::user(m.content.clone()),
+                    msg: ChatMessage::synthetic_user(m.content.clone()),
                     lo,
                     hi,
                     summary_row: Some(m.id),
@@ -639,6 +792,17 @@ pub fn replay_items(rows: &[Message]) -> Vec<Item> {
     pair(out.into_iter().map(|(_, i)| i).collect())
 }
 
+fn is_synthetic_raw(raw: Option<&serde_json::Value>) -> bool {
+    let Some(obj) = raw.and_then(|v| v.as_object()) else {
+        return false;
+    };
+    obj.contains_key("tool_context")
+        || obj.contains_key("hook_context")
+        || obj.contains_key("hook_stop")
+        || obj.contains_key("subagents_joined")
+        || obj.contains_key("summary")
+}
+
 fn row_to_chat(m: &Message) -> Option<ChatMessage> {
     match m.role {
         Role::User | Role::System => {
@@ -650,7 +814,11 @@ fn row_to_chat(m: &Message) -> Option<ChatMessage> {
             } else {
                 PRole::System
             };
-            Some(ChatMessage::new(role, m.content.clone()))
+            let mut msg = ChatMessage::new(role, m.content.clone());
+            if m.role == Role::User && is_synthetic_raw(m.raw.as_ref()) {
+                msg.synthetic = true;
+            }
+            Some(msg)
         }
         Role::Assistant => {
             let calls: Vec<ToolCall> = m
@@ -728,7 +896,7 @@ mod routing_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zerith_sessions::SessionSource;
+    use zerith_sessions::{NewMessage, SessionSource};
 
     struct Canned;
     impl Summarizer for Canned {
@@ -804,5 +972,178 @@ mod tests {
         assert!(auto_compact(&store, &sid, 100, Some(64_000), &Canned, &c)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn replayed_synthetic_user_rows_preserve_synthetic_flag() {
+        let store = Store::open_in_memory().unwrap();
+        let sid = store
+            .create_session("syn", zerith_sessions::SessionSource::Native)
+            .unwrap()
+            .id;
+        store
+            .append(&sid, &NewMessage::new(Role::User, "real ![a](x.png)"))
+            .unwrap();
+        store
+            .append(
+                &sid,
+                &NewMessage {
+                    raw: Some(json!({"steer": true})),
+                    ..NewMessage::new(Role::User, "steer ![b](y.png)")
+                },
+            )
+            .unwrap();
+        for key in [
+            "tool_context",
+            "hook_context",
+            "hook_stop",
+            "subagents_joined",
+        ] {
+            store
+                .append(
+                    &sid,
+                    &NewMessage {
+                        raw: Some(json!({ key: true })),
+                        ..NewMessage::new(Role::User, format!("{key} ![s](secret.png)"))
+                    },
+                )
+                .unwrap();
+        }
+        store
+            .append(
+                &sid,
+                &NewMessage {
+                    raw: Some(
+                        json!({"summary": {"start_id": 999, "end_id": 1000, "supersedes": []}}),
+                    ),
+                    ..NewMessage::new(Role::User, "summary ![s](secret.png)")
+                },
+            )
+            .unwrap();
+
+        let replayed = replay(&store.recent_messages(&sid, 50).unwrap());
+        assert_eq!(replayed.len(), 7);
+        assert!(
+            !replayed[0].synthetic,
+            "plain user message is not synthetic"
+        );
+        assert!(
+            !replayed[1].synthetic,
+            "steer user message is not synthetic"
+        );
+        for m in &replayed[2..] {
+            assert!(m.synthetic, "synthetic row must remain synthetic: {m:?}");
+        }
+    }
+
+    #[test]
+    fn stale_summarize_into_aborts_cleanly_after_newer_message_or_superseded_rewind() {
+        struct MutatingSummarizer<F: Fn()>(F);
+        impl<F: Fn()> Summarizer for MutatingSummarizer<F> {
+            fn summarize(&self, _t: &str, _: &Cancel) -> std::result::Result<String, String> {
+                (self.0)();
+                Ok("resumo obsoleto".into())
+            }
+        }
+
+        let scratch =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let dir = tempfile::Builder::new().tempdir_in(&scratch).unwrap();
+        let db = dir.path().join("compact-stale.db");
+
+        // Case 1: Concurrent newer message appended mid-summarization.
+        {
+            let store = Store::open(&db).unwrap();
+            let sid = store
+                .create_session("c1", SessionSource::Native)
+                .unwrap()
+                .id;
+            for i in 0..4 {
+                store
+                    .append(&sid, &NewMessage::new(Role::User, format!("u{i}")))
+                    .unwrap();
+                store
+                    .append(&sid, &NewMessage::new(Role::Assistant, format!("a{i}")))
+                    .unwrap();
+            }
+            let rows = store.recent_messages(&sid, 100).unwrap();
+            let mut hist = History::new(Vec::new(), replay_items(&rows));
+            let db2 = db.clone();
+            let sid2 = sid.clone();
+            let log = TurnLog::outside_turn(&store, &sid);
+            let sum = MutatingSummarizer(move || {
+                let s2 = Store::open(&db2).unwrap();
+                s2.append(&sid2, &NewMessage::new(Role::User, "concurrent msg"))
+                    .unwrap();
+            });
+            let res = summarize_into(
+                &store,
+                &sid,
+                &mut hist,
+                0,
+                &sum,
+                &Cancel::default(),
+                &log,
+                "auto",
+            )
+            .unwrap();
+            assert!(res.is_none(), "stale snapshot must skip inserting summary");
+            assert!(!store.has_open_compaction(&sid).unwrap());
+            let all = store.messages(&sid, 100, 0).unwrap();
+            assert!(all.iter().all(|m| !m.content.contains("resumo obsoleto")));
+        }
+
+        // Case 2: Concurrent rewind supersedes rows in lo..=hi mid-summarization.
+        {
+            let store = Store::open(&db).unwrap();
+            let sid = store
+                .create_session("c2", SessionSource::Native)
+                .unwrap()
+                .id;
+            let mut ids = Vec::new();
+            for i in 0..4 {
+                ids.push(
+                    store
+                        .append(&sid, &NewMessage::new(Role::User, format!("u{i}")))
+                        .unwrap(),
+                );
+                ids.push(
+                    store
+                        .append(&sid, &NewMessage::new(Role::Assistant, format!("a{i}")))
+                        .unwrap(),
+                );
+            }
+            let boundary = ids[2];
+            let rows = store.recent_messages(&sid, 100).unwrap();
+            let mut hist = History::new(Vec::new(), replay_items(&rows));
+            let db2 = db.clone();
+            let sid2 = sid.clone();
+            let log = TurnLog::outside_turn(&store, &sid);
+            let sum = MutatingSummarizer(move || {
+                let s2 = Store::open(&db2).unwrap();
+                s2.conn()
+                    .execute(
+                        "UPDATE messages SET superseded = 1 WHERE session_id = ?1 AND id > ?2",
+                        (&sid2, boundary),
+                    )
+                    .unwrap();
+            });
+            let res = summarize_into(
+                &store,
+                &sid,
+                &mut hist,
+                0,
+                &sum,
+                &Cancel::default(),
+                &log,
+                "auto",
+            )
+            .unwrap();
+            assert!(res.is_none(), "rewound rows must prevent summary insertion");
+            assert!(!store.has_open_compaction(&sid).unwrap());
+            let all = store.messages(&sid, 100, 0).unwrap();
+            assert!(all.iter().all(|m| !m.content.contains("resumo obsoleto")));
+        }
     }
 }

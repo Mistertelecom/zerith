@@ -1,6 +1,6 @@
 // Active interactive terminals (`terminal_open`, `net_connect`) with live tail
 // inspection, client/VPN/transport badges, command history, quick keys, and log copy.
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Check, Copy, Eye, EyeOff, Send, Square, Terminal, X } from "lucide-react";
 import {
   onTerminalsChanged,
@@ -25,19 +25,22 @@ export function ActiveTerminals({ active }: { active: boolean }) {
   const [copied, setCopied] = useState(false);
   const [historyByTerm, setHistoryByTerm] = useState<Record<string, string[]>>({});
   const [histCursor, setHistCursor] = useState<number>(-1);
+  const openTailRef = useRef<string | null>(openTail);
+  openTailRef.current = openTail;
 
   const refresh = useCallback(() => {
     terminalsApi
       .list()
       .then((list) => {
         setItems(list);
-        if (openTail && !list.some((t) => t.id === openTail)) {
+        const curOpen = openTailRef.current;
+        if (curOpen && !list.some((t) => t.id === curOpen)) {
           setOpenTail(null);
           setTailText("");
         }
       })
       .catch(() => setItems([]));
-  }, [openTail]);
+  }, []);
 
   useEffect(() => {
     refresh();
@@ -60,11 +63,16 @@ export function ActiveTerminals({ active }: { active: boolean }) {
   const pullTail = useCallback((id: string) => {
     void terminalsApi
       .tail(id, 16384)
-      .then(setTailText)
-      .catch(() => setTailText(""));
+      .then((text) => {
+        if (openTailRef.current === id) setTailText(text);
+      })
+      .catch(() => {
+        if (openTailRef.current === id) setTailText("");
+      });
   }, []);
 
   useEffect(() => {
+    setTailText("");
     if (!openTail) return;
     setHistCursor(-1);
     pullTail(openTail);

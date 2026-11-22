@@ -75,6 +75,11 @@ impl Store {
                 PRIMARY KEY (scope, item_key)
             );
 
+            CREATE TABLE IF NOT EXISTS workflow_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_runs_wf_started
                 ON workflow_runs(workflow_id, started_at_ms DESC);
             "#,
@@ -84,19 +89,32 @@ impl Store {
         Ok(())
     }
 
-    /// Seeds starter workflows on a clean database so new users
-    /// immediately see the OpenMausBot-style visual studio populated.
+    /// Seeds starter workflows once on a clean database so new users
+    /// immediately see the OpenMausBot-style visual studio populated,
+    /// without resurrecting templates after the user deletes them.
     pub fn seed_defaults(&self) -> Result<()> {
-        let existing: i64 = {
-            let conn = self.conn.lock().map_err(|_| WorkflowError::Lock)?;
-            conn.query_row("SELECT COUNT(*) FROM workflows", [], |r| r.get(0))?
-        };
-        if existing > 0 {
+        let conn = self.conn.lock().map_err(|_| WorkflowError::Lock)?;
+        let seeded: Option<String> = conn
+            .query_row(
+                "SELECT value FROM workflow_meta WHERE key = 'seeded_defaults'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if seeded.is_some() {
             return Ok(());
         }
-        for wf in starter_templates() {
-            self.save_workflow(&wf)?;
+        let existing: i64 = conn.query_row("SELECT COUNT(*) FROM workflows", [], |r| r.get(0))?;
+        if existing == 0 {
+            for wf in starter_templates() {
+                upsert_workflow(&conn, &wf)?;
+            }
         }
+        conn.execute(
+            "INSERT INTO workflow_meta (key, value) VALUES ('seeded_defaults', '1')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )?;
         Ok(())
     }
 
@@ -131,54 +149,7 @@ impl Store {
 
     pub fn save_workflow(&self, wf: &Workflow) -> Result<Workflow> {
         let conn = self.conn.lock().map_err(|_| WorkflowError::Lock)?;
-        let nodes_json = serde_json::to_string(&wf.nodes)?;
-        let edges_json = serde_json::to_string(&wf.edges)?;
-        let now = now_ms();
-        let created = if wf.created_at_ms > 0 {
-            wf.created_at_ms
-        } else {
-            now
-        };
-        let updated = if wf.updated_at_ms > 0 {
-            wf.updated_at_ms
-        } else {
-            now
-        };
-        let bot_name = wf
-            .bot_name
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
-        conn.execute(
-            "INSERT INTO workflows (
-                id, name, description, icon, enabled, nodes_json, edges_json,
-                created_at_ms, updated_at_ms, last_run_at_ms, last_status, bot_name
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-             ON CONFLICT(id) DO UPDATE SET
-                name = excluded.name,
-                description = excluded.description,
-                icon = excluded.icon,
-                enabled = excluded.enabled,
-                nodes_json = excluded.nodes_json,
-                edges_json = excluded.edges_json,
-                updated_at_ms = excluded.updated_at_ms,
-                bot_name = excluded.bot_name",
-            params![
-                wf.id,
-                wf.name,
-                wf.description,
-                wf.icon,
-                i32::from(wf.enabled),
-                nodes_json,
-                edges_json,
-                created,
-                updated,
-                wf.last_run_at_ms,
-                wf.last_status,
-                bot_name
-            ],
-        )?;
+        upsert_workflow(&conn, wf)?;
         drop(conn);
         Ok(self.get_workflow(&wf.id)?.unwrap_or_else(|| wf.clone()))
     }
@@ -360,6 +331,58 @@ impl Store {
         }
         Ok(unseen)
     }
+}
+
+fn upsert_workflow(conn: &Connection, wf: &Workflow) -> Result<()> {
+    let nodes_json = serde_json::to_string(&wf.nodes)?;
+    let edges_json = serde_json::to_string(&wf.edges)?;
+    let now = now_ms();
+    let created = if wf.created_at_ms > 0 {
+        wf.created_at_ms
+    } else {
+        now
+    };
+    let updated = if wf.updated_at_ms > 0 {
+        wf.updated_at_ms
+    } else {
+        now
+    };
+    let bot_name = wf
+        .bot_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    conn.execute(
+        "INSERT INTO workflows (
+            id, name, description, icon, enabled, nodes_json, edges_json,
+            created_at_ms, updated_at_ms, last_run_at_ms, last_status, bot_name
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+         ON CONFLICT(id) DO UPDATE SET
+            name = excluded.name,
+            description = excluded.description,
+            icon = excluded.icon,
+            enabled = excluded.enabled,
+            nodes_json = excluded.nodes_json,
+            edges_json = excluded.edges_json,
+            updated_at_ms = excluded.updated_at_ms,
+            bot_name = excluded.bot_name",
+        params![
+            wf.id,
+            wf.name,
+            wf.description,
+            wf.icon,
+            i32::from(wf.enabled),
+            nodes_json,
+            edges_json,
+            created,
+            updated,
+            wf.last_run_at_ms,
+            wf.last_status,
+            bot_name
+        ],
+    )?;
+    Ok(())
 }
 
 fn row_to_workflow(row: &rusqlite::Row<'_>) -> rusqlite::Result<Workflow> {
@@ -770,4 +793,58 @@ fn default_templates(now: i64) -> Vec<Workflow> {
             bot_name: Some("workflow-architect".into()),
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seed_defaults_does_not_resurrect_after_user_deletes_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("workflows.db")).unwrap();
+
+        store.seed_defaults().unwrap();
+        let seeded = store.list_workflows().unwrap();
+        assert!(!seeded.is_empty());
+
+        for wf in seeded {
+            store.delete_workflow(&wf.id).unwrap();
+        }
+        assert!(store.list_workflows().unwrap().is_empty());
+
+        // Calling seed_defaults again on subsequent startups must leave 0 workflows.
+        store.seed_defaults().unwrap();
+        assert!(store.list_workflows().unwrap().is_empty());
+    }
+
+    #[test]
+    fn seed_defaults_marks_existing_nonempty_db_without_inserting_templates() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("legacy.db")).unwrap();
+        let custom = Workflow {
+            id: "custom-1".into(),
+            name: "Custom".into(),
+            description: String::new(),
+            icon: "workflow".into(),
+            enabled: false,
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            last_run_at_ms: None,
+            last_status: None,
+            bot_name: None,
+        };
+        store.save_workflow(&custom).unwrap();
+
+        store.seed_defaults().unwrap();
+        let list = store.list_workflows().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, "custom-1");
+
+        store.delete_workflow("custom-1").unwrap();
+        store.seed_defaults().unwrap();
+        assert!(store.list_workflows().unwrap().is_empty());
+    }
 }

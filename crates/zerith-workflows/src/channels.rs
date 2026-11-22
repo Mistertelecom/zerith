@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use serde_json::{json, Value};
 
 use crate::model::{ChannelConfig, ChannelKind};
@@ -132,7 +134,9 @@ pub fn dispatch(
                 .replace("{{message}}", text)
                 .replace("{{target}}", target.unwrap_or(""));
 
-            let mut req = ureq::request(&method, url).set("Content-Type", "application/json");
+            let mut req = ureq::request(&method, url)
+                .timeout(Duration::from_secs(30))
+                .set("Content-Type", "application/json");
             if let Some(auth) = opt_str(cfg, "auth_header") {
                 if let Some((k, v)) = auth.split_once(':') {
                     req = req.set(k.trim(), v.trim());
@@ -177,7 +181,9 @@ fn normalize_waha_chat_id(raw: &str) -> String {
 }
 
 fn post_json(url: &str, headers: &[(&str, &str)], body: &Value) -> Result<String> {
-    let mut req = ureq::post(url).set("Content-Type", "application/json");
+    let mut req = ureq::post(url)
+        .timeout(Duration::from_secs(30))
+        .set("Content-Type", "application/json");
     for (k, v) in headers {
         req = req.set(k, v);
     }

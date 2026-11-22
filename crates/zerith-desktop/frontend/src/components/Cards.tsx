@@ -1,14 +1,30 @@
 import { useState } from "react";
-import { Check, HelpCircle, ShieldAlert, ShieldCheck } from "lucide-react";
+import { Check, CircleAlert, HelpCircle, ShieldAlert, ShieldCheck } from "lucide-react";
 import type { Question } from "../lib/api";
 import { toolIcon } from "./Transcript";
 
 export function ApprovalCard(props: {
   tool: string;
   summary: string;
-  onAnswer: (d: "once" | "session" | "deny") => void;
+  onAnswer: (d: "once" | "session" | "deny") => void | Promise<unknown>;
 }) {
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
   const Icon = toolIcon(props.tool);
+
+  const submit = async (d: "once" | "session" | "deny") => {
+    if (busy) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      await props.onAnswer(d);
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <div className="ask" role="alertdialog" aria-label="Pedido de permissão">
       <div className="ask-head">
@@ -25,15 +41,21 @@ export function ApprovalCard(props: {
         </span>
       </div>
       <pre className="ask-body">{props.summary}</pre>
+      {err ? (
+        <div className="toast bad" role="alert">
+          <CircleAlert size={15} strokeWidth={1.75} />
+          <span>{err}</span>
+        </div>
+      ) : null}
       <div className="ask-actions">
-        <button className="btn btn-ghost" onClick={() => props.onAnswer("deny")}>
+        <button className="btn btn-ghost" disabled={busy} onClick={() => void submit("deny")}>
           Negar
         </button>
         <span className="spacer" />
-        <button className="btn" onClick={() => props.onAnswer("session")}>
+        <button className="btn" disabled={busy} onClick={() => void submit("session")}>
           Permitir nesta conversa
         </button>
-        <button className="btn btn-primary" onClick={() => props.onAnswer("once")}>
+        <button className="btn btn-primary" disabled={busy} onClick={() => void submit("once")}>
           <ShieldCheck size={16} strokeWidth={1.75} />
           Permitir uma vez
         </button>
@@ -44,9 +66,11 @@ export function ApprovalCard(props: {
 
 export function QuestionCard(props: {
   questions: Question[];
-  onAnswer: (answers: string[]) => void;
+  onAnswer: (answers: string[]) => void | Promise<unknown>;
 }) {
   const [picked, setPicked] = useState<Record<number, string[]>>({});
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
   const pick = (qi: number, label: string) => {
     const q = props.questions[qi];
     setPicked((prev) => {
@@ -62,6 +86,20 @@ export function QuestionCard(props: {
   };
   const complete = props.questions.every((_, i) => (picked[i] ?? []).length > 0);
   const multi = props.questions.some((q) => q.multi_select);
+
+  const submit = async () => {
+    if (!complete || busy) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      await props.onAnswer(props.questions.map((_, i) => (picked[i] ?? []).join(", ")));
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <div className="ask" role="group" aria-label="Pergunta do assistente">
       <div className="ask-head">
@@ -87,6 +125,7 @@ export function QuestionCard(props: {
                   key={o.label}
                   role={q.multi_select ? "checkbox" : "radio"}
                   aria-checked={on}
+                  disabled={busy}
                   className={"option" + (on ? " option-on" : "")}
                   onClick={() => pick(qi, o.label)}
                 >
@@ -103,12 +142,18 @@ export function QuestionCard(props: {
           </div>
         </div>
       ))}
+      {err ? (
+        <div className="toast bad" role="alert">
+          <CircleAlert size={15} strokeWidth={1.75} />
+          <span>{err}</span>
+        </div>
+      ) : null}
       <div className="ask-actions">
         <span className="spacer" />
         <button
           className="btn btn-primary"
-          disabled={!complete}
-          onClick={() => props.onAnswer(props.questions.map((_, i) => (picked[i] ?? []).join(", ")))}
+          disabled={!complete || busy}
+          onClick={() => void submit()}
         >
           Responder
         </button>

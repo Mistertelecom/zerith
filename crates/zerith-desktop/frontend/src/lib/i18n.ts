@@ -547,7 +547,9 @@ export function tr(
 }
 
 const ORIG_TEXT = new WeakMap<Text, string>();
+const LAST_RENDERED_TEXT = new WeakMap<Text, string>();
 const ORIG_ATTR = new WeakMap<Element, Map<string, string>>();
+const LAST_RENDERED_ATTR = new WeakMap<Element, Map<string, string>>();
 const SKIP_TAGS = new Set(["SCRIPT", "STYLE", "CODE", "PRE", "TEXTAREA"]);
 const ATTRS = ["placeholder", "title", "aria-label"] as const;
 
@@ -556,7 +558,7 @@ function shouldSkipElement(el: Element | null): boolean {
   if (SKIP_TAGS.has(el.tagName)) return true;
   if (
     el.closest(
-      "pre, code, textarea, .mono, .mono-path, .term-tail, .side-list .side-row-title",
+      "pre, code, textarea, .mono, .mono-path, .term-tail, .side-list .side-row-title, .msg-user, .md, .think-body, .msg-note > span, .tool-body, .tool-arg, .tool-file, .ask-body, .learned-preview, .learned-item-text, .subagent-title, .subagent-live, .subagent-body, .changes-diff, .change-path",
     )
   ) {
     return true;
@@ -579,9 +581,12 @@ function applyDomTranslation(root: Node, lang: Lang): void {
         if (orig === undefined) {
           if (current.trim()) ORIG_TEXT.set(textNode, current);
         } else {
-          // If React updated the text node to a new value, update our stored original
-          const prevTranslated = translateText(orig, lang);
-          if (current !== orig && current !== prevTranslated && current.trim()) {
+          // If React updated the text node to a new value (not our previous translation), update stored original
+          if (
+            current !== orig &&
+            current !== LAST_RENDERED_TEXT.get(textNode) &&
+            current.trim()
+          ) {
             ORIG_TEXT.set(textNode, current);
           }
         }
@@ -591,26 +596,37 @@ function applyDomTranslation(root: Node, lang: Lang): void {
           if (textNode.nodeValue !== next) {
             textNode.nodeValue = next;
           }
+          LAST_RENDERED_TEXT.set(textNode, next);
         }
       }
     } else if (node.nodeType === Node.ELEMENT_NODE) {
       const el = node as Element;
-      let attrMap = ORIG_ATTR.get(el);
-      for (const attr of ATTRS) {
-        const val = el.getAttribute(attr);
-        if (!val) continue;
-        if (!attrMap) {
-          attrMap = new Map<string, string>();
-          ORIG_ATTR.set(el, attrMap);
-        }
-        const orig = attrMap.get(attr);
-        if (orig === undefined) {
-          attrMap.set(attr, val);
-        }
-        const base = attrMap.get(attr) ?? val;
-        const next = translateText(base, lang);
-        if (val !== next) {
-          el.setAttribute(attr, next);
+      if (!shouldSkipElement(el)) {
+        let attrMap = ORIG_ATTR.get(el);
+        let lastAttrMap = LAST_RENDERED_ATTR.get(el);
+        for (const attr of ATTRS) {
+          const val = el.getAttribute(attr);
+          if (!val) continue;
+          if (!attrMap) {
+            attrMap = new Map<string, string>();
+            ORIG_ATTR.set(el, attrMap);
+          }
+          const orig = attrMap.get(attr);
+          if (orig === undefined) {
+            attrMap.set(attr, val);
+          } else if (val !== orig && val !== lastAttrMap?.get(attr)) {
+            attrMap.set(attr, val);
+          }
+          const base = attrMap.get(attr) ?? val;
+          const next = translateText(base, lang);
+          if (!lastAttrMap) {
+            lastAttrMap = new Map<string, string>();
+            LAST_RENDERED_ATTR.set(el, lastAttrMap);
+          }
+          if (val !== next) {
+            el.setAttribute(attr, next);
+          }
+          lastAttrMap.set(attr, next);
         }
       }
     }
@@ -623,20 +639,33 @@ export function useDomTranslator(lang: Lang): void {
   useEffect(() => {
     if (typeof document === "undefined" || !document.body) return;
     document.documentElement.lang = lang;
-    applyDomTranslation(document.body, lang);
-    let raf = 0;
-    const observer = new MutationObserver(() => {
-      if (raf) return;
-      raf = requestAnimationFrame(() => {
-        raf = 0;
-        if (document.body) applyDomTranslation(document.body, lang);
-      });
-    });
-    observer.observe(document.body, {
+    const target = document.body;
+    const observeOpts: MutationObserverInit = {
       childList: true,
       subtree: true,
-      characterData: false,
+      characterData: true,
+    };
+    let raf = 0;
+    let applying = false;
+    const run = () => {
+      if (applying || !document.body) return;
+      applying = true;
+      observer.disconnect();
+      try {
+        applyDomTranslation(document.body, lang);
+      } finally {
+        applying = false;
+        observer.observe(target, observeOpts);
+      }
+    };
+    const observer = new MutationObserver(() => {
+      if (applying || raf) return;
+      raf = requestAnimationFrame(() => {
+        raf = 0;
+        run();
+      });
     });
+    run();
     return () => {
       if (raf) cancelAnimationFrame(raf);
       observer.disconnect();

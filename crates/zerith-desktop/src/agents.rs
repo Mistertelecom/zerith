@@ -342,8 +342,7 @@ pub async fn agent_delete(
             .agents()
             .join(format!("{}.md", name.trim()));
         if path.exists() {
-            std::fs::remove_file(&path)
-                .map_err(|e| format!("Não consegui excluir o bot: {e}"))?;
+            std::fs::remove_file(&path).map_err(|e| format!("Não consegui excluir o bot: {e}"))?;
         }
         Ok::<_, String>(all(&root))
     })

@@ -17,11 +17,13 @@ pub fn parse_data_line(line: &str) -> Option<StreamEvent> {
         return None;
     }
     let v: Value = serde_json::from_str(data).ok()?;
-    text_event(&v)
+    text_events(&v).into_iter().flatten().next()
 }
 
-fn text_event(v: &Value) -> Option<StreamEvent> {
-    let delta = v.pointer("/choices/0/delta")?;
+fn text_events(v: &Value) -> [Option<StreamEvent>; 2] {
+    let Some(delta) = v.pointer("/choices/0/delta") else {
+        return [None, None];
+    };
     let nonempty = |k: &str| {
         delta
             .get(k)
@@ -29,10 +31,12 @@ fn text_event(v: &Value) -> Option<StreamEvent> {
             .filter(|s| !s.is_empty())
             .map(str::to_string)
     };
-    if let Some(t) = nonempty("content") {
-        return Some(StreamEvent::Delta(t));
-    }
-    nonempty("reasoning_content").map(StreamEvent::Reasoning)
+    [
+        nonempty("reasoning_content")
+            .or_else(|| nonempty("reasoning"))
+            .map(StreamEvent::Reasoning),
+        nonempty("content").map(StreamEvent::Delta),
+    ]
 }
 
 /// Calls `f` with every `data:` payload until it returns `true` or the body
@@ -162,10 +166,11 @@ impl OpenAiStream {
         if let Some(r) = v
             .pointer("/choices/0/finish_reason")
             .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
         {
             self.finish_reason = Some(r.to_string());
         }
-        if let Some(ev) = text_event(&v) {
+        for ev in text_events(&v).into_iter().flatten() {
             on(ev);
         }
         if let Some(frags) = v
@@ -174,9 +179,28 @@ impl OpenAiStream {
         {
             const MAX_TOOL_CALLS: usize = 128;
             for (pos, frag) in frags.iter().enumerate() {
-                let raw_idx = frag["index"].as_u64().unwrap_or(pos as u64);
-                let Ok(i) = usize::try_from(raw_idx) else {
-                    continue;
+                let i = if let Some(raw_idx) = frag["index"].as_u64() {
+                    let Ok(idx) = usize::try_from(raw_idx) else {
+                        continue;
+                    };
+                    idx
+                } else {
+                    match frag["id"].as_str().filter(|s| !s.is_empty()) {
+                        Some(id) => {
+                            if let Some(existing) = self.calls.iter().position(|c| c.id == id) {
+                                existing
+                            } else if self
+                                .calls
+                                .get(pos)
+                                .is_some_and(|c| !c.id.is_empty() && c.id != id)
+                            {
+                                self.calls.len()
+                            } else {
+                                pos
+                            }
+                        }
+                        None => pos,
+                    }
                 };
                 if i >= MAX_TOOL_CALLS {
                     continue;
@@ -383,6 +407,62 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_millis(800),
             "cancel took too long: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn multi_tool_chunks_without_index_match_by_id_or_append_new_slots() {
+        let (r, ev) = replay(&[
+            r#"{"choices":[{"delta":{"tool_calls":[{"id":"call_a","function":{"name":"read_file","arguments":"{\"path\":"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"id":"call_b","function":{"name":"glob","arguments":"{\"pattern\":"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"id":"call_a","function":{"arguments":"\"a.rs\"}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"id":"call_b","function":{"arguments":"\"*.rs\"}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "[DONE]",
+        ]);
+        r.unwrap();
+        let StreamEvent::ToolCalls(calls) = &ev[0] else {
+            panic!("{ev:?}");
+        };
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].id, "call_a");
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].arguments, r#"{"path":"a.rs"}"#);
+        assert_eq!(calls[1].id, "call_b");
+        assert_eq!(calls[1].name, "glob");
+        assert_eq!(calls[1].arguments, r#"{"pattern":"*.rs"}"#);
+    }
+
+    #[test]
+    fn copresent_reasoning_and_content_are_both_emitted() {
+        let (r, ev) = replay(&[
+            r#"{"choices":[{"delta":{"reasoning_content":"pensando","content":"olá"}}]}"#,
+            r#"{"choices":[{"delta":{"reasoning":" mais","content":" mundo"},"finish_reason":"stop"}]}"#,
+            "[DONE]",
+        ]);
+        r.unwrap();
+        assert_eq!(
+            ev,
+            vec![
+                StreamEvent::Reasoning("pensando".into()),
+                StreamEvent::Delta("olá".into()),
+                StreamEvent::Reasoning(" mais".into()),
+                StreamEvent::Delta(" mundo".into()),
+                StreamEvent::Done {
+                    usage: None,
+                    stop_reason: Some("stop".into()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_finish_reason_does_not_mark_truncated_stream_finished() {
+        let (r, _) =
+            replay(&[r#"{"choices":[{"delta":{"content":"parcial"},"finish_reason":""}]}"#]);
+        assert!(
+            matches!(r, Err(ProviderError::Transport(ref m)) if m == CUT),
+            "{r:?}"
         );
     }
 }

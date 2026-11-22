@@ -30,7 +30,7 @@ pub mod tokensaver;
 pub use agent::{
     approval_channel, approval_channel_with_grants, approval_grant_key, inbox_channel,
     run_agent_turn, AgentOptions, Approval, ApprovalGate, ApprovalSender, InboxReceiver,
-    InboxSender, SharedGrants, DEFAULT_MAX_PARALLEL_TOOLS, DEFAULT_MAX_STEPS,
+    InboxSender, PromptGuard, SharedGrants, DEFAULT_MAX_PARALLEL_TOOLS, DEFAULT_MAX_STEPS,
 };
 pub use compact::{compact_now, CompactReport, Summarizer};
 pub use events::{cancel_with, CancelCause, CauseSlot};
@@ -738,6 +738,46 @@ pub fn hydrate_oauth_with(
         }
         Err(_) => Some(cred),
     }
+}
+
+/// Loads `account`'s OAuth credential from the OS keyring and renews it if
+/// stale, holding the same per-account `refresh_lock` as [`hydrate_oauth`].
+pub fn fresh_oauth(
+    account: &str,
+) -> std::result::Result<zerith_providers::OAuthCredential, String> {
+    fresh_oauth_with(account, &zerith_core::secrets::OsKeyring, &|c| {
+        zerith_providers::oauth::refresh(c.tool, c).map_err(|e| e.to_string())
+    })
+}
+
+/// Same as [`fresh_oauth`], with secret store and refresh injected. Test seam.
+pub fn fresh_oauth_with(
+    account: &str,
+    store: &dyn zerith_core::secrets::SecretStore,
+    refresh: &dyn Fn(
+        &zerith_providers::OAuthCredential,
+    ) -> std::result::Result<zerith_providers::OAuthCredential, String>,
+) -> std::result::Result<zerith_providers::OAuthCredential, String> {
+    let load = || -> std::result::Result<zerith_providers::OAuthCredential, String> {
+        zerith_core::secrets::load_oauth(store, account)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "sem credencial no cofre para esta conta".to_string())
+    };
+    let cred = load()?;
+    // Codex is never refreshed here: its refresh token rotates on use, so
+    // renewing it from the app would log the user's `codex` CLI out.
+    if cred.tool == zerith_providers::OAuthTool::Codex || !cred.needs_refresh(oauth_now()) {
+        return Ok(cred);
+    }
+    let lock = refresh_lock(account);
+    let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let cred = load()?;
+    if !cred.needs_refresh(oauth_now()) {
+        return Ok(cred);
+    }
+    let fresh = refresh(&cred)?;
+    zerith_core::secrets::save_oauth(store, account, &fresh).map_err(|e| e.to_string())?;
+    Ok(fresh)
 }
 
 fn refresh_lock(account: &str) -> std::sync::Arc<std::sync::Mutex<()>> {
@@ -1939,5 +1979,113 @@ mod gateway_tests {
         );
         assert_eq!(plain.static_system, a.static_system);
         assert_eq!(plain.dynamic_reminder, None);
+    }
+
+    #[test]
+    fn fresh_oauth_and_hydrate_oauth_share_per_account_refresh_lock() {
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        use zerith_core::secrets::{self, SecretError, SecretStore};
+        use zerith_providers::{OAuthCredential, OAuthTool};
+
+        struct SyncMem(Mutex<HashMap<String, String>>);
+        impl SecretStore for SyncMem {
+            fn get(&self, n: &str) -> std::result::Result<String, SecretError> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .get(n)
+                    .cloned()
+                    .ok_or_else(|| SecretError::NotFound(n.into()))
+            }
+            fn set(&self, n: &str, v: &str) -> std::result::Result<(), SecretError> {
+                self.0.lock().unwrap().insert(n.into(), v.into());
+                Ok(())
+            }
+            fn delete(&self, n: &str) -> std::result::Result<(), SecretError> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .remove(n)
+                    .map(|_| ())
+                    .ok_or_else(|| SecretError::NotFound(n.into()))
+            }
+        }
+
+        let store = SyncMem(Mutex::default());
+        let expired = OAuthCredential {
+            access_token: "old-tok".into(),
+            refresh_token: Some("old-ref".into()),
+            expires_at: 1,
+            account_id: None,
+            tool: OAuthTool::ClaudeCode,
+        };
+        let acc_id = "shared-lock-acc";
+        secrets::save_oauth(&store, acc_id, &expired).unwrap();
+        let acc = AccountEntry {
+            id: acc_id.into(),
+            provider: "anthropic".into(),
+            auth: zerith_core::settings::AuthMode::Oauth,
+            oauth_tool: Some("claude-code".into()),
+            ..Default::default()
+        };
+
+        let refreshes = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+
+        std::thread::scope(|s| {
+            let r1 = Arc::clone(&refreshes);
+            let st1 = &store;
+            let rel = Arc::clone(&release_rx);
+            let h1 = s.spawn(move || {
+                fresh_oauth_with(acc_id, st1, &|c| {
+                    r1.fetch_add(1, Ordering::SeqCst);
+                    let _ = entered_tx.send(());
+                    let _ = rel.lock().unwrap().recv();
+                    Ok(OAuthCredential {
+                        access_token: "new-tok".into(),
+                        refresh_token: Some("new-ref".into()),
+                        expires_at: oauth_now() + 7200,
+                        account_id: c.account_id.clone(),
+                        tool: c.tool,
+                    })
+                })
+            });
+
+            entered_rx.recv().unwrap();
+
+            let r2 = Arc::clone(&refreshes);
+            let st2 = &store;
+            let acc_ref = &acc;
+            let h2 = s.spawn(move || {
+                hydrate_oauth_with(acc_ref, st2, &|c| {
+                    r2.fetch_add(1, Ordering::SeqCst);
+                    Ok(OAuthCredential {
+                        access_token: "unexpected-second-refresh".into(),
+                        refresh_token: None,
+                        expires_at: oauth_now() + 7200,
+                        account_id: c.account_id.clone(),
+                        tool: c.tool,
+                    })
+                })
+            });
+
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+            release_tx.send(()).unwrap();
+
+            let c1 = h1.join().unwrap().unwrap();
+            let c2 = h2.join().unwrap().unwrap();
+            assert_eq!(c1.access_token, "new-tok");
+            assert_eq!(c2.access_token, "new-tok");
+            assert_eq!(
+                refreshes.load(Ordering::SeqCst),
+                1,
+                "hydrate_oauth must observe the saved fresh token instead of refreshing again"
+            );
+        });
     }
 }

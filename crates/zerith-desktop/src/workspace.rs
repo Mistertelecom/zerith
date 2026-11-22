@@ -200,7 +200,15 @@ if ($d.ShowDialog($f) -eq 'OK') { $d.SelectedPath }";
 /// A local image checked against the rules above and confined to `roots`
 /// (after canonicalizing symlinks).
 fn checked_image_in(raw: &str, roots: &[PathBuf]) -> Cmd<(PathBuf, &'static str)> {
+    let trimmed = raw.trim();
+    if trimmed.starts_with("\\\\") || trimmed.starts_with("//") || trimmed.starts_with("/\\") {
+        return Err("caminhos UNC não são permitidos".into());
+    }
     let path = image_path(raw);
+    let path_str = path.to_string_lossy();
+    if path_str.starts_with("\\\\") || path_str.starts_with("//") {
+        return Err("caminhos UNC não são permitidos".into());
+    }
     let mime = image_mime(&path)
         .ok_or("só abro imagens (png, jpg, gif, webp, bmp, avif) e vídeos (mp4, webm, mov)")?;
     let canon = path
@@ -249,6 +257,23 @@ pub async fn read_image(state: State<'_, AppState>, path: String) -> Cmd<String>
     .map_err(|e| e.to_string())?
 }
 
+fn strip_verbatim_str(s: &str) -> Option<String> {
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        Some(format!(r"\\{rest}"))
+    } else {
+        s.strip_prefix(r"\\?\").map(str::to_string)
+    }
+}
+
+fn reveal_path(canon: &Path) -> PathBuf {
+    let native: PathBuf = canon.components().collect();
+    #[cfg(windows)]
+    if let Some(stripped) = native.to_str().and_then(strip_verbatim_str) {
+        return PathBuf::from(stripped);
+    }
+    native
+}
+
 /// Opens a local image in the system's default viewer.
 #[tauri::command]
 pub async fn open_image(state: State<'_, AppState>, path: String) -> Cmd<()> {
@@ -257,8 +282,8 @@ pub async fn open_image(state: State<'_, AppState>, path: String) -> Cmd<()> {
     tauri::async_runtime::spawn_blocking(move || {
         let roots = allowed_media_roots(&root, &db);
         let (canon, _) = checked_image_in(&path, &roots)?;
-        // Native separators: `explorer C:/a/b.png` does not find the file.
-        let native: PathBuf = canon.components().collect();
+        // Native separators without `\\?\` verbatim prefix: `explorer` rejects verbatim paths.
+        let native = reveal_path(&canon);
         wire::reveal(&native)
     })
     .await
@@ -284,14 +309,18 @@ pub struct RewindView {
 /// Restores the newest checkpoint: the files it recorded and the conversation
 /// up to then.
 #[tauri::command]
-pub async fn rewind(state: State<'_, AppState>, session_id: String) -> Cmd<RewindView> {
+pub async fn rewind(
+    state: State<'_, AppState>,
+    turns: State<'_, crate::chat::Turns>,
+    session_id: String,
+) -> Cmd<RewindView> {
+    if turns.with(&session_id, |_| ()).is_some() {
+        return Err("Aguarde ou pare o turno atual antes de continuar".into());
+    }
+    turns.cancel_precompact(&session_id);
     let db = state.db();
-    let turn = wire::checkpoint_turns(&db, &session_id)
-        .last()
-        .copied()
-        .ok_or("nenhum ponto de restauração nesta conversa")?;
     tauri::async_runtime::spawn_blocking(move || {
-        wire::rewind_latest(&db, &session_id).map(|text| RewindView { turn, text })
+        wire::rewind_latest_turn(&db, &session_id).map(|(turn, text)| RewindView { turn, text })
     })
     .await
     .map_err(|e| e.to_string())?
@@ -299,12 +328,21 @@ pub async fn rewind(state: State<'_, AppState>, session_id: String) -> Cmd<Rewin
 
 /// Summarizes older messages so the next turn fits the context window.
 #[tauri::command]
-pub async fn compact(state: State<'_, AppState>, session_id: String, model: String) -> Cmd<usize> {
-    let root = state.root().to_path_buf();
-    let db = state.db();
+pub async fn compact(
+    state: State<'_, AppState>,
+    turns: State<'_, crate::chat::Turns>,
+    session_id: String,
+    model: String,
+) -> Cmd<usize> {
+    if turns.with(&session_id, |_| ()).is_some() {
+        return Err("Aguarde ou pare o turno atual antes de continuar".into());
+    }
     if model.trim().is_empty() {
         return Err("Escolha um modelo antes de compactar".into());
     }
+    turns.cancel_precompact(&session_id);
+    let root = state.root().to_path_buf();
+    let db = state.db();
     tauri::async_runtime::spawn_blocking(move || {
         // The primary provider is the one the turn would use; it is first in
         // this list by construction.
@@ -402,6 +440,18 @@ mod tests {
             image_data_url_in(&d.join("pasta.png").to_string_lossy(), &roots).is_err(),
             "a directory"
         );
+
+        for unc in [
+            r"\\attacker\share\a.png",
+            "//attacker/share/a.png",
+            r"/\attacker/share/a.png",
+            r"file://\\attacker\share\a.png",
+        ] {
+            assert!(
+                checked_image_in(unc, &roots).is_err(),
+                "UNC path `{unc}` must be refused before canonicalize"
+            );
+        }
     }
 }
 
@@ -450,5 +500,18 @@ mod open_url_tests {
         ] {
             assert!(check_url(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn strip_verbatim_handles_drive_and_unc_paths() {
+        assert_eq!(
+            strip_verbatim_str(r"\\?\C:\Users\Joao\img.png").as_deref(),
+            Some(r"C:\Users\Joao\img.png")
+        );
+        assert_eq!(
+            strip_verbatim_str(r"\\?\UNC\fileserver\share\img.png").as_deref(),
+            Some(r"\\fileserver\share\img.png")
+        );
+        assert_eq!(strip_verbatim_str(r"C:\Users\Joao\img.png"), None);
     }
 }

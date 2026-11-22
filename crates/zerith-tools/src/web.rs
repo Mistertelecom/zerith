@@ -453,7 +453,11 @@ fn ddg_target(href: &str) -> String {
     let mut i = 0;
     while i < b.len() {
         let hex = (b[i] == b'%' && i + 2 < b.len())
-            .then(|| u8::from_str_radix(&enc[i + 1..i + 3], 16).ok())
+            .then(|| {
+                std::str::from_utf8(&b[i + 1..i + 3])
+                    .ok()
+                    .and_then(|s| u8::from_str_radix(s, 16).ok())
+            })
             .flatten();
         match hex {
             Some(v) => {
@@ -562,6 +566,16 @@ mod tests {
         assert_eq!(
             SearchTool::new("http://x/s?f=1").url("a"),
             "http://x/s?f=1&q=a"
+        );
+    }
+
+    #[test]
+    fn ddg_target_handles_percent_before_multibyte_utf8_without_panicking() {
+        assert_eq!(ddg_target("//duckduckgo.com/l/?uddg=%aé&rut=1"), "%aé");
+        assert_eq!(ddg_target("//duckduckgo.com/l/?uddg=%€"), "%€");
+        assert_eq!(
+            ddg_target("//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2F%aé%2F%€&x=1"),
+            "https://example.com/%aé/%€"
         );
     }
 }

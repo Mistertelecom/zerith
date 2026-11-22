@@ -1,4 +1,4 @@
-use zerith_memory::{Confidence, FactKind, MemoryBackend, Scope, SqliteMemory};
+use zerith_memory::{Confidence, FactKind, MemoryBackend, MemoryError, Scope, SqliteMemory};
 
 fn mem() -> SqliteMemory {
     SqliteMemory::open_in_memory().unwrap()
@@ -391,4 +391,33 @@ fn a_password_is_never_remembered() {
             None
         )
         .is_ok());
+}
+
+#[test]
+fn update_rejects_empty_and_secrets_and_recall_list_skip_superseded() {
+    let m = mem();
+    let s = Scope::user("joao");
+    let c = Confidence::Confirmed;
+    let id1 = m
+        .remember(&s, FactKind::Fact, "roteador antigo em 10.0.0.1", c, None)
+        .unwrap();
+    let id2 = m
+        .remember(&s, FactKind::Fact, "roteador novo em 10.0.0.2", c, None)
+        .unwrap();
+
+    assert!(matches!(m.update(id2, "   "), Err(MemoryError::Empty)));
+    assert!(matches!(
+        m.update(id2, "a senha do roteador é Admin@123"),
+        Err(MemoryError::Secret)
+    ));
+    assert_eq!(m.get(id2).unwrap().text, "roteador novo em 10.0.0.2");
+
+    m.supersede(id1, id2).unwrap();
+    let listed = m.list(&s, 10).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, id2);
+
+    let hits = m.recall(&s, "roteador", 10).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].fact.id, id2);
 }

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   CircleAlert,
   CircleCheck,
@@ -133,20 +133,25 @@ export function MediaTab() {
       .catch((e) => setError(String(e)));
   }, []);
 
-  const load = useCallback(() => {
+  useEffect(() => {
+    let live = true;
     setModels(null);
     api
       .mediaModels(kind, query)
       .then((p) => {
+        if (!live) return;
         setModels(p.models);
         setError(null);
       })
-      .catch((e) => setError(String(e)));
+      .catch((e) => {
+        if (!live) return;
+        setModels([]);
+        setError(String(e));
+      });
+    return () => {
+      live = false;
+    };
   }, [kind, query]);
-
-  useEffect(() => {
-    load();
-  }, [load]);
 
   // Picking a model restores the parameters saved for it, if it is the one in
   // the slot; otherwise the descriptor defaults apply.

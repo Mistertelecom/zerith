@@ -358,9 +358,24 @@ export function WorkflowsStudio(props: {
   const [channelsOpen, setChannelsOpen] = useState(false);
   const [templatesOpen, setTemplatesOpen] = useState(false);
   const [templates, setTemplates] = useState<Workflow[]>([]);
+  const [templateErr, setTemplateErr] = useState<string | null>(null);
   const [nodeTestInput, setNodeTestInput] = useState("");
   const [nodeTestOutput, setNodeTestOutput] = useState<string | null>(null);
   const [nodeTestBusy, setNodeTestBusy] = useState(false);
+
+  const loadedIdRef = useRef<string | null>(null);
+  const selectedIdRef = useRef(selectedId);
+  selectedIdRef.current = selectedId;
+  const selectedNodeIdRef = useRef(selectedNodeId);
+  selectedNodeIdRef.current = selectedNodeId;
+  const langRef = useRef(lang);
+  langRef.current = lang;
+  const zoomRef = useRef(zoom);
+  zoomRef.current = zoom;
+  const panRef = useRef(pan);
+  panRef.current = pan;
+  const dragUndoPushedRef = useRef(false);
+  const beforeDragDraftRef = useRef<Workflow | null>(null);
 
   const dragNodeRef = useRef<{
     id: string;
@@ -376,6 +391,14 @@ export function WorkflowsStudio(props: {
     origPanX: number;
     origPanY: number;
   } | null>(null);
+
+  const resetPointerDrag = useCallback(() => {
+    dragNodeRef.current = null;
+    dragPanRef.current = null;
+    dragUndoPushedRef.current = false;
+    beforeDragDraftRef.current = null;
+    setIsPanning(false);
+  }, []);
 
   const fitToView = useCallback((wf: Workflow | null) => {
     const vp = viewportRef.current;
@@ -435,12 +458,14 @@ export function WorkflowsStudio(props: {
 
   useEffect(() => {
     if (!selectedId) {
+      loadedIdRef.current = null;
       setDraft(null);
       setRuns([]);
       return;
     }
     const found = workflows.find((w) => w.id === selectedId);
-    if (found && !dirty) {
+    if (found && loadedIdRef.current !== selectedId) {
+      loadedIdRef.current = selectedId;
       const cloned = structuredClone(found);
       setDraft(cloned);
       pastRef.current = [];
@@ -451,43 +476,73 @@ export function WorkflowsStudio(props: {
       );
       requestAnimationFrame(() => fitToView(cloned));
     }
-    void workflowsApi.runs(selectedId, 25).then(setRuns).catch(() => undefined);
-  }, [selectedId, workflows, dirty, fitToView]);
+  }, [selectedId, workflows, fitToView]);
 
   useEffect(() => {
+    if (!selectedId) return;
+    let live = true;
+    void workflowsApi
+      .runs(selectedId, 25)
+      .then((r) => {
+        if (live) setRuns(r);
+      })
+      .catch(() => undefined);
+    return () => {
+      live = false;
+    };
+  }, [selectedId]);
+
+  useEffect(() => {
+    setNodeTestOutput(null);
+  }, [selectedId, selectedNodeId]);
+
+  useEffect(() => {
+    let cancelled = false;
     let offEv = () => {};
     let offDone = () => {};
     let offChanged = () => {};
     void onWorkflowEvent((ev) => {
+      if (cancelled) return;
+      if (ev.workflow_id !== selectedIdRef.current) return;
       setLiveNodes((prev) => ({ ...prev, [ev.node_id]: ev }));
     }).then((fn) => {
-      offEv = fn;
+      if (cancelled) fn();
+      else offEv = fn;
     });
     void onWorkflowDone((run) => {
+      if (cancelled) return;
       setRunningId((cur) => (cur === run.workflow_id ? null : cur));
       void loadAll(true);
-      if (run.workflow_id === selectedId) {
-        void workflowsApi.runs(run.workflow_id, 25).then(setRuns).catch(() => undefined);
+      if (run.workflow_id === selectedIdRef.current) {
+        void workflowsApi
+          .runs(run.workflow_id, 25)
+          .then((r) => {
+            if (!cancelled && run.workflow_id === selectedIdRef.current) setRuns(r);
+          })
+          .catch(() => undefined);
       }
       setBanner({
-        text: run.status === "ok" ? tr(lang, "Execução concluída", "Run completed") : run.summary,
+        text: run.status === "ok" ? tr(langRef.current, "Execução concluída", "Run completed") : run.summary,
         tone: run.status === "ok" ? "ok" : "err",
       });
     }).then((fn) => {
-      offDone = fn;
+      if (cancelled) fn();
+      else offDone = fn;
     });
     void onWorkflowsChanged(() => {
-      setDirty(false);
+      if (cancelled) return;
       void loadAll(true);
     }).then((fn) => {
-      offChanged = fn;
+      if (cancelled) fn();
+      else offChanged = fn;
     });
     return () => {
+      cancelled = true;
       offEv();
       offDone();
       offChanged();
     };
-  }, [loadAll, selectedId, lang]);
+  }, [loadAll]);
 
   const handleUndo = useCallback(() => {
     const prev = pastRef.current.pop();
@@ -575,10 +630,57 @@ export function WorkflowsStudio(props: {
     try {
       const text = await file.text();
       const parsed = JSON.parse(text) as Partial<Workflow>;
-      if (!parsed || !Array.isArray(parsed.nodes)) {
+      if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.nodes)) {
         setBanner({ text: tr(lang, "JSON inválido de workflow.", "Invalid workflow JSON."), tone: "err" });
         return;
       }
+      const validNodes = parsed.nodes.every(
+        (n): n is WorkflowNode =>
+          Boolean(n) &&
+          typeof n === "object" &&
+          typeof n.id === "string" &&
+          n.id.length > 0 &&
+          typeof n.kind === "string" &&
+          Object.prototype.hasOwnProperty.call(NODE_META, n.kind) &&
+          typeof n.x === "number" &&
+          Number.isFinite(n.x) &&
+          typeof n.y === "number" &&
+          Number.isFinite(n.y),
+      );
+      if (!validNodes) {
+        setBanner({
+          text: tr(
+            lang,
+            "JSON inválido: todos os blocos precisam ter id, tipo válido e posições numéricas.",
+            "Invalid workflow JSON: every node must have a string id, valid kind, and finite numeric x/y.",
+          ),
+          tone: "err",
+        });
+        return;
+      }
+      const normalizedNodes: WorkflowNode[] = parsed.nodes.map((n) => ({
+        id: n.id,
+        kind: n.kind,
+        label:
+          typeof n.label === "string" && n.label
+            ? n.label
+            : lang === "pt-BR"
+              ? NODE_META[n.kind].pt
+              : NODE_META[n.kind].en,
+        x: n.x,
+        y: n.y,
+        config: n.config && typeof n.config === "object" ? n.config : NODE_META[n.kind].defaultCfg(),
+      }));
+      const validEdges = Array.isArray(parsed.edges)
+        ? parsed.edges.filter(
+            (e): e is WorkflowEdge =>
+              Boolean(e) &&
+              typeof e === "object" &&
+              typeof e.id === "string" &&
+              typeof e.from === "string" &&
+              typeof e.to === "string",
+          )
+        : [];
       const now = Date.now();
       const fresh: Workflow = {
         id: `wf-${now}`,
@@ -587,8 +689,8 @@ export function WorkflowsStudio(props: {
         icon: String(parsed.icon || "workflow"),
         enabled: false,
         bot_name: parsed.bot_name ?? null,
-        nodes: parsed.nodes,
-        edges: Array.isArray(parsed.edges) ? parsed.edges : [],
+        nodes: normalizedNodes,
+        edges: validEdges,
         created_at_ms: now,
         updated_at_ms: now,
         last_run_at_ms: null,
@@ -664,10 +766,14 @@ export function WorkflowsStudio(props: {
       created_at_ms: now,
       updated_at_ms: now,
     };
-    const saved = await workflowsApi.save(fresh);
-    setDirty(false);
-    await loadAll(false);
-    setSelectedId(saved.id);
+    try {
+      const saved = await workflowsApi.save(fresh);
+      setDirty(false);
+      await loadAll(false);
+      setSelectedId(saved.id);
+    } catch (e) {
+      setBanner({ text: String(e), tone: "err" });
+    }
   };
 
   const handleGenerateAi = async () => {
@@ -797,6 +903,7 @@ export function WorkflowsStudio(props: {
   };
 
   const openTemplates = async () => {
+    setTemplateErr(null);
     try {
       const t = await workflowsApi.templates();
       setTemplates(t);
@@ -807,6 +914,7 @@ export function WorkflowsStudio(props: {
   };
 
   const instantiateTemplate = async (tpl: Workflow) => {
+    setTemplateErr(null);
     const now = Date.now();
     const copy: Workflow = {
       ...structuredClone(tpl),
@@ -817,16 +925,24 @@ export function WorkflowsStudio(props: {
       last_run_at_ms: null,
       last_status: null,
     };
-    const saved = await workflowsApi.save(copy);
-    setTemplatesOpen(false);
-    setDirty(false);
-    await loadAll(false);
-    setSelectedId(saved.id);
+    try {
+      const saved = await workflowsApi.save(copy);
+      setTemplatesOpen(false);
+      setDirty(false);
+      await loadAll(false);
+      setSelectedId(saved.id);
+    } catch (e) {
+      const msg = String(e);
+      setTemplateErr(msg);
+      setBanner({ text: msg, tone: "err" });
+    }
   };
 
   const runSingleNodeTest = async (targetNode?: WorkflowNode) => {
     const nodeToTest = targetNode ?? selectedNode;
     if (!nodeToTest || nodeTestBusy) return;
+    const wfId = selectedId;
+    selectedNodeIdRef.current = nodeToTest.id;
     setSelectedNodeId(nodeToTest.id);
     setInspOpen(true);
     setInspTab("insp");
@@ -834,30 +950,43 @@ export function WorkflowsStudio(props: {
     setNodeTestOutput(null);
     try {
       const out = await workflowsApi.testNode(nodeToTest, nodeTestInput);
-      setNodeTestOutput(out || "(sem saída)");
+      if (selectedIdRef.current === wfId && selectedNodeIdRef.current === nodeToTest.id) {
+        setNodeTestOutput(out || "(sem saída)");
+      }
     } catch (e) {
-      setNodeTestOutput(`Erro: ${String(e)}`);
+      if (selectedIdRef.current === wfId && selectedNodeIdRef.current === nodeToTest.id) {
+        setNodeTestOutput(`Erro: ${String(e)}`);
+      }
     } finally {
       setNodeTestBusy(false);
     }
   };
 
-  const handleWheelZoom = (e: React.WheelEvent<HTMLDivElement>) => {
-    e.preventDefault();
+  useEffect(() => {
     const vp = viewportRef.current;
     if (!vp) return;
-    const rect = vp.getBoundingClientRect();
-    const mx = e.clientX - rect.left;
-    const my = e.clientY - rect.top;
-    const factor = e.deltaY < 0 ? 1.1 : 0.9;
-    const nextZoom = Math.max(0.35, Math.min(1.8, +(zoom * factor).toFixed(3)));
-    const scaleRatio = nextZoom / zoom;
-    setPan({
-      x: mx - (mx - pan.x) * scaleRatio,
-      y: my - (my - pan.y) * scaleRatio,
-    });
-    setZoom(nextZoom);
-  };
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const rect = vp.getBoundingClientRect();
+      const mx = e.clientX - rect.left;
+      const my = e.clientY - rect.top;
+      const curZoom = zoomRef.current;
+      const curPan = panRef.current;
+      const factor = e.deltaY < 0 ? 1.1 : 0.9;
+      const nextZoom = Math.max(0.35, Math.min(1.8, +(curZoom * factor).toFixed(3)));
+      const scaleRatio = nextZoom / curZoom;
+      const nextPan = {
+        x: mx - (mx - curPan.x) * scaleRatio,
+        y: my - (my - curPan.y) * scaleRatio,
+      };
+      zoomRef.current = nextZoom;
+      panRef.current = nextPan;
+      setPan(nextPan);
+      setZoom(nextZoom);
+    };
+    vp.addEventListener("wheel", onWheel, { passive: false });
+    return () => vp.removeEventListener("wheel", onWheel);
+  }, []);
 
   const zoomAtCenter = (nextZ: number) => {
     const vp = viewportRef.current;
@@ -974,7 +1103,12 @@ export function WorkflowsStudio(props: {
                     const next = e.target.checked;
                     void workflowsApi
                       .toggle(w.id, next)
-                      .then(() => loadAll(true))
+                      .then(() => {
+                        setDraft((prev) =>
+                          prev && prev.id === w.id ? { ...prev, enabled: next } : prev,
+                        );
+                        return loadAll(true);
+                      })
                       .catch((err) => setBanner({ text: String(err), tone: "err" }));
                   }}
                 />
@@ -1146,7 +1280,7 @@ export function WorkflowsStudio(props: {
                 type="button"
                 className="icon-btn sm"
                 title={tr(lang, "Excluir workflow", "Delete workflow")}
-                onClick={() => {
+                onClick={async () => {
                   if (
                     !window.confirm(
                       tr(lang, `Excluir "${draft.name}"?`, `Delete "${draft.name}"?`),
@@ -1154,10 +1288,14 @@ export function WorkflowsStudio(props: {
                   ) {
                     return;
                   }
-                  void workflowsApi.delete(draft.id).then(() => {
+                  try {
+                    await workflowsApi.delete(draft.id);
                     setDirty(false);
-                    void loadAll(false);
-                  });
+                    await loadAll(false);
+                    setBanner({ text: tr(lang, "Workflow excluído", "Workflow deleted"), tone: "ok" });
+                  } catch (e) {
+                    setBanner({ text: String(e), tone: "err" });
+                  }
                 }}
               >
                 <Trash2 size={14} strokeWidth={2} />
@@ -1214,7 +1352,6 @@ export function WorkflowsStudio(props: {
             backgroundPosition: `${pan.x}px ${pan.y}px`,
             backgroundSize: `${22 * zoom}px ${22 * zoom}px`,
           }}
-          onWheel={handleWheelZoom}
           onClick={() => {
             setConnectingFrom(null);
             setQuickMenuNode(null);
@@ -1252,8 +1389,20 @@ export function WorkflowsStudio(props: {
             }
             const dn = dragNodeRef.current;
             if (!dn) return;
-            const nx = Math.round(dn.origX + (e.clientX - dn.startX) / zoom);
-            const ny = Math.round(dn.origY + (e.clientY - dn.startY) / zoom);
+            const dx = e.clientX - dn.startX;
+            const dy = e.clientY - dn.startY;
+            if (!dragUndoPushedRef.current) {
+              if (Math.hypot(dx, dy) <= 2) return;
+              dragUndoPushedRef.current = true;
+              if (beforeDragDraftRef.current) {
+                pastRef.current = [...pastRef.current.slice(-39), beforeDragDraftRef.current];
+                futureRef.current = [];
+                setHistLen({ undo: pastRef.current.length, redo: 0 });
+              }
+              beforeDragDraftRef.current = null;
+            }
+            const nx = Math.round(dn.origX + dx / zoom);
+            const ny = Math.round(dn.origY + dy / zoom);
             patchDraft(
               (w) => ({
                 ...w,
@@ -1262,11 +1411,8 @@ export function WorkflowsStudio(props: {
               false,
             );
           }}
-          onPointerUp={() => {
-            dragNodeRef.current = null;
-            dragPanRef.current = null;
-            setIsPanning(false);
-          }}
+          onPointerUp={resetPointerDrag}
+          onPointerCancel={resetPointerDrag}
         >
           {draft ? (
             <div
@@ -1366,11 +1512,8 @@ export function WorkflowsStudio(props: {
                         return;
                       }
                       e.currentTarget.setPointerCapture(e.pointerId);
-                      if (draft) {
-                        pastRef.current = [...pastRef.current.slice(-39), structuredClone(draft)];
-                        futureRef.current = [];
-                        setHistLen({ undo: pastRef.current.length, redo: 0 });
-                      }
+                      dragUndoPushedRef.current = false;
+                      beforeDragDraftRef.current = draft ? structuredClone(draft) : null;
                       dragNodeRef.current = {
                         id: n.id,
                         startX: e.clientX,
@@ -1379,6 +1522,7 @@ export function WorkflowsStudio(props: {
                         origY: n.y,
                       };
                     }}
+                    onPointerCancel={resetPointerDrag}
                   >
                     {isSel ? (
                       <div className="wf-node-actions" onClick={(e) => e.stopPropagation()}>
@@ -1719,7 +1863,15 @@ export function WorkflowsStudio(props: {
               <button
                 type="button"
                 className="btn btn-sm"
-                onClick={() => selectedId && void workflowsApi.runs(selectedId, 25).then(setRuns)}
+                onClick={async () => {
+                  if (!selectedId) return;
+                  try {
+                    const r = await workflowsApi.runs(selectedId, 25);
+                    setRuns(r);
+                  } catch (e) {
+                    setBanner({ text: String(e), tone: "err" });
+                  }
+                }}
               >
                 <RefreshCw size={13} />
                 <span>{tr(lang, "Atualizar histórico", "Refresh history")}</span>
@@ -1810,6 +1962,7 @@ export function WorkflowsStudio(props: {
                   </div>
                 ))}
               </div>
+              {templateErr ? <div className="wf-banner-msg err">{templateErr}</div> : null}
             </div>
           </div>
         </div>
@@ -2715,12 +2868,21 @@ function ChannelsModal(props: {
                 <button
                   type="button"
                   className="btn btn-sm"
-                  onClick={() =>
-                    void channelsApi.delete(draft.id).then(() => {
+                  disabled={busy}
+                  onClick={async () => {
+                    setBusy(true);
+                    setMsg(null);
+                    try {
+                      await channelsApi.delete(draft.id);
                       props.onUpdated();
                       createNew();
-                    })
-                  }
+                      setMsg({ text: tr(lang, "Canal removido!", "Channel deleted!"), tone: "ok" });
+                    } catch (e) {
+                      setMsg({ text: String(e), tone: "err" });
+                    } finally {
+                      setBusy(false);
+                    }
+                  }}
                 >
                   <Trash2 size={13} />
                 </button>

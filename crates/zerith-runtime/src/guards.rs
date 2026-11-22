@@ -284,7 +284,9 @@ impl Guards {
 pub fn tool_subject(tool: &str, args: &Value) -> Option<String> {
     let key = match tool {
         "shell" => "command",
-        "read_file" | "write_file" | "edit_file" | "list_dir" | "glob" | "grep" => "path",
+        "read_file" | "write_file" | "edit_file" | "multi_edit" | "list_dir" | "glob" | "grep" => {
+            "path"
+        }
         "skill" => "name",
         _ => "url",
     };

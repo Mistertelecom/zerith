@@ -58,13 +58,15 @@ struct ModelEntry {
     id: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Completion {
     pub text: String,
     pub reasoning: Option<String>,
     pub usage: Option<Usage>,
     pub finish_reason: Option<String>,
     pub tool_calls: Vec<ToolCall>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub thinking_blocks: Vec<serde_json::Value>,
 }
 
 /// Reuses HTTP/TLS connection pools across turns and steps for each timeout bucket.
@@ -341,6 +343,21 @@ impl Client {
     }
 }
 
+pub(crate) fn is_openai_reasoning_model(model: &str) -> bool {
+    let bare = model
+        .trim()
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    ["o1", "o3", "o4", "gpt-5"].iter().any(|prefix| {
+        bare == *prefix
+            || bare
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with(['-', '.', ':']))
+    })
+}
+
 pub(crate) fn role_str(r: Role) -> &'static str {
     match r {
         Role::System => "system",
@@ -359,7 +376,7 @@ pub(crate) fn body(req: &ChatRequest, stream: bool) -> Value {
         .map(|m| {
             let mut v = json!({"role": role_str(m.role), "content": m.content});
             let images = match m.role {
-                Role::User => crate::images::local_images(&m.content),
+                Role::User if !m.synthetic => crate::images::local_images(&m.content),
                 _ => Vec::new(),
             };
             if !images.is_empty() {
@@ -398,7 +415,10 @@ pub(crate) fn body(req: &ChatRequest, stream: bool) -> Value {
     if let Some(n) = req.max_tokens {
         b["max_tokens"] = json!(n);
     }
-    if let Some(t) = req.temperature {
+    if let Some(t) = req
+        .temperature
+        .filter(|_| !is_openai_reasoning_model(&req.model))
+    {
         b["temperature"] = json!(t);
     }
     if let Some(e) = crate::normalize_reasoning_effort(req.reasoning_effort.as_deref()) {
@@ -523,6 +543,7 @@ fn parse_completion(text: &str) -> Result<Completion> {
         usage: v.get("usage").and_then(parse_openai_usage),
         finish_reason: str_at(&choice["finish_reason"]),
         tool_calls,
+        thinking_blocks: Vec::new(),
     })
 }
 
@@ -688,5 +709,36 @@ mod tests {
         .unwrap();
         assert_eq!(u2.cache_read_tokens, 640);
         assert_eq!(u2.total_tokens, 940);
+    }
+
+    #[test]
+    fn reasoning_models_omit_temperature_while_gpt_4o_keeps_it() {
+        for model in [
+            "o1",
+            "o1-mini",
+            "o3",
+            "openai/o3",
+            "openrouter/openai/o3-mini",
+            "o4-mini",
+            "gpt-5",
+            "gpt-5-codex",
+            "openai/gpt-5-codex",
+        ] {
+            let req = ChatRequest::new(model, vec![ChatMessage::user("oi")]).temperature(0.7);
+            let b = body(&req, false);
+            assert!(
+                b.get("temperature").is_none(),
+                "expected temperature omitted for {model}: {b}"
+            );
+        }
+
+        for model in ["gpt-4o", "openai/gpt-4o"] {
+            let req = ChatRequest::new(model, vec![ChatMessage::user("oi")]).temperature(0.7);
+            let b = body(&req, false);
+            assert!(
+                b.get("temperature").is_some(),
+                "expected temperature retained for {model}: {b}"
+            );
+        }
     }
 }

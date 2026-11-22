@@ -48,6 +48,22 @@ function when(ms: number, g: number): string {
   return d.toLocaleDateString(undefined, { day: "2-digit", month: "2-digit" });
 }
 
+function matchesBotSession(title: string, name: string): boolean {
+  return (
+    title === `@${name}` ||
+    title.startsWith(`@${name} · `) ||
+    title.startsWith(`@${name} `)
+  );
+}
+
+function stripBotPrefix(title: string, name: string): string {
+  const prefix = `@${name}`;
+  if (title === prefix) return "";
+  if (title.startsWith(`${prefix} · `)) return title.slice(prefix.length + 3).trim();
+  if (title.startsWith(`${prefix} `)) return title.slice(prefix.length + 1).trim();
+  return title.trim();
+}
+
 export function Sidebar(props: {
   sessions: Session[];
   selected: string | null;
@@ -76,7 +92,7 @@ export function Sidebar(props: {
   /** Live turn of a conversation: `busy` or `waiting` (approval/question). */
   status?: (id: string) => "busy" | "waiting" | null;
 }) {
-  const { onNew } = props;
+  const { onNew, onNewBotChat, view } = props;
   const lang = useLang();
   const [menu, setMenu] = useState<{
     id: string;
@@ -116,12 +132,12 @@ export function Sidebar(props: {
         e.key.toLowerCase() === "n"
       ) {
         e.preventDefault();
-        onNew();
+        (view === "bots" ? (onNewBotChat ?? onNew) : onNew)();
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onNew]);
+  }, [view, onNewBotChat, onNew]);
 
   const pinnedSet = useMemo(() => new Set(props.pinned ?? []), [props.pinned]);
 
@@ -237,7 +253,7 @@ export function Sidebar(props: {
               })
               .map((bot) => {
                 const botSessions = props.sessions.filter((s) =>
-                  s.title.startsWith(`@${bot.name}`),
+                  matchesBotSession(s.title, bot.name),
                 );
                 const liveStates = botSessions
                   .map((s) => props.status?.(s.id))
@@ -271,7 +287,7 @@ export function Sidebar(props: {
                       />
                       <div className="bot-roster-info">
                         <span className="bot-roster-name">
-                          @{bot.name}
+                          <span className="bot-roster-label">@{bot.name}</span>
                           {botSessions.length > 0 ? (
                             <span className="bot-roster-count">{botSessions.length}</span>
                           ) : null}
@@ -300,20 +316,23 @@ export function Sidebar(props: {
               })}
           </section>
           {props.activeBot ? (() => {
+            const activeBot = props.activeBot;
             const activeRows = props.sessions.filter((s) =>
-              s.title.startsWith(`@${props.activeBot}`),
+              matchesBotSession(s.title, activeBot),
             );
+            const midnight = new Date();
+            midnight.setHours(0, 0, 0, 0);
+            const midnightMs = midnight.getTime();
             return activeRows.length > 0 ? (
               <section className="side-group">
                 <h2 className="side-group-label">
-                  {tr(lang, `Histórico de @${props.activeBot}`, `@${props.activeBot} History`)}
+                  {tr(lang, `Histórico de @${activeBot}`, `@${activeBot} History`)}
                 </h2>
                 {activeRows.map((s) => {
                   const ts = s.updated_at < 1e12 ? s.updated_at * 1000 : s.updated_at;
-                  const cleanTitle = s.title
-                    .replace(`@${props.activeBot}`, "")
-                    .replace(/^\s*·\s*/, "")
-                    .trim() || tr(lang, "Conversa", "Chat");
+                  const g = group(ts, midnightMs);
+                  const cleanTitle =
+                    stripBotPrefix(s.title, activeBot) || tr(lang, "Conversa", "Chat");
                   const state = props.status?.(s.id);
                   return (
                     <button
@@ -330,7 +349,7 @@ export function Sidebar(props: {
                           {state === "waiting" ? "!" : <Loader size={11} strokeWidth={2.5} />}
                         </span>
                       ) : null}
-                      <span className="side-row-time">{when(ts, 0)}</span>
+                      <span className="side-row-time">{when(ts, g)}</span>
                     </button>
                   );
                 })}
@@ -370,6 +389,7 @@ export function Sidebar(props: {
                         setRenaming({ id: s.id, text: e.target.value })
                       }
                       onKeyDown={(e) => {
+                        if (e.nativeEvent.isComposing || e.keyCode === 229) return;
                         if (e.key === "Enter") {
                           e.preventDefault();
                           commitRename();
@@ -467,7 +487,7 @@ export function Sidebar(props: {
             position: "fixed",
             left: menu.x,
             top: menu.y,
-            zIndex: 9999,
+            zIndex: 80,
             minWidth: 175,
             padding: 4,
             display: "flex",
@@ -529,8 +549,7 @@ export function Sidebar(props: {
           {props.onDelete ? (
             <button
               type="button"
-              className="popup-row"
-              style={{ color: "var(--danger, #ff5c5c)" }}
+              className="popup-row danger"
               onClick={() => {
                 props.onDelete!(menu.id);
                 setMenu(null);

@@ -58,6 +58,13 @@ assert.deepEqual(parseInline("![gato](https://x.dev/a.png)"), [{ t: "img", src: 
 assert.deepEqual(parseInline("![](C:\\img\\a.png)"), [{ t: "img", src: "C:\\img\\a.png", alt: "" }]);
 assert.deepEqual(parseInline("![x](<C:/Meus Prints/a b.png>)"), [{ t: "img", src: "C:/Meus Prints/a b.png", alt: "x" }]);
 assert.deepEqual(parseInline("![x](javascript:alert(1))"), ["![x](javascript:alert(1)", ")"]);
+assert.deepEqual(parseInline("![x](//evil.local/share/a.png)"), ["![x](//evil.local/share/a.png)"]);
+assert.deepEqual(parseInline("![x](/\\evil.local/share/a.png)"), ["![x](/\\evil.local/share/a.png)"]);
 assert.deepEqual(parseInline("[a](https://x.dev)")[0], { t: "a", href: "https://x.dev", c: ["a"] }, "links still work");
+assert.deepEqual(parseInline("[https://example.com](https://example.com)"), [
+  { t: "a", href: "https://example.com", c: ["https://example.com"] },
+]);
+assert.deepEqual(parseInline("`` `code` ``"), [{ t: "code", v: " `code` " }]);
+assert.deepEqual(parseInline("``a `b` c``"), [{ t: "code", v: "a `b` c" }]);
 
 console.log("markdown ok");

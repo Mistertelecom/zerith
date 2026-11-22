@@ -8,7 +8,9 @@ use zerith_workflows::{
     WorkflowEdge, WorkflowNode,
 };
 
-use crate::fntool::{make, opt_str, str_arg};
+use zerith_security::{Action, Sandbox, Verdict};
+
+use crate::fntool::{make, make_with, opt_str, str_arg};
 use crate::{CallCtx, Exec, Permission, Result, Tool, ToolError};
 
 pub type WorkflowChangeHook = Arc<dyn Fn() + Send + Sync>;
@@ -86,7 +88,7 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
             true,
             channel_list,
         ),
-        make(
+        make_with(
             "workflow_create_or_update",
             "Cria ou atualiza um workflow visual global no Zerith (salvo em ~/.zerith/workflows.db e sincronizado ao vivo no Canvas). Sempre prefira nós sem gasto de token (trigger_cron, shell, ssh_command, http_request, transform, condition) antes de ai_agent e notify_channel.",
             json!({
@@ -133,9 +135,10 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
             Permission::Write,
             10,
             false,
+            |_, _| Ok(Some(Action::Write(data_root().join("workflows.db")))),
             workflow_create_or_update,
         ),
-        make(
+        make_with(
             "workflow_toggle",
             "Ativa ou pausa um workflow global pelo seu id.",
             json!({
@@ -150,9 +153,10 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
             Permission::Write,
             5,
             false,
+            |_, _| Ok(Some(Action::Write(data_root().join("workflows.db")))),
             workflow_toggle,
         ),
-        make(
+        make_with(
             "workflow_delete",
             "Remove um workflow global pelo seu id.",
             json!({
@@ -166,9 +170,10 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
             Permission::Write,
             5,
             false,
+            |_, _| Ok(Some(Action::Write(data_root().join("workflows.db")))),
             workflow_delete,
         ),
-        make(
+        make_with(
             "workflow_run",
             "Executa um workflow global imediatamente para testar ou rodar sob demanda e retorna os logs de cada bloco.",
             json!({
@@ -182,6 +187,12 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
             Permission::Shell,
             120,
             false,
+            |args, _| {
+                Ok(Some(Action::Shell(format!(
+                    "workflow_run {}",
+                    args["id"].as_str().unwrap_or("")
+                ))))
+            },
             workflow_run,
         ),
     ]
@@ -443,13 +454,60 @@ fn workflow_delete(args: &Value, _: &CallCtx<'_>, _: &Exec<'_>) -> Result<String
     Ok(format!("Workflow '{id}' removido"))
 }
 
-fn workflow_run(args: &Value, _: &CallCtx<'_>, _: &Exec<'_>) -> Result<String> {
+fn authorize_workflow_nodes(wf: &Workflow, ctx: &CallCtx<'_>) -> Result<()> {
+    if ctx.policy.preset.sandbox == Sandbox::ReadOnly
+        && wf.nodes.iter().any(|n| {
+            matches!(
+                n.kind,
+                NodeKind::Shell
+                    | NodeKind::SshCommand
+                    | NodeKind::SaveFile
+                    | NodeKind::HttpRequest
+                    | NodeKind::Loop
+            )
+        })
+    {
+        return Err(ToolError::Denied(
+            "workflow bloqueado no sandbox somente-leitura".into(),
+        ));
+    }
+    for node in &wf.nodes {
+        match node.kind {
+            NodeKind::SaveFile => {
+                if let Some(path) = node.config.get("path").and_then(|v| v.as_str()) {
+                    if let Verdict::Deny(r) = ctx
+                        .policy
+                        .check_tool("write_file", &Action::Write(ctx.resolve(path)))
+                    {
+                        return Err(ToolError::Denied(r));
+                    }
+                }
+            }
+            NodeKind::Shell => {
+                if let Some(cmd) = node.config.get("command").and_then(|v| v.as_str()) {
+                    if let Verdict::Deny(r) = ctx
+                        .policy
+                        .check_tool("shell", &Action::Shell(cmd.to_string()))
+                    {
+                        return Err(ToolError::Denied(r));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn workflow_run(args: &Value, ctx: &CallCtx<'_>, _: &Exec<'_>) -> Result<String> {
     let (root, store) = open_store()?;
     let id = str_arg(args, "id")?;
     let wf = store
         .get_workflow(id)
         .map_err(|e| ToolError::Failed(e.to_string()))?
         .ok_or_else(|| ToolError::Failed(format!("workflow '{id}' não encontrado")))?;
+
+    authorize_workflow_nodes(&wf, ctx)?;
 
     let registered_ai = ai_hook_slot().lock().ok().and_then(|g| g.clone());
     let fallback_ai = NoopAiExecutor;
@@ -478,4 +536,118 @@ fn workflow_run(args: &Value, _: &CallCtx<'_>, _: &Exec<'_>) -> Result<String> {
         "node_logs": run.node_logs,
     }))
     .map_err(|e| ToolError::Failed(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Registry;
+    use zerith_security::{preset, Mode, Policy, Rule, RuleKind};
+
+    fn make_ctx<'a>(policy: &'a Policy) -> CallCtx<'a> {
+        CallCtx {
+            workspace: policy.workspace.as_path(),
+            policy,
+            memory: None,
+            scope: None,
+        }
+    }
+
+    #[test]
+    fn plan_and_readonly_deny_workflow_mutations_and_execution() {
+        let reg = Registry::new();
+        let ws = std::path::Path::new(".");
+        let create_args = json!({
+            "name": "wf",
+            "nodes": [{"id": "n1", "kind": "shell", "label": "sh", "config": {"command": "echo oi"}}],
+            "edges": []
+        });
+
+        let plan_pol = Policy::new(preset("workspace-write").unwrap(), Mode::Plan, ws);
+        let plan_ctx = make_ctx(&plan_pol);
+        for (tool, args) in [
+            ("workflow_create_or_update", create_args.clone()),
+            ("workflow_toggle", json!({"id": "wf-1", "enabled": true})),
+            ("workflow_delete", json!({"id": "wf-1"})),
+            ("workflow_run", json!({"id": "wf-1"})),
+        ] {
+            let (v, _) = reg.authorize(tool, &args, &plan_ctx).unwrap();
+            assert!(matches!(v, Verdict::Deny(_)), "{tool} in plan: {v:?}");
+            assert!(matches!(
+                reg.call(tool, &args, &plan_ctx),
+                Err(ToolError::Denied(_))
+            ));
+        }
+
+        let ro_pol = Policy::new(preset("read-only").unwrap(), Mode::Bypass, ws);
+        let ro_ctx = make_ctx(&ro_pol);
+        for (tool, args) in [
+            ("workflow_create_or_update", create_args),
+            ("workflow_toggle", json!({"id": "wf-1", "enabled": true})),
+            ("workflow_delete", json!({"id": "wf-1"})),
+        ] {
+            let (v, _) = reg.authorize(tool, &args, &ro_ctx).unwrap();
+            assert!(matches!(v, Verdict::Deny(_)), "{tool} in readonly: {v:?}");
+        }
+
+        let shell_wf = Workflow {
+            id: "wf-1".into(),
+            name: "sh".into(),
+            description: String::new(),
+            icon: "workflow".into(),
+            enabled: false,
+            nodes: vec![WorkflowNode {
+                id: "n1".into(),
+                kind: NodeKind::Shell,
+                label: "sh".into(),
+                x: 0.0,
+                y: 0.0,
+                config: json!({"command": "rm -rf /"}),
+            }],
+            edges: vec![],
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            last_run_at_ms: None,
+            last_status: None,
+            bot_name: None,
+        };
+        assert!(matches!(
+            authorize_workflow_nodes(&shell_wf, &ro_ctx),
+            Err(ToolError::Denied(_))
+        ));
+
+        let mut deny_shell_pol = Policy::new(preset("workspace-write").unwrap(), Mode::Bypass, ws);
+        deny_shell_pol.rules = vec![Rule::parse(RuleKind::Deny, "shell(rm *)").unwrap()];
+        let deny_shell_ctx = make_ctx(&deny_shell_pol);
+        assert!(matches!(
+            authorize_workflow_nodes(&shell_wf, &deny_shell_ctx),
+            Err(ToolError::Denied(_))
+        ));
+
+        let save_wf = Workflow {
+            id: "wf-2".into(),
+            name: "save".into(),
+            description: String::new(),
+            icon: "workflow".into(),
+            enabled: false,
+            nodes: vec![WorkflowNode {
+                id: "n1".into(),
+                kind: NodeKind::SaveFile,
+                label: "save".into(),
+                x: 0.0,
+                y: 0.0,
+                config: json!({"path": "out.txt"}),
+            }],
+            edges: vec![],
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            last_run_at_ms: None,
+            last_status: None,
+            bot_name: None,
+        };
+        assert!(matches!(
+            authorize_workflow_nodes(&save_wf, &plan_ctx),
+            Err(ToolError::Denied(_))
+        ));
+    }
 }

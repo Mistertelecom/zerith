@@ -46,14 +46,18 @@ pub(crate) fn body(req: &ChatRequest, stream: bool) -> Value {
             }
             Role::User => {
                 let mut b = vec![json!({"type": "text", "text": m.content})];
-                b.extend(crate::images::local_images(&m.content).iter().map(|i| {
-                    json!({"type": "image", "source":
-                        {"type": "base64", "media_type": i.mime, "data": i.data}})
-                }));
+                if !m.synthetic {
+                    b.extend(crate::images::local_images(&m.content).iter().map(|i| {
+                        json!({"type": "image", "source":
+                            {"type": "base64", "media_type": i.mime, "data": i.data}})
+                    }));
+                }
                 ("user", b)
             }
             Role::Assistant => {
                 let mut b = Vec::new();
+                // Signed thinking / redacted_thinking blocks must precede text and tool_use.
+                b.extend(m.thinking_blocks.iter().cloned());
                 if !m.content.is_empty() {
                     b.push(json!({"type": "text", "text": m.content}));
                 }
@@ -109,7 +113,11 @@ pub(crate) fn body(req: &ChatRequest, stream: bool) -> Value {
     if let Some(block) = messages
         .last_mut()
         .and_then(|m| m["content"].as_array_mut())
-        .and_then(|c| c.last_mut())
+        .and_then(|c| {
+            c.iter_mut()
+                .rev()
+                .find(|blk| !matches!(blk["type"].as_str(), Some("thinking" | "redacted_thinking")))
+        })
     {
         block["cache_control"] = json!({"type": "ephemeral"});
     }
@@ -117,18 +125,26 @@ pub(crate) fn body(req: &ChatRequest, stream: bool) -> Value {
     if let Some(t) = req.temperature {
         b["temperature"] = json!(t);
     }
-    if let Some(budget) = crate::thinking_budget(req.reasoning_effort.as_deref()) {
-        // Anthropic API rejects `temperature` when extended thinking is active
-        // and requires `max_tokens > budget_tokens`.
-        if let Some(obj) = b.as_object_mut() {
-            obj.remove("temperature");
+    // Anthropic rejects `thinking: enabled` with HTTP 400 if any assistant
+    // message carrying `tool_use` lacks signed thinking/redacted_thinking blocks
+    // (e.g., SQLite-replayed sessions or turns from non-Anthropic providers).
+    let has_unsigned_tool_turn = req.messages.iter().any(|m| {
+        m.role == Role::Assistant && !m.tool_calls.is_empty() && m.thinking_blocks.is_empty()
+    });
+    if !has_unsigned_tool_turn {
+        if let Some(budget) = crate::thinking_budget(req.reasoning_effort.as_deref()) {
+            // Anthropic API rejects `temperature` when extended thinking is active
+            // and requires `max_tokens > budget_tokens`.
+            if let Some(obj) = b.as_object_mut() {
+                obj.remove("temperature");
+            }
+            let current_max = b["max_tokens"].as_u64().unwrap_or(0);
+            let floor = u64::from(budget).saturating_add(1024);
+            if current_max < floor {
+                b["max_tokens"] = json!(floor);
+            }
+            b["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
         }
-        let current_max = b["max_tokens"].as_u64().unwrap_or(0);
-        let floor = u64::from(budget).saturating_add(1024);
-        if current_max < floor {
-            b["max_tokens"] = json!(floor);
-        }
-        b["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
     }
     if !req.tools.is_empty() {
         b["tools"] = req
@@ -202,17 +218,34 @@ fn parse_completion(text: &str) -> Result<Completion> {
     let mut out = Completion {
         text: String::new(),
         reasoning: None,
-        usage: usage(&v["usage"], 0),
+        usage: usage(&v["usage"]),
         finish_reason: v["stop_reason"].as_str().map(str::to_string),
         tool_calls: Vec::new(),
+        thinking_blocks: Vec::new(),
     };
     for b in blocks {
         match b["type"].as_str() {
             Some("text") => out.text.push_str(b["text"].as_str().unwrap_or("")),
             Some("thinking") => {
+                let thinking = b["thinking"].as_str().unwrap_or("");
                 out.reasoning
                     .get_or_insert_with(String::new)
-                    .push_str(b["thinking"].as_str().unwrap_or(""));
+                    .push_str(thinking);
+                if let Some(sig) = b["signature"].as_str().filter(|s| !s.is_empty()) {
+                    out.thinking_blocks.push(json!({
+                        "type": "thinking",
+                        "thinking": thinking,
+                        "signature": sig,
+                    }));
+                }
+            }
+            Some("redacted_thinking") => {
+                if let Some(data) = b["data"].as_str().filter(|s| !s.is_empty()) {
+                    out.thinking_blocks.push(json!({
+                        "type": "redacted_thinking",
+                        "data": data,
+                    }));
+                }
             }
             Some("tool_use") => out.tool_calls.push(ToolCall {
                 id: b["id"].as_str().unwrap_or_default().to_string(),
@@ -225,7 +258,7 @@ fn parse_completion(text: &str) -> Result<Completion> {
     Ok(out)
 }
 
-fn usage(u: &Value, input_seen: u64) -> Option<Usage> {
+fn usage(u: &Value) -> Option<Usage> {
     if !u.is_object() {
         return None;
     }
@@ -234,7 +267,7 @@ fn usage(u: &Value, input_seen: u64) -> Option<Usage> {
     let cache_read = u["cache_read_input_tokens"].as_u64().unwrap_or(0);
     let cache_write = u["cache_creation_input_tokens"].as_u64().unwrap_or(0);
     let cached = cache_read + cache_write;
-    let input = u["input_tokens"].as_u64().unwrap_or(input_seen) + cached;
+    let input = u["input_tokens"].as_u64().unwrap_or(0) + cached;
     let output = u["output_tokens"].as_u64().unwrap_or(0);
     Some(Usage {
         prompt_tokens: input,
@@ -257,15 +290,23 @@ pub(crate) fn stream(
     state.finish(on)
 }
 
+#[derive(Debug, Clone)]
+enum ThinkingBlockAcc {
+    Thinking { thinking: String, signature: String },
+    Redacted { data: String },
+}
+
 /// One Messages stream. Blocks are tracked by `index`, since a `tool_use`
 /// block's JSON arrives as `input_json_delta` fragments addressed by index.
 #[derive(Default)]
 pub(crate) struct AnthropicStream {
     /// (index, call) for every tool_use block, in order.
     calls: Vec<(u64, ToolCall)>,
-    input_tokens: u64,
+    thinking_blocks: Vec<(u64, ThinkingBlockAcc)>,
+    uncached_input_tokens: u64,
     cache_read_tokens: u64,
     cache_write_tokens: u64,
+    output_tokens: u64,
     usage: Option<Usage>,
     stop_reason: Option<String>,
     stopped: bool,
@@ -273,6 +314,32 @@ pub(crate) struct AnthropicStream {
 }
 
 impl AnthropicStream {
+    fn update_usage(&mut self, u: &Value) {
+        if !u.is_object() {
+            return;
+        }
+        if let Some(n) = u.get("input_tokens").and_then(Value::as_u64) {
+            self.uncached_input_tokens = n;
+        }
+        if let Some(n) = u.get("cache_read_input_tokens").and_then(Value::as_u64) {
+            self.cache_read_tokens = n;
+        }
+        if let Some(n) = u.get("cache_creation_input_tokens").and_then(Value::as_u64) {
+            self.cache_write_tokens = n;
+        }
+        if let Some(n) = u.get("output_tokens").and_then(Value::as_u64) {
+            self.output_tokens = n;
+        }
+        let prompt = self.uncached_input_tokens + self.cache_read_tokens + self.cache_write_tokens;
+        self.usage = Some(Usage {
+            prompt_tokens: prompt,
+            completion_tokens: self.output_tokens,
+            total_tokens: prompt + self.output_tokens,
+            cache_read_tokens: self.cache_read_tokens,
+            cache_write_tokens: self.cache_write_tokens,
+        });
+    }
+
     pub(crate) fn feed(&mut self, data: &str, on: &mut impl FnMut(StreamEvent)) -> Result<bool> {
         let Ok(v) = serde_json::from_str::<Value>(data) else {
             return Ok(false);
@@ -281,26 +348,45 @@ impl AnthropicStream {
         let index = v["index"].as_u64().unwrap_or(0);
         match v["type"].as_str() {
             Some("message_start") => {
-                // Cached prompt is reported apart: count it as input too and
-                // retain cache counters when `message_delta` only reports output.
-                if let Some(u) = usage(&v["message"]["usage"], 0) {
-                    self.input_tokens = u.prompt_tokens;
-                    self.cache_read_tokens = u.cache_read_tokens;
-                    self.cache_write_tokens = u.cache_write_tokens;
-                    self.usage = Some(u);
-                }
+                // Cached prompt is reported apart: update each component so
+                // subsequent `message_delta` events neither wipe nor double-count.
+                self.update_usage(&v["message"]["usage"]);
             }
             Some("content_block_start") => {
                 let b = &v["content_block"];
-                if b["type"] == "tool_use" {
-                    self.calls.push((
-                        index,
-                        ToolCall {
-                            id: b["id"].as_str().unwrap_or_default().to_string(),
-                            name: b["name"].as_str().unwrap_or_default().to_string(),
-                            arguments: String::new(),
-                        },
-                    ));
+                match b["type"].as_str() {
+                    Some("tool_use") => {
+                        self.calls.push((
+                            index,
+                            ToolCall {
+                                id: b["id"].as_str().unwrap_or_default().to_string(),
+                                name: b["name"].as_str().unwrap_or_default().to_string(),
+                                arguments: String::new(),
+                            },
+                        ));
+                    }
+                    Some("thinking") => {
+                        let initial = b["thinking"].as_str().unwrap_or_default().to_string();
+                        if !initial.is_empty() {
+                            on(StreamEvent::Reasoning(initial.clone()));
+                        }
+                        self.thinking_blocks.push((
+                            index,
+                            ThinkingBlockAcc::Thinking {
+                                thinking: initial,
+                                signature: b["signature"].as_str().unwrap_or_default().to_string(),
+                            },
+                        ));
+                    }
+                    Some("redacted_thinking") => {
+                        self.thinking_blocks.push((
+                            index,
+                            ThinkingBlockAcc::Redacted {
+                                data: b["data"].as_str().unwrap_or_default().to_string(),
+                            },
+                        ));
+                    }
+                    _ => {}
                 }
             }
             Some("content_block_delta") => {
@@ -308,7 +394,23 @@ impl AnthropicStream {
                 let s = |k: &str| d[k].as_str().unwrap_or("").to_string();
                 match d["type"].as_str() {
                     Some("text_delta") => on(StreamEvent::Delta(s("text"))),
-                    Some("thinking_delta") => on(StreamEvent::Reasoning(s("thinking"))),
+                    Some("thinking_delta") => {
+                        let chunk = s("thinking");
+                        if let Some((_, ThinkingBlockAcc::Thinking { thinking, .. })) =
+                            self.thinking_blocks.iter_mut().find(|(i, _)| *i == index)
+                        {
+                            thinking.push_str(&chunk);
+                        }
+                        on(StreamEvent::Reasoning(chunk));
+                    }
+                    Some("signature_delta") => {
+                        let sig = d["signature"].as_str().unwrap_or("");
+                        if let Some((_, ThinkingBlockAcc::Thinking { signature, .. })) =
+                            self.thinking_blocks.iter_mut().find(|(i, _)| *i == index)
+                        {
+                            signature.push_str(sig);
+                        }
+                    }
                     Some("input_json_delta") => {
                         if let Some((_, c)) = self.calls.iter_mut().find(|(i, _)| *i == index) {
                             c.arguments.push_str(&s("partial_json"));
@@ -318,15 +420,7 @@ impl AnthropicStream {
                 }
             }
             Some("message_delta") => {
-                if let Some(mut u) = usage(&v["usage"], self.input_tokens) {
-                    if u.cache_read_tokens == 0 && self.cache_read_tokens > 0 {
-                        u.cache_read_tokens = self.cache_read_tokens;
-                    }
-                    if u.cache_write_tokens == 0 && self.cache_write_tokens > 0 {
-                        u.cache_write_tokens = self.cache_write_tokens;
-                    }
-                    self.usage = Some(u);
-                }
+                self.update_usage(&v["usage"]);
                 if let Some(r) = v["delta"]["stop_reason"].as_str() {
                     self.stop_reason = Some(r.to_string());
                 }
@@ -349,6 +443,28 @@ impl AnthropicStream {
         }
         if !self.stopped {
             return Err(ProviderError::Transport(crate::stream::CUT.into()));
+        }
+        let thinking_blocks: Vec<Value> = self
+            .thinking_blocks
+            .into_iter()
+            .filter_map(|(_, blk)| match blk {
+                ThinkingBlockAcc::Thinking {
+                    thinking,
+                    signature,
+                } if !signature.is_empty() => Some(json!({
+                    "type": "thinking",
+                    "thinking": thinking,
+                    "signature": signature,
+                })),
+                ThinkingBlockAcc::Redacted { data } if !data.is_empty() => Some(json!({
+                    "type": "redacted_thinking",
+                    "data": data,
+                })),
+                _ => None,
+            })
+            .collect();
+        if !thinking_blocks.is_empty() {
+            on(StreamEvent::ThinkingBlocks(thinking_blocks));
         }
         let calls: Vec<ToolCall> = self
             .calls
@@ -450,7 +566,6 @@ mod tests {
         // what was read from cache still counts as prompt and surfaces cache metrics
         let u = usage(
             &json!({"input_tokens": 10, "cache_read_input_tokens": 900, "cache_creation_input_tokens": 90, "output_tokens": 5}),
-            0,
         )
         .unwrap();
         assert_eq!((u.prompt_tokens, u.total_tokens), (1000, 1005));
@@ -589,5 +704,182 @@ mod tests {
         assert!(crate::is_failover_error(&e));
         let h = crate::explain::headline(&e);
         assert!(h.contains("sobrecarregado") && !h.contains("/v1"), "{h}");
+    }
+
+    #[test]
+    fn signed_thinking_and_redacted_thinking_capture_and_replay_in_body() {
+        let (r, ev) = replay(&[
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":10}}}"#,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"passo 1 "}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"passo 2"}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig_part_1"}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"_part_2"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"redacted_thinking","data":"ENC_DATA"}}"#,
+            r#"{"type":"content_block_stop","index":1}"#,
+            r#"{"type":"content_block_start","index":2,"content_block":{"type":"text","text":""}}"#,
+            r#"{"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":"vou rodar"}}"#,
+            r#"{"type":"content_block_stop","index":2}"#,
+            r#"{"type":"content_block_start","index":3,"content_block":{"type":"tool_use","id":"call_1","name":"glob"}}"#,
+            r#"{"type":"content_block_delta","index":3,"delta":{"type":"input_json_delta","partial_json":"{\"pattern\":\"*\"}"}}"#,
+            r#"{"type":"content_block_stop","index":3}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":20}}"#,
+            r#"{"type":"message_stop"}"#,
+        ]);
+        r.unwrap();
+        let blocks = ev
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::ThinkingBlocks(b) => Some(b.clone()),
+                _ => None,
+            })
+            .expect("thinking blocks");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(
+            blocks[0],
+            json!({
+                "type": "thinking",
+                "thinking": "passo 1 passo 2",
+                "signature": "sig_part_1_part_2"
+            })
+        );
+        assert_eq!(
+            blocks[1],
+            json!({
+                "type": "redacted_thinking",
+                "data": "ENC_DATA"
+            })
+        );
+
+        let parsed = parse_completion(
+            r#"{"content":[{"type":"thinking","thinking":"hm","signature":"s1"},{"type":"redacted_thinking","data":"ENC2"},{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":4,"output_tokens":6}}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.thinking_blocks.len(), 2);
+        assert_eq!(parsed.thinking_blocks[0]["signature"], "s1");
+        assert_eq!(parsed.thinking_blocks[1]["data"], "ENC2");
+
+        // Replay in `body`: thinking blocks must precede text and tool_use, and
+        // `b["thinking"]` remains enabled since the tool_use assistant turn is signed.
+        let assistant = ChatMessage::assistant(
+            "vou rodar",
+            vec![ToolCall {
+                id: "call_1".into(),
+                name: "glob".into(),
+                arguments: r#"{"pattern":"*"}"#.into(),
+            }],
+        )
+        .with_thinking_blocks(blocks);
+        let req = ChatRequest::new(
+            "claude-sonnet-4-5",
+            vec![
+                ChatMessage::user("oi"),
+                assistant,
+                ChatMessage::tool("call_1", "a.rs"),
+            ],
+        )
+        .reasoning_effort("medium");
+        let b = body(&req, true);
+        assert_eq!(
+            b["thinking"],
+            json!({"type": "enabled", "budget_tokens": 8192})
+        );
+        let content = b["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["signature"], "sig_part_1_part_2");
+        assert_eq!(content[1]["type"], "redacted_thinking");
+        assert_eq!(content[2]["type"], "text");
+        assert_eq!(content[3]["type"], "tool_use");
+    }
+
+    #[test]
+    fn omits_thinking_config_when_assistant_tool_turn_lacks_thinking_blocks() {
+        let req = ChatRequest::new(
+            "claude-sonnet-4-5",
+            vec![
+                ChatMessage::user("oi"),
+                ChatMessage::assistant(
+                    "",
+                    vec![ToolCall {
+                        id: "c1".into(),
+                        name: "read_file".into(),
+                        arguments: r#"{"path":"a"}"#.into(),
+                    }],
+                ),
+                ChatMessage::tool("c1", "conteudo"),
+            ],
+        )
+        .temperature(0.4)
+        .reasoning_effort("high");
+        let b = body(&req, true);
+        assert!(
+            b.get("thinking").is_none(),
+            "must omit thinking when a tool_use turn has no thinking_blocks: {b}"
+        );
+        assert_eq!(
+            b["temperature"],
+            json!(0.4_f32),
+            "temperature stays intact when thinking is omitted"
+        );
+    }
+
+    #[test]
+    fn message_delta_usage_preserves_cache_and_never_double_counts() {
+        // Case 1: message_delta only reports output_tokens — cache_read/write and prompt_tokens stay exact.
+        let (r1, ev1) = replay(&[
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":10,"cache_read_input_tokens":900,"cache_creation_input_tokens":90,"output_tokens":1}}}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":50}}"#,
+            r#"{"type":"message_stop"}"#,
+        ]);
+        r1.unwrap();
+        let Some(StreamEvent::Done {
+            usage: Some(u1), ..
+        }) = ev1.last()
+        else {
+            panic!("{ev1:?}");
+        };
+        assert_eq!(u1.prompt_tokens, 1000);
+        assert_eq!(u1.completion_tokens, 50);
+        assert_eq!(u1.total_tokens, 1050);
+        assert_eq!(u1.cache_read_tokens, 900);
+        assert_eq!(u1.cache_write_tokens, 90);
+
+        // Case 2: message_delta repeats full cache + input fields — must NOT add on top of already-summed input_tokens.
+        let (r2, ev2) = replay(&[
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":10,"cache_read_input_tokens":900,"cache_creation_input_tokens":90}}}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":10,"cache_read_input_tokens":900,"cache_creation_input_tokens":90,"output_tokens":25}}"#,
+            r#"{"type":"message_stop"}"#,
+        ]);
+        r2.unwrap();
+        let Some(StreamEvent::Done {
+            usage: Some(u2), ..
+        }) = ev2.last()
+        else {
+            panic!("{ev2:?}");
+        };
+        assert_eq!(u2.prompt_tokens, 1000);
+        assert_eq!(u2.completion_tokens, 25);
+        assert_eq!(u2.total_tokens, 1025);
+        assert_eq!(u2.cache_read_tokens, 900);
+        assert_eq!(u2.cache_write_tokens, 90);
+
+        // Case 3: message_delta updates input_tokens while omitting cache fields — cache_read_tokens preserved.
+        let (r3, ev3) = replay(&[
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":10,"cache_read_input_tokens":900}}}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":12,"output_tokens":8}}"#,
+            r#"{"type":"message_stop"}"#,
+        ]);
+        r3.unwrap();
+        let Some(StreamEvent::Done {
+            usage: Some(u3), ..
+        }) = ev3.last()
+        else {
+            panic!("{ev3:?}");
+        };
+        assert_eq!(u3.prompt_tokens, 912);
+        assert_eq!(u3.cache_read_tokens, 900);
+        assert_eq!(u3.completion_tokens, 8);
+        assert_eq!(u3.total_tokens, 920);
     }
 }

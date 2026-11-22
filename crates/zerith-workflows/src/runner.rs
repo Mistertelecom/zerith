@@ -1,6 +1,9 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -54,9 +57,12 @@ pub struct RunOptions<'a> {
     pub on_event: &'a mut (dyn FnMut(NodeEvent) + Send),
 }
 
+static RUN_SEQ: AtomicU64 = AtomicU64::new(1);
+
 pub fn execute_workflow(wf: &Workflow, opts: &mut RunOptions<'_>) -> Result<WorkflowRun> {
-    let run_id = format!("run-{}-{}", wf.id, now_ms());
     let started_at_ms = now_ms();
+    let seq = RUN_SEQ.fetch_add(1, Ordering::Relaxed);
+    let run_id = format!("run-{}-{}-{}", wf.id, started_at_ms, seq);
     opts.store
         .record_run_start(&run_id, &wf.id, opts.trigger_source)?;
 
@@ -88,12 +94,6 @@ pub fn execute_workflow(wf: &Workflow, opts: &mut RunOptions<'_>) -> Result<Work
         if indegree.get(n.id.as_str()).copied().unwrap_or(0) == 0 {
             queue.push_back(n.id.as_str());
             scheduled.insert(n.id.as_str());
-        }
-    }
-    if queue.is_empty() {
-        if let Some(first) = wf.nodes.first() {
-            queue.push_back(first.id.as_str());
-            scheduled.insert(first.id.as_str());
         }
     }
 
@@ -220,6 +220,13 @@ pub fn execute_workflow(wf: &Workflow, opts: &mut RunOptions<'_>) -> Result<Work
                 break;
             }
         }
+    }
+
+    if overall_status == "ok"
+        && (scheduled.len() < nodes_map.len() || indegree.values().any(|&d| d > 0))
+    {
+        overall_status = "error".into();
+        summary = "ciclo detectado no grafo do workflow".into();
     }
 
     opts.store
@@ -362,7 +369,12 @@ fn execute_http(call: HttpCall<'_>) -> Result<String> {
     }
 }
 
-fn parse_loop_items(raw_items: Option<&str>, prev: &str, outputs: &HashMap<String, String>, now_dt: &LocalDateTime) -> Vec<String> {
+fn parse_loop_items(
+    raw_items: Option<&str>,
+    prev: &str,
+    outputs: &HashMap<String, String>,
+    now_dt: &LocalDateTime,
+) -> Vec<String> {
     let source = match raw_items {
         Some(raw) if !raw.is_empty() => interpolate(raw, prev, outputs, now_dt),
         _ => prev.to_string(),
@@ -552,7 +564,8 @@ fn run_node(
                     tool_mode,
                 )?
             } else {
-                opts.ai.complete(resolved_model.as_deref(), &system, &prompt)?
+                opts.ai
+                    .complete(resolved_model.as_deref(), &system, &prompt)?
             };
             Ok((out, None))
         }
@@ -633,9 +646,13 @@ fn run_node(
                 let res = match mode {
                     "shell" => {
                         let cmd_tpl = cfg_str(cfg, "command").unwrap_or("echo {{item}}");
-                        let cmd = interpolate(cmd_tpl, prev, outputs, now_dt)
-                            .replace("{{item}}", item)
-                            .replace("{{index}}", &idx_str);
+                        let cmd = interpolate_inner(
+                            cmd_tpl,
+                            prev,
+                            outputs,
+                            now_dt,
+                            Some((item, &idx_str)),
+                        );
                         let out = run_shell_command(&cmd, None, Duration::from_secs(30))?;
                         format!("{item}: {out}")
                     }
@@ -644,13 +661,21 @@ fn run_node(
                         if url_tpl.is_empty() {
                             return Err(WorkflowError::Exec("URL HTTP vazia no nó Loop".into()));
                         }
-                        let url = interpolate(url_tpl, prev, outputs, now_dt)
-                            .replace("{{item}}", item)
-                            .replace("{{index}}", &idx_str);
+                        let url = interpolate_inner(
+                            url_tpl,
+                            prev,
+                            outputs,
+                            now_dt,
+                            Some((item, &idx_str)),
+                        );
                         let method = cfg_str(cfg, "method").unwrap_or("GET").to_ascii_uppercase();
-                        let body = interpolate(cfg_str(cfg, "body").unwrap_or(""), prev, outputs, now_dt)
-                            .replace("{{item}}", item)
-                            .replace("{{index}}", &idx_str);
+                        let body = interpolate_inner(
+                            cfg_str(cfg, "body").unwrap_or(""),
+                            prev,
+                            outputs,
+                            now_dt,
+                            Some((item, &idx_str)),
+                        );
                         let out = execute_http(HttpCall {
                             cfg,
                             method: &method,
@@ -665,9 +690,7 @@ fn run_node(
                     }
                     _ => {
                         let tpl = cfg_str(cfg, "template").unwrap_or("{{item}}");
-                        interpolate(tpl, prev, outputs, now_dt)
-                            .replace("{{item}}", item)
-                            .replace("{{index}}", &idx_str)
+                        interpolate_inner(tpl, prev, outputs, now_dt, Some((item, &idx_str)))
                     }
                 };
                 results.push(res);
@@ -778,39 +801,233 @@ fn run_direct_command(bin: &str, args: &[&str], timeout: Duration) -> Result<Str
     wait_command_with_timeout(c, timeout)
 }
 
-fn wait_command_with_timeout(mut c: Command, timeout: Duration) -> Result<String> {
+const MAX_PIPE_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Default)]
+struct PipeState {
+    bytes: Vec<u8>,
+    done: bool,
+}
+
+struct PipeReader {
+    pair: Arc<(Mutex<PipeState>, Condvar)>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+struct MarkPipeDone(Arc<(Mutex<PipeState>, Condvar)>);
+
+impl Drop for MarkPipeDone {
+    fn drop(&mut self) {
+        if let Ok(mut st) = self.0 .0.lock() {
+            st.done = true;
+        }
+        self.0 .1.notify_all();
+    }
+}
+
+fn spawn_pipe_reader<R: Read + Send + 'static>(pipe: Option<R>) -> PipeReader {
+    let Some(mut reader) = pipe else {
+        let pair = Arc::new((
+            Mutex::new(PipeState {
+                bytes: Vec::new(),
+                done: true,
+            }),
+            Condvar::new(),
+        ));
+        return PipeReader { pair, handle: None };
+    };
+    let pair = Arc::new((Mutex::new(PipeState::default()), Condvar::new()));
+    let worker_pair = Arc::clone(&pair);
+    let handle = std::thread::spawn(move || {
+        let _done = MarkPipeDone(Arc::clone(&worker_pair));
+        let mut buf = [0u8; 8192];
+        let mut kept = 0usize;
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if kept < MAX_PIPE_BYTES {
+                        let take = n.min(MAX_PIPE_BYTES - kept);
+                        if let Ok(mut st) = worker_pair.0.lock() {
+                            st.bytes.extend_from_slice(&buf[..take]);
+                        }
+                        kept += take;
+                    }
+                }
+            }
+        }
+    });
+    PipeReader {
+        pair,
+        handle: Some(handle),
+    }
+}
+
+impl PipeReader {
+    fn collect_until(self, deadline: Instant) -> Vec<u8> {
+        let bytes = if let Ok(guard) = self.pair.0.lock() {
+            let mut guard = guard;
+            while !guard.done {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let (next, res) = self
+                    .pair
+                    .1
+                    .wait_timeout(guard, remaining)
+                    .unwrap_or_else(|e| e.into_inner());
+                guard = next;
+                if res.timed_out() {
+                    break;
+                }
+            }
+            let done = guard.done;
+            let bytes = std::mem::take(&mut guard.bytes);
+            drop(guard);
+            if done {
+                if let Some(h) = self.handle {
+                    let _ = h.join();
+                }
+            }
+            bytes
+        } else {
+            Vec::new()
+        };
+        bytes
+    }
+}
+
+fn combine_output(stdout: &[u8], stderr: &[u8]) -> String {
+    let mut text = String::from_utf8_lossy(stdout).into_owned();
+    let err = String::from_utf8_lossy(stderr);
+    if !err.trim().is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&err);
+    }
+    text
+}
+
+enum CommandWait {
+    Exited(std::process::ExitStatus, Vec<u8>, Vec<u8>),
+    TimedOut(Vec<u8>, Vec<u8>),
+}
+
+fn wait_command_raw(mut c: Command, timeout: Duration) -> Result<CommandWait> {
     let mut child = c.spawn()?;
+    let stdout_reader = spawn_pipe_reader(child.stdout.take());
+    let stderr_reader = spawn_pipe_reader(child.stderr.take());
     let start = Instant::now();
     loop {
         if let Some(status) = child.try_wait()? {
-            let output = child.wait_with_output()?;
-            let mut text = String::from_utf8_lossy(&output.stdout).to_string();
-            let err = String::from_utf8_lossy(&output.stderr);
-            if !err.trim().is_empty() {
-                if !text.is_empty() {
-                    text.push('\n');
-                }
-                text.push_str(&err);
-            }
-            if status.success() {
-                return Ok(clip_text(text.trim(), 16_000));
-            }
-            return Err(WorkflowError::Exec(format!(
-                "código {:?}: {}",
-                status.code(),
-                clip_text(text.trim(), 2000)
-            )));
+            let deadline = Instant::now() + Duration::from_millis(750);
+            let out = stdout_reader.collect_until(deadline);
+            let err = stderr_reader.collect_until(deadline);
+            return Ok(CommandWait::Exited(status, out, err));
         }
         if start.elapsed() >= timeout {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(WorkflowError::Exec(format!(
-                "comando expirou após {}s",
-                timeout.as_secs()
-            )));
+            let deadline = Instant::now() + Duration::from_millis(250);
+            let out = stdout_reader.collect_until(deadline);
+            let err = stderr_reader.collect_until(deadline);
+            return Ok(CommandWait::TimedOut(out, err));
         }
-        std::thread::sleep(Duration::from_millis(40));
+        std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+fn wait_command_with_timeout(c: Command, timeout: Duration) -> Result<String> {
+    match wait_command_raw(c, timeout)? {
+        CommandWait::Exited(status, out, err) => {
+            let text = combine_output(&out, &err);
+            if status.success() {
+                return Ok(clip_text(text.trim(), 16_000));
+            }
+            Err(WorkflowError::Exec(format!(
+                "código {:?}: {}",
+                status.code(),
+                clip_text(text.trim(), 2000)
+            )))
+        }
+        CommandWait::TimedOut(out, err) => {
+            let msg = format!("comando expirou após {}s", timeout.as_secs());
+            let text = combine_output(&out, &err);
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                Err(WorkflowError::Exec(msg))
+            } else {
+                Err(WorkflowError::Exec(format!(
+                    "{msg}: {}",
+                    clip_text(trimmed, 2000)
+                )))
+            }
+        }
+    }
+}
+
+fn interpolate_inner(
+    tpl: &str,
+    prev: &str,
+    outputs: &HashMap<String, String>,
+    now_dt: &LocalDateTime,
+    loop_vars: Option<(&str, &str)>,
+) -> String {
+    let mut out = String::with_capacity(tpl.len());
+    let mut rest = tpl;
+    while let Some(start) = rest.find("{{") {
+        out.push_str(&rest[..start]);
+        if rest[start..].starts_with("{{{") {
+            out.push('{');
+            rest = &rest[start + 1..];
+            continue;
+        }
+        let after_open = &rest[start + 2..];
+        let Some(end) = after_open.find("}}") else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        if let Some(nested) = after_open[..end].find("{{") {
+            out.push_str(&rest[start..start + 2 + nested]);
+            rest = &after_open[nested..];
+            continue;
+        }
+        let token = &after_open[..end];
+        match token {
+            "prev" => out.push_str(prev),
+            "date" => out.push_str(&now_dt.date_string()),
+            "time" => out.push_str(&now_dt.time_string()),
+            "item" => {
+                if let Some((item, _)) = loop_vars {
+                    out.push_str(item);
+                } else {
+                    out.push_str(&rest[start..start + 2 + end + 2]);
+                }
+            }
+            "index" => {
+                if let Some((_, idx)) = loop_vars {
+                    out.push_str(idx);
+                } else {
+                    out.push_str(&rest[start..start + 2 + end + 2]);
+                }
+            }
+            _ => {
+                if let Some(id) = token
+                    .strip_prefix("node.")
+                    .filter(|id| outputs.contains_key(*id))
+                {
+                    out.push_str(&outputs[id]);
+                } else {
+                    out.push_str(&rest[start..start + 2 + end + 2]);
+                }
+            }
+        }
+        rest = &after_open[end + 2..];
+    }
+    out.push_str(rest);
+    out
 }
 
 pub fn interpolate(
@@ -819,17 +1036,7 @@ pub fn interpolate(
     outputs: &HashMap<String, String>,
     now_dt: &LocalDateTime,
 ) -> String {
-    let mut out = tpl
-        .replace("{{prev}}", prev)
-        .replace("{{date}}", &now_dt.date_string())
-        .replace("{{time}}", &now_dt.time_string());
-    for (id, val) in outputs {
-        let key = format!("{{{{node.{id}}}}}");
-        if out.contains(&key) {
-            out = out.replace(&key, val);
-        }
-    }
-    out
+    interpolate_inner(tpl, prev, outputs, now_dt, None)
 }
 
 fn cfg_str<'a>(cfg: &'a Value, key: &str) -> Option<&'a str> {
@@ -1021,7 +1228,9 @@ mod tests {
         assert!(!dir.path().join("out_false.txt").is_file());
         let saved = std::fs::read_to_string(dir.path().join("out_true.txt")).unwrap();
         assert!(
-            saved.contains("AI_REPORT[default|You are a helpful automation agent.]: Check: OFFLINE_SWITCH_01"),
+            saved.contains(
+                "AI_REPORT[default|You are a helpful automation agent.]: Check: OFFLINE_SWITCH_01"
+            ),
             "{saved}"
         );
         assert!(events
@@ -1139,9 +1348,24 @@ mod tests {
                 },
             ],
             edges: vec![
-                WorkflowEdge { id: "e1".into(), from: "wh".into(), to: "lp".into(), branch: None },
-                WorkflowEdge { id: "e2".into(), from: "lp".into(), to: "mk".into(), branch: None },
-                WorkflowEdge { id: "e3".into(), from: "mk".into(), to: "ai".into(), branch: None },
+                WorkflowEdge {
+                    id: "e1".into(),
+                    from: "wh".into(),
+                    to: "lp".into(),
+                    branch: None,
+                },
+                WorkflowEdge {
+                    id: "e2".into(),
+                    from: "lp".into(),
+                    to: "mk".into(),
+                    branch: None,
+                },
+                WorkflowEdge {
+                    id: "e3".into(),
+                    from: "mk".into(),
+                    to: "ai".into(),
+                    branch: None,
+                },
             ],
             created_at_ms: 1,
             updated_at_ms: 1,
@@ -1178,11 +1402,13 @@ mod tests {
             y: 0.0,
             config: json!({ "mode": "dedup_lines", "pattern": "yt-videos" }),
         };
-        let first = test_single_node(&n, "https://yt/1\nhttps://yt/2\nhttps://yt/1", &opts).unwrap();
+        let first =
+            test_single_node(&n, "https://yt/1\nhttps://yt/2\nhttps://yt/1", &opts).unwrap();
         assert_eq!(first, "https://yt/1\nhttps://yt/2");
         let second = test_single_node(&n, "https://yt/2\nhttps://yt/3", &opts).unwrap();
         assert_eq!(second, "https://yt/3");
-        let third = test_single_node(&n, "https://yt/1\nhttps://yt/2\nhttps://yt/3", &opts).unwrap();
+        let third =
+            test_single_node(&n, "https://yt/1\nhttps://yt/2\nhttps://yt/3", &opts).unwrap();
         assert_eq!(third, "");
 
         let ai_loop = WorkflowNode {
@@ -1201,5 +1427,195 @@ mod tests {
         };
         let ai_out = test_single_node(&ai_loop, "", &opts).unwrap();
         assert!(ai_out.contains("Find videos"), "{ai_out}");
+    }
+
+    #[test]
+    fn large_output_over_100kib_does_not_deadlock_pipe() {
+        let cmd = if cfg!(windows) {
+            "echo BEGIN_LARGE && (for /L %i in (1,1,1600) do @echo 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef) && echo END_LARGE"
+        } else {
+            "echo BEGIN_LARGE && i=0 && while [ $i -lt 1600 ]; do echo 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef; i=$((i+1)); done && echo END_LARGE"
+        };
+
+        let mut raw_cmd = if cfg!(windows) {
+            let mut c = Command::new("cmd");
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                c.raw_arg(format!("/S /C \"{cmd}\""));
+            }
+            c
+        } else {
+            let mut c = Command::new("sh");
+            c.arg("-c").arg(cmd);
+            c
+        };
+        raw_cmd
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        let wait = wait_command_raw(raw_cmd, Duration::from_secs(10)).unwrap();
+        match wait {
+            CommandWait::Exited(status, out, err) => {
+                assert!(
+                    status.success(),
+                    "status={status:?} err={}",
+                    String::from_utf8_lossy(&err)
+                );
+                assert!(
+                    out.len() > 100 * 1024,
+                    "expected >100 KiB output, got {}",
+                    out.len()
+                );
+                let text = String::from_utf8_lossy(&out);
+                assert!(text.contains("BEGIN_LARGE"));
+                assert!(text.contains("END_LARGE"));
+            }
+            CommandWait::TimedOut(_, _) => panic!("command timed out while draining >100 KiB pipe"),
+        }
+
+        let shell_out = run_shell_command(cmd, None, Duration::from_secs(10)).unwrap();
+        assert!(shell_out.starts_with("BEGIN_LARGE"));
+        assert!(shell_out.contains("...[truncado]"));
+    }
+
+    #[test]
+    fn cycle_detection_marks_run_error_and_preserves_skipped_branches() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("cycles.db")).unwrap();
+        let ai = EchoAi;
+
+        // Trigger -> A -> B -> A cycle
+        let wf_cycle = Workflow {
+            id: "cycle-wf".into(),
+            name: "Cycle".into(),
+            description: "".into(),
+            icon: "workflow".into(),
+            enabled: true,
+            bot_name: None,
+            nodes: vec![
+                WorkflowNode {
+                    id: "t".into(),
+                    kind: NodeKind::TriggerManual,
+                    label: "Trigger".into(),
+                    x: 0.0,
+                    y: 0.0,
+                    config: json!({}),
+                },
+                WorkflowNode {
+                    id: "a".into(),
+                    kind: NodeKind::Transform,
+                    label: "A".into(),
+                    x: 100.0,
+                    y: 0.0,
+                    config: json!({ "mode": "template", "template": "{{prev}}" }),
+                },
+                WorkflowNode {
+                    id: "b".into(),
+                    kind: NodeKind::Transform,
+                    label: "B".into(),
+                    x: 200.0,
+                    y: 0.0,
+                    config: json!({ "mode": "template", "template": "{{prev}}" }),
+                },
+            ],
+            edges: vec![
+                WorkflowEdge {
+                    id: "e1".into(),
+                    from: "t".into(),
+                    to: "a".into(),
+                    branch: None,
+                },
+                WorkflowEdge {
+                    id: "e2".into(),
+                    from: "a".into(),
+                    to: "b".into(),
+                    branch: None,
+                },
+                WorkflowEdge {
+                    id: "e3".into(),
+                    from: "b".into(),
+                    to: "a".into(),
+                    branch: None,
+                },
+            ],
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            last_run_at_ms: None,
+            last_status: None,
+        };
+
+        let mut opts1 = RunOptions {
+            store: &store,
+            data_root: dir.path(),
+            ai: &ai,
+            trigger_source: "test",
+            tz_offset_minutes: 0,
+            initial_input: None,
+            on_event: &mut |_| {},
+        };
+        let run1 = execute_workflow(&wf_cycle, &mut opts1).unwrap();
+        assert_eq!(run1.status, "error");
+        assert_eq!(run1.summary, "ciclo detectado no grafo do workflow");
+
+        // Rapid consecutive runs still get distinct monotonic run_ids.
+        let run2 = execute_workflow(&wf_cycle, &mut opts1).unwrap();
+        assert_ne!(run1.id, run2.id);
+    }
+
+    #[test]
+    fn interpolate_single_pass_preserves_literal_tokens_in_upstream_output() {
+        let dt = LocalDateTime::from_unix_secs(1_700_000_000, 0);
+        let mut outputs = HashMap::new();
+        outputs.insert(
+            "n1".to_string(),
+            "up {{date}} {{time}} {{prev}}".to_string(),
+        );
+
+        let prev = "literal {{date}} {{time}} {{node.n1}} {{prev}}";
+        let rendered = interpolate(
+            "D={{date}} | P={{prev}} | N={{node.n1}} | U={{unknown}}",
+            prev,
+            &outputs,
+            &dt,
+        );
+        assert_eq!(
+            rendered,
+            format!(
+                "D={} | P=literal {{{{date}}}} {{{{time}}}} {{{{node.n1}}}} {{{{prev}}}} | N=up {{{{date}}}} {{{{time}}}} {{{{prev}}}} | U={{{{unknown}}}}",
+                dt.date_string()
+            )
+        );
+
+        // Loop node does not re-expand {{date}} or {{index}} inside {{item}} or {{prev}}.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("loop.db")).unwrap();
+        let ai = EchoAi;
+        let opts = RunOptions {
+            store: &store,
+            data_root: dir.path(),
+            ai: &ai,
+            trigger_source: "test",
+            tz_offset_minutes: 0,
+            initial_input: None,
+            on_event: &mut |_| {},
+        };
+        let lp = WorkflowNode {
+            id: "lp".into(),
+            kind: NodeKind::Loop,
+            label: "Loop".into(),
+            x: 0.0,
+            y: 0.0,
+            config: json!({
+                "mode": "template",
+                "template": "#{{index}}={{item}}|{{prev}}"
+            }),
+        };
+        let out = test_single_node(&lp, "{{date}} {{index}} {{item}}", &opts).unwrap();
+        assert_eq!(
+            out,
+            "#0={{date}} {{index}} {{item}}|{{date}} {{index}} {{item}}"
+        );
     }
 }

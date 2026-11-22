@@ -1,6 +1,7 @@
 //! Session operations beyond append/read: search, fork, export, archive,
 //! model, and a small key/value settings table.
 
+use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 
 use rusqlite::{params, OptionalExtension, ToSql};
@@ -154,12 +155,70 @@ impl Store {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, (SELECT workspace FROM sessions WHERE id = ?7))",
             params![fork.id, fork.title, fork.source.as_str(), fork.model, fork.provider, ts, id],
         )?;
-        tx.execute(
+        struct ForkRow {
+            id: i64,
+            role: String,
+            content: String,
+            tool_name: Option<String>,
+            tool_calls: Option<String>,
+            reasoning: Option<String>,
+            token_count: Option<i64>,
+            created_at: i64,
+            raw: Option<String>,
+        }
+        let rows: Vec<ForkRow> = {
+            let mut sel = tx.prepare(
+                "SELECT id, role, content, tool_name, tool_calls, reasoning, token_count, created_at, raw
+                 FROM messages WHERE session_id = ?1 AND superseded = 0 AND (?2 IS NULL OR id <= ?2) ORDER BY id",
+            )?;
+            let mapped = sel.query_map(params![id, upto_message_id], |r| {
+                Ok(ForkRow {
+                    id: r.get(0)?,
+                    role: r.get(1)?,
+                    content: r.get(2)?,
+                    tool_name: r.get(3)?,
+                    tool_calls: r.get(4)?,
+                    reasoning: r.get(5)?,
+                    token_count: r.get(6)?,
+                    created_at: r.get(7)?,
+                    raw: r.get(8)?,
+                })
+            })?;
+            mapped.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut ins = tx.prepare(
             "INSERT INTO messages(session_id, role, content, tool_name, tool_calls, reasoning, token_count, created_at, raw)
-             SELECT ?1, role, content, tool_name, tool_calls, reasoning, token_count, created_at, raw
-             FROM messages WHERE session_id = ?2 AND superseded = 0 AND (?3 IS NULL OR id <= ?3) ORDER BY id",
-            params![fork.id, id, upto_message_id],
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         )?;
+        let mut id_map: HashMap<i64, i64> = HashMap::new();
+        let mut non_summary_map: BTreeMap<i64, i64> = BTreeMap::new();
+        for row in rows {
+            let (is_summary, raw_out) = match row.raw {
+                Some(raw_str) => match remap_summary_raw(&raw_str, &id_map, &non_summary_map) {
+                    SummaryAction::NotSummary => (false, Some(raw_str)),
+                    SummaryAction::SkipOrphaned => continue,
+                    SummaryAction::Remapped(remapped) => (true, Some(remapped)),
+                },
+                None => (false, None),
+            };
+            ins.execute(params![
+                fork.id,
+                row.role,
+                row.content,
+                row.tool_name,
+                row.tool_calls,
+                row.reasoning,
+                row.token_count,
+                row.created_at,
+                raw_out,
+            ])?;
+            let new_id = tx.last_insert_rowid();
+            id_map.insert(row.id, new_id);
+            if !is_summary {
+                non_summary_map.insert(row.id, new_id);
+            }
+        }
+        drop(ins);
         tx.commit()?;
         Ok(fork)
     }
@@ -293,5 +352,161 @@ impl Store {
         self.conn()
             .execute("DELETE FROM settings WHERE key = ?1", params![key])?;
         Ok(())
+    }
+}
+
+enum SummaryAction {
+    NotSummary,
+    SkipOrphaned,
+    Remapped(String),
+}
+
+fn remap_summary_raw(
+    raw_str: &str,
+    id_map: &HashMap<i64, i64>,
+    non_summary_map: &BTreeMap<i64, i64>,
+) -> SummaryAction {
+    let Ok(mut val) = serde_json::from_str::<serde_json::Value>(raw_str) else {
+        return SummaryAction::NotSummary;
+    };
+    let Some(summary) = val.get("summary").and_then(|s| s.as_object()) else {
+        return SummaryAction::NotSummary;
+    };
+    let (Some(old_lo), Some(old_hi)) = (
+        summary.get("start_id").and_then(|v| v.as_i64()),
+        summary.get("end_id").and_then(|v| v.as_i64()),
+    ) else {
+        return SummaryAction::NotSummary;
+    };
+
+    let mut new_lo: Option<i64> = None;
+    let mut new_hi: Option<i64> = None;
+    for (_, &new_id) in non_summary_map.range(old_lo..=old_hi) {
+        new_lo = Some(new_lo.map_or(new_id, |cur| cur.min(new_id)));
+        new_hi = Some(new_hi.map_or(new_id, |cur| cur.max(new_id)));
+    }
+    let (Some(lo), Some(hi)) = (new_lo, new_hi) else {
+        return SummaryAction::SkipOrphaned;
+    };
+
+    let remapped_supersedes: Option<Vec<i64>> = summary
+        .get("supersedes")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_i64())
+                .filter_map(|old_sid| id_map.get(&old_sid).copied())
+                .collect()
+        });
+
+    if let Some(summary_obj) = val.get_mut("summary").and_then(|s| s.as_object_mut()) {
+        summary_obj.insert("start_id".into(), serde_json::json!(lo));
+        summary_obj.insert("end_id".into(), serde_json::json!(hi));
+        if let Some(sup) = remapped_supersedes {
+            summary_obj.insert("supersedes".into(), serde_json::json!(sup));
+        }
+    }
+    SummaryAction::Remapped(val.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{NewMessage, Role};
+    use serde_json::json;
+
+    #[test]
+    fn fork_remaps_compaction_summary_ids_and_supersedes() {
+        let store = Store::open_in_memory().unwrap();
+        // Seed another session first so message IDs don't align with 1..N.
+        let other = store
+            .create_session("other", SessionSource::Native)
+            .unwrap();
+        store
+            .append(&other.id, &NewMessage::new(Role::User, "noise 1"))
+            .unwrap();
+        store
+            .append(&other.id, &NewMessage::new(Role::Assistant, "noise 2"))
+            .unwrap();
+
+        let src = store.create_session("src", SessionSource::Native).unwrap();
+        let m1 = store
+            .append(&src.id, &NewMessage::new(Role::User, "u1"))
+            .unwrap();
+        let _m2 = store
+            .append(&src.id, &NewMessage::new(Role::Assistant, "a1"))
+            .unwrap();
+        let m3 = store
+            .append(&src.id, &NewMessage::new(Role::User, "u2"))
+            .unwrap();
+        let s1 = store
+            .append(
+                &src.id,
+                &NewMessage {
+                    raw: Some(json!({
+                        "summary": {"start_id": m1, "end_id": m3, "supersedes": []}
+                    })),
+                    ..NewMessage::new(Role::User, "summary 1")
+                },
+            )
+            .unwrap();
+        let m4 = store
+            .append(&src.id, &NewMessage::new(Role::User, "u3"))
+            .unwrap();
+        let m5 = store
+            .append(&src.id, &NewMessage::new(Role::Assistant, "a3"))
+            .unwrap();
+        let s2 = store
+            .append(
+                &src.id,
+                &NewMessage {
+                    raw: Some(json!({
+                        "summary": {"start_id": m1, "end_id": m5, "supersedes": [s1]}
+                    })),
+                    ..NewMessage::new(Role::User, "summary 2")
+                },
+            )
+            .unwrap();
+        let m6 = store
+            .append(&src.id, &NewMessage::new(Role::User, "u4"))
+            .unwrap();
+        assert!(m4 > s1 && s2 > m5 && m6 > s2);
+
+        // Also seed an orphaned summary pointing to non-existent IDs to verify it is skipped.
+        let _orphan = store
+            .append(
+                &src.id,
+                &NewMessage {
+                    raw: Some(json!({
+                        "summary": {"start_id": 999001, "end_id": 999002, "supersedes": []}
+                    })),
+                    ..NewMessage::new(Role::User, "orphaned summary")
+                },
+            )
+            .unwrap();
+
+        let fork = store.fork_session(&src.id, None, "forked").unwrap();
+        let forked_msgs = store.messages(&fork.id, 100, 0).unwrap();
+        // 6 non-summary + 2 valid summaries (orphan skipped).
+        assert_eq!(forked_msgs.len(), 8);
+        assert!(forked_msgs.iter().all(|m| m.content != "orphaned summary"));
+
+        let f_m1 = forked_msgs[0].id;
+        let f_m3 = forked_msgs[2].id;
+        let f_s1 = &forked_msgs[3];
+        let f_m5 = forked_msgs[5].id;
+        let f_s2 = &forked_msgs[6];
+
+        assert_eq!(f_s1.content, "summary 1");
+        assert_eq!(
+            f_s1.raw.as_ref().unwrap()["summary"],
+            json!({"start_id": f_m1, "end_id": f_m3, "supersedes": []})
+        );
+
+        assert_eq!(f_s2.content, "summary 2");
+        assert_eq!(
+            f_s2.raw.as_ref().unwrap()["summary"],
+            json!({"start_id": f_m1, "end_id": f_m5, "supersedes": [f_s1.id]})
+        );
     }
 }

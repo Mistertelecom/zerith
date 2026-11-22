@@ -208,7 +208,7 @@ impl MemoryBackend for SqliteMemory {
                           f.created_at, f.updated_at, f.superseded_by, bm25(memory_fts) AS score
                    FROM memory_fts
                    JOIN memory_facts f ON f.id = memory_fts.rowid
-                   WHERE memory_fts MATCH ?1 AND (?2 = '*' OR instr('|' || ?2 || '|', '|' || f.scope || '|') > 0) AND f.deleted = 0
+                   WHERE memory_fts MATCH ?1 AND (?2 = '*' OR instr('|' || ?2 || '|', '|' || f.scope || '|') > 0) AND f.deleted = 0 AND f.superseded_by IS NULL
                    ORDER BY score LIMIT ?3";
         let mut st = self.conn.prepare(sql)?;
         let rows = st.query_map(params![query, scope.as_str(), fetch as i64], |r| {
@@ -246,7 +246,7 @@ impl MemoryBackend for SqliteMemory {
         self.select_where(
             &format!(
                 "SELECT {COLUMNS} FROM memory_facts
-                 WHERE (?1 = '*' OR instr('|' || ?1 || '|', '|' || scope || '|') > 0) AND deleted = 0
+                 WHERE (?1 = '*' OR instr('|' || ?1 || '|', '|' || scope || '|') > 0) AND deleted = 0 AND superseded_by IS NULL
                  ORDER BY updated_at DESC LIMIT ?2"
             ),
             &[&scope.as_str(), &(limit as i64)],
@@ -265,9 +265,16 @@ impl MemoryBackend for SqliteMemory {
     }
 
     fn update(&self, id: i64, text: &str) -> Result<()> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Err(MemoryError::Empty);
+        }
+        if zerith_security::mentions_secret(text) {
+            return Err(MemoryError::Secret);
+        }
         let n = self.conn.execute(
             "UPDATE memory_facts SET text = ?1, updated_at = ?2 WHERE id = ?3 AND deleted = 0",
-            params![text.trim(), now_ms(), id],
+            params![text, now_ms(), id],
         )?;
         if n == 0 {
             return Err(MemoryError::NotFound(id));

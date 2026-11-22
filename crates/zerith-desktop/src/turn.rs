@@ -31,6 +31,16 @@ pub struct Setup {
     pub orchestrator: bool,
     pub executor_model: Option<String>,
     pub mcp_cache: Option<Arc<crate::state::McpCache>>,
+    /// Registers and returns a cancellable token when background pre-compaction spawns.
+    pub register_precompact: Option<Arc<dyn Fn() -> Cancel + Send + Sync>>,
+}
+
+/// Terminal classification of [`run`] for desktop notifications and callers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnOutcome {
+    Done,
+    Cancelled,
+    Failed(String),
 }
 
 /// One thing that happened during the turn, already shaped for the window.
@@ -221,7 +231,7 @@ pub fn run(
     questions: &QuestionGate,
     inbox: Option<&InboxReceiver>,
     on: &mut dyn FnMut(TurnEvent),
-) -> Result<(), String> {
+) -> Result<TurnOutcome, String> {
     let store = Store::open(&setup.db).map_err(|e| e.to_string())?;
     let paths = zerith_core::Paths::with_root(&setup.root);
     let cfg = zerith_core::Settings::load(&paths, Some(&setup.workspace)).settings;
@@ -320,9 +330,17 @@ pub fn run(
         zerith_core::agents::find_with_extra(&paths, Some(&setup.workspace), extra, n)
     });
 
+    if cancel.is_cancelled() {
+        return Ok(TurnOutcome::Cancelled);
+    }
+
     auto_compact(
         &store, &settings, &client, session_id, model, history, cancel, on,
     );
+
+    if cancel.is_cancelled() {
+        return Ok(TurnOutcome::Cancelled);
+    }
 
     let mut digest = zerith_runtime::learn::TurnDigest::new(&prompt);
     let result = run_agent_turn(
@@ -405,11 +423,17 @@ pub fn run(
                     let cfg_bg = client.config().clone();
                     let sid_bg = session_id.to_string();
                     let model_bg = model.to_string();
+                    let bg_cancel = setup
+                        .register_precompact
+                        .as_ref()
+                        .map_or_else(Cancel::default, |f| f());
                     std::thread::spawn(move || {
+                        if bg_cancel.is_cancelled() {
+                            return;
+                        }
                         if let (Ok(bg_store), Ok(bg_client)) =
                             (Store::open(&db_bg), Client::new(cfg_bg))
                         {
-                            let bg_cancel = Cancel::default();
                             let _ = zerith_runtime::compact::pre_compact_routed(
                                 &bg_store,
                                 &settings_bg,
@@ -435,15 +459,20 @@ pub fn run(
                 scope: scope.clone(),
                 digest,
             });
-            Ok(())
+            Ok(TurnOutcome::Done)
+        }
+        Err(zerith_runtime::RunError::Provider(zerith_providers::ProviderError::Cancelled)) => {
+            Ok(TurnOutcome::Cancelled)
         }
         Err(e) => {
             let msg = match &e {
                 zerith_runtime::RunError::Provider(p) => zerith_providers::explain::headline(p),
                 other => other.to_string(),
             };
-            on(TurnEvent::Failed { message: msg });
-            Ok(())
+            on(TurnEvent::Failed {
+                message: msg.clone(),
+            });
+            Ok(TurnOutcome::Failed(msg))
         }
     }
 }

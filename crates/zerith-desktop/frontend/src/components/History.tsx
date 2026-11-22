@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Archive,
   ArchiveRestore,
@@ -33,6 +33,7 @@ const FILTERS = [
 
 export function HistoryTab() {
   const [rows, setRows] = useState<SessionRow[] | null>(null);
+  const [hits, setHits] = useState<string[] | null>(null);
   const [archived, setArchived] = useState(false);
   const [query, setQuery] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -56,14 +57,25 @@ export function HistoryTab() {
 
   const search = () => {
     const q = query.trim();
-    if (!q) return load();
+    if (!q) {
+      setHits(null);
+      return;
+    }
     api
       .searchSessions(q)
-      .then((ids) =>
-        setRows((prev) => (prev ?? []).filter((r) => ids.includes(r.id))),
-      )
+      .then((ids) => {
+        setHits(ids);
+        setError(null);
+      })
       .catch((e) => setError(String(e)));
   };
+
+  const shown = useMemo(() => {
+    if (rows === null) return null;
+    if (hits === null) return rows;
+    const hitSet = new Set(hits);
+    return rows.filter((r) => hitSet.has(r.id));
+  }, [rows, hits]);
 
   const scan = () => {
     setBusy(true);
@@ -106,7 +118,11 @@ export function HistoryTab() {
             value={query}
             placeholder="Buscar no título e nas mensagens"
             aria-label="Buscar conversas"
-            onChange={(e) => setQuery(e.target.value)}
+            onChange={(e) => {
+              const next = e.target.value;
+              setQuery(next);
+              if (!next.trim()) setHits(null);
+            }}
             onKeyDown={(e) => {
               if (e.key === "Enter") search();
             }}
@@ -137,22 +153,30 @@ export function HistoryTab() {
         title="Conversas"
         icon={MessagesSquare}
         description={
-          rows
-            ? `${rows.length} ${rows.length === 1 ? "conversa" : "conversas"}${archived ? ", incluindo arquivadas" : ""}`
+          shown
+            ? `${shown.length} ${shown.length === 1 ? "conversa" : "conversas"}${archived ? ", incluindo arquivadas" : ""}`
             : undefined
         }
       >
-        {rows === null ? (
+        {shown === null ? (
           <div className="pn-loading">
             <span className="spinner" /> Lendo o histórico…
           </div>
         ) : null}
-        {rows?.length === 0 ? (
-          <EmptyState icon={MessageSquare} title="Nenhuma conversa" text="As conversas aparecem aqui assim que você começa uma." />
+        {shown?.length === 0 ? (
+          <EmptyState
+            icon={MessageSquare}
+            title={hits !== null ? "Nada encontrado" : "Nenhuma conversa"}
+            text={
+              hits !== null
+                ? "Nenhuma conversa corresponde à busca."
+                : "As conversas aparecem aqui assim que você começa uma."
+            }
+          />
         ) : null}
-        {rows?.length ? (
+        {shown?.length ? (
           <div className="pn-list">
-            {rows.map((r) => (
+            {shown.map((r) => (
               <div key={r.id} className={"pn-item" + (r.archived ? " dim" : "")}>
                 <Logo id={r.provider ?? r.model} size={28} />
                 <span className="pn-body">

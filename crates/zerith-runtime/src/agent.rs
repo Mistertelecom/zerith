@@ -13,7 +13,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -71,6 +71,22 @@ pub struct ApprovalGate {
     early: Arc<Mutex<HashMap<u64, Approval>>>,
     /// `ApprovalNeeded` events of subagents, for the parent loop to emit.
     relayed: Arc<Mutex<Vec<RunEvent>>>,
+    /// Serializes interactive approval prompts across concurrent subagents/waiters.
+    prompt_busy: Arc<(Mutex<bool>, Condvar)>,
+}
+
+/// RAII guard for an interactive approval prompt slot acquired via [`ApprovalGate::acquire_prompt_slot`].
+pub struct PromptGuard<'a> {
+    busy: &'a (Mutex<bool>, Condvar),
+}
+
+impl Drop for PromptGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut g) = self.busy.0.lock() {
+            *g = false;
+        }
+        self.busy.1.notify_all();
+    }
 }
 
 pub fn approval_channel() -> (ApprovalSender, ApprovalGate) {
@@ -87,6 +103,7 @@ pub fn approval_channel_with_grants(grants: SharedGrants) -> (ApprovalSender, Ap
             granted: grants,
             early: Arc::default(),
             relayed: Arc::default(),
+            prompt_busy: Arc::new((Mutex::new(false), Condvar::new())),
         },
     )
 }
@@ -96,6 +113,17 @@ pub fn approval_channel_with_grants(grants: SharedGrants) -> (ApprovalSender, Ap
 /// whereas chained/piped/redirected commands require an exact normalized match
 /// so `AllowSession` never widens to arbitrary suffixes.
 pub fn approval_grant_key(tool: &str, args: &Value) -> String {
+    if tool == "web_fetch" {
+        return if args
+            .get("allow_private")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            "web_fetch:private".to_string()
+        } else {
+            "web_fetch".to_string()
+        };
+    }
     if tool != "shell" {
         return tool.to_string();
     }
@@ -187,6 +215,28 @@ impl ApprovalGate {
     pub(crate) fn grant(&self, tool: &str) {
         if let Ok(mut g) = self.granted.lock() {
             g.insert(tool.to_string());
+        }
+    }
+
+    /// Acquires the exclusive interactive-prompt slot, polling `cancel` while waiting.
+    /// Returns `None` immediately if `cancel` is triggered before the slot is free.
+    pub fn acquire_prompt_slot(&self, cancel: &Cancel) -> Option<PromptGuard<'_>> {
+        let (lock, cv) = &*self.prompt_busy;
+        let mut busy = lock.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if cancel.is_cancelled() {
+                return None;
+            }
+            if !*busy {
+                *busy = true;
+                return Some(PromptGuard {
+                    busy: &self.prompt_busy,
+                });
+            }
+            let (next, _) = cv
+                .wait_timeout(busy, Duration::from_millis(50))
+                .unwrap_or_else(|e| e.into_inner());
+            busy = next;
         }
     }
 }
@@ -584,7 +634,7 @@ fn turn_body(
                 ..NewMessage::new(Role::User, text.clone())
             },
         )?;
-        hist.push(ChatMessage::user(text), cid);
+        hist.push(ChatMessage::synthetic_user(text), cid);
     }
 
     let context_probe = {
@@ -654,6 +704,7 @@ fn turn_body(
         spill_dir: agent.spill_dir.as_deref(),
         session_id,
         cancel,
+        orchestrator_root: is_root_orchestrator,
     };
 
     let (mut prompt_tokens, mut completion_tokens) = (0u64, 0u64);
@@ -800,7 +851,11 @@ fn turn_body(
                    "completion_tokens": out.usage.as_ref().map(|u| u.completion_tokens)}),
         );
         last = (id, out.text.clone(), out.reasoning.clone());
-        hist.push(ChatMessage::assistant(out.text, out.calls.clone()), id);
+        hist.push(
+            ChatMessage::assistant(out.text, out.calls.clone())
+                .with_thinking_blocks(out.thinking_blocks),
+            id,
+        );
         if out.calls.is_empty() {
             // Told something while the answer streamed: the turn is not over.
             if step < max_steps && steer(store, session_id, agent, &mut hist, log, on_event)? > 0 {
@@ -835,7 +890,7 @@ fn turn_body(
                         "subagent/joined",
                         json!({"n": joined.len(), "message_id": id}),
                     );
-                    hist.push(ChatMessage::user(text), id);
+                    hist.push(ChatMessage::synthetic_user(text), id);
                     continue;
                 }
             }
@@ -860,7 +915,7 @@ fn turn_body(
                                 ..NewMessage::new(Role::User, msg.clone())
                             },
                         )?;
-                        hist.push(ChatMessage::user(msg), cid);
+                        hist.push(ChatMessage::synthetic_user(msg), cid);
                         continue;
                     }
                 }
@@ -908,6 +963,9 @@ fn turn_body(
             let group = &out.calls[i..j];
             let mut prepared = Vec::with_capacity(group.len());
             for call in group {
+                if cancel.is_cancelled() {
+                    break;
+                }
                 on_event(RunEvent::ToolCall {
                     id: call.id.clone(),
                     name: call.name.clone(),
@@ -919,9 +977,13 @@ fn turn_body(
                 );
                 prepared.push(pipe.prepare(call, on_event));
             }
+            let prepared_len = prepared.len();
             // `ask_user` blocks on the person, so the loop answers it itself,
             // on this thread, before the rest of the group runs.
             for p in prepared.iter_mut() {
+                if cancel.is_cancelled() {
+                    break;
+                }
                 if p.settled.is_none() && p.inv.name == "ask_user" {
                     let (ok, text) =
                         question::settle(agent.questions, &p.inv.args, cancel, on_event);
@@ -942,7 +1004,21 @@ fn turn_body(
                 }
             }
             // Commit in the model's order, whatever order they finished in.
-            for ((call, p), ran) in group.iter().zip(prepared).zip(ran) {
+            for ((call, p), ran) in group[..prepared_len].iter().zip(prepared).zip(ran) {
+                if p.settled.is_none() && ran.is_none() && cancel.is_cancelled() {
+                    record(store, session_id, call, "[cancelado]", &mut hist)?;
+                    log.emit(
+                        "tool/result",
+                        json!({"id": call.id, "name": call.name, "ok": false, "cancelled": true}),
+                    );
+                    on_event(RunEvent::ToolResult {
+                        id: call.id.clone(),
+                        name: call.name.clone(),
+                        ok: false,
+                        output_preview: "[cancelado]".into(),
+                    });
+                    continue;
+                }
                 let ran = ran.or_else(|| {
                     cancel
                         .is_cancelled()
@@ -1041,6 +1117,16 @@ fn turn_body(
                 });
                 context.extend(outcome.context);
             }
+            if prepared_len < group.len() {
+                close_cancelled(
+                    store,
+                    session_id,
+                    &out.calls[i + prepared_len..],
+                    &mut hist,
+                    log,
+                )?;
+                return Err(ProviderError::Cancelled.into());
+            }
             i = j;
         }
         // Extra context comes after every result of the step: a user message
@@ -1057,7 +1143,7 @@ fn turn_body(
                 "tool/context",
                 json!({"message_id": id, "chars": text.chars().count()}),
             );
-            hist.push(ChatMessage::user(text), id);
+            hist.push(ChatMessage::synthetic_user(text), id);
         }
         if cancel.is_cancelled() {
             return Err(ProviderError::Cancelled.into());
@@ -1345,6 +1431,7 @@ fn close_cancelled(
 struct StepOut {
     text: String,
     reasoning: Option<String>,
+    thinking_blocks: Vec<Value>,
     calls: Vec<ToolCall>,
     usage: Option<Usage>,
     stop_reason: Option<String>,
@@ -1445,6 +1532,7 @@ fn apply_stream_event(
             out.reasoning.get_or_insert_with(String::new).push_str(&r);
             on_event(RunEvent::Reasoning(r));
         }
+        StreamEvent::ThinkingBlocks(b) => out.thinking_blocks = b,
         StreamEvent::ToolCalls(c) => out.calls = c,
         // A trailing chunk without usage must not erase earlier counts.
         StreamEvent::Done { usage, stop_reason } => {
@@ -1572,6 +1660,7 @@ fn request_single(
         StepOut {
             text: c.text,
             reasoning: c.reasoning,
+            thinking_blocks: c.thinking_blocks,
             calls: c.tool_calls,
             usage: c.usage,
             stop_reason: c.finish_reason,
@@ -1993,6 +2082,17 @@ mod approval_grant_tests {
             approval_grant_key("write_file", &json!({"path": "a.txt"})),
             "write_file"
         );
+        assert_eq!(
+            approval_grant_key("web_fetch", &json!({"url": "https://example.com"})),
+            "web_fetch"
+        );
+        assert_eq!(
+            approval_grant_key(
+                "web_fetch",
+                &json!({"url": "http://127.0.0.1", "allow_private": true})
+            ),
+            "web_fetch:private"
+        );
     }
 
     #[test]
@@ -2039,5 +2139,352 @@ mod approval_grant_tests {
             "browser_screenshot",
             browser_ctx
         ));
+    }
+}
+
+#[cfg(test)]
+mod runtime_hardening_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use zerith_providers::{Protocol, ProviderConfig, ProviderKind, RetryPolicy};
+    use zerith_security::{preset, Mode};
+    use zerith_sessions::SessionSource;
+    use zerith_tools::{CallCtx, Exec, Permission, Tool, ToolSpec};
+
+    fn serve_raw(responses: Vec<String>) -> (String, Arc<Mutex<Vec<Value>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for resp in responses {
+                let Ok((mut sock, _)) = listener.accept() else {
+                    return;
+                };
+                let mut r = BufReader::new(sock.try_clone().unwrap());
+                let mut first = String::new();
+                r.read_line(&mut first).unwrap();
+                let mut len = 0;
+                loop {
+                    let mut h = String::new();
+                    r.read_line(&mut h).unwrap();
+                    if h.trim().is_empty() {
+                        break;
+                    }
+                    if let Some(v) = h.to_ascii_lowercase().strip_prefix("content-length:") {
+                        len = v.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; len];
+                r.read_exact(&mut body).unwrap();
+                log.lock()
+                    .unwrap()
+                    .push(serde_json::from_slice(&body).unwrap_or(Value::Null));
+                let _ = sock.write_all(resp.as_bytes());
+            }
+        });
+        (url, seen)
+    }
+
+    fn anthropic_sse(events: &[(&str, Value)]) -> String {
+        let mut s = String::from(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+        );
+        for (ev, data) in events {
+            s.push_str(&format!("event: {ev}\ndata: {data}\n\n"));
+        }
+        s
+    }
+
+    #[test]
+    fn apply_stream_event_captures_thinking_blocks_and_replays_in_multi_step_turn() {
+        let mut step_out = StepOut::default();
+        let mut painted = false;
+        let blocks = vec![json!({
+            "type": "thinking",
+            "thinking": "passo interno",
+            "signature": "sig-abc"
+        })];
+        apply_stream_event(
+            StreamEvent::ThinkingBlocks(blocks.clone()),
+            &mut step_out,
+            &mut painted,
+            &mut |_| {},
+        );
+        assert_eq!(step_out.thinking_blocks, blocks);
+
+        let step1 = anthropic_sse(&[
+            (
+                "message_start",
+                json!({"type": "message_start", "message": {"usage": {"input_tokens": 10, "output_tokens": 1}}}),
+            ),
+            (
+                "content_block_start",
+                json!({"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "analisando"}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "sig-123"}}),
+            ),
+            (
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": 0}),
+            ),
+            (
+                "content_block_start",
+                json!({"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "t1", "name": "list_dir", "input": {}}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "{\"path\":\".\"}"}}),
+            ),
+            (
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": 1}),
+            ),
+            (
+                "message_delta",
+                json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 5}}),
+            ),
+            ("message_stop", json!({"type": "message_stop"})),
+        ]);
+        let step2 = anthropic_sse(&[
+            (
+                "message_start",
+                json!({"type": "message_start", "message": {"usage": {"input_tokens": 20, "output_tokens": 1}}}),
+            ),
+            (
+                "content_block_start",
+                json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "concluido"}}),
+            ),
+            (
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": 0}),
+            ),
+            (
+                "message_delta",
+                json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 3}}),
+            ),
+            ("message_stop", json!({"type": "message_stop"})),
+        ]);
+
+        let (url, seen) = serve_raw(vec![step1, step2]);
+        let mut cfg = ProviderConfig::new(ProviderKind::Anthropic).with_key("k");
+        cfg.base_url = url;
+        cfg.protocol = Protocol::Anthropic;
+        cfg.timeout_ms = 5_000;
+        let client = Client::new(cfg).unwrap().with_retry(RetryPolicy {
+            max_retries: 0,
+            base_ms: 1,
+            max_ms: 5,
+            max_retry_after_ms: 1_000,
+        });
+        let store = Store::open_in_memory().unwrap();
+        let sid = store
+            .create_session("thinking", SessionSource::Native)
+            .unwrap()
+            .id;
+        let reg = Registry::new();
+        let scratch = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let ws = tempfile::Builder::new().tempdir_in(&scratch).unwrap();
+        let policy = Policy::new(preset("workspace-write").unwrap(), Mode::Bypass, ws.path());
+        let report = run_agent_turn(
+            &store,
+            &client,
+            TurnContext {
+                no_project_instructions: true,
+                ..Default::default()
+            },
+            AgentOptions {
+                tools: Some(&reg),
+                policy: Some(&policy),
+                ..Default::default()
+            },
+            &sid,
+            "claude-sonnet-4",
+            "liste",
+            &Cancel::default(),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(report.text, "concluido");
+
+        let reqs = seen.lock().unwrap();
+        assert_eq!(reqs.len(), 2);
+        let step2_msgs = reqs[1]["messages"].as_array().unwrap();
+        let assistant_msg = step2_msgs
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .expect("step 2 must replay assistant message");
+        let content = assistant_msg["content"].as_array().unwrap();
+        assert!(
+            content.iter().any(|b| b["type"] == "thinking"
+                && b["thinking"] == "analisando"
+                && b["signature"] == "sig-123"),
+            "step 2 assistant message must preserve signed thinking block: {content:?}"
+        );
+    }
+
+    #[test]
+    fn cancelling_during_tool_group_skips_unstarted_calls_and_hooks() {
+        struct CountingTool {
+            spec: ToolSpec,
+            cancel_on_run: Cancel,
+            runs: Arc<AtomicUsize>,
+        }
+        impl Tool for CountingTool {
+            fn spec(&self) -> &ToolSpec {
+                &self.spec
+            }
+            fn action(
+                &self,
+                _args: &Value,
+                _ctx: &CallCtx<'_>,
+            ) -> zerith_tools::Result<Option<zerith_security::Action>> {
+                Ok(None)
+            }
+            fn run(
+                &self,
+                _args: &Value,
+                _ctx: &CallCtx<'_>,
+                _exec: &Exec<'_>,
+            ) -> zerith_tools::Result<String> {
+                self.runs.fetch_add(1, Ordering::SeqCst);
+                self.cancel_on_run.cancel();
+                Ok("ran-first".into())
+            }
+            fn concurrency_safe(&self, _args: &Value) -> bool {
+                true
+            }
+        }
+        struct CountMiddleware {
+            before_calls: Arc<AtomicUsize>,
+            after_calls: Arc<AtomicUsize>,
+            cancel_on_second_before: Option<Cancel>,
+        }
+        impl Middleware for CountMiddleware {
+            fn before(&self, _call: &mut crate::ToolInvocation) -> crate::Flow {
+                let n = self.before_calls.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    if let Some(c) = &self.cancel_on_second_before {
+                        c.cancel();
+                    }
+                }
+                crate::Flow::Continue
+            }
+            fn after(&self, _call: &crate::ToolInvocation, _result: &mut crate::ToolOutcome) {
+                self.after_calls.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\
+             data: {}\n\n\
+             data: [DONE]\n\n",
+            json!({"choices":[{"delta":{"tool_calls":[
+                {"index": 0, "id": "c1", "function": {"name": "t_safe", "arguments": "{}"}},
+                {"index": 1, "id": "c2", "function": {"name": "t_safe", "arguments": "{}"}},
+                {"index": 2, "id": "c3", "function": {"name": "t_safe", "arguments": "{}"}}
+            ]}}]})
+        );
+        let (base, _) = serve_raw(vec![resp]);
+        let mut cfg = ProviderConfig::new(ProviderKind::Custom).with_key("k");
+        cfg.base_url = format!("{base}/v1");
+        cfg.protocol = zerith_providers::Protocol::OpenAi;
+        cfg.timeout_ms = 5_000;
+        let client = Client::new(cfg).unwrap().with_retry(RetryPolicy {
+            max_retries: 0,
+            base_ms: 1,
+            max_ms: 5,
+            max_retry_after_ms: 1_000,
+        });
+
+        let cancel = Cancel::default();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let before_calls = Arc::new(AtomicUsize::new(0));
+        let after_calls = Arc::new(AtomicUsize::new(0));
+        let mut reg = Registry::empty();
+        reg.register(Box::new(CountingTool {
+            spec: ToolSpec {
+                name: "t_safe".into(),
+                description: "safe".into(),
+                parameters: json!({"type": "object"}),
+                returns: "text",
+                permission: Permission::Read,
+                timeout: Duration::from_secs(5),
+                cancellable: true,
+                local: true,
+                source: "test".into(),
+            },
+            cancel_on_run: cancel.clone(),
+            runs: Arc::clone(&runs),
+        }));
+        let scratch = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let ws = tempfile::Builder::new().tempdir_in(&scratch).unwrap();
+        let policy = Policy::new(preset("workspace-write").unwrap(), Mode::Bypass, ws.path());
+        let store = Store::open_in_memory().unwrap();
+        let sid = store
+            .create_session("cancel-group", SessionSource::Native)
+            .unwrap()
+            .id;
+
+        let err = run_agent_turn(
+            &store,
+            &client,
+            TurnContext {
+                no_project_instructions: true,
+                ..Default::default()
+            },
+            AgentOptions {
+                tools: Some(&reg),
+                policy: Some(&policy),
+                middleware: vec![Box::new(CountMiddleware {
+                    before_calls: Arc::clone(&before_calls),
+                    after_calls: Arc::clone(&after_calls),
+                    cancel_on_second_before: Some(cancel.clone()),
+                })],
+                max_parallel_tools: 1,
+                ..Default::default()
+            },
+            &sid,
+            "m",
+            "oi",
+            &cancel,
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(matches!(err, RunError::Provider(ProviderError::Cancelled)));
+        assert_eq!(
+            before_calls.load(Ordering::SeqCst),
+            1,
+            "c2 and c3 must not run PreToolUse"
+        );
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            0,
+            "c1 must not execute after cancel"
+        );
+        assert_eq!(
+            after_calls.load(Ordering::SeqCst),
+            0,
+            "unstarted calls must not run PostToolUseFailure"
+        );
+
+        let msgs = store.messages(&sid, 20, 0).unwrap();
+        let tool_msgs: Vec<_> = msgs.iter().filter(|m| m.role == Role::Tool).collect();
+        assert_eq!(tool_msgs.len(), 3, "every tool call stays paired");
+        assert!(tool_msgs.iter().all(|m| m.content == "[cancelado]"));
     }
 }

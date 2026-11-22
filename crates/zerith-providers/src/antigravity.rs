@@ -28,16 +28,21 @@ pub(crate) fn body(req: &ChatRequest, project: Option<&str>) -> Value {
     // tool_call_id → name: a functionResponse must repeat the call's name
     let mut names = std::collections::HashMap::new();
     for m in &req.messages {
-        match m.role {
-            Role::System => system.push(json!({"text": m.content})),
+        let (role, parts) = match m.role {
+            Role::System => {
+                system.push(json!({"text": m.content}));
+                continue;
+            }
             Role::User => {
                 let mut parts = vec![json!({"text": m.content})];
-                parts.extend(
-                    crate::images::local_images(&m.content)
-                        .iter()
-                        .map(|i| json!({"inlineData": {"mimeType": i.mime, "data": i.data}})),
-                );
-                contents.push(json!({"role": "user", "parts": parts}));
+                if !m.synthetic {
+                    parts.extend(
+                        crate::images::local_images(&m.content)
+                            .iter()
+                            .map(|i| json!({"inlineData": {"mimeType": i.mime, "data": i.data}})),
+                    );
+                }
+                ("user", parts)
             }
             Role::Assistant => {
                 let mut parts = Vec::new();
@@ -46,15 +51,16 @@ pub(crate) fn body(req: &ChatRequest, project: Option<&str>) -> Value {
                 }
                 for c in &m.tool_calls {
                     names.insert(c.id.clone(), c.name.clone());
-                    let args: Value = serde_json::from_str(&c.arguments).unwrap_or(json!({}));
+                    let args: Value = serde_json::from_str::<Value>(&c.arguments)
+                        .ok()
+                        .filter(Value::is_object)
+                        .unwrap_or_else(|| json!({}));
                     parts.push(json!({
                         "functionCall": {"name": c.name, "args": args, "id": c.id},
                         "thoughtSignature": SKIP_SIGNATURE,
                     }));
                 }
-                if !parts.is_empty() {
-                    contents.push(json!({"role": "model", "parts": parts}));
-                }
+                ("model", parts)
             }
             Role::Tool => {
                 let id = m.tool_call_id.clone().unwrap_or_default();
@@ -63,17 +69,21 @@ pub(crate) fn body(req: &ChatRequest, project: Option<&str>) -> Value {
                     "id": id,
                     "response": {"output": m.content},
                 }});
-                // parallel results travel together, in one user turn
-                match contents.last_mut() {
-                    Some(last)
-                        if last["role"] == "user"
-                            && last["parts"][0].get("functionResponse").is_some() =>
-                    {
-                        last["parts"].as_array_mut().unwrap().push(part)
-                    }
-                    _ => contents.push(json!({"role": "user", "parts": [part]})),
+                ("user", vec![part])
+            }
+        };
+        if parts.is_empty() {
+            continue;
+        }
+        // Consecutive same-role turns (steering/synthetic user messages,
+        // parallel tool results, or tool result followed by user prompt) merge.
+        match contents.last_mut() {
+            Some(last) if last["role"] == role => {
+                if let Some(arr) = last["parts"].as_array_mut() {
+                    arr.extend(parts);
                 }
             }
+            _ => contents.push(json!({"role": role, "parts": parts})),
         }
     }
     let mut request = json!({"contents": contents});
@@ -227,10 +237,12 @@ pub(crate) fn complete(client: &Client, req: &ChatRequest, cancel: &Cancel) -> R
         usage: None,
         finish_reason: None,
         tool_calls: Vec::new(),
+        thinking_blocks: Vec::new(),
     };
     stream(client, req, cancel, &mut |e| match e {
         StreamEvent::Delta(d) => out.text.push_str(&d),
         StreamEvent::Reasoning(r) => out.reasoning.get_or_insert_with(String::new).push_str(&r),
+        StreamEvent::ThinkingBlocks(b) => out.thinking_blocks = b,
         StreamEvent::ToolCalls(c) => out.tool_calls = c,
         StreamEvent::Done { usage, stop_reason } => {
             out.usage = usage;
@@ -479,5 +491,64 @@ mod tests {
             .unwrap_err();
         assert!(matches!(e, ProviderError::Http { status: 503, .. }));
         assert!(crate::is_cut_off("MAX_TOKENS"));
+    }
+
+    #[test]
+    fn consecutive_user_and_tool_turns_merge_and_non_object_args_become_empty_object() {
+        let req = ChatRequest::new(
+            "gemini-4-hydrogen-medium",
+            vec![
+                ChatMessage::synthetic_user("resumo"),
+                ChatMessage::user("primeira pergunta"),
+                ChatMessage::assistant(
+                    "",
+                    vec![
+                        ToolCall {
+                            id: "c1".into(),
+                            name: "t_arr".into(),
+                            arguments: "[1, 2, 3]".into(),
+                        },
+                        ToolCall {
+                            id: "c2".into(),
+                            name: "t_str".into(),
+                            arguments: "\"hello\"".into(),
+                        },
+                        ToolCall {
+                            id: "c3".into(),
+                            name: "t_bad".into(),
+                            arguments: "not json".into(),
+                        },
+                    ],
+                ),
+                ChatMessage::tool("c1", "r1"),
+                ChatMessage::tool("c2", "r2"),
+                ChatMessage::tool("c3", "r3"),
+                ChatMessage::synthetic_user("contexto extra"),
+                ChatMessage::user("siga"),
+            ],
+        );
+        let b = body(&req, None);
+        let contents = b["request"]["contents"].as_array().unwrap();
+        assert_eq!(contents.len(), 3, "must alternate user/model/user: {b}");
+        assert_eq!(contents[0]["role"], "user");
+        assert_eq!(contents[0]["parts"].as_array().unwrap().len(), 2);
+        assert_eq!(contents[0]["parts"][0]["text"], "resumo");
+        assert_eq!(contents[0]["parts"][1]["text"], "primeira pergunta");
+
+        assert_eq!(contents[1]["role"], "model");
+        let model_parts = contents[1]["parts"].as_array().unwrap();
+        assert!(model_parts.len() >= 3);
+        for part in &model_parts[..3] {
+            assert_eq!(part["functionCall"]["args"], json!({}));
+        }
+
+        assert_eq!(contents[2]["role"], "user");
+        let last_parts = contents[2]["parts"].as_array().unwrap();
+        assert_eq!(last_parts.len(), 5);
+        assert_eq!(last_parts[0]["functionResponse"]["id"], "c1");
+        assert_eq!(last_parts[1]["functionResponse"]["id"], "c2");
+        assert_eq!(last_parts[2]["functionResponse"]["id"], "c3");
+        assert_eq!(last_parts[3]["text"], "contexto extra");
+        assert_eq!(last_parts[4]["text"], "siga");
     }
 }

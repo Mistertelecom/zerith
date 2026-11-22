@@ -45,7 +45,7 @@ export interface ToolRow {
 export interface TurnState {
   blocks: Block[];
   tasks: Todo[];
-  approval: { id: number; tool: string; summary: string } | null;
+  approvals: { id: number; tool: string; summary: string }[];
   question: { id: number; questions: Question[] } | null;
   usage: {
     input: number;
@@ -75,7 +75,7 @@ export interface SubagentRun {
 export const emptyTurn: TurnState = {
   blocks: [],
   tasks: [],
-  approval: null,
+  approvals: [],
   question: null,
   usage: null,
   saved: 0,
@@ -121,7 +121,21 @@ export function applyEvent(prev: TurnState, ev: TurnEvent): TurnState {
     }
     case "toolResult": {
       const a = assistant(state);
-      const i = a.tools.findIndex((t) => t.id === ev.id);
+      let i = -1;
+      for (let k = a.tools.length - 1; k >= 0; k--) {
+        if (a.tools[k].id === ev.id && a.tools[k].ok === undefined) {
+          i = k;
+          break;
+        }
+      }
+      if (i < 0) {
+        for (let k = a.tools.length - 1; k >= 0; k--) {
+          if (a.tools[k].id === ev.id) {
+            i = k;
+            break;
+          }
+        }
+      }
       if (i >= 0) {
         a.tools[i] = { ...a.tools[i], ok: ev.ok, preview: ev.preview };
       } else {
@@ -156,7 +170,11 @@ export function applyEvent(prev: TurnState, ev: TurnEvent): TurnState {
       state.blocks = [...state.blocks, { kind: "note", text: `Direcionado: ${ev.text}` }];
       return state;
     case "approval":
-      state.approval = { id: ev.id, tool: ev.tool, summary: ev.summary };
+      if (prev.approvals.some((a) => a.id === ev.id)) return prev;
+      state.approvals = [
+        ...prev.approvals,
+        { id: ev.id, tool: ev.tool, summary: ev.summary },
+      ];
       return state;
     case "question":
       state.question = { id: ev.id, questions: ev.questions };
@@ -264,7 +282,7 @@ export function applyEvent(prev: TurnState, ev: TurnEvent): TurnState {
  * and a turn that ended without its own `done`/`failed` says so instead of
  * leaving a silent or still-"typing" answer behind. */
 export function finishTurn(prev: TurnState): TurnState {
-  const state = { ...prev, busy: false, approval: null, question: null };
+  const state = { ...prev, busy: false, approvals: [], question: null };
   const last = [...state.blocks].reverse().find((b) => b.kind === "assistant");
   if (!last || (last.streaming && !last.error)) {
     const a = assistant(state);

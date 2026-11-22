@@ -110,6 +110,7 @@ pub(crate) struct Pipeline<'a> {
     pub spill_dir: Option<&'a Path>,
     pub session_id: &'a str,
     pub cancel: &'a Cancel,
+    pub orchestrator_root: bool,
 }
 
 impl Pipeline<'_> {
@@ -154,6 +155,14 @@ impl Pipeline<'_> {
                 "erro: ferramentas desativadas neste turno".into(),
             );
         };
+        if self.orchestrator_root && !crate::agent::is_orchestrator_root_tool(&inv.name) {
+            return settle(
+                inv,
+                false,
+                "modo orquestrador: ferramenta exclusiva dos subagentes; delegue usando `agent`"
+                    .into(),
+            );
+        }
         inv.args = match parse_args(&call.arguments) {
             Ok(v) => v,
             Err(e) => {
@@ -250,8 +259,27 @@ impl Pipeline<'_> {
                         }
                     }
                 } else {
-                    let forced = why.starts_with("regra ") || remote_access(&inv.name, &inv.args);
-                    (Some((why, forced)), None)
+                    let sensitive_boundary = match &action {
+                        Some(Action::Write(path) | Action::Read(path)) => {
+                            !policy.inside_workspace(path) || policy.is_own_control(path)
+                        }
+                        _ => false,
+                    } || (inv.name == "web_fetch"
+                        && inv
+                            .args
+                            .get("allow_private")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false));
+                    let forced = why.starts_with("regra ")
+                        || remote_access(&inv.name, &inv.args)
+                        || sensitive_boundary;
+                    let grant_override = sensitive_boundary.then(|| {
+                        format!(
+                            "{}:boundary",
+                            crate::agent::approval_grant_key(&inv.name, &inv.args)
+                        )
+                    });
+                    (Some((why, forced)), grant_override)
                 }
             }
             (None, Some(s)) => (Some((s, true)), None),
@@ -315,6 +343,18 @@ impl Pipeline<'_> {
         if !forced && gate.granted(grant_key) {
             return Ok(());
         }
+        if self.cancel.is_cancelled() {
+            return Err("cancelado".into());
+        }
+        let Some(_slot) = gate.acquire_prompt_slot(self.cancel) else {
+            return Err("cancelado".into());
+        };
+        if !forced && gate.granted(grant_key) {
+            return Ok(());
+        }
+        if self.cancel.is_cancelled() {
+            return Err("cancelado".into());
+        }
         let id = NEXT_APPROVAL.fetch_add(1, Ordering::Relaxed);
         if self.relay {
             on_event(RunEvent::ApprovalNeeded {
@@ -336,7 +376,13 @@ impl Pipeline<'_> {
                 gate.grant(grant_key);
                 Ok(())
             }
-            Approval::Deny => Err("negado pelo usuário".into()),
+            Approval::Deny => {
+                if self.cancel.is_cancelled() {
+                    Err("cancelado".into())
+                } else {
+                    Err("negado pelo usuário".into())
+                }
+            }
         }
     }
 
@@ -379,6 +425,9 @@ impl Pipeline<'_> {
         if max_parallel <= 1 || todo.len() < 2 || !all_safe {
             let cancel = self.cancel;
             for i in todo {
+                if cancel.is_cancelled() {
+                    break;
+                }
                 let inv = &jobs[i].inv;
                 out[i] = Some(if tools.uses_memory(&inv.name) {
                     self.run_one(tools, policy, inv)
@@ -399,19 +448,34 @@ impl Pipeline<'_> {
         let finished = AtomicUsize::new(0);
         let cancel = self.cancel;
         let workers = max_parallel.min(pool.len());
+        struct FinishOnDrop<'a>(&'a AtomicUsize);
+        impl Drop for FinishOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
         std::thread::scope(|s| {
             for _ in 0..workers {
                 s.spawn(|| loop {
                     let k = next.fetch_add(1, Ordering::SeqCst);
                     let Some(&i) = pool.get(k) else { break };
-                    let r = run_plain(tools, policy, &jobs[i].inv, cancel);
+                    let _done = FinishOnDrop(&finished);
+                    if cancel.is_cancelled() {
+                        continue;
+                    }
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        run_plain(tools, policy, &jobs[i].inv, cancel)
+                    }))
+                    .unwrap_or_else(|_| (false, "erro interno na ferramenta (panic)".into()));
                     if let Ok(mut g) = slots.lock() {
                         g[i] = Some(r);
                     }
-                    finished.fetch_add(1, Ordering::SeqCst);
                 });
             }
             for &i in &mine {
+                if cancel.is_cancelled() {
+                    break;
+                }
                 let r = self.run_one(tools, policy, &jobs[i].inv);
                 if let Ok(mut g) = slots.lock() {
                     g[i] = Some(r);
@@ -669,5 +733,416 @@ mod remote_tests {
         assert!(!sh("git status"));
         assert!(!remote_access("read_file", &json!({ "path": "ssh" })));
         assert!(remote_access("net_connect", &json!({ "device": "core-1" })));
+    }
+}
+
+#[cfg(test)]
+mod parallel_panic_tests {
+    use super::*;
+    use zerith_security::{preset, Mode};
+    use zerith_tools::{Exec, Permission, Tool, ToolSpec};
+
+    struct MockTool {
+        spec: ToolSpec,
+        panic: bool,
+    }
+
+    impl Tool for MockTool {
+        fn spec(&self) -> &ToolSpec {
+            &self.spec
+        }
+
+        fn action(
+            &self,
+            _args: &Value,
+            _ctx: &CallCtx<'_>,
+        ) -> zerith_tools::Result<Option<Action>> {
+            Ok(None)
+        }
+
+        fn run(
+            &self,
+            _args: &Value,
+            _ctx: &CallCtx<'_>,
+            _exec: &Exec<'_>,
+        ) -> zerith_tools::Result<String> {
+            if self.panic {
+                panic!("boom in parallel tool");
+            }
+            Ok("ok".into())
+        }
+
+        fn concurrency_safe(&self, _args: &Value) -> bool {
+            true
+        }
+    }
+
+    fn spec(name: &str) -> ToolSpec {
+        ToolSpec {
+            name: name.into(),
+            description: "mock".into(),
+            parameters: serde_json::json!({"type": "object"}),
+            returns: "text",
+            permission: Permission::Read,
+            timeout: Duration::from_secs(5),
+            cancellable: false,
+            local: true,
+            source: "built-in".into(),
+        }
+    }
+
+    #[test]
+    fn parallel_tool_panic_does_not_deadlock_run_group() {
+        let mut reg = Registry::empty();
+        reg.register(Box::new(MockTool {
+            spec: spec("panicker"),
+            panic: true,
+        }));
+        reg.register(Box::new(MockTool {
+            spec: spec("healthy"),
+            panic: false,
+        }));
+        let policy = Policy::new(
+            preset("workspace-write").unwrap(),
+            Mode::Bypass,
+            Path::new("."),
+        );
+        let cancel = Cancel::default();
+        let pipe = Pipeline {
+            core: Some((&reg, &policy)),
+            memory: None,
+            scope: None,
+            middleware: &[],
+            approvals: None,
+            relay: false,
+            spill_dir: None,
+            session_id: "s1",
+            cancel: &cancel,
+            orchestrator_root: false,
+        };
+        let calls = [
+            ToolCall {
+                id: "1".into(),
+                name: "panicker".into(),
+                arguments: "{}".into(),
+            },
+            ToolCall {
+                id: "2".into(),
+                name: "healthy".into(),
+                arguments: "{}".into(),
+            },
+        ];
+        let prepared: Vec<Prepared> = calls.iter().map(|c| pipe.prepare(c, &mut |_| {})).collect();
+        let out = pipe.run_group(&prepared, 2, &mut |_| {});
+        assert_eq!(
+            out,
+            vec![
+                Some((false, "erro interno na ferramenta (panic)".into())),
+                Some((true, "ok".into())),
+            ]
+        );
+    }
+
+    #[test]
+    fn allow_session_never_bypasses_sensitive_boundaries_or_private_web_fetch() {
+        let scratch = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let ws = tempfile::Builder::new().tempdir_in(&scratch).unwrap();
+        let outside = tempfile::Builder::new().tempdir_in(&scratch).unwrap();
+        std::fs::create_dir_all(ws.path().join(".zerith")).unwrap();
+
+        let reg = Registry::new();
+        let policy = Policy::new(preset("workspace-write").unwrap(), Mode::Default, ws.path());
+        let cancel = Cancel::default();
+
+        // Scenario 1: AllowSession granted on an in-workspace write must NOT waive
+        // outside-workspace writes or control files (`.zerith/`, `.git/hooks/`).
+        let (tx, gate) = crate::agent::approval_channel();
+        let pipe = Pipeline {
+            core: Some((&reg, &policy)),
+            memory: None,
+            scope: None,
+            middleware: &[],
+            approvals: Some(&gate),
+            relay: true,
+            spill_dir: None,
+            session_id: "s-bound",
+            cancel: &cancel,
+            orchestrator_root: false,
+        };
+        let in_ws_call = ToolCall {
+            id: "w1".into(),
+            name: "write_file".into(),
+            arguments: serde_json::json!({"path": "ok.txt", "content": "hi"}).to_string(),
+        };
+        let prep1 = pipe.prepare(&in_ws_call, &mut |ev| {
+            if let RunEvent::ApprovalNeeded { id, .. } = ev {
+                assert!(tx.answer(id, Approval::AllowSession));
+            }
+        });
+        assert!(prep1.settled.is_none());
+
+        // Another in-workspace write uses the AllowSession grant without prompting.
+        let in_ws_call2 = ToolCall {
+            id: "w2".into(),
+            name: "write_file".into(),
+            arguments: serde_json::json!({"path": "ok2.txt", "content": "hi"}).to_string(),
+        };
+        assert!(pipe.prepare(&in_ws_call2, &mut |_| {}).settled.is_none());
+
+        // Outside-workspace and control-file writes STILL prompt even with AllowSession on write_file.
+        for sensitive_path in [
+            outside
+                .path()
+                .join("pwn.txt")
+                .to_string_lossy()
+                .into_owned(),
+            ".zerith/settings.toml".into(),
+            ".git/hooks/pre-commit".into(),
+        ] {
+            let (tx_d, gate_d) = crate::agent::approval_channel();
+            gate_d.grant("write_file");
+            let pipe_d = Pipeline {
+                approvals: Some(&gate_d),
+                ..pipe
+            };
+            let call = ToolCall {
+                id: "wsens".into(),
+                name: "write_file".into(),
+                arguments: serde_json::json!({"path": sensitive_path, "content": "x"}).to_string(),
+            };
+            let mut prompted = false;
+            let prep = pipe_d.prepare(&call, &mut |ev| {
+                if let RunEvent::ApprovalNeeded { id, .. } = ev {
+                    prompted = true;
+                    assert!(tx_d.answer(id, Approval::Deny));
+                }
+            });
+            assert!(
+                prompted,
+                "sensitive path `{sensitive_path}` must prompt despite AllowSession on write_file"
+            );
+            assert!(
+                prep.settled.is_some_and(|s| !s.ok),
+                "denying prompt must settle `{sensitive_path}` as refused"
+            );
+        }
+
+        // Scenario 2: AllowSession on public web_fetch must NOT auto-approve allow_private: true.
+        let (tx_w, gate_w) = crate::agent::approval_channel();
+        gate_w.grant(&crate::agent::approval_grant_key(
+            "web_fetch",
+            &serde_json::json!({"url": "https://example.com"}),
+        ));
+        let pipe_w = Pipeline {
+            approvals: Some(&gate_w),
+            ..pipe
+        };
+        let pub_call = ToolCall {
+            id: "wf1".into(),
+            name: "web_fetch".into(),
+            arguments: serde_json::json!({"url": "https://example.org"}).to_string(),
+        };
+        assert!(pipe_w.prepare(&pub_call, &mut |_| {}).settled.is_none());
+
+        let priv_call = ToolCall {
+            id: "wf2".into(),
+            name: "web_fetch".into(),
+            arguments: serde_json::json!({"url": "http://127.0.0.1:8080", "allow_private": true})
+                .to_string(),
+        };
+        let mut prompted_priv = false;
+        let prep_priv = pipe_w.prepare(&priv_call, &mut |ev| {
+            if let RunEvent::ApprovalNeeded { id, .. } = ev {
+                prompted_priv = true;
+                assert!(tx_w.answer(id, Approval::Deny));
+            }
+        });
+        assert!(prompted_priv);
+        assert!(prep_priv.settled.is_some_and(|s| !s.ok));
+    }
+
+    #[test]
+    fn concurrent_approvals_serialize_and_share_allow_session_grant() {
+        let scratch = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let ws = tempfile::Builder::new().tempdir_in(&scratch).unwrap();
+
+        let reg = Registry::new();
+        let policy = Policy::new(preset("workspace-write").unwrap(), Mode::Default, ws.path());
+        let cancel = Cancel::default();
+        let (tx, gate) = crate::agent::approval_channel();
+        let prompt_count = Arc::new(AtomicUsize::new(0));
+        let (first_seen_tx, first_seen_rx) = mpsc::channel::<u64>();
+        let (second_entered_tx, second_entered_rx) = mpsc::channel::<()>();
+
+        std::thread::scope(|s| {
+            let reg_ref = &reg;
+            let pol_ref = &policy;
+            let cancel_ref = &cancel;
+            let g1 = gate.clone();
+            let cnt1 = Arc::clone(&prompt_count);
+            let h1 = s.spawn(move || {
+                let p1 = Pipeline {
+                    core: Some((reg_ref, pol_ref)),
+                    memory: None,
+                    scope: None,
+                    middleware: &[],
+                    approvals: Some(&g1),
+                    relay: true,
+                    spill_dir: None,
+                    session_id: "s-serial",
+                    cancel: cancel_ref,
+                    orchestrator_root: false,
+                };
+                let c1 = ToolCall {
+                    id: "w1".into(),
+                    name: "write_file".into(),
+                    arguments: serde_json::json!({"path": "a.txt", "content": "1"}).to_string(),
+                };
+                p1.prepare(&c1, &mut |ev| {
+                    if let RunEvent::ApprovalNeeded { id, .. } = ev {
+                        cnt1.fetch_add(1, Ordering::SeqCst);
+                        let _ = first_seen_tx.send(id);
+                    }
+                })
+            });
+
+            let first_id = first_seen_rx.recv().unwrap();
+
+            let g2 = gate.clone();
+            let cnt2 = Arc::clone(&prompt_count);
+            let h2 = s.spawn(move || {
+                let p2 = Pipeline {
+                    core: Some((reg_ref, pol_ref)),
+                    memory: None,
+                    scope: None,
+                    middleware: &[],
+                    approvals: Some(&g2),
+                    relay: false,
+                    spill_dir: None,
+                    session_id: "s-serial",
+                    cancel: cancel_ref,
+                    orchestrator_root: false,
+                };
+                let _ = second_entered_tx.send(());
+                let c2 = ToolCall {
+                    id: "w2".into(),
+                    name: "write_file".into(),
+                    arguments: serde_json::json!({"path": "b.txt", "content": "2"}).to_string(),
+                };
+                p2.prepare(&c2, &mut |ev| {
+                    if let RunEvent::ApprovalNeeded { .. } = ev {
+                        cnt2.fetch_add(1, Ordering::SeqCst);
+                    }
+                })
+            });
+
+            second_entered_rx.recv().unwrap();
+            std::thread::sleep(Duration::from_millis(80));
+            assert_eq!(
+                prompt_count.load(Ordering::SeqCst),
+                1,
+                "second approval must block on prompt slot before emitting"
+            );
+            assert!(gate.take_relayed().is_empty());
+
+            // Grant AllowSession for #1 -> #2 must acquire slot, see grant, and return without prompting.
+            assert!(tx.answer(first_id, Approval::AllowSession));
+            assert!(h1.join().unwrap().settled.is_none());
+            assert!(h2.join().unwrap().settled.is_none());
+            assert_eq!(prompt_count.load(Ordering::SeqCst), 1);
+            assert!(gate.take_relayed().is_empty());
+        });
+
+        // Forced approvals still prompt even when the tool has an AllowSession grant.
+        let p_forced = Pipeline {
+            core: Some((&reg, &policy)),
+            memory: None,
+            scope: None,
+            middleware: &[],
+            approvals: Some(&gate),
+            relay: true,
+            spill_dir: None,
+            session_id: "s-serial",
+            cancel: &cancel,
+            orchestrator_root: false,
+        };
+        let mut forced_prompted = false;
+        let res = p_forced.approve(
+            "write_file",
+            "write_file",
+            "regra explícita".into(),
+            true,
+            &mut |ev| {
+                if let RunEvent::ApprovalNeeded { id, .. } = ev {
+                    forced_prompted = true;
+                    assert!(tx.answer(id, Approval::AllowOnce));
+                }
+            },
+        );
+        assert!(forced_prompted);
+        assert!(res.is_ok());
+
+        // Cancel unblocks a waiting prompt slot immediately with None.
+        let c_wait = Cancel::default();
+        let _held = gate.acquire_prompt_slot(&Cancel::default()).unwrap();
+        let c_wait2 = c_wait.clone();
+        std::thread::scope(|s| {
+            let g_wait = gate.clone();
+            let h = s.spawn(move || g_wait.acquire_prompt_slot(&c_wait2).is_none());
+            std::thread::sleep(Duration::from_millis(40));
+            c_wait.cancel();
+            assert!(h.join().unwrap());
+        });
+    }
+
+    #[test]
+    fn orchestrator_root_denies_execution_tools_and_allows_brain_tools() {
+        let scratch = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let ws = tempfile::Builder::new().tempdir_in(&scratch).unwrap();
+        let reg = Registry::new();
+        let policy = Policy::new(preset("workspace-write").unwrap(), Mode::Bypass, ws.path());
+        let cancel = Cancel::default();
+        let pipe = Pipeline {
+            core: Some((&reg, &policy)),
+            memory: None,
+            scope: None,
+            middleware: &[],
+            approvals: None,
+            relay: true,
+            spill_dir: None,
+            session_id: "s-orch",
+            cancel: &cancel,
+            orchestrator_root: true,
+        };
+
+        for blocked in ["shell", "write_file", "edit_file"] {
+            let prep = pipe.prepare(
+                &ToolCall {
+                    id: format!("id-{blocked}"),
+                    name: blocked.into(),
+                    arguments: "{}".into(),
+                },
+                &mut |_| {},
+            );
+            let settled = prep.settled.expect("execution tool must be denied");
+            assert!(!settled.ok);
+            assert_eq!(
+                settled.output,
+                "modo orquestrador: ferramenta exclusiva dos subagentes; delegue usando `agent`"
+            );
+        }
+
+        let allowed = pipe.prepare(
+            &ToolCall {
+                id: "id-read".into(),
+                name: "read_file".into(),
+                arguments: serde_json::json!({"path": "Cargo.toml"}).to_string(),
+            },
+            &mut |_| {},
+        );
+        assert!(allowed.settled.is_none(), "read_file must stay allowed");
     }
 }

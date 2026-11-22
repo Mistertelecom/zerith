@@ -112,7 +112,9 @@ export function SkillsTab() {
   const [tab, setTab] = useState<Tab>("Instaladas");
   const [skills, setSkills] = useState<SkillView[] | null>(null);
   const [catalog, setCatalog] = useState<Catalogue | null>(null);
+  const [catalogFailed, setCatalogFailed] = useState(false);
   const [plugins, setPlugins] = useState<PluginsView | null>(null);
+  const [pluginsFailed, setPluginsFailed] = useState(false);
   const [pluginBusy, setPluginBusy] = useState<string | null>(null);
   const [marketSrc, setMarketSrc] = useState("");
   const [selected, setSelected] = useState<string | null>(null);
@@ -141,14 +143,46 @@ export function SkillsTab() {
 
   useEffect(load, [load]);
 
+  const loadCatalog = useCallback((force = false) => {
+    setCatalogFailed(false);
+    setCatalog(null);
+    api
+      .skillsCatalog(force)
+      .then((c) => {
+        setCatalog(c);
+        setCatalogFailed(false);
+        setError(null);
+      })
+      .catch((e) => {
+        setCatalogFailed(true);
+        setError(String(e));
+      });
+  }, []);
+
+  const loadPlugins = useCallback(() => {
+    setPluginsFailed(false);
+    setPlugins(null);
+    api
+      .skillsPlugins()
+      .then((p) => {
+        setPlugins(p);
+        setPluginsFailed(false);
+        setError(null);
+      })
+      .catch((e) => {
+        setPluginsFailed(true);
+        setError(String(e));
+      });
+  }, []);
+
   useEffect(() => {
-    if (tab === "Catálogo" && !catalog) {
-      api.skillsCatalog().then(setCatalog).catch((e) => setError(String(e)));
+    if (tab === "Catálogo" && !catalog && !catalogFailed) {
+      loadCatalog();
     }
-    if (tab === "Plugins" && !plugins) {
-      api.skillsPlugins().then(setPlugins).catch((e) => setError(String(e)));
+    if (tab === "Plugins" && !plugins && !pluginsFailed) {
+      loadPlugins();
     }
-  }, [tab, catalog, plugins]);
+  }, [tab, catalog, catalogFailed, plugins, pluginsFailed, loadCatalog, loadPlugins]);
 
   const act = async (job: () => Promise<SkillView[]>) => {
     setBusy(true);
@@ -177,15 +211,17 @@ export function SkillsTab() {
       .finally(() => setLoadingRepo(null));
   };
 
-  const plugin = async (action: PluginAction, target: string, done?: string) => {
+  const plugin = async (action: PluginAction, target: string, done?: string): Promise<boolean> => {
     setPluginBusy(action + ":" + target);
     setNotice(null);
     try {
       setPlugins(await api.pluginAction(action, target));
       setError(null);
       if (done) setNotice(done);
+      return true;
     } catch (e) {
       setError(String(e));
+      return false;
     } finally {
       setPluginBusy(null);
     }
@@ -546,7 +582,20 @@ export function SkillsTab() {
                 <Info size={14} strokeWidth={2} />
                 Abra um repositório para ver as skills dele e instalar com um clique — sem clonar nada.
               </p>
-              {catalog === null ? <Loading text="Lendo o catálogo…" /> : null}
+              {catalog === null && !catalogFailed ? <Loading text="Lendo o catálogo…" /> : null}
+              {catalog === null && catalogFailed ? (
+                <div className="card">
+                  <EmptyState
+                    icon={Package}
+                    title="Catálogo indisponível"
+                    text="Não consegui falar com o GitHub agora. Tente de novo em alguns minutos."
+                  >
+                    <button className="btn btn-sm" onClick={() => loadCatalog(true)}>
+                      <RefreshCw size={14} strokeWidth={2} /> Tentar de novo
+                    </button>
+                  </EmptyState>
+                </div>
+              ) : null}
               {catalog?.entries.length === 0 ? (
                 <div className="card">
                   <EmptyState
@@ -613,7 +662,18 @@ export function SkillsTab() {
             icon={Store}
             description="Pacotes no formato do Claude Code. Depois de instalado, a IA usa as skills e os comandos dele sozinha quando o assunto aparece."
           >
-            {plugins === null ? <Loading text="Lendo as lojas…" /> : null}
+            {plugins === null && !pluginsFailed ? <Loading text="Lendo as lojas…" /> : null}
+            {plugins === null && pluginsFailed ? (
+              <EmptyState
+                icon={Store}
+                title="Não consegui carregar os plugins"
+                text="Falha ao ler as lojas e plugins configurados."
+              >
+                <button className="btn btn-sm" onClick={loadPlugins}>
+                  <RefreshCw size={14} strokeWidth={2} /> Tentar de novo
+                </button>
+              </EmptyState>
+            ) : null}
             {plugins?.offers.length ? (
               <div className="pn-list">
                 {plugins.offers.map((o) => {
@@ -672,8 +732,8 @@ export function SkillsTab() {
                 className="btn"
                 disabled={pluginBusy !== null || !marketSrc.trim()}
                 onClick={() =>
-                  void plugin("market-add", marketSrc.trim(), "Loja adicionada: os plugins dela aparecem na lista acima.").then(() =>
-                    setMarketSrc(""),
+                  void plugin("market-add", marketSrc.trim(), "Loja adicionada: os plugins dela aparecem na lista acima.").then(
+                    (ok) => ok && setMarketSrc(""),
                   )
                 }
               >

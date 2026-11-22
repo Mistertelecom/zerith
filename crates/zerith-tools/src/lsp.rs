@@ -372,6 +372,11 @@ pub fn warm_diagnostics_for_edit(workspace: &Path, path: &Path) -> Option<String
         s.touch();
         s
     };
+    // What the server said about the old text is not about this one: drop it
+    // before the change, so only a fresh publish can answer below.
+    if let Ok(mut d) = sess.diagnostics.lock() {
+        d.remove(&file_uri(path));
+    }
     let uri = sess.open_doc(path, lang).ok()?;
     if let Ok(res) = sess.request(
         "textDocument/diagnostic",
@@ -385,17 +390,22 @@ pub fn warm_diagnostics_for_edit(workspace: &Path, path: &Path) -> Option<String
             return None;
         }
     }
-    std::thread::sleep(Duration::from_millis(160));
-    let diags = sess
-        .diagnostics
-        .lock()
-        .ok()
-        .and_then(|d| d.get(&uri).cloned())
-        .unwrap_or_default();
-    if diags.is_empty() {
-        None
-    } else {
-        Some(format_diagnostics(&diags))
+    // Push servers (rust-analyzer) publish when they finish: wait for that
+    // publish, up to a bound, instead of a fixed nap that read stale errors.
+    let deadline = std::time::Instant::now() + Duration::from_millis(1500);
+    loop {
+        if let Some(diags) = sess
+            .diagnostics
+            .lock()
+            .ok()
+            .and_then(|d| d.get(&uri).cloned())
+        {
+            return (!diags.is_empty()).then(|| format_diagnostics(&diags));
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 

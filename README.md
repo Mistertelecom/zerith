@@ -13,7 +13,7 @@
 
   <p>
     <a href="https://github.com/Mistertelecom/zerith/releases">
-      <img alt="Release v0.3.3" src="https://img.shields.io/badge/version-v0.3.3-111827?style=flat-square" />
+      <img alt="Release v0.3.4" src="https://img.shields.io/badge/version-v0.3.4-111827?style=flat-square" />
     </a>
     <a href="https://github.com/Mistertelecom/zerith/actions/workflows/zerith.yml">
       <img alt="CI Status" src="https://github.com/Mistertelecom/zerith/actions/workflows/zerith.yml/badge.svg" />
@@ -69,9 +69,11 @@ It combines a **pure-SVG Visual Workflows Studio** (`zerith-workflows`), **Stric
 
 ---
 
-## What's Inside (v0.3.3)
+## What's Inside (v0.3.4)
 
 ### 1. Bots Workbench, Visual Workflows Studio & Global Channels (`zerith-workflows`)
+- **Autonomous Bot Loop & Deduplication:** Workflow `AI Agent` nodes now support bounded **Agent Loop mode** (`use_tools`, `max_turns`, `tool_mode`) with full Skills, Plugins, MCP tools, and SQLite memory access, plus persistent **Deduplication (`workflow_seen` / `dedup_lines`)** and a 1-click **"Create Routine (Heartbeat)"** generator on every Bot screen (staying quiet when scheduled cron runs find nothing new).
+- **Hardened Orchestrator & Antigravity-Standard Subagent Cards:** Subagents now inherit the parent turn's **Workspace Checkpoint** (automatic backups + inline diff/undo even for delegated writes), the Orchestrator Brain keeps read-only inspection (`read_file`, `list_dir`, `glob`, `grep`), duplicate-call loop detection stops GUI launch retries (`run_in_background: true`), and delegated subagents render as crisp expandable cards instead of raw status pills.
 - **Specialist Bots Contact Roster (`Chat | Bots | Workflows`):** Create, customize, and chat directly with specialist bots (`@noc-engineer`, `@finance-analyst`, `@workflow-architect`, `@code-reviewer`, or your own custom bots) featuring custom emblems, quick-action prompt chips, per-bot filtered history, live busy/waiting status dots, and automatic workflow completion reports delivered straight into the bot's chat thread.
 - **Ultra-Lightweight Pure-SVG Canvas (Tauri 2):** Lazy-loaded automation studio (`zero` heavy graph dependencies) with infinite pan/zoom, minimap, Undo/Redo (`Ctrl+Z`/`Ctrl+Y`), 1-click **Auto-Arrange** topological layout, JSON Import/Export, clickable `{{...}}` variable chips, floating **`+` quick-add** node chaining, live dash-flow execution animations, and a side **Inspector + Runs** drawer.
 - **13 Combinable Global Blocks + Retry & Mock Pins:** `trigger_cron`, `trigger_manual`, `trigger_webhook` (built-in local HTTP server on `127.0.0.1:47891`), `shell`, `ssh_command`, `http_request`, `transform` (`json_path`, `filter_lines`, `template`), `condition` (`true`/`false` branches), `loop` (ForEach over JSON arrays or lines), `delay`, `ai_agent` (bind directly to any specialist Bot or model), `notify_channel`, and `save_file` — plus per-node retry configuration (`0-5` attempts), **Pin / Mock Output** testing (`MOCK` badge), and `/run <workflow>` chat commands.

@@ -257,8 +257,10 @@ function nodeSubPreview(n: WorkflowNode, channels: ChannelConfig[]): string {
       return `${String(c.mode ?? "template")} ${String(c.pattern ?? "")}`.trim();
     case "condition":
       return `${String(c.mode ?? "not_empty")} ${String(c.pattern ?? "")}`.trim();
-    case "ai_agent":
-      return c.bot_name ? `@${String(c.bot_name)}` : String(c.model || "default model");
+    case "ai_agent": {
+      const base = c.bot_name ? `@${String(c.bot_name)}` : String(c.model || "default model");
+      return c.use_tools ? `${base} · ⚡ loop` : base;
+    }
     case "notify_channel": {
       const ch = channels.find((x) => x.id === c.channel_id);
       return ch ? `${ch.name}${c.target ? " → " + String(c.target) : ""}` : "select channel";
@@ -2120,6 +2122,7 @@ function NodeInspector(props: {
               <option value="template">{tr(lang, "Formatar template", "Template")}</option>
               <option value="json_path">{tr(lang, "Extrair JSON (a.b.0)", "JSON path (a.b.0)")}</option>
               <option value="filter_lines">{tr(lang, "Filtrar linhas", "Filter lines")}</option>
+              <option value="dedup_lines">{tr(lang, "Filtrar apenas inéditos (Anti-repetição)", "Only unseen lines (Deduplicate)")}</option>
             </select>
           </div>
           {String(cfg.mode ?? "template") === "template" ? (
@@ -2133,9 +2136,14 @@ function NodeInspector(props: {
             </div>
           ) : (
             <div className="wf-field">
-              <label>{tr(lang, "Caminho / Padrão", "Path / Pattern")}</label>
+              <label>
+                {String(cfg.mode ?? "") === "dedup_lines"
+                  ? tr(lang, "Chave de memória (opcional, ex: videos-yt)", "Seen key (optional, e.g. videos-yt)")
+                  : tr(lang, "Caminho / Padrão", "Path / Pattern")}
+              </label>
               <input
                 value={String(cfg.pattern ?? "")}
+                placeholder={String(cfg.mode ?? "") === "dedup_lines" ? node.id : ""}
                 onChange={(e) => setCfg({ pattern: e.target.value })}
               />
             </div>
@@ -2211,6 +2219,48 @@ function NodeInspector(props: {
               onChange={(e) => setCfg({ prompt: e.target.value })}
             />
             {renderVarChips("prompt")}
+          </div>
+          <div className="wf-pin-box" style={{ borderStyle: "solid" }}>
+            <label className="pn-inline">
+              <input
+                type="checkbox"
+                checked={Boolean(cfg.use_tools)}
+                onChange={(e) => setCfg({ use_tools: e.target.checked })}
+              />
+              <span>
+                {tr(
+                  lang,
+                  "Usar Skills, Plugins, MCP & Memória em Loop",
+                  "Enable Skills, Plugins, MCP & Memory Agent Loop",
+                )}
+              </span>
+            </label>
+            {cfg.use_tools ? (
+              <div className="wf-retry-row">
+                <div className="wf-field">
+                  <label>{tr(lang, "Máx. voltas (1–20)", "Max loop steps (1–20)")}</label>
+                  <input
+                    type="number"
+                    min={1}
+                    max={20}
+                    value={Number(cfg.max_turns ?? 6)}
+                    onChange={(e) =>
+                      setCfg({ max_turns: Math.max(1, Math.min(20, Number(e.target.value) || 6)) })
+                    }
+                  />
+                </div>
+                <div className="wf-field">
+                  <label>{tr(lang, "Modo de ferramentas", "Tool access mode")}</label>
+                  <select
+                    value={String(cfg.tool_mode ?? "safe")}
+                    onChange={(e) => setCfg({ tool_mode: e.target.value })}
+                  >
+                    <option value="safe">{tr(lang, "Seguro (Leitura + Web/MCP)", "Safe (Read + Web/MCP)")}</option>
+                    <option value="bypass">{tr(lang, "Autônomo total (Bypass)", "Autonomous (Bypass)")}</option>
+                  </select>
+                </div>
+              </div>
+            ) : null}
           </div>
         </>
       ) : null}

@@ -238,7 +238,7 @@ fn builtin(name: &str) -> Option<(&'static str, Allow)> {
             Allow::ReadOnly,
         ),
         "executor" => (
-            "Você é o subagente Executor Técnico do Zerith. Execute diretamente todas as tarefas operacionais pedidas pelo Orquestrador usando as ferramentas disponíveis (`net_connect`, `terminal_batch`, `net_broadcast`, `net_vpn`, `net_probe`, `net_path`, `net_backup`, `net_transfer`, `net_diff`, `shell`, `read_file`, `edit_file`, `write_file`, `multi_edit`, `grep`, `glob`). Não responda apenas com teoria: execute os comandos/edições reais até concluir e devolva um relatório técnico conciso com o que foi executado, saídas relevantes e status final.",
+            "Você é o subagente Executor Técnico do Zerith. Execute diretamente todas as tarefas operacionais pedidas pelo Orquestrador usando as ferramentas disponíveis (`net_connect`, `terminal_batch`, `net_broadcast`, `net_vpn`, `net_probe`, `net_path`, `net_backup`, `net_transfer`, `net_diff`, `shell`, `read_file`, `edit_file`, `write_file`, `multi_edit`, `grep`, `glob`).\nREGRAS CRÍTICAS DE SEGURANÇA:\n1. Antes de usar `write_file`, verifique se o arquivo já existe com `list_dir`/`read_file`. NUNCA sobrescreva código existente do usuário sem preservar ou fazer backup (use `edit_file` para ajustes incrementais ou copie para `<arquivo>.bak` se precisar reescrever).\n2. Para abrir programas com interface gráfica (Tkinter, PyQt, browser, janela desktop) ou servidores contínuos, chame `shell` com `run_in_background: true` **UMA ÚNICA VEZ** e conclua imediatamente — NUNCA execute janela GUI em primeiro plano nem repita chamadas de abertura em loop.\n3. Se qualquer comando falhar 2 vezes seguidas, pare de repetir o mesmo comando, mude a estratégia ou reporte exatamente o erro.",
             Allow::All,
         ),
         "general" | "default" => (
@@ -350,6 +350,8 @@ pub struct ChildSpec {
     pub announce: Option<(String, String)>,
     /// Optional isolation mode (`"worktree"`).
     pub isolation: Option<String>,
+    /// Parent turn checkpoint so child mutations stay backed up and undoable.
+    pub parent_checkpoint: Option<Arc<zerith_sessions::checkpoints::Checkpoint>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -546,6 +548,11 @@ pub(crate) fn run_child_with(
             depth: spec.depth,
             gate: spec.gate.clone(),
             max_concurrent: None,
+        },
+        parent_checkpoint: if wt_guard.is_some() {
+            None
+        } else {
+            spec.parent_checkpoint.clone()
         },
         ..crate::AgentOptions::default()
     };
@@ -809,6 +816,7 @@ struct Runtime {
     approvals: Option<ApprovalGate>,
     middleware: Vec<SharedMiddleware>,
     saved: SavedTotals,
+    parent_checkpoint: Option<Arc<zerith_sessions::checkpoints::Checkpoint>>,
 }
 
 /// Binds the turn's session to its registry so the session tools work. Called
@@ -827,6 +835,7 @@ pub(crate) fn bind(
     opts: &SubagentOptions,
     approvals: Option<&ApprovalGate>,
     middleware: &[SharedMiddleware],
+    parent_checkpoint: Option<Arc<zerith_sessions::checkpoints::Checkpoint>>,
 ) -> SavedTotals {
     let db = store
         .conn()
@@ -851,6 +860,7 @@ pub(crate) fn bind(
         approvals: approvals.cloned(),
         middleware: middleware.to_vec(),
         saved: SavedTotals::default(),
+        parent_checkpoint,
     };
     let saved = rt.saved.clone();
     tools.host().bind(session_id, Arc::new(rt));
@@ -1040,6 +1050,7 @@ impl Services for Runtime {
             approvals: self.approvals.clone(),
             announce: Some((id.clone(), format!("{name}: {description}"))),
             isolation: req.isolation.clone(),
+            parent_checkpoint: self.parent_checkpoint.clone(),
         };
         let totals = self.saved.clone();
         let middleware = self.middleware.clone();
@@ -1067,7 +1078,7 @@ impl Services for Runtime {
                 Some((gate, _)) => Some(gate.acquire(limit, &spec.cancel, spec.deadline)?),
                 None => None,
             };
-            announce("running", &spec.prompt);
+            announce("running", "iniciando...");
             match run_child_with(spec, &middleware) {
                 Ok(o) => {
                     if let Ok(mut t) = totals.lock() {

@@ -19,7 +19,19 @@ export type Block =
       toolsAtText?: number;
     }
   /** `learned`: what the background review saved after the turn (with undo). */
-  | { kind: "note"; text: string; learned?: LearnedItem[]; sub?: string };
+  | { kind: "note"; text: string; learned?: LearnedItem[]; sub?: string }
+  /** Antigravity-style live/expandable card for a delegated subagent. */
+  | {
+      kind: "subagent";
+      id: string;
+      name: string;
+      model: string;
+      state: string;
+      summary: string;
+      steps: string[];
+      startedAt: number;
+      updatedAt: number;
+    };
 
 export interface ToolRow {
   id: string;
@@ -178,32 +190,54 @@ export function applyEvent(prev: TurnState, ev: TurnEvent): TurnState {
       return state;
     }
     case "subagent": {
-      // One line per subagent, updated in place: its live progress (step,
-      // tool) and then how it ended, never a stream of notes.
-      const word: Record<string, string> = {
-        running: "rodando",
-        done: "concluído",
-        failed: "falhou",
-        cancelled: "parado",
-      };
-      const who = ev.model ? ` (${ev.model})` : "";
-      const text = `Subagente ${ev.name}${who}: ${word[ev.state] ?? ev.state}${ev.summary ? " — " + ev.summary : ""}`;
+      const now = Date.now();
       state.subagents = [...(state.subagents ?? [])];
+      const known = state.subagents.findIndex((s) => s.id === ev.id);
+      const prevSub = known >= 0 ? state.subagents[known] : null;
       const run: SubagentRun = {
         id: ev.id,
         name: ev.name,
-        model: ev.model ?? "",
+        model: ev.model || prevSub?.model || "",
         state: ev.state,
         summary: ev.summary,
-        at: Date.now(),
+        at: now,
       };
-      const known = state.subagents.findIndex((s) => s.id === ev.id);
       if (known >= 0) state.subagents[known] = run;
       else state.subagents.push(run);
-      const at = state.blocks.findIndex((b) => b.kind === "note" && b.sub === ev.id);
+      const at = state.blocks.findIndex(
+        (b) => b.kind === "subagent" && b.id === ev.id,
+      );
       state.blocks = [...state.blocks];
-      if (at >= 0) state.blocks[at] = { kind: "note", text, sub: ev.id };
-      else state.blocks.push({ kind: "note", text, sub: ev.id });
+      if (at >= 0) {
+        const prevBlk = state.blocks[at] as Extract<Block, { kind: "subagent" }>;
+        const summary = ev.summary?.trim() ?? "";
+        const steps =
+          summary && prevBlk.steps[prevBlk.steps.length - 1] !== summary
+            ? [...prevBlk.steps.slice(-11), summary]
+            : prevBlk.steps;
+        state.blocks[at] = {
+          ...prevBlk,
+          name: ev.name,
+          model: ev.model || prevBlk.model,
+          state: ev.state,
+          summary,
+          steps,
+          updatedAt: now,
+        };
+      } else {
+        const summary = ev.summary?.trim() ?? "";
+        state.blocks.push({
+          kind: "subagent",
+          id: ev.id,
+          name: ev.name,
+          model: ev.model ?? "",
+          state: ev.state,
+          summary,
+          steps: summary ? [summary] : [],
+          startedAt: now,
+          updatedAt: now,
+        });
+      }
       return state;
     }
     case "done": {

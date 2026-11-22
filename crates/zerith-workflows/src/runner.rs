@@ -16,6 +16,20 @@ use crate::{now_ms, unix_secs, Result, WorkflowError};
 pub trait AiExecutor: Send + Sync {
     fn complete(&self, model: Option<&str>, system: &str, prompt: &str) -> Result<String>;
 
+    /// Full bounded agent turn with skills, plugins, MCP tools and memory.
+    /// Defaults to [`AiExecutor::complete`] for lightweight executors/tests.
+    fn complete_agent_loop(
+        &self,
+        _bot_name: Option<&str>,
+        model: Option<&str>,
+        system: &str,
+        prompt: &str,
+        _max_turns: usize,
+        _tool_mode: &str,
+    ) -> Result<String> {
+        self.complete(model, system, prompt)
+    }
+
     /// Optional specialist bot lookup returning `(preferred_model, instructions)`.
     fn resolve_bot(&self, _bot_name: &str) -> Option<(Option<String>, String)> {
         None
@@ -138,7 +152,12 @@ pub fn execute_workflow(wf: &Workflow, opts: &mut RunOptions<'_>) -> Result<Work
         match res {
             Ok((out, branch)) => {
                 outputs.insert(node.id.clone(), out.clone());
-                if !out.is_empty() {
+                if node.kind == NodeKind::Transform
+                    && node.config.get("mode").and_then(|v| v.as_str()) == Some("dedup_lines")
+                {
+                    // Deduplication overrides upstream summary so already-seen items don't leak forward.
+                    summary = out.clone();
+                } else if !out.is_empty() {
                     summary = out.clone();
                 }
                 logs.push(NodeRunLog {
@@ -496,7 +515,8 @@ fn run_node(
         }
         NodeKind::AiAgent => {
             let explicit_model = cfg_str(cfg, "model");
-            let bot_meta = cfg_str(cfg, "bot_name").and_then(|name| opts.ai.resolve_bot(name));
+            let bot_name = cfg_str(cfg, "bot_name");
+            let bot_meta = bot_name.and_then(|name| opts.ai.resolve_bot(name));
             let resolved_model = explicit_model
                 .map(str::to_string)
                 .or_else(|| bot_meta.as_ref().and_then(|(m, _)| m.clone()));
@@ -512,7 +532,28 @@ fn run_node(
             let prompt_raw = cfg_str(cfg, "prompt").unwrap_or("{{prev}}");
             let system = interpolate(&combined_sys, prev, outputs, now_dt);
             let prompt = interpolate(prompt_raw, prev, outputs, now_dt);
-            let out = opts.ai.complete(resolved_model.as_deref(), &system, &prompt)?;
+            let use_tools = cfg
+                .get("use_tools")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let out = if use_tools {
+                let max_turns = cfg
+                    .get("max_turns")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(6)
+                    .clamp(1, 20) as usize;
+                let tool_mode = cfg_str(cfg, "tool_mode").unwrap_or("safe");
+                opts.ai.complete_agent_loop(
+                    bot_name,
+                    resolved_model.as_deref(),
+                    &system,
+                    &prompt,
+                    max_turns,
+                    tool_mode,
+                )?
+            } else {
+                opts.ai.complete(resolved_model.as_deref(), &system, &prompt)?
+            };
             Ok((out, None))
         }
         NodeKind::Condition => {
@@ -546,6 +587,19 @@ fn run_node(
                         .filter(|l| pat.is_empty() || l.to_lowercase().contains(&pat))
                         .collect::<Vec<_>>()
                         .join("\n")
+                }
+                "dedup_lines" => {
+                    let scope = cfg_str(cfg, "pattern")
+                        .map(|p| interpolate(p, prev, outputs, now_dt))
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or_else(|| format!("node:{}", node.id));
+                    let lines: Vec<String> = prev
+                        .lines()
+                        .map(str::trim)
+                        .filter(|l| !l.is_empty())
+                        .map(str::to_string)
+                        .collect();
+                    opts.store.filter_unseen_items(&scope, &lines)?.join("\n")
                 }
                 _ => {
                     let tpl = cfg_str(cfg, "template").unwrap_or("{{prev}}");
@@ -1100,5 +1154,52 @@ mod tests {
             run.summary,
             "AI_REPORT[gpt-4o-mini|NOC specialist]: #0 host=10.0.0.1, #1 host=10.0.0.2 | PINNED_OK"
         );
+    }
+
+    #[test]
+    fn dedup_lines_filters_previously_seen_items() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("w.db")).unwrap();
+        let ai = EchoAi;
+        let opts = RunOptions {
+            store: &store,
+            data_root: dir.path(),
+            ai: &ai,
+            trigger_source: "test",
+            tz_offset_minutes: -180,
+            initial_input: None,
+            on_event: &mut |_| {},
+        };
+        let n = WorkflowNode {
+            id: "dedup1".into(),
+            kind: NodeKind::Transform,
+            label: "Dedup Videos".into(),
+            x: 0.0,
+            y: 0.0,
+            config: json!({ "mode": "dedup_lines", "pattern": "yt-videos" }),
+        };
+        let first = test_single_node(&n, "https://yt/1\nhttps://yt/2\nhttps://yt/1", &opts).unwrap();
+        assert_eq!(first, "https://yt/1\nhttps://yt/2");
+        let second = test_single_node(&n, "https://yt/2\nhttps://yt/3", &opts).unwrap();
+        assert_eq!(second, "https://yt/3");
+        let third = test_single_node(&n, "https://yt/1\nhttps://yt/2\nhttps://yt/3", &opts).unwrap();
+        assert_eq!(third, "");
+
+        let ai_loop = WorkflowNode {
+            id: "ai_loop".into(),
+            kind: NodeKind::AiAgent,
+            label: "Loop Agent".into(),
+            x: 0.0,
+            y: 0.0,
+            config: json!({
+                "use_tools": true,
+                "max_turns": 8,
+                "tool_mode": "bypass",
+                "bot_name": "noc-engineer",
+                "prompt": "Find videos"
+            }),
+        };
+        let ai_out = test_single_node(&ai_loop, "", &opts).unwrap();
+        assert!(ai_out.contains("Find videos"), "{ai_out}");
     }
 }

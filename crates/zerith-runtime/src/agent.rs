@@ -264,6 +264,9 @@ pub struct AgentOptions<'a> {
     pub executor_model: Option<String>,
     /// Depth and concurrency of the subagents this turn may start.
     pub subagents: SubagentOptions,
+    /// Parent turn's checkpoint when running inside a subagent so every child
+    /// file write/shell mutation is backed up and undoable in the parent chat.
+    pub parent_checkpoint: Option<Arc<checkpoints::Checkpoint>>,
 }
 
 pub const DEFAULT_MAX_STEPS: usize = 25;
@@ -289,6 +292,7 @@ impl Default for AgentOptions<'_> {
             orchestrator: false,
             executor_model: None,
             subagents: SubagentOptions::default(),
+            parent_checkpoint: None,
         }
     }
 }
@@ -437,30 +441,35 @@ fn turn_body(
     // Checkpoint first: its boundary is the newest message *before* this
     // prompt, so a conversation rewind removes the prompt too. A failure only
     // disables rewind for this turn; it never stops the turn.
-    if let (Some(r), Some(root)) = (
-        agent.tools,
-        store.conn().path().filter(|p| !p.is_empty()).and_then(|p| {
-            std::path::Path::new(p)
-                .parent()
-                .map(std::path::Path::to_path_buf)
-        }),
-    ) {
-        let opened = checkpoints::next_turn(store, session_id)
-            .and_then(|turn| checkpoints::Checkpoint::begin(store, &root, session_id, turn));
-        match opened {
-            Ok(cp) => {
-                // The whole workspace is snapshotted at the turn's first
-                // mutation, so rewind also undoes what the shell changed.
-                let cp = Arc::new(cp);
-                let (w, ws) = (cp.clone(), cwd.clone());
-                r.host().on_before_write(move |p| {
-                    w.snapshot(&ws);
-                    w.record_file(p).map_err(|e| e.to_string())
-                });
-                r.host().on_before_shell(move |ws| cp.snapshot(ws));
+    let mut turn_checkpoint = agent.parent_checkpoint.clone();
+    if turn_checkpoint.is_none() {
+        if let (Some(_), Some(root)) = (
+            agent.tools,
+            store.conn().path().filter(|p| !p.is_empty()).and_then(|p| {
+                std::path::Path::new(p)
+                    .parent()
+                    .map(std::path::Path::to_path_buf)
+            }),
+        ) {
+            let opened = checkpoints::next_turn(store, session_id)
+                .and_then(|turn| checkpoints::Checkpoint::begin(store, &root, session_id, turn));
+            match opened {
+                Ok(cp) => turn_checkpoint = Some(Arc::new(cp)),
+                Err(e) => eprintln!("zerith: checkpoint indisponível: {e}"),
             }
-            Err(e) => eprintln!("zerith: checkpoint indisponível: {e}"),
         }
+    }
+    if let (Some(r), Some(cp)) = (agent.tools, turn_checkpoint.as_ref()) {
+        // The whole workspace is snapshotted at the turn's first
+        // mutation, so rewind also undoes what any child or shell changed.
+        let cp_w = Arc::clone(cp);
+        let ws = cwd.clone();
+        r.host().on_before_write(move |p| {
+            cp_w.snapshot(&ws);
+            cp_w.record_file(p).map_err(|e| e.to_string())
+        });
+        let cp_s = Arc::clone(cp);
+        r.host().on_before_shell(move |ws| cp_s.snapshot(ws));
     }
     let prompt_row_id = store.append(session_id, &NewMessage::new(Role::User, prompt))?;
 
@@ -477,6 +486,7 @@ fn turn_body(
             &agent.subagents,
             agent.approvals,
             inherited,
+            turn_checkpoint.clone(),
         ))
     } else {
         None
@@ -506,12 +516,12 @@ fn turn_body(
     let orch_block = is_root_orchestrator.then(|| {
         format!(
             "# Modo Orquestrador Ativo (Pensamento: `{model}` → Execução: `{exec_label}`)\n\
-             Você é o **Modelo de Pensamento (Arquiteto/Orquestrador)**. As ferramentas operacionais pesadas (`shell`, `edit_file`, `write_file`, `multi_edit`, `net_connect`, `terminal_batch`, `net_broadcast`, `net_vpn`, `net_probe`, `net_path`, `net_backup`, `net_transfer`, `read_file`, `grep`, `glob`) estão atribuídas exclusivamente aos subagentes executores, que rodam no modelo **`{exec_label}`**.\n\
-             Fluxo obrigatório para pedidos técnicos/operacionais:\n\
-             1. **Pense e Planeje:** Analise o pedido, consulte as skills pré-carregadas (e `net_inventory` se envolver clientes) e estruture os passos com `task_create`.\n\
-             2. **Delegue a Execução:** Chame a ferramenta `agent` (ex.: `agent=\"executor\"`, `\"netops-architect\"`, `\"proxmox-architect\"`, `\"noc-incident-commander\"`, `\"ftth-gpon-architect\"`, `\"linux-devops-architect\"`, `\"explore\"` ou `\"general\"`) passando um `prompt` completo e autossuficiente (com IPs/cliente, instruções da skill e o que verificar). Para tarefas independentes, chame vários `agent` em paralelo.\n\
-             3. **Audite e Conclua:** Revise o relatório técnico do Executor, atualize `task_update` e entregue a resposta final ao usuário.\n\
-             (Se o usuário fizer apenas uma pergunta conceitual simples que não exija executar ferramentas, responda diretamente.)"
+             Você é o **Modelo de Pensamento (Arquiteto/Orquestrador)**. Você tem acesso direto somente-leitura (`list_dir`, `read_file`, `grep`, `glob`, `skill`, `net_inventory`) para inspecionar o projeto antes de agir; as ferramentas de mutação e execução (`shell`, `edit_file`, `write_file`, `multi_edit`, `net_connect`, `terminal_batch`) rodam nos subagentes executores (**`{exec_label}`**).\n\
+             Regras obrigatórias de segurança e fluxo:\n\
+             1. **Inspecione antes de delegar:** Use `list_dir`/`read_file` para verificar se já existem arquivos do usuário no destino. NUNCA mande sobrescrever um arquivo existente sem antes ler o atual e pedir ao Executor para preservá-lo/fazer backup ou editar incrementalmente.\n\
+             2. **Delegue com contexto exato:** Chame `agent` (`\"executor\"`, `\"explore\"`, etc.) com um `prompt` claro e autossuficiente. Para tarefas independentes, dispare em paralelo.\n\
+             3. **Abrir apps GUI ou servidores contínuos:** Instrua explicitamente o Executor a chamar `shell` com `run_in_background: true` **uma única vez** e encerrar sem esperar nem repetir.\n\
+             4. **Audite e Conclua:** Revise o resultado do subagente, atualize `task_update` e entregue uma resposta clara ao usuário."
         )
     });
     let merged_dyn = match (
@@ -657,6 +667,10 @@ fn turn_body(
     let mut last = (0i64, String::new(), None::<String>);
     let max_steps = agent.max_steps.max(1);
     let mut reason = "done";
+    let mut fail_counts: std::collections::HashMap<(String, String), u8> =
+        std::collections::HashMap::new();
+    let mut exec_counts: std::collections::HashMap<(String, String), u8> =
+        std::collections::HashMap::new();
 
     for step in 1..=max_steps {
         on_event(RunEvent::Step { n: step });
@@ -982,6 +996,35 @@ fn turn_body(
                     }
                 }
                 record(store, session_id, call, &outcome.output, &mut hist)?;
+                let sig = (call.name.clone(), call.arguments.clone());
+                if outcome.ok {
+                    if matches!(
+                        call.name.as_str(),
+                        "shell" | "agent" | "write_file" | "edit_file" | "multi_edit"
+                    ) {
+                        let count = exec_counts
+                            .entry(sig)
+                            .and_modify(|c| *c = c.saturating_add(1))
+                            .or_insert(1);
+                        if *count >= 3 {
+                            context.push(format!(
+                                "[Loop Detectado] A ferramenta `{}` foi executada {}x com os mesmos argumentos neste turno. NÃO repita a mesma ação — verifique o resultado anterior ou responda ao usuário.",
+                                call.name, *count
+                            ));
+                        }
+                    }
+                } else {
+                    let count = fail_counts
+                        .entry(sig)
+                        .and_modify(|c| *c = c.saturating_add(1))
+                        .or_insert(1);
+                    if *count >= 2 {
+                        context.push(format!(
+                            "[Loop Detectado] A chamada `{}` com os mesmos argumentos falhou {}x neste turno. PARE de repetir o mesmo comando. Se for app GUI ou servidor contínuo, use `run_in_background: true` uma única vez ou explique o bloqueio ao usuário.",
+                            call.name, *count
+                        ));
+                    }
+                }
                 let preview: String = outcome.output.chars().take(PREVIEW_CHARS).collect();
                 log.emit(
                     "tool/result",
@@ -1735,6 +1778,10 @@ pub(crate) fn is_orchestrator_root_tool(name: &str) -> bool {
         name,
         "agent"
             | "agent_result"
+            | "read_file"
+            | "list_dir"
+            | "glob"
+            | "grep"
             | "task_create"
             | "task_update"
             | "task_list"
@@ -1961,11 +2008,16 @@ mod approval_grant_tests {
     #[test]
     fn orchestrator_root_keeps_brain_tools_and_delegates_execution_tools() {
         assert!(is_orchestrator_root_tool("agent"));
+        assert!(is_orchestrator_root_tool("read_file"));
+        assert!(is_orchestrator_root_tool("list_dir"));
+        assert!(is_orchestrator_root_tool("glob"));
+        assert!(is_orchestrator_root_tool("grep"));
         assert!(is_orchestrator_root_tool("task_create"));
         assert!(is_orchestrator_root_tool("skill"));
         assert!(is_orchestrator_root_tool("net_inventory"));
         assert!(!is_orchestrator_root_tool("shell"));
         assert!(!is_orchestrator_root_tool("edit_file"));
+        assert!(!is_orchestrator_root_tool("write_file"));
         assert!(!is_orchestrator_root_tool("net_connect"));
         assert!(!is_orchestrator_root_tool("terminal_batch"));
     }

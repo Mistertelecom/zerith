@@ -68,6 +68,13 @@ impl Store {
                 node_logs_json TEXT NOT NULL DEFAULT '[]'
             );
 
+            CREATE TABLE IF NOT EXISTS workflow_seen (
+                scope TEXT NOT NULL,
+                item_key TEXT NOT NULL,
+                seen_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (scope, item_key)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_runs_wf_started
                 ON workflow_runs(workflow_id, started_at_ms DESC);
             "#,
@@ -321,6 +328,37 @@ impl Store {
             out.push(row?);
         }
         Ok(out)
+    }
+
+    /// Persistent deduplication (`Seen Store`): returns only items not yet seen
+    /// under `scope`, recording newly observed items in `workflow_seen`.
+    pub fn filter_unseen_items(&self, scope: &str, items: &[String]) -> Result<Vec<String>> {
+        let conn = self.conn.lock().map_err(|_| WorkflowError::Lock)?;
+        let now = now_ms();
+        let mut unseen = Vec::new();
+        for raw in items {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let inserted = conn.execute(
+                "INSERT OR IGNORE INTO workflow_seen (scope, item_key, seen_at_ms) VALUES (?1, ?2, ?3)",
+                params![scope, trimmed, now],
+            )?;
+            if inserted > 0 {
+                unseen.push(trimmed.to_string());
+            }
+        }
+        if !unseen.is_empty() {
+            let _ = conn.execute(
+                "DELETE FROM workflow_seen
+                 WHERE scope = ?1 AND item_key NOT IN (
+                     SELECT item_key FROM workflow_seen WHERE scope = ?1 ORDER BY seen_at_ms DESC LIMIT 2000
+                 )",
+                params![scope],
+            );
+        }
+        Ok(unseen)
     }
 }
 

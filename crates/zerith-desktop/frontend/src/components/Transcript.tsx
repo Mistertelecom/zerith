@@ -69,6 +69,95 @@ function LearnedNote(props: { text: string; items: LearnedItem[] }) {
   );
 }
 
+const SUBAGENT_STATE_LABEL: Record<string, string> = {
+  running: "Executando",
+  done: "Concluído",
+  failed: "Falhou",
+  cancelled: "Cancelado",
+};
+
+function shortSubagentModel(raw: string): string {
+  const idx = raw.indexOf(":");
+  return idx > 0 ? raw.slice(idx + 1) : raw;
+}
+
+function splitSubagentName(raw: string): { role: string; title: string } {
+  const colon = raw.indexOf(":");
+  if (colon <= 0) return { role: "agente", title: raw.trim() };
+  return {
+    role: raw.slice(0, colon).trim(),
+    title: raw.slice(colon + 1).trim(),
+  };
+}
+
+function SubagentCard({ block }: { block: Extract<Block, { kind: "subagent" }> }) {
+  const [open, setOpen] = useState(false);
+  const { role, title } = splitSubagentName(block.name);
+  const st =
+    block.state === "running" ||
+    block.state === "done" ||
+    block.state === "failed" ||
+    block.state === "cancelled"
+      ? block.state
+      : "done";
+  const hasDetails = block.steps.length > 0 || Boolean(block.summary);
+  const modelLabel = block.model ? shortSubagentModel(block.model) : "";
+  const statusLabel = SUBAGENT_STATE_LABEL[block.state] ?? block.state;
+
+  return (
+    <div className={`subagent-card ${st}` + (open ? " open" : "")}>
+      <button
+        type="button"
+        className="subagent-head"
+        disabled={!hasDetails}
+        aria-expanded={hasDetails ? open : undefined}
+        onClick={() => hasDetails && setOpen((v) => !v)}
+      >
+        <span className={`subagent-icon ${st}`} aria-hidden>
+          {st === "running" ? (
+            <span className="spinner" />
+          ) : st === "done" ? (
+            <Check size={14} strokeWidth={2.25} />
+          ) : st === "failed" ? (
+            <AlertTriangle size={14} strokeWidth={2} />
+          ) : (
+            <X size={14} strokeWidth={2.25} />
+          )}
+        </span>
+        <span className="subagent-role">{role}</span>
+        <span className="subagent-title" title={title}>
+          {title}
+        </span>
+        {modelLabel ? (
+          <span className="subagent-model" title={block.model}>
+            {modelLabel}
+          </span>
+        ) : null}
+        <span className={`subagent-status ${st}`}>{statusLabel}</span>
+        {hasDetails ? (
+          <ChevronRight size={14} strokeWidth={2} className="chev" />
+        ) : null}
+      </button>
+      {st === "running" && block.summary && !open ? (
+        <div className="subagent-live">{block.summary}</div>
+      ) : null}
+      {open && hasDetails ? (
+        <div className="subagent-body">
+          {block.steps.length > 0 ? (
+            <ul className="subagent-steps">
+              {block.steps.map((s, idx) => (
+                <li key={idx}>{s}</li>
+              ))}
+            </ul>
+          ) : (
+            <p>{block.summary}</p>
+          )}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 const isWeb = (src: string) => /^(https?:|data:)/i.test(src);
 const USER_IMG = /^!\[([^\]\n]*)\]\(<([^>\n]+)>\)\s*$/gm;
 
@@ -190,7 +279,7 @@ export function toolIcon(name: string): LucideIcon {
   return TOOL_ICONS.find(([re]) => re.test(n))?.[1] ?? Wrench;
 }
 
-const ARG_KEYS = ["path", "file_path", "filePath", "pattern", "command", "cmd", "url", "query", "glob", "prompt", "description"];
+const ARG_KEYS = ["path", "file_path", "filePath", "pattern", "command", "cmd", "url", "query", "glob", "description", "prompt"];
 
 function parseArgs(args: string): unknown {
   try {
@@ -709,9 +798,15 @@ function computeFileLineRange(name: string, argsObj: Record<string, unknown> | n
 function ToolLine({ row }: { row: ToolRow }) {
   const [open, setOpen] = useState(false);
   const Icon = toolIcon(row.name);
-  const arg = argSummary(row.args);
   const parsed = parseArgs(row.args);
   const argsObj = parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : null;
+  let arg = argSummary(row.args);
+  if (row.name === "agent" && argsObj) {
+    const role = typeof argsObj.agent === "string" ? argsObj.agent.trim() : "";
+    const desc = typeof argsObj.description === "string" ? argsObj.description.trim() : "";
+    if (role && desc) arg = `${role}: ${desc}`;
+    else if (desc || role) arg = desc || role;
+  }
   const body = row.preview ?? row.progress ?? (parsed ? JSON.stringify(parsed, null, 2) : row.args);
   const state = row.ok === undefined ? "run" : row.ok ? "ok" : "fail";
   const liveTail =
@@ -939,9 +1034,18 @@ export function Transcript(props: {
           // the stored row when there is one, so a list that grows at the top
           // (a compaction note) does not re-key everything.
           const key =
-            b.kind === "assistant" ? (b.stored ?? `a${i}`) : b.kind === "user" ? (b.id ?? `u${i}`) : `n${i}`;
+            b.kind === "assistant"
+              ? (b.stored ?? `a${i}`)
+              : b.kind === "user"
+                ? (b.id ?? `u${i}`)
+                : b.kind === "subagent"
+                  ? `sub-${b.id}`
+                  : `n${i}`;
           if (b.kind === "user") {
             return <UserRow key={key} block={b} onEdit={onEdit} />;
+          }
+          if (b.kind === "subagent") {
+            return <SubagentCard key={key} block={b} />;
           }
           if (b.kind === "note" && b.learned?.length) {
             return <LearnedNote key={key} text={b.text} items={b.learned} />;

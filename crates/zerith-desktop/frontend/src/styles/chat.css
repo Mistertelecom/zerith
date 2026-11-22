@@ -1718,3 +1718,138 @@
   color: var(--label-tertiary);
   font-size: var(--fs-small);
 }
+
+/* ---- Antigravity-standard Subagent Card ---- */
+
+.subagent-card {
+  width: 100%;
+  border-radius: var(--r-md, 10px);
+  border: 1px solid var(--line);
+  background: var(--layer-1);
+  overflow: hidden;
+  transition: border-color var(--t-fast, 120ms) var(--ease, ease);
+}
+.subagent-card.running {
+  border-color: var(--accent-line, rgba(99, 102, 241, 0.4));
+}
+.subagent-card.failed {
+  border-color: rgba(239, 68, 68, 0.35);
+}
+.subagent-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 36px;
+  padding: 6px 10px;
+  text-align: left;
+  background: transparent;
+  border: 0;
+  color: var(--label-primary);
+  font-size: var(--fs-small);
+  cursor: pointer;
+}
+.subagent-head:hover:not(:disabled) {
+  background: var(--hover);
+}
+.subagent-head:disabled {
+  cursor: default;
+}
+.subagent-icon {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 18px;
+  height: 18px;
+}
+.subagent-icon.done {
+  color: var(--ok-text, #34d399);
+}
+.subagent-icon.failed {
+  color: var(--danger-text, #f87171);
+}
+.subagent-icon.cancelled {
+  color: var(--label-caption);
+}
+.subagent-role {
+  flex: none;
+  padding: 2px 7px;
+  border-radius: var(--r-full, 999px);
+  background: var(--layer-2);
+  border: 1px solid var(--line);
+  color: var(--label-secondary);
+  font-size: 10.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.subagent-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 500;
+  color: var(--label-primary);
+}
+.subagent-model {
+  flex: none;
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--layer-2);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--label-tertiary);
+}
+.subagent-status {
+  flex: none;
+  font-size: 11px;
+  font-weight: 550;
+}
+.subagent-status.running {
+  color: var(--accent-text, #a5b4fc);
+}
+.subagent-status.done {
+  color: var(--ok-text, #34d399);
+}
+.subagent-status.failed {
+  color: var(--danger-text, #f87171);
+}
+.subagent-status.cancelled {
+  color: var(--label-caption);
+}
+.subagent-head .chev {
+  flex: none;
+  color: var(--label-caption);
+  transition: transform var(--t-fast, 120ms) var(--ease, ease);
+}
+.subagent-card.open .subagent-head .chev {
+  transform: rotate(90deg);
+}
+.subagent-live {
+  padding: 0 12px 7px 36px;
+  font-size: 11.5px;
+  font-family: var(--mono);
+  color: var(--label-tertiary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.subagent-body {
+  padding: 8px 12px 10px 36px;
+  border-top: 1px solid var(--line-faint, var(--line));
+  background: var(--bg-chrome, transparent);
+  font-size: 11.5px;
+  color: var(--label-secondary);
+}
+.subagent-steps {
+  margin: 0;
+  padding-left: 16px;
+  display: grid;
+  gap: 3px;
+  font-family: var(--mono);
+}

@@ -951,7 +951,8 @@ export default function App() {
 
   const lastUserText = useMemo(() => {
     for (let i = surface.length - 1; i >= 0; i--) {
-      if (surface[i].kind === "user") return surface[i].text;
+      const b = surface[i];
+      if (b.kind === "user") return b.text;
     }
     return undefined;
   }, [surface]);
@@ -1117,6 +1118,84 @@ export default function App() {
       setRunningWfId(null);
     }
   }, []);
+
+  const createBotHeartbeat = useCallback(
+    async (bot: AgentView) => {
+      const now = Date.now();
+      const tz = -new Date().getTimezoneOffset();
+      const firstQP = bot.quickPrompts?.[0] ?? "";
+      const taskPrompt = firstQP
+        ? `${firstQP}\nResponda com 1 item/link novo por linha ou deixe vazio se não houver novidade.`
+        : `Execute uma checagem periódica na sua especialidade (@${bot.name}) usando suas skills e plugins ativos.\nListe apenas novidades relevantes (1 por linha) ou responda vazio se tudo estiver normal.`;
+      const wf: Workflow = {
+        id: `wf-hb-${bot.name}-${now}`,
+        name: `Rotina · @${bot.name}`,
+        description: `Heartbeat autônomo do bot @${bot.name} com Skills/Plugins + anti-repetição`,
+        icon: bot.icon || emblemForAgent(bot.name),
+        enabled: false,
+        bot_name: bot.name,
+        nodes: [
+          {
+            id: "hb_cron",
+            kind: "trigger_cron",
+            label: "A cada 1h",
+            x: 60,
+            y: 140,
+            config: { cron: "0 * * * *", tz_offset_minutes: tz },
+          },
+          {
+            id: "hb_agent",
+            kind: "ai_agent",
+            label: `@${bot.name} (Loop)`,
+            x: 340,
+            y: 140,
+            config: {
+              bot_name: bot.name,
+              model: bot.model ?? "",
+              use_tools: true,
+              max_turns: 6,
+              tool_mode: "bypass",
+              system: "",
+              prompt: taskPrompt,
+            },
+          },
+          {
+            id: "hb_dedup",
+            kind: "transform",
+            label: "Apenas inéditos",
+            x: 620,
+            y: 140,
+            config: { mode: "dedup_lines", pattern: `hb:${bot.name}` },
+          },
+          {
+            id: "hb_check",
+            kind: "condition",
+            label: "Teve novidade?",
+            x: 900,
+            y: 140,
+            config: { mode: "not_empty", pattern: "" },
+          },
+        ],
+        edges: [
+          { id: "e_hb1", from: "hb_cron", to: "hb_agent", branch: null },
+          { id: "e_hb2", from: "hb_agent", to: "hb_dedup", branch: null },
+          { id: "e_hb3", from: "hb_dedup", to: "hb_check", branch: null },
+        ],
+        created_at_ms: now,
+        updated_at_ms: now,
+      };
+      try {
+        await workflowsApi.save(wf);
+        const list = await workflowsApi.list().catch(() => []);
+        setWorkflowsList(list);
+        setActiveView("workflows");
+        setStatus(`Rotina criada para @${bot.name}`);
+      } catch (e) {
+        setStatus(`Erro ao criar rotina: ${e}`);
+      }
+    },
+    [],
+  );
 
   if (error && !boot) {
     return (
@@ -1377,6 +1456,14 @@ export default function App() {
                         >
                           <Pencil size={13} />
                           <span>{tr(lang, "Editar bot", "Edit bot")}</span>
+                        </button>
+                        <button
+                          type="button"
+                          className="btn sm"
+                          onClick={() => void createBotHeartbeat(activeBotSpec)}
+                        >
+                          <Sparkles size={13} />
+                          <span>{tr(lang, "Criar Rotina (Heartbeat)", "Create Routine (Heartbeat)")}</span>
                         </button>
                         <button
                           type="button"

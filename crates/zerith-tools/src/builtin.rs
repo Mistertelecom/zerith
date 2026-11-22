@@ -500,6 +500,23 @@ pub(crate) fn shell_without_snapshot(
     shell_exec(args, ctx, exec, false)
 }
 
+fn looks_like_detached_launch(cmd: &str) -> bool {
+    cmd.split("&&")
+        .flat_map(|s| s.split("||"))
+        .flat_map(|s| s.split([';', '\n']))
+        .any(|seg| {
+            let s = seg.trim_start().to_ascii_lowercase();
+            s.starts_with("start ")
+                || s.starts_with("start\t")
+                || s.starts_with("cmd /c start")
+                || s.starts_with("cmd.exe /c start")
+                || s.starts_with("start-process ")
+                || s.starts_with("pythonw ")
+                || s.starts_with("pythonw.exe ")
+                || s.starts_with("nohup ")
+        })
+}
+
 fn shell_exec(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>, snapshot: bool) -> Result<String> {
     let cmd = str_arg(args, "command")?;
     if snapshot {
@@ -601,7 +618,7 @@ fn shell_exec(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>, snapshot: bool) 
             std::thread::sleep(Duration::from_millis(150));
             return Err(match e {
                 ToolError::Timeout(d) => ToolError::Failed(format!(
-                    "tempo esgotado após {}s: o comando e o que ele iniciou foram encerrados\n--- stdout (parcial)\n{}\n--- stderr (parcial)\n{}",
+                    "tempo esgotado após {}s: o comando e o que ele iniciou foram encerrados.\nDICA: Se o comando abre uma janela gráfica (GUI) ou servidor contínuo, NÃO repita em primeiro plano — execute UMA ÚNICA VEZ com run_in_background: true.\n--- stdout (parcial)\n{}\n--- stderr (parcial)\n{}",
                     d.as_secs(),
                     text_of(&out),
                     text_of(&err)
@@ -623,6 +640,10 @@ fn shell_exec(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>, snapshot: bool) 
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+    let killed_descendant = {
+        use std::sync::atomic::Ordering::SeqCst;
+        !(out_done.load(SeqCst) && err_done.load(SeqCst))
+    };
     jailed.kill_tree();
     let stdout = text_of(&out);
     let stderr = text_of(&err);
@@ -636,6 +657,9 @@ fn shell_exec(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>, snapshot: bool) 
     }
     if !stderr.is_empty() {
         text.push_str(&format!("\n--- stderr\n{stderr}"));
+    }
+    if status.success() && (killed_descendant || looks_like_detached_launch(cmd)) {
+        text.push_str("\n[AVISO] O comando deixou ou tentou abrir um processo filho/janela em segundo plano, que foi ENCERRADO automaticamente ao fim do shell em primeiro plano. Para abrir janelas GUI ou servidores contínuos, execute o comando direto (sem `start`/`nohup`) UMA ÚNICA VEZ com `run_in_background: true`.");
     }
     if status.success() {
         Ok(text)
@@ -997,5 +1021,19 @@ mod ondav4_tests {
         assert!(out.contains("hostname PE-CORE-01"), "{out}");
         assert!(out.contains("interface GigabitEthernet0/0/0"), "{out}");
         assert!(out.contains("router bgp 65001"), "{out}");
+    }
+
+    #[test]
+    fn detached_launch_detector_catches_gui_wrappers_only() {
+        use super::looks_like_detached_launch;
+        assert!(looks_like_detached_launch("start python calc.py"));
+        assert!(looks_like_detached_launch("cd app && Start-Process calc.exe"));
+        assert!(looks_like_detached_launch("pythonw app.py"));
+        assert!(looks_like_detached_launch("nohup server &"));
+        assert!(looks_like_detached_launch("cmd /c start app.exe"));
+
+        assert!(!looks_like_detached_launch("python --version"));
+        assert!(!looks_like_detached_launch("cargo test"));
+        assert!(!looks_like_detached_launch("echo start"));
     }
 }

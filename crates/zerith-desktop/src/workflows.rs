@@ -9,8 +9,12 @@ use tauri::{AppHandle, Emitter, State};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use zerith_core::{Paths, Settings};
+use zerith_memory::{MemoryBackend, SqliteMemory};
 use zerith_providers::{Cancel, ChatMessage, ChatRequest, Client, ProviderConfig};
+use zerith_runtime::{run_agent_turn, AgentOptions, TurnContext};
+use zerith_security::{Mode, ModeHandle, Policy};
 use zerith_sessions::{NewMessage, Role, SessionSource, Store as SessionStore};
+use zerith_tools::Registry;
 use zerith_workflows::{
     channels, execute_workflow, now_ms, starter_templates, test_single_node, unix_secs, AiExecutor,
     ChannelConfig, CronSchedule, LocalDateTime, NodeEvent, NodeKind, RunOptions, Store, Workflow,
@@ -31,13 +35,11 @@ struct DesktopAiExecutor {
     root: PathBuf,
 }
 
-impl AiExecutor for DesktopAiExecutor {
-    fn complete(
+impl DesktopAiExecutor {
+    fn resolve_gateway_candidates(
         &self,
         model: Option<&str>,
-        system: &str,
-        prompt: &str,
-    ) -> zerith_workflows::Result<String> {
+    ) -> (Paths, PathBuf, Settings, Vec<(Client, String)>) {
         let paths = Paths::with_root(&self.root);
         let dir = crate::turn::last_workspace(&paths.db());
         let cfg = Settings::load(&paths, Some(&dir)).settings;
@@ -72,9 +74,7 @@ impl AiExecutor for DesktopAiExecutor {
             .unwrap_or("");
 
         let (gw, _) = zerith_runtime::resolve_gateway(&cfg, wanted, &fallback);
-        let mut last_err = None;
-        let mut tried = false;
-
+        let mut clients = Vec::new();
         for cand in gw.candidates.into_iter().take(3) {
             let model_name = if !cand.model.trim().is_empty() {
                 cand.model
@@ -84,14 +84,30 @@ impl AiExecutor for DesktopAiExecutor {
             if model_name.trim().is_empty() {
                 continue;
             }
-            tried = true;
-            let client = match Client::new(cand.config) {
-                Ok(c) => c,
-                Err(e) => {
-                    last_err = Some(zerith_providers::explain::headline(&e));
-                    continue;
-                }
-            };
+            if let Ok(client) = Client::new(cand.config) {
+                clients.push((client, model_name));
+            }
+        }
+        (paths, dir, cfg, clients)
+    }
+}
+
+impl AiExecutor for DesktopAiExecutor {
+    fn complete(
+        &self,
+        model: Option<&str>,
+        system: &str,
+        prompt: &str,
+    ) -> zerith_workflows::Result<String> {
+        let (_, _, _, clients) = self.resolve_gateway_candidates(model);
+        if clients.is_empty() {
+            return Err(WorkflowError::Ai(
+                "Nenhum modelo de IA configurado. Selecione um modelo no nó ou configure uma conta em Ajustes → Contas.".into(),
+            ));
+        }
+
+        let mut last_err = None;
+        for (client, model_name) in clients {
             let req = ChatRequest::new(
                 &model_name,
                 vec![ChatMessage::system(system), ChatMessage::user(prompt)],
@@ -107,15 +123,116 @@ impl AiExecutor for DesktopAiExecutor {
             }
         }
 
-        if !tried {
-            return Err(WorkflowError::Ai(
-                "Nenhum modelo de IA configurado. Selecione um modelo no nó ou configure uma conta em Ajustes → Contas.".into(),
-            ));
-        }
-
         Err(WorkflowError::Ai(last_err.unwrap_or_else(|| {
             "Falha desconhecida ao chamar modelo de IA".into()
         })))
+    }
+
+    fn complete_agent_loop(
+        &self,
+        bot_name: Option<&str>,
+        model: Option<&str>,
+        system: &str,
+        prompt: &str,
+        max_turns: usize,
+        tool_mode: &str,
+    ) -> zerith_workflows::Result<String> {
+        let (paths, workspace, mut settings, clients) = self.resolve_gateway_candidates(model);
+        let Some((client, model_name)) = clients.into_iter().next() else {
+            return Err(WorkflowError::Ai(
+                "Nenhum modelo de IA configurado para o loop do agente.".into(),
+            ));
+        };
+
+        let db_path = paths.db();
+        let store = SessionStore::open(&db_path).map_err(|e| WorkflowError::Ai(e.to_string()))?;
+        let contrib = zerith_plugins::Library::open(&self.root.join("plugins"))
+            .and_then(|l| l.contributions())
+            .ok();
+        if let Some(c) = &contrib {
+            c.apply_hooks(&mut settings);
+        }
+        let sec_mode = if tool_mode.eq_ignore_ascii_case("bypass") {
+            settings.permissions.mode = "danger-full-access".to_string();
+            Mode::Bypass
+        } else {
+            Mode::DontAsk
+        };
+
+        let policy = Policy::from_settings(&settings, &workspace)
+            .map(|p| p.with_handle(ModeHandle::new(sec_mode)))
+            .ok();
+
+        let mut tools = Registry::new();
+        let mut mcp = zerith_mcp::McpRegistry::load(&paths, Some(&workspace));
+        if let Some(c) = &contrib {
+            mcp.extend(c.mcp.iter().map(|(_, s)| s.clone()).collect());
+        }
+        let _ = mcp.register_into(&mut tools);
+        let prompt = if mcp.is_empty() {
+            prompt.to_string()
+        } else {
+            mcp.expand_mentions(prompt).0
+        };
+
+        let skills = zerith_skills::Library::open(self.root.join("skills"))
+            .ok()
+            .map(|l| match &contrib {
+                Some(c) => l.with_extra(c.skill_dirs()),
+                None => l,
+            });
+        let extra = contrib.as_ref().map(|c| c.agents.as_slice()).unwrap_or(&[]);
+        let agent = bot_name
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .and_then(|n| zerith_core::agents::find_with_extra(&paths, Some(&workspace), extra, n));
+
+        let memory = SqliteMemory::open(&db_path).ok();
+        let scope = zerith_memory::Scope::workspace(&workspace);
+        let sess_label = match bot_name.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(b) => format!("@{b} · Loop Workflow"),
+            None => "Workflow · Loop Agente".to_string(),
+        };
+        let session = store
+            .create_session(&sess_label, SessionSource::Subagent)
+            .map_err(|e| WorkflowError::Ai(e.to_string()))?;
+        let _ = store.set_workspace(&session.id, &workspace.display().to_string());
+
+        let full_prompt = if agent.is_none() && !system.trim().is_empty() {
+            format!("[Instruções do bloco]\n{}\n\n{}", system.trim(), prompt)
+        } else {
+            prompt
+        };
+
+        let report = run_agent_turn(
+            &store,
+            &client,
+            TurnContext {
+                memory: memory.as_ref().map(|m| m as &dyn MemoryBackend),
+                scope: Some(&scope),
+                skills: skills.as_ref(),
+                agent: agent.as_ref(),
+                settings: Some(&settings),
+                project_dir: Some(&workspace),
+                no_project_instructions: false,
+            },
+            AgentOptions {
+                tools: policy.is_some().then_some(&tools),
+                policy: policy.as_ref(),
+                max_steps: max_turns.clamp(1, 20),
+                history: 4,
+                spill_dir: Some(self.root.join("spill")),
+                ..AgentOptions::default()
+            },
+            &session.id,
+            &model_name,
+            &full_prompt,
+            &Cancel::default(),
+            |_| {},
+        )
+        .map_err(|e| WorkflowError::Ai(e.to_string()))?;
+
+        Ok(report.text)
     }
 
     fn resolve_bot(&self, bot_name: &str) -> Option<(Option<String>, String)> {
@@ -134,6 +251,10 @@ fn notify_bot_chat(app: &AppHandle, root: &Path, wf: &Workflow, run: &WorkflowRu
     let Some(bot_raw) = wf.bot_name.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
         return;
     };
+    // Quiet heartbeat: scheduled cron runs with zero new output stay silent.
+    if run.trigger_source == "cron" && run.status == "ok" && run.summary.trim().is_empty() {
+        return;
+    }
     let db_path = Paths::with_root(root).db();
     let Ok(st) = SessionStore::open(&db_path) else {
         return;

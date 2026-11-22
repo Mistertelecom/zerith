@@ -759,6 +759,10 @@ fn anthropic_streams_tool_use_and_gets_tool_results_back() {
     .unwrap();
     assert_eq!(report.text, "diz dados");
     assert_eq!(report.prompt_tokens, 27);
+    assert_eq!(
+        report.last_prompt_tokens, 20,
+        "the last step alone: the window fill"
+    );
     assert!(events.contains(&RunEvent::Reasoning("vou ler".into())));
     assert!(events.contains(&RunEvent::ToolCall {
         id: "tu1".into(),

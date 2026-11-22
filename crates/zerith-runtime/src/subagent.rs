@@ -308,6 +308,8 @@ pub fn child_registry(base: &Registry, r: &Resolved, depth: usize) -> Registry {
             // A child must never be able to mint more skills or agents: what it
             // writes would outlive it and be offered to the person as theirs.
             && !matches!(n, "create_skill" | "create_agent" | "delete_ai_item")
+            // The plan tools switch the parent's shared mode handle.
+            && !matches!(n, "enter_plan_mode" | "exit_plan_mode")
             && (can_spawn || !matches!(n, "agent" | "agent_result"))
     });
     if can_spawn {
@@ -453,7 +455,13 @@ impl WorktreeGuard {
 
     /// Removes the worktree if clean; if dirty, keeps it and returns diff stat note.
     fn finish(mut self) -> Option<String> {
-        self.active = false;
+        self.cleanup()
+    }
+
+    fn cleanup(&mut self) -> Option<String> {
+        if !std::mem::take(&mut self.active) {
+            return None;
+        }
         let status = std::process::Command::new("git")
             .arg("-C")
             .arg(&self.worktree_dir)
@@ -492,16 +500,11 @@ impl WorktreeGuard {
     }
 }
 
+/// Error paths (panic, timeout, cancel) drop the guard: a dirty worktree is
+/// kept then too, never `remove --force`d with the child's edits in it.
 impl Drop for WorktreeGuard {
     fn drop(&mut self) {
-        if self.active {
-            let _ = std::process::Command::new("git")
-                .arg("-C")
-                .arg(&self.repo_root)
-                .args(["worktree", "remove", "--force"])
-                .arg(&self.worktree_dir)
-                .output();
-        }
+        self.cleanup();
     }
 }
 
@@ -515,7 +518,7 @@ pub(crate) fn run_child_with(
     let session = store
         .create_subagent_session(&spec.parent, &spec.title, Some(&spec.model))
         .map_err(|e| fail(&e))?;
-    let wt_guard = if spec.isolation.as_deref() == Some("worktree") {
+    let mut wt_guard = if spec.isolation.as_deref() == Some("worktree") {
         let g = WorktreeGuard::enter(&spec.policy.workspace, &session.id)
             .map_err(ChildError::Failed)?;
         spec.policy.workspace = g.worktree_dir.clone();
@@ -661,19 +664,24 @@ pub(crate) fn run_child_with(
     }));
     let timed_out = watchdog.timed_out.load(Ordering::SeqCst);
     drop(watchdog);
+    // A failure still tells where the kept edits are.
+    let mut fail = |msg: String| {
+        let note = wt_guard.take().and_then(WorktreeGuard::finish);
+        ChildError::Failed(msg + note.as_deref().unwrap_or(""))
+    };
     match run {
-        Err(_) => Err(ChildError::Failed("o subagente entrou em pânico".into())),
+        Err(_) => Err(fail("o subagente entrou em pânico".into())),
         Ok(Err(RunError::Provider(ProviderError::Cancelled))) => Err(if timed_out {
             ChildError::TimedOut
         } else {
             ChildError::Cancelled
         }),
-        Ok(Err(e)) => Err(fail(&e)),
+        Ok(Err(e)) => Err(fail(e.to_string())),
         Ok(Ok(report)) => {
             if report.text.starts_with("[parado: limite") {
                 // The note is not an answer: hand back what the child did say.
                 let partial = last_real_text(&store, &session.id).unwrap_or_default();
-                return Err(ChildError::Failed(format!(
+                return Err(fail(format!(
                     "o subagente atingiu o limite de {} passos sem concluir{}",
                     spec.max_steps,
                     if partial.is_empty() {
@@ -1301,15 +1309,27 @@ mod worktree_tests {
         assert!(note.contains("app.txt"), "{note}");
         assert!(dirty_path.exists(), "worktree sujo deve ser preservado");
 
-        let _ = git(
-            &base,
-            &[
-                "worktree",
-                "remove",
-                "--force",
-                &dirty_path.to_string_lossy(),
-            ],
+        // 3. An error path only drops the guard: dirty edits survive that too.
+        let dropped = WorktreeGuard::enter(&base, "dropped-sub").unwrap();
+        let dropped_path = dropped.worktree_dir.clone();
+        std::fs::write(
+            dropped_path.join("app.txt"),
+            "editado
+",
+        )
+        .unwrap();
+        drop(dropped);
+        assert!(
+            dropped_path.exists(),
+            "drop não pode apagar edições pendentes"
         );
+
+        for p in [&dirty_path, &dropped_path] {
+            let _ = git(
+                &base,
+                &["worktree", "remove", "--force", &p.to_string_lossy()],
+            );
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 

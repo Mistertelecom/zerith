@@ -2,6 +2,7 @@
 //! the head and the path, and reads the rest on demand.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 /// How much of a spilled output the model still sees.
@@ -31,10 +32,17 @@ fn safe_name(s: &str) -> String {
     }
 }
 
-/// Where the output of `call_id` is (or would be) spilled.
+/// A fresh file for the output of `call_id`. Call ids may repeat (fallback
+/// ids, a resumed session), so every call gets its own name: an earlier spill
+/// the model was told to read must never be overwritten.
 pub fn spill_path(root: &Path, session_id: &str, call_id: &str) -> PathBuf {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let ms = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
     root.join(safe_name(session_id))
-        .join(format!("{}.txt", safe_name(call_id)))
+        .join(format!("{}-{ms}-{n}.txt", safe_name(call_id)))
 }
 
 /// The directory of one session's spill files.
@@ -107,6 +115,15 @@ mod tests {
     #[test]
     fn call_ids_cannot_escape_the_root() {
         let p = spill_path(Path::new("r"), "s", "../../etc/passwd");
-        assert_eq!(p, Path::new("r").join("s").join("______etc_passwd.txt"));
+        assert_eq!(p.parent().unwrap(), Path::new("r").join("s"));
+        let name = p.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with("______etc_passwd-"), "{name}");
+    }
+
+    #[test]
+    fn a_repeated_call_id_never_overwrites_an_earlier_spill() {
+        let a = spill_path(Path::new("r"), "s", "call_0");
+        let b = spill_path(Path::new("r"), "s", "call_0");
+        assert_ne!(a, b);
     }
 }

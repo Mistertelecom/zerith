@@ -341,6 +341,27 @@ pub(crate) fn summarize_into(
         log.emit("compaction/end", json!({"ok": false, "error": e}));
         Err(e)
     };
+    // Checked before the (paid, slow) summary too: a doomed span must not
+    // call the summarizer on every step only to throw the text away.
+    match skip_reason(
+        store,
+        session_id,
+        snapshot_max_id,
+        &expected_ids,
+        &supersedes,
+        lo,
+        hi,
+    ) {
+        Ok(Some(reason)) => {
+            log.emit(
+                "compaction/end",
+                json!({"ok": false, "skipped": true, "reason": reason}),
+            );
+            return Ok(None);
+        }
+        Ok(None) => {}
+        Err(e) => return fail(e),
+    }
     let text = match summarizer.summarize(&transcript(span), cancel) {
         Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
         Ok(_) => return fail("resumo vazio".into()),
@@ -394,70 +415,18 @@ pub(crate) fn summarize_into(
             Err(e) => return fail(e),
         };
         let check = (|| -> std::result::Result<TxOutcome, String> {
+            if let Some(reason) = skip_reason(
+                store,
+                session_id,
+                snapshot_max_id,
+                &expected_ids,
+                &supersedes,
+                lo,
+                hi,
+            )? {
+                return Ok(TxOutcome::Skipped(reason));
+            }
             let conn = store.conn();
-            let session_exists: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM sessions WHERE id = ?1",
-                    (session_id,),
-                    |r| r.get(0),
-                )
-                .map_err(|e| e.to_string())?;
-            if session_exists == 0 {
-                return Ok(TxOutcome::Skipped("session_deleted"));
-            }
-            let db_max_id: i64 = conn
-                .query_row(
-                    "SELECT COALESCE(MAX(id), 0) FROM messages WHERE session_id = ?1",
-                    (session_id,),
-                    |r| r.get(0),
-                )
-                .map_err(|e| e.to_string())?;
-            if db_max_id > snapshot_max_id {
-                return Ok(TxOutcome::Skipped("stale_snapshot"));
-            }
-            {
-                let mut sup_stmt = conn
-                    .prepare("SELECT superseded FROM messages WHERE id = ?1 AND session_id = ?2")
-                    .map_err(|e| e.to_string())?;
-                for &row_id in &expected_ids {
-                    let sup: std::result::Result<i64, _> =
-                        sup_stmt.query_row((row_id, session_id), |r| r.get(0));
-                    if sup.ok() != Some(0) {
-                        return Ok(TxOutcome::Skipped("superseded_or_missing"));
-                    }
-                }
-            }
-            let existing_summaries: Vec<(i64, String)> = {
-                let mut sum_stmt = conn
-                    .prepare(
-                        "SELECT id, raw FROM messages WHERE session_id = ?1 AND superseded = 0
-                         AND CASE WHEN raw IS NULL OR NOT json_valid(raw) THEN 0
-                             ELSE json_type(raw, '$.summary.start_id') IS NOT NULL END",
-                    )
-                    .map_err(|e| e.to_string())?;
-                let rows = sum_stmt
-                    .query_map((session_id,), |r| Ok((r.get(0)?, r.get(1)?)))
-                    .map_err(|e| e.to_string())?;
-                rows.collect::<std::result::Result<Vec<_>, _>>()
-                    .map_err(|e| e.to_string())?
-            };
-            let already_covered = existing_summaries.into_iter().any(|(sum_id, raw_str)| {
-                if supersedes.contains(&sum_id) {
-                    return false;
-                }
-                serde_json::from_str::<serde_json::Value>(&raw_str)
-                    .ok()
-                    .and_then(|v| {
-                        let s = v.get("summary")?;
-                        let s_lo = s.get("start_id")?.as_i64()?;
-                        let s_hi = s.get("end_id")?.as_i64()?;
-                        Some(s_lo <= hi && s_hi >= lo)
-                    })
-                    .unwrap_or(false)
-            });
-            if already_covered {
-                return Ok(TxOutcome::Skipped("already_summarized"));
-            }
             let ts = zerith_sessions::migrations::now_ms();
             conn.execute(
                 "INSERT INTO messages(session_id, role, content, tool_name, tool_calls, reasoning, token_count, created_at, raw)
@@ -519,6 +488,83 @@ pub(crate) fn summarize_into(
         tokens_before,
         tokens_after,
     }))
+}
+
+/// Why storing a summary of `lo..=hi` would be wrong now, if it would: the
+/// session is gone, rows arrived after the snapshot, a row of the span was
+/// rewound, or a live summary already covers part of it. A summary named in
+/// any live summary's `supersedes` is dead, whatever its flag says (the same
+/// rule as [`replay_items`]).
+#[allow(clippy::too_many_arguments)]
+fn skip_reason(
+    store: &Store,
+    session_id: &str,
+    snapshot_max_id: i64,
+    expected_ids: &[i64],
+    supersedes: &[i64],
+    lo: i64,
+    hi: i64,
+) -> std::result::Result<Option<&'static str>, String> {
+    let conn = store.conn();
+    let session_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sessions WHERE id = ?1",
+            (session_id,),
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if session_exists == 0 {
+        return Ok(Some("session_deleted"));
+    }
+    let db_max_id: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(id), 0) FROM messages WHERE session_id = ?1",
+            (session_id,),
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if db_max_id > snapshot_max_id {
+        return Ok(Some("stale_snapshot"));
+    }
+    let mut sup_stmt = conn
+        .prepare("SELECT superseded FROM messages WHERE id = ?1 AND session_id = ?2")
+        .map_err(|e| e.to_string())?;
+    for &row_id in expected_ids {
+        let sup: std::result::Result<i64, _> =
+            sup_stmt.query_row((row_id, session_id), |r| r.get(0));
+        if sup.ok() != Some(0) {
+            return Ok(Some("superseded_or_missing"));
+        }
+    }
+    let mut sum_stmt = conn
+        .prepare(
+            "SELECT id, raw FROM messages WHERE session_id = ?1 AND superseded = 0
+             AND CASE WHEN raw IS NULL OR NOT json_valid(raw) THEN 0
+                 ELSE json_type(raw, '$.summary.start_id') IS NOT NULL END",
+        )
+        .map_err(|e| e.to_string())?;
+    let summaries: Vec<(i64, serde_json::Value)> = sum_stmt
+        .query_map((session_id,), |r| Ok((r.get(0)?, r.get::<_, String>(1)?)))
+        .map_err(|e| e.to_string())?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter_map(|(id, raw)| Some((id, serde_json::from_str(&raw).ok()?)))
+        .collect();
+    let dead: HashSet<i64> = summaries
+        .iter()
+        .filter_map(|(_, v)| v["summary"]["supersedes"].as_array())
+        .flatten()
+        .filter_map(|v| v.as_i64())
+        .chain(supersedes.iter().copied())
+        .collect();
+    let covered = summaries.iter().any(|(id, v)| {
+        let s = &v["summary"];
+        !dead.contains(id)
+            && matches!((s["start_id"].as_i64(), s["end_id"].as_i64()),
+                        (Some(s_lo), Some(s_hi)) if s_lo <= hi && s_hi >= lo)
+    });
+    Ok(covered.then_some("already_summarized"))
 }
 
 /// Manual compaction (a future `/compact`): everything before the latest user
@@ -1034,6 +1080,40 @@ mod tests {
         for m in &replayed[2..] {
             assert!(m.synthetic, "synthetic row must remain synthetic: {m:?}");
         }
+    }
+
+    #[test]
+    fn third_compaction_ignores_summary_superseded_by_newer_one() {
+        struct Count(std::cell::Cell<usize>);
+        impl Summarizer for Count {
+            fn summarize(&self, _: &str, _: &Cancel) -> std::result::Result<String, String> {
+                self.0.set(self.0.get() + 1);
+                Ok(format!("resumo {}", self.0.get()))
+            }
+        }
+        let store = Store::open_in_memory().unwrap();
+        let sid = store
+            .create_session("3x", SessionSource::Native)
+            .unwrap()
+            .id;
+        let sum = Count(std::cell::Cell::new(0));
+        let c = Cancel::default();
+        for round in 0..3 {
+            for i in 0..3 {
+                store
+                    .append(&sid, &NewMessage::new(Role::User, format!("p{round}-{i}")))
+                    .unwrap();
+                store
+                    .append(
+                        &sid,
+                        &NewMessage::new(Role::Assistant, format!("r{round}-{i}")),
+                    )
+                    .unwrap();
+            }
+            let r = compact_with(&store, &sid, &sum, &c, "manual").unwrap();
+            assert!(r.is_some(), "compaction {round} must store a summary");
+        }
+        assert_eq!(sum.0.get(), 3);
     }
 
     #[test]

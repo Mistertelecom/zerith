@@ -1480,11 +1480,27 @@ fn a_subagent_registry_has_no_authoring_tools() {
     }) {
         base.register(t);
     }
+    // The plan tools flip the parent's shared mode: never a child's.
+    let mut pol = zerith_security::Policy::new(
+        zerith_security::preset("workspace-write").unwrap(),
+        zerith_security::Mode::Default,
+        dir.path(),
+    );
+    let guards =
+        zerith_runtime::guards::Guards::new(zerith_core::Settings::default(), &mut pol, "s");
+    base.register(guards.enter_plan_mode_tool());
+    base.register(guards.exit_plan_mode_tool());
     assert!(base.get("create_agent").is_some(), "the parent has them");
     // `general` is the broadest child: every tool of the parent, minus these.
     let resolved = resolve_agent(dir.path(), Some("general")).unwrap();
     let child = child_registry(&base, &resolved, 1);
-    for name in ["create_skill", "create_agent", "delete_ai_item"] {
+    for name in [
+        "create_skill",
+        "create_agent",
+        "delete_ai_item",
+        "enter_plan_mode",
+        "exit_plan_mode",
+    ] {
         assert!(child.get(name).is_none(), "{name} leaked into a subagent");
     }
     assert!(child.get("read_file").is_some());

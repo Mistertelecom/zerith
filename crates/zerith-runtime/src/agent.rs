@@ -221,6 +221,17 @@ impl ApprovalGate {
     /// Acquires the exclusive interactive-prompt slot, polling `cancel` while waiting.
     /// Returns `None` immediately if `cancel` is triggered before the slot is free.
     pub fn acquire_prompt_slot(&self, cancel: &Cancel) -> Option<PromptGuard<'_>> {
+        self.acquire_prompt_slot_pumping(cancel, &mut || {})
+    }
+
+    /// Like [`Self::acquire_prompt_slot`], calling `pump` on every wait tick.
+    /// The root turn pumps relayed child prompts here: a background child may
+    /// hold the slot while its own `ApprovalNeeded` waits in `relayed`.
+    pub(crate) fn acquire_prompt_slot_pumping(
+        &self,
+        cancel: &Cancel,
+        pump: &mut dyn FnMut(),
+    ) -> Option<PromptGuard<'_>> {
         let (lock, cv) = &*self.prompt_busy;
         let mut busy = lock.lock().unwrap_or_else(|e| e.into_inner());
         loop {
@@ -236,7 +247,9 @@ impl ApprovalGate {
             let (next, _) = cv
                 .wait_timeout(busy, Duration::from_millis(50))
                 .unwrap_or_else(|e| e.into_inner());
-            busy = next;
+            drop(next);
+            pump();
+            busy = lock.lock().unwrap_or_else(|e| e.into_inner());
         }
     }
 }
@@ -256,20 +269,30 @@ impl InboxSender {
 /// The turn's half. Messages sent while a turn runs are drained at the next
 /// step boundary (before the next model request, or before the turn would
 /// end) and appended as user messages, stored and logged like any other.
-pub struct InboxReceiver(Mutex<mpsc::Receiver<String>>);
+pub struct InboxReceiver(Mutex<Option<mpsc::Receiver<String>>>);
 
 impl InboxReceiver {
-    fn drain(&self) -> Vec<String> {
-        let Ok(rx) = self.0.lock() else {
+    /// What arrived so far. `close` also drops the receiver, so a later
+    /// [`InboxSender::send`] returns false (the UI keeps the draft) instead
+    /// of being acked into a turn that will never read it.
+    fn drain(&self, close: bool) -> Vec<String> {
+        let Ok(mut slot) = self.0.lock() else {
             return Vec::new();
         };
-        rx.try_iter().filter(|s| !s.trim().is_empty()).collect()
+        let msgs = slot
+            .as_ref()
+            .map(|rx| rx.try_iter().filter(|s| !s.trim().is_empty()).collect())
+            .unwrap_or_default();
+        if close {
+            *slot = None;
+        }
+        msgs
     }
 }
 
 pub fn inbox_channel() -> (InboxSender, InboxReceiver) {
     let (tx, rx) = mpsc::channel();
-    (InboxSender(tx), InboxReceiver(Mutex::new(rx)))
+    (InboxSender(tx), InboxReceiver(Mutex::new(Some(rx))))
 }
 
 /// What the loop may use besides the conversation. `Default` is "no tools":
@@ -708,6 +731,7 @@ fn turn_body(
     };
 
     let (mut prompt_tokens, mut completion_tokens) = (0u64, 0u64);
+    let mut last_prompt_tokens = 0u64;
     let (mut cache_read_tokens, mut cache_write_tokens) = (0u64, 0u64);
     let mut pending_rtk_tokens: u64 = 0;
     let mut total_saved_rtk_tokens: u64 = 0;
@@ -725,7 +749,7 @@ fn turn_body(
 
     for step in 1..=max_steps {
         on_event(RunEvent::Step { n: step });
-        steer(store, session_id, agent, &mut hist, log, on_event)?;
+        steer(store, session_id, agent, &mut hist, log, on_event, false)?;
 
         if let Some(b) = budget {
             if hist.tokens() > shrink_at(window, schema_tokens, b, folded()) {
@@ -823,6 +847,7 @@ fn turn_body(
         last_model_used = Some(gw_outcome.model);
         if let Some(u) = &out.usage {
             prompt_tokens += u.prompt_tokens;
+            last_prompt_tokens = u.prompt_tokens;
             completion_tokens += u.completion_tokens;
             cache_read_tokens += u.cache_read_tokens;
             cache_write_tokens += u.cache_write_tokens;
@@ -858,7 +883,9 @@ fn turn_body(
         );
         if out.calls.is_empty() {
             // Told something while the answer streamed: the turn is not over.
-            if step < max_steps && steer(store, session_id, agent, &mut hist, log, on_event)? > 0 {
+            if step < max_steps
+                && steer(store, session_id, agent, &mut hist, log, on_event, false)? > 0
+            {
                 continue;
             }
             // Background children the model never collected: the turn waits
@@ -919,6 +946,13 @@ fn turn_body(
                         continue;
                     }
                 }
+            }
+            // The turn is about to end: close the inbox so a late steer is
+            // refused (not acked and lost), and answer what slipped in.
+            if steer(store, session_id, agent, &mut hist, log, on_event, true)? > 0
+                && step < max_steps
+            {
+                continue;
             }
             break;
         }
@@ -1158,6 +1192,9 @@ fn turn_body(
             reason = "max_steps";
         }
     }
+    // Every way out of the loop closes the inbox; what slipped in after the
+    // last drain is stored (the next turn reads it), never acked and lost.
+    steer(store, session_id, agent, &mut hist, log, on_event, true)?;
 
     // What the subagents saved counts for the turn that delegated; their own
     // usage rows already hold it, so only the report adds it up.
@@ -1179,6 +1216,7 @@ fn turn_body(
             text: last.1,
             reasoning: last.2,
             prompt_tokens,
+            last_prompt_tokens,
             completion_tokens,
             cache_read_tokens,
             cache_write_tokens,
@@ -1321,11 +1359,12 @@ fn steer(
     hist: &mut History,
     log: &TurnLog<'_>,
     on_event: &mut dyn FnMut(RunEvent),
+    close: bool,
 ) -> Result<usize> {
     let Some(inbox) = agent.inbox else {
         return Ok(0);
     };
-    let msgs = inbox.drain();
+    let msgs = inbox.drain(close);
     for text in &msgs {
         let id = store.append(
             session_id,

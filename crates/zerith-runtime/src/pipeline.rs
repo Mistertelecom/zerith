@@ -91,6 +91,8 @@ impl Middleware for NoopMiddleware {}
 
 static NEXT_APPROVAL: AtomicU64 = AtomicU64::new(1);
 
+const PANICKED: &str = "erro interno na ferramenta (panic)";
+
 /// A call that went through the first phases. `settled` is `Some` when it
 /// already has its outcome (refused, replaced) and must not run.
 pub(crate) struct Prepared {
@@ -346,7 +348,17 @@ impl Pipeline<'_> {
         if self.cancel.is_cancelled() {
             return Err("cancelado".into());
         }
-        let Some(_slot) = gate.acquire_prompt_slot(self.cancel) else {
+        // The root pumps while it waits: the slot may be held by a background
+        // child whose prompt sits in `relayed`, which only the root emits.
+        let relay = self.relay;
+        let slot = gate.acquire_prompt_slot_pumping(self.cancel, &mut || {
+            if relay {
+                for e in gate.take_relayed() {
+                    on_event(e);
+                }
+            }
+        });
+        let Some(_slot) = slot else {
             return Err("cancelado".into());
         };
         if !forced && gate.granted(grant_key) {
@@ -463,10 +475,7 @@ impl Pipeline<'_> {
                     if cancel.is_cancelled() {
                         continue;
                     }
-                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        run_plain(tools, policy, &jobs[i].inv, cancel)
-                    }))
-                    .unwrap_or_else(|_| (false, "erro interno na ferramenta (panic)".into()));
+                    let r = run_plain(tools, policy, &jobs[i].inv, cancel);
                     if let Ok(mut g) = slots.lock() {
                         g[i] = Some(r);
                     }
@@ -553,10 +562,7 @@ impl Pipeline<'_> {
     }
 
     fn run_one(&self, tools: &Registry, policy: &Policy, inv: &ToolInvocation) -> (bool, String) {
-        match tools.run_raw(&inv.name, &inv.args, &self.ctx(policy), self.cancel) {
-            Ok(o) => (true, o),
-            Err(e) => (false, format!("erro: {e}")),
-        }
+        run_caught(|| tools.run_raw(&inv.name, &inv.args, &self.ctx(policy), self.cancel))
     }
 
     /// Phases 6-7: after-middleware, then spill/truncate. Returns the outcome
@@ -711,9 +717,16 @@ fn run_plain(
         memory: None,
         scope: None,
     };
-    match tools.run_raw(&inv.name, &inv.args, &ctx, cancel) {
-        Ok(o) => (true, o),
-        Err(e) => (false, format!("erro: {e}")),
+    run_caught(|| tools.run_raw(&inv.name, &inv.args, &ctx, cancel))
+}
+
+/// A tool that panics fails its call, not the turn: an unwinding turn would
+/// skip abandoning its subagents and writing `turn/end`.
+fn run_caught(run: impl FnOnce() -> zerith_tools::Result<String>) -> (bool, String) {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+        Ok(Ok(o)) => (true, o),
+        Ok(Err(e)) => (false, format!("erro: {e}")),
+        Err(_) => (false, PANICKED.into()),
     }
 }
 
@@ -833,14 +846,13 @@ mod parallel_panic_tests {
             },
         ];
         let prepared: Vec<Prepared> = calls.iter().map(|c| pipe.prepare(c, &mut |_| {})).collect();
-        let out = pipe.run_group(&prepared, 2, &mut |_| {});
-        assert_eq!(
-            out,
-            vec![
-                Some((false, "erro interno na ferramenta (panic)".into())),
-                Some((true, "ok".into())),
-            ]
-        );
+        let expected = vec![
+            Some((false, "erro interno na ferramenta (panic)".into())),
+            Some((true, "ok".into())),
+        ];
+        assert_eq!(pipe.run_group(&prepared, 2, &mut |_| {}), expected);
+        // Serial path too: a panic fails the call, it never unwinds the turn.
+        assert_eq!(pipe.run_group(&prepared, 1, &mut |_| {}), expected);
     }
 
     #[test]
@@ -1083,6 +1095,31 @@ mod parallel_panic_tests {
         );
         assert!(forced_prompted);
         assert!(res.is_ok());
+
+        // A background child holds the slot and its prompt sits in `relayed`:
+        // the root waiting for the slot must emit it, or nobody ever answers.
+        {
+            let held = gate.acquire_prompt_slot(&Cancel::default()).unwrap();
+            gate.relay(RunEvent::ApprovalNeeded {
+                id: 999_999,
+                tool: "shell".into(),
+                summary: "[subagente] x".into(),
+            });
+            let held = std::sync::Mutex::new(Some(held));
+            let mut seen = false;
+            let got = p_forced.approve("write_file", "k-pump", "w".into(), true, &mut |ev| {
+                if let RunEvent::ApprovalNeeded { id, .. } = ev {
+                    if id == 999_999 {
+                        seen = true;
+                        held.lock().unwrap().take(); // child answered: frees the slot
+                    } else {
+                        assert!(tx.answer(id, Approval::AllowOnce));
+                    }
+                }
+            });
+            assert!(seen, "relayed child prompt must be pumped while waiting");
+            assert!(got.is_ok());
+        }
 
         // Cancel unblocks a waiting prompt slot immediately with None.
         let c_wait = Cancel::default();

@@ -817,7 +817,6 @@ fn a_big_output_spills_to_a_file_the_model_can_read_back_without_asking() {
     let pol = policy(ws.path());
     let store = Store::open_in_memory().unwrap();
     let sid = session(&store);
-    let spill_file: PathBuf = spill_root.path().join(&sid).join("c1.txt");
 
     let fake = serve(vec![
         calls(&[("c1", "read_file", json!({"path": "big.txt"}))]),
@@ -850,14 +849,21 @@ fn a_big_output_spills_to_a_file_the_model_can_read_back_without_asking() {
     assert!(shown.contains("2000 linhas") || shown.contains("linhas)"));
     assert!(shown.contains("read_file com offset/limit"));
     assert!(shown.len() < 10_000, "only the head reaches the model");
+    let ev = store.events(&sid, 0, 100).unwrap();
+    let res = ev.iter().find(|e| e.kind == "tool/result").unwrap();
+    let spill_file = PathBuf::from(res.payload["spill"].as_str().unwrap());
+    assert_eq!(spill_file.parent().unwrap(), spill_root.path().join(&sid));
+    assert!(spill_file
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .starts_with("c1-"));
     let full = std::fs::read_to_string(&spill_file).unwrap();
     assert!(
         full.contains("linha numero 02000"),
         "the spill holds everything"
     );
-    let ev = store.events(&sid, 0, 100).unwrap();
-    let res = ev.iter().find(|e| e.kind == "tool/result").unwrap();
-    assert!(res.payload["spill"].as_str().unwrap().ends_with("c1.txt"));
 
     // The model reads the rest from the spill file. It lives outside the
     // workspace, so without the exemption this would be refused (no gate).
@@ -1339,6 +1345,8 @@ fn a_steer_sent_while_the_final_answer_streams_keeps_the_turn_going() {
     .unwrap();
     assert_eq!(report.text, "segunda");
     assert_eq!(fake.seen.lock().unwrap().len(), 2);
+    // The ended turn closed its inbox: a late steer is refused, not acked and lost.
+    assert!(!tx.send("tarde demais"));
 }
 
 // ---- gateway failover & token saver ---------------------------------------
@@ -1628,7 +1636,7 @@ fn token_saver_full_injects_prompts_compresses_build_output_and_records_savings(
     let mut reg = Registry::empty();
     reg.register(Box::new(FakeBuildTool {
         spec: ToolSpec {
-            name: "fake_build".into(),
+            name: "list_dir".into(),
             description: "runs build".into(),
             parameters: json!({"type": "object"}),
             returns: "build log",
@@ -1645,7 +1653,7 @@ fn token_saver_full_injects_prompts_compresses_build_output_and_records_savings(
         json!({"choices":[{"delta":{"content":"```rust\nlet x: &str = \"hi\";\n```\ncorrigido"}}]}),
         json!({"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30}}),
     ]);
-    let fake = serve(vec![calls(&[("b1", "fake_build", json!({}))]), final_reply]);
+    let fake = serve(vec![calls(&[("b1", "list_dir", json!({}))]), final_reply]);
     let store = Store::open_in_memory().unwrap();
     let sid = session(&store);
 
@@ -1690,7 +1698,7 @@ fn token_saver_full_injects_prompts_compresses_build_output_and_records_savings(
     assert!(events.iter().any(|e| matches!(
         e,
         RunEvent::TokenSaved { tool, before_bytes, after_bytes, filter }
-            if tool == "fake_build"
+            if tool == "list_dir"
                 && *after_bytes < *before_bytes
                 && filter.as_deref() == Some("build-output")
     )));

@@ -213,7 +213,10 @@ pub struct TurnReport {
     pub message_id: i64,
     pub text: String,
     pub reasoning: Option<String>,
+    /// Summed over every step: what the turn cost.
     pub prompt_tokens: u64,
+    /// The last step's prompt alone: how full the context window is now.
+    pub last_prompt_tokens: u64,
     pub completion_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
@@ -698,7 +701,7 @@ pub fn hydrate_oauth(
     store: &dyn zerith_core::secrets::SecretStore,
 ) -> Option<zerith_providers::OAuthCredential> {
     hydrate_oauth_with(acc, store, &|c| {
-        zerith_providers::oauth::refresh(c.tool, c).map_err(|e| e.to_string())
+        zerith_providers::oauth::renew(c).map_err(|e| e.to_string())
     })
 }
 
@@ -716,9 +719,10 @@ pub fn hydrate_oauth_with(
             .flatten()
     };
     let cred = load()?;
-    // Codex's refresh token rotates on use: renewing it here would log the
-    // user's own `codex` CLI out. Its token is used as it is.
-    if cred.tool == zerith_providers::OAuthTool::Codex || !cred.needs_refresh(oauth_now()) {
+    // `oauth::renew` never refreshes a credential imported from a CLI's file:
+    // it re-reads that file, since a refresh would rotate the CLI's token and
+    // log it out.
+    if !cred.needs_refresh(oauth_now()) {
         return Some(cred);
     }
     // Parallel turns and subagents hit this together; a rotating refresh
@@ -746,7 +750,7 @@ pub fn fresh_oauth(
     account: &str,
 ) -> std::result::Result<zerith_providers::OAuthCredential, String> {
     fresh_oauth_with(account, &zerith_core::secrets::OsKeyring, &|c| {
-        zerith_providers::oauth::refresh(c.tool, c).map_err(|e| e.to_string())
+        zerith_providers::oauth::renew(c).map_err(|e| e.to_string())
     })
 }
 
@@ -764,9 +768,7 @@ pub fn fresh_oauth_with(
             .ok_or_else(|| "sem credencial no cofre para esta conta".to_string())
     };
     let cred = load()?;
-    // Codex is never refreshed here: its refresh token rotates on use, so
-    // renewing it from the app would log the user's `codex` CLI out.
-    if cred.tool == zerith_providers::OAuthTool::Codex || !cred.needs_refresh(oauth_now()) {
+    if !cred.needs_refresh(oauth_now()) {
         return Ok(cred);
     }
     let lock = refresh_lock(account);
@@ -775,7 +777,12 @@ pub fn fresh_oauth_with(
     if !cred.needs_refresh(oauth_now()) {
         return Ok(cred);
     }
-    let fresh = refresh(&cred)?;
+    let fresh = match refresh(&cred) {
+        Ok(fresh) => fresh,
+        // An imported credential the CLI has not renewed yet is used as is.
+        Err(_) if cred.is_imported() => return Ok(cred),
+        Err(e) => return Err(e),
+    };
     zerith_core::secrets::save_oauth(store, account, &fresh).map_err(|e| e.to_string())?;
     Ok(fresh)
 }
@@ -2020,6 +2027,7 @@ mod gateway_tests {
             expires_at: 1,
             account_id: None,
             tool: OAuthTool::ClaudeCode,
+            imported: None,
         };
         let acc_id = "shared-lock-acc";
         secrets::save_oauth(&store, acc_id, &expired).unwrap();
@@ -2051,6 +2059,7 @@ mod gateway_tests {
                         expires_at: oauth_now() + 7200,
                         account_id: c.account_id.clone(),
                         tool: c.tool,
+                        imported: c.imported,
                     })
                 })
             });
@@ -2069,6 +2078,7 @@ mod gateway_tests {
                         expires_at: oauth_now() + 7200,
                         account_id: c.account_id.clone(),
                         tool: c.tool,
+                        imported: c.imported,
                     })
                 })
             });

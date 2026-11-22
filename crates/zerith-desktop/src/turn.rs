@@ -125,6 +125,12 @@ pub enum TurnEvent {
     Steered {
         text: String,
     },
+    /// The permission mode changed mid-turn (the plan was approved, or the
+    /// model entered plan). `mode` is spelled like `send_turn`'s `mode` arg,
+    /// so the window stores it and sends it back on the next turn.
+    ModeChanged {
+        mode: String,
+    },
     Done {
         stored: Option<i64>,
         text: String,
@@ -270,9 +276,13 @@ pub fn run(
     {
         settings.routing.subagent_model = Some(exec_m.to_string());
     }
-    let mut policy = Policy::from_settings(&settings, &setup.workspace)
-        .map(|p| p.with_handle(zerith_security::ModeHandle::new(setup.mode)))
-        .ok();
+    // A broken rule fails the turn out loud: dropping it would run the turn
+    // with no tools and no word why.
+    let mut policy = Some(
+        Policy::from_settings(&settings, &setup.workspace)
+            .map_err(|e| format!("Permissões inválidas nas configurações: {e}"))?
+            .with_handle(zerith_security::ModeHandle::new(setup.mode)),
+    );
 
     let mut tools = Registry::new();
     let build_mcp = || {
@@ -342,6 +352,11 @@ pub fn run(
         return Ok(TurnOutcome::Cancelled);
     }
 
+    let mut mode_watch = policy.as_mut().map(|p| {
+        let h = p.mode_handle();
+        let now = h.get();
+        (h, now)
+    });
     let mut digest = zerith_runtime::learn::TurnDigest::new(&prompt);
     let result = run_agent_turn(
         &store,
@@ -381,6 +396,17 @@ pub fn run(
             if let Some(ev) = shape(ev) {
                 on(ev);
             }
+            // Tools (exit/enter_plan_mode) switch the handle while they run;
+            // tell the window, or its next turn sends the old mode again.
+            if let Some((h, seen)) = mode_watch.as_mut() {
+                let now = h.get();
+                if now != *seen {
+                    *seen = now;
+                    on(TurnEvent::ModeChanged {
+                        mode: mode_name(now).into(),
+                    });
+                }
+            }
         },
     );
 
@@ -416,7 +442,9 @@ pub fn run(
                 .or(client.config().context_limit)
                 .or_else(|| zerith_providers::models::context_window(model_for_win));
             if let Some(win) = ctx_limit.filter(|&w| w > 0) {
-                let pct = r.prompt_tokens.saturating_mul(100) / u64::from(win);
+                // The last request's prompt is the window's fill; the
+                // turn's sum counts the same history once per step.
+                let pct = r.last_prompt_tokens.saturating_mul(100) / u64::from(win);
                 if (70..85).contains(&pct) {
                     let db_bg = setup.db.clone();
                     let settings_bg = settings.clone();
@@ -500,6 +528,16 @@ fn auto_compact(
         }),
         Ok(None) => {}
         Err(e) => eprintln!("zerith-desktop: resumo automático falhou: {e}"),
+    }
+}
+
+/// The inverse of [`parse_mode`]: the spelling the window sends.
+pub fn mode_name(m: Mode) -> &'static str {
+    match m {
+        Mode::Default => "default",
+        Mode::AcceptEdits => "acceptEdits",
+        Mode::Plan => "plan",
+        Mode::DontAsk | Mode::Bypass => "bypass",
     }
 }
 
@@ -603,6 +641,20 @@ mod tests {
         assert_eq!(session_workspace(&db, &s1.id), a, "cada uma a sua");
         std::fs::remove_dir_all(&b).unwrap();
         assert_eq!(session_workspace(&db, &s2.id), a, "pasta apagada");
+    }
+
+    #[test]
+    fn mode_names_round_trip_through_parse_mode() {
+        for m in [Mode::Default, Mode::AcceptEdits, Mode::Plan, Mode::Bypass] {
+            assert_eq!(parse_mode(mode_name(m)), m);
+        }
+        let ev = TurnEvent::ModeChanged {
+            mode: mode_name(Mode::AcceptEdits).into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&ev).unwrap(),
+            serde_json::json!({"type": "modeChanged", "mode": "acceptEdits"})
+        );
     }
 
     #[test]

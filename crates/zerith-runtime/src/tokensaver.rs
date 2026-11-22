@@ -135,34 +135,33 @@ pub fn estimate_caveman_saved_tokens(
 }
 
 /// Estimates output tokens saved by Ponytail code/diff minimalism for one step.
+///
+/// ponytail: an estimate, not a measurement: there is no "without Ponytail"
+/// answer to compare against. Only fenced code counts (prose is Caveman's,
+/// tool arguments such as a `write_file` body are content the user asked for).
 pub fn estimate_ponytail_saved_tokens(
     level: PonytailLevel,
     text: &str,
-    tool_args_bytes: usize,
+    _tool_args_bytes: usize,
     completion_tokens: u64,
 ) -> u64 {
     if level == PonytailLevel::Off {
         return 0;
     }
     let (_prose_bytes, code_bytes) = split_prose_and_code_bytes(text);
-    let total_bytes = text.len() + tool_args_bytes;
-    let code_plus_args_bytes = code_bytes + tool_args_bytes;
-    let effective_tokens = if completion_tokens > 0 {
-        completion_tokens
+    if code_bytes == 0 {
+        return 0;
+    }
+    let code_tokens = if completion_tokens > 0 && !text.is_empty() {
+        (completion_tokens.saturating_mul(code_bytes as u64) / text.len() as u64).max(1)
     } else {
-        total_bytes.div_ceil(4) as u64
-    };
-    let base = if code_plus_args_bytes > 0 {
-        (effective_tokens.saturating_mul(code_plus_args_bytes as u64) / total_bytes.max(1) as u64)
-            .max(1)
-    } else {
-        effective_tokens / 2
+        code_bytes.div_ceil(4) as u64
     };
     match level {
         PonytailLevel::Off => 0,
-        PonytailLevel::Lite => base.saturating_mul(25) / 100,
-        PonytailLevel::Full => base.saturating_mul(54) / 100,
-        PonytailLevel::Ultra => base,
+        PonytailLevel::Lite => code_tokens.saturating_mul(25) / 100,
+        PonytailLevel::Full => code_tokens.saturating_mul(54) / 100,
+        PonytailLevel::Ultra => code_tokens,
     }
 }
 
@@ -203,12 +202,71 @@ fn head_complete_lines(head: &str, is_full_text: bool) -> Vec<&str> {
 /// Applies deterministic RTK compression filters to tool outputs before they
 /// are persisted or sent back to the model.
 pub fn compress_tool_output(tool_name: &str, text: &str) -> RtkOutcome {
-    // read_file already has offset/limit: the model asked for those lines,
-    // and a cut there makes it invent the missing ones.
-    if tool_name == "read_file" || text.len() < RTK_MIN_BYTES || text.len() > RTK_MAX_BYTES {
+    // Only command output comes in known noisy shapes. Prose (subagent
+    // reports, web pages, memory) that happens to cite `file:12:` must never
+    // be cut, and read_file already has offset/limit.
+    if !is_command_tool(tool_name) || text.len() < RTK_MIN_BYTES || text.len() > RTK_MAX_BYTES {
         return unchanged(text);
     }
+    let mut out = compress_command_output(tool_name, text);
+    if out.filter.is_some() {
+        keep_frame(text, &mut out);
+    }
+    out
+}
 
+/// Tools whose output is raw command/terminal text.
+fn is_command_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "shell" | "sh" | "remote_shell" | "ssh" | "ssh_command" | "grep" | "glob" | "list_dir"
+    ) || name.starts_with("terminal_")
+        || name.starts_with("net_")
+}
+
+/// Lines a filter must never drop: the exit code and the runtime's own
+/// notes (spill path, truncation, warnings).
+fn is_frame_line(line: &str) -> bool {
+    let t = line.trim_start();
+    (t.starts_with("exit ") && t.len() < 16)
+        || t.starts_with("[saída completa:")
+        || t.starts_with("[saída truncada")
+        || t.starts_with("[AVISO]")
+}
+
+/// Puts back frame lines a filter dropped: the exit line first, notes last.
+fn keep_frame(original: &str, out: &mut RtkOutcome) {
+    let have: std::collections::HashSet<&str> = out.text.lines().collect();
+    let missing: Vec<&str> = original
+        .lines()
+        .filter(|l| is_frame_line(l) && !have.contains(l))
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+    let (head, tail): (Vec<&str>, Vec<&str>) = missing
+        .into_iter()
+        .partition(|l| l.trim_start().starts_with("exit "));
+    let mut text = String::new();
+    for l in head {
+        text.push_str(l);
+        text.push('\n');
+    }
+    text.push_str(&out.text);
+    for l in tail {
+        text.push('\n');
+        text.push_str(l);
+    }
+    if text.len() >= original.len() {
+        *out = unchanged(original);
+        return;
+    }
+    out.saved_bytes = original.len() - text.len();
+    out.saved_tokens = (out.saved_bytes / 4) as u64;
+    out.text = text;
+}
+
+fn compress_command_output(tool_name: &str, text: &str) -> RtkOutcome {
     let cut = floor_char_boundary(text, 1024);
     let head = &text[..cut];
     let is_full = cut == text.len();
@@ -676,6 +734,16 @@ fn filter_build_output(text: &str) -> Option<String> {
             continue;
         }
 
+        if t.contains("panicked at")
+            || t.ends_with("... FAILED")
+            || t.starts_with("failures:")
+            || t.starts_with("---- ")
+            || t.starts_with("thread '")
+        {
+            state = DiagState::Error;
+            errors.push(line);
+            continue;
+        }
         if t.starts_with("error[")
             || t.starts_with("error:")
             || t.starts_with("ERROR:")
@@ -796,8 +864,12 @@ fn filter_grep(text: &str) -> Option<String> {
     let mut groups: Vec<(&str, Vec<(&str, &str)>)> = Vec::new();
     let mut index_by_file: HashMap<&str, usize> = HashMap::new();
 
+    let mut other: Vec<&str> = Vec::new();
     for line in text.lines() {
         let Some((file, num, content)) = parse_grep_line(line) else {
+            if !line.trim().is_empty() && line.trim() != "--" && !is_frame_line(line) {
+                other.push(line);
+            }
             continue;
         };
         if let Some(&idx) = index_by_file.get(file) {
@@ -822,6 +894,8 @@ fn filter_grep(text: &str) -> Option<String> {
             out.push(format!("  ... (+{} more)", matches.len() - 10));
         }
     }
+    // Context lines (`file-12-...`), stderr and anything unparsed stay.
+    out.extend(other.into_iter().map(str::to_string));
 
     Some(out.join("\n"))
 }
@@ -877,7 +951,13 @@ fn looks_like_path(line: &str) -> bool {
     } else {
         s
     };
-    if without_drive.contains(':') {
+    if without_drive.contains(':')
+        || s.contains("/*")
+        || s.contains("//")
+        || s.contains(|c: char| {
+            matches!(c, '{' | '}' | '(' | ')' | ';' | '=' | '"' | '<' | '>' | '|')
+        })
+    {
         return false;
     }
     s.starts_with("./")
@@ -1191,6 +1271,80 @@ mod network_rtk_tests {
         assert!(out.text.contains("Idle"), "must keep anomaly row");
         assert!(out.text.contains("Total number of neighbors 60"));
         assert!(out.text.contains("linhas normais de tabela omitidas"));
+    }
+}
+
+#[cfg(test)]
+mod fidelity_tests {
+    use super::compress_tool_output as c;
+
+    #[test]
+    fn prose_from_non_command_tools_is_never_filtered() {
+        let report = "crates/x/src/lib.rs:120: unwrap panics\ncrates/x/src/api.rs:44: missing auth\n\nSummary: ".to_string()
+            + &"the auth module trusts the client id and must be fixed. ".repeat(20);
+        for tool in ["agent", "web_fetch", "memory_recall", "read_file"] {
+            assert_eq!(c(tool, &report).text, report, "{tool}");
+        }
+    }
+
+    #[test]
+    fn exit_code_and_spill_note_survive_filters() {
+        let mut s = String::from("exit 101\n--- stdout\n");
+        for i in 0..200 {
+            s += &format!("   Compiling crate{i} v0.1.0\n");
+        }
+        s += "\n\n[saída completa: /spill/s/call_0-1-0.txt (900 linhas); use read_file com offset/limit ou grep]";
+        let out = c("shell", &s);
+        assert!(out.filter.is_some());
+        assert!(out.text.starts_with("exit 101\n"), "{}", out.text);
+        assert!(
+            out.text
+                .contains("[saída completa: /spill/s/call_0-1-0.txt"),
+            "{}",
+            out.text
+        );
+    }
+
+    #[test]
+    fn test_failures_and_panics_are_kept() {
+        let mut s = String::from("exit 101\n--- stdout\nrunning 40 tests\n");
+        for i in 0..60 {
+            s += &format!("   Compiling dep{i} v0.1.0\n");
+        }
+        s += "test tests::boom ... FAILED\n\nfailures:\n\n---- tests::boom stdout ----\nthread 'tests::boom' panicked at src/lib.rs:10:5:\nassertion `left == right` failed\n  left: 1\n right: 2\n\ntest result: FAILED. 38 passed; 2 failed\n";
+        let out = c("shell", &s).text;
+        for needle in [
+            "tests::boom ... FAILED",
+            "panicked at src/lib.rs:10:5",
+            "left: 1",
+            "right: 2",
+            "test result: FAILED",
+        ] {
+            assert!(out.contains(needle), "missing {needle}:\n{out}");
+        }
+    }
+
+    #[test]
+    fn source_code_via_cat_is_not_mistaken_for_find_output() {
+        let src: String = (0..400)
+            .map(|i| format!("fn f{i}() {{ /* body {i} */ }}\n"))
+            .collect();
+        let out = c("shell", &src);
+        assert_ne!(out.filter, Some("find"));
+        assert!(out.text.contains("fn f0() { /* body 0 */ }"));
+    }
+
+    #[test]
+    fn grep_keeps_stderr_and_context_lines() {
+        let mut s = String::from("exit 2\n--- stdout\n");
+        for i in 0..30 {
+            s += &format!("src/a.rs:{i}:hit\n");
+        }
+        s += "src/b.rs-5-context line\n--- stderr\ngrep: secrets/: Permission denied\n";
+        let out = c("shell", &s).text;
+        assert!(out.starts_with("exit 2\n"), "{out}");
+        assert!(out.contains("grep: secrets/: Permission denied"), "{out}");
+        assert!(out.contains("src/b.rs-5-context line"), "{out}");
     }
 }
 
@@ -1525,13 +1679,14 @@ mod tests {
     }
 
     #[test]
-    fn estimate_ponytail_saved_tokens_weights_code_and_tool_args_across_levels() {
-        let code = "```rust\nfn add(a: i32, b: i32) -> i32 { a + b }\n```";
+    fn estimate_ponytail_saved_tokens_counts_only_code() {
+        let code = "```rust
+fn add(a: i32, b: i32) -> i32 { a + b }
+```";
         assert_eq!(
             estimate_ponytail_saved_tokens(PonytailLevel::Off, code, 0, 100),
             0
         );
-
         // Pure code with completion_tokens = 100
         assert_eq!(
             estimate_ponytail_saved_tokens(PonytailLevel::Lite, code, 0, 100),
@@ -1545,26 +1700,22 @@ mod tests {
             estimate_ponytail_saved_tokens(PonytailLevel::Ultra, code, 0, 100),
             100
         );
-
-        // Prose-only output halves effective_tokens before applying level factor
+        // No code, no Ponytail saving: prose belongs to Caveman.
         let prose = "Here is a plain explanation without any code blocks.";
         assert_eq!(
-            estimate_ponytail_saved_tokens(PonytailLevel::Lite, prose, 0, 100),
-            12
-        );
-        assert_eq!(
-            estimate_ponytail_saved_tokens(PonytailLevel::Full, prose, 0, 100),
-            27
-        );
-        assert_eq!(
             estimate_ponytail_saved_tokens(PonytailLevel::Ultra, prose, 0, 100),
-            50
+            0
         );
-
-        // Tool arguments with empty text count as code_plus_args_bytes
+        // Tool arguments (a write_file body) are not counted.
         assert_eq!(
             estimate_ponytail_saved_tokens(PonytailLevel::Full, "", 80, 0),
-            20 * 54 / 100
+            0
+        );
+        // Half prose, half code: only the code share counts.
+        let mixed = format!("{}{}", "p".repeat(code.len()), code);
+        assert_eq!(
+            estimate_ponytail_saved_tokens(PonytailLevel::Ultra, &mixed, 0, 100),
+            50
         );
     }
 }

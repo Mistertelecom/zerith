@@ -279,6 +279,7 @@ pub fn run() {
             memory::memory_add,
             memory::memory_import_hermes,
             skills::skills_list,
+            skills::slash_skills,
             skills::skills_catalog,
             skills::skills_plugins,
             skills::plugin_action,

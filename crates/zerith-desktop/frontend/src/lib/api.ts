@@ -647,6 +647,7 @@ export const api = {
     invoke<Fact>("memory_add", { kind, text }),
   memoryImportHermes: () => invoke<number>("memory_import_hermes"),
   skillsList: () => invoke<SkillView[]>("skills_list"),
+  slashSkills: () => invoke<[string, string][]>("slash_skills"),
   skillsCatalog: (force = false) =>
     invoke<Catalogue>("skills_catalog", { force }),
   skillsPlugins: () => invoke<PluginsView>("skills_plugins"),

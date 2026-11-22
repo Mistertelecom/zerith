@@ -11,6 +11,7 @@ import {
 } from "react";
 import {
   ArrowUp,
+  BookOpen,
   Bot,
   Check,
   Layers,
@@ -365,6 +366,16 @@ export function Composer(props: {
     [props.draft, caret, dismissed],
   );
 
+  // Skills for `/`: asked on the first slash of the window, then kept.
+  const [skills, setSkills] = useState<[string, string][] | null>(null);
+  useEffect(() => {
+    if (trigger?.kind !== "slash" || skills) return;
+    void api
+      .slashSkills()
+      .then(setSkills)
+      .catch(() => setSkills([]));
+  }, [trigger?.kind, skills]);
+
   // The file list is asked once, on the first `@`; the workspace walk is
   // cheap but not free, and the popup closes and reopens constantly.
   const prevFilesRef = useRef(props.files);
@@ -410,19 +421,34 @@ export function Composer(props: {
     if (!trigger) return [];
     const q = trigger.text.toLowerCase();
     if (trigger.kind === "slash") {
-      return COMMANDS.filter(([n]) => n.startsWith(q)).map(
+      const builtins = COMMANDS.filter(([n]) => n.startsWith(q)).map(
         ([n, d]) => `${n}\u0000${d}`,
       );
+      const isCmd = new Set<string>(COMMANDS.map(([n]) => n));
+      const fromSkills = (skills ?? [])
+        .filter(([n]) => !isCmd.has(n) && n.toLowerCase().includes(q))
+        .slice(0, 30)
+        .map(([n, d]) => `${n}\u0000${d}\u0000skill`);
+      return [...builtins, ...fromSkills];
     }
     return (list ?? [])
       .filter((f) => f.toLowerCase().includes(q))
       .slice(0, 40)
       .map((f) => `${f}\u0000`);
-  }, [trigger, list]);
+  }, [trigger, list, skills]);
 
   const accept = (i: number) => {
     if (!trigger || !rows[i]) return;
-    const [name] = rows[i].split("\u0000");
+    const [name, , kind] = rows[i].split("\u0000");
+    if (trigger.kind === "slash" && kind === "skill") {
+      // Naming the skill in the prompt is what loads it for the model.
+      const next = `use a skill ${name} `;
+      props.onDraft(next);
+      setCaret(next.length);
+      box.current?.focus();
+      requestAnimationFrame(() => box.current?.setSelectionRange(next.length, next.length));
+      return;
+    }
     if (trigger.kind === "slash") {
       props.onDraft("");
       setCaret(0);
@@ -534,11 +560,13 @@ export function Composer(props: {
                   : "Arquivos do workspace"}
               </div>
               {rows.map((r, i) => {
-                const [name, desc] = r.split("\u0000");
+                const [name, desc, kind] = r.split("\u0000");
                 const Icon =
-                  trigger.kind === "slash"
-                    ? COMMAND_ICONS[name as CommandName]
-                    : FileText;
+                  kind === "skill"
+                    ? BookOpen
+                    : trigger.kind === "slash"
+                      ? COMMAND_ICONS[name as CommandName]
+                      : FileText;
                 const cut = name.lastIndexOf("/");
                 return (
                   <button

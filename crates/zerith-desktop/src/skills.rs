@@ -168,6 +168,43 @@ pub async fn skills_list(state: State<'_, AppState>) -> Result<Vec<SkillView>, S
     .map_err(|e| e.to_string())?
 }
 
+/// Enabled skills (library and enabled plugins) as `(name, description)`,
+/// for the `/` popup. Naming a skill in the prompt is what loads it.
+#[tauri::command]
+pub async fn slash_skills(state: State<'_, AppState>) -> Result<Vec<(String, String)>, String> {
+    let root = state.root().to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut out: Vec<(String, String)> = Vec::new();
+        if let Ok(lib) = Library::open(root.join("skills")) {
+            if let Ok(m) = lib.manifest() {
+                out.extend(
+                    m.skills
+                        .into_iter()
+                        .filter(|s| s.status == zerith_skills::Status::Enabled)
+                        .map(|s| (s.name, s.description)),
+                );
+            }
+        }
+        if let Ok(c) =
+            zerith_plugins::Library::open(&root.join("plugins")).and_then(|l| l.contributions())
+        {
+            for (_, dir) in c.skills {
+                let Ok(text) = std::fs::read_to_string(dir.join("SKILL.md")) else {
+                    continue;
+                };
+                if let Ok((fm, _)) = zerith_skills::parse(&text) {
+                    out.push((fm.name, fm.description));
+                }
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out.dedup_by(|a, b| a.0 == b.0);
+        Ok(out)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Reads the suggested repositories. The cached answer is used until it goes
 /// stale; force asks the network again.
 #[tauri::command]

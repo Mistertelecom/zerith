@@ -38,14 +38,42 @@ pub(super) fn edit_file(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Res
     };
     let (old, new) = (old.as_str(), new.as_str());
     let n = text.matches(old).count();
+    if n == 0 && !all {
+        // Same tolerance as multi_edit: indentation lost in a copy is not a miss.
+        let raw_new = str_arg(args, "new_string")?;
+        return match find_unique_whitespace_span(&text, str_arg(args, "old_string")?) {
+            WhitespaceFallback::Applied(start, end) => {
+                let rep = if text.contains("\r\n") {
+                    crlf(raw_new)
+                } else {
+                    raw_new.to_string()
+                };
+                let mut buf = text;
+                buf.replace_range(start..end, &rep);
+                exec.host.before_write(&path)?;
+                super::write_atomic(&path, buf.as_bytes())?;
+                exec.host.note_read(&path);
+                let mut msg = format!(
+                    "1 ocorrência substituída em {} (casada ignorando espaços)",
+                    path.display()
+                );
+                if let Some(diags) = crate::lsp::warm_diagnostics_for_edit(ctx.workspace, &path) {
+                    msg.push_str(&format!("\n\n[diagnósticos LSP]\n{diags}"));
+                }
+                Ok(msg)
+            }
+            WhitespaceFallback::Ambiguous(k) => Err(ToolError::Failed(format!(
+                "old_string não encontrado exato; {k} trechos casam ignorando espaços em {}: inclua mais contexto",
+                path.display()
+            ))),
+            WhitespaceFallback::None => Err(ToolError::Failed(not_found(&text, old, &path))),
+        };
+    }
     if n > 0 {
         exec.host.before_write(&path)?;
     }
     match (n, all) {
-        (0, _) => Err(ToolError::Failed(format!(
-            "old_string não encontrado em {}",
-            path.display()
-        ))),
+        (0, _) => Err(ToolError::Failed(not_found(&text, old, &path))),
         (n, false) if n > 1 => Err(ToolError::Failed(format!(
             "old_string aparece {n} vezes em {}; inclua mais contexto ou use replace_all",
             path.display()
@@ -60,6 +88,36 @@ pub(super) fn edit_file(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Res
             Ok(msg)
         }
     }
+}
+
+/// The miss, plus the file lines closest to `old`'s first line, so the model
+/// can copy the real text instead of guessing again.
+fn not_found(buf: &str, old: &str, path: &std::path::Path) -> String {
+    let mut msg = format!("old_string não encontrado em {}", path.display());
+    let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let first = norm(old.lines().find(|l| !l.trim().is_empty()).unwrap_or(""));
+    if first.is_empty() {
+        return msg;
+    }
+    let words: Vec<&str> = first.split(' ').collect();
+    let mut scored: Vec<(usize, usize, &str)> = buf
+        .lines()
+        .enumerate()
+        .filter_map(|(i, l)| {
+            let n = norm(l);
+            let hits = words.iter().filter(|w| n.contains(*w)).count();
+            (hits * 2 >= words.len()).then_some((hits, i + 1, l))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    if !scored.is_empty() {
+        msg.push_str("\nlinhas mais parecidas (releia com read_file e copie o texto exato):");
+        for (_, n, l) in scored.iter().take(3) {
+            let l: String = l.chars().take(200).collect();
+            msg.push_str(&format!("\n{n}\t{l}"));
+        }
+    }
+    msg
 }
 
 #[derive(Clone, Copy)]
@@ -173,8 +231,8 @@ pub(super) fn multi_edit(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Re
                 }
                 WhitespaceFallback::None => {
                     return Err(ToolError::Failed(format!(
-                        "edits[{idx}]: trecho não encontrado em {}",
-                        path.display()
+                        "edits[{idx}]: {}",
+                        not_found(&buf, raw_old, &path)
                     )));
                 }
             }

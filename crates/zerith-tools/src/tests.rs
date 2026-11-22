@@ -117,6 +117,50 @@ fn edit_requires_a_unique_match_unless_replace_all() {
 }
 
 #[test]
+fn edit_tolerates_lost_indentation_and_points_at_the_closest_line() {
+    let dir = scratch();
+    let f = dir.path().join("m.rs");
+    std::fs::write(
+        &f,
+        "fn main() {
+    let total = soma(a, b);
+    println!(\"{total}\");
+}
+",
+    )
+    .unwrap();
+    let p = policy(dir.path(), Mode::AcceptEdits);
+    let (r, c) = (Registry::new(), ctx(&p));
+    r.call("read_file", &json!({"path": "m.rs"}), &c).unwrap();
+    let out = r
+        .call(
+            "edit_file",
+            &json!({"path": "m.rs", "old_string": "let total = soma(a, b);
+println!(\"{total}\");", "new_string": "    let total = soma(a, c);
+    println!(\"{total}\");"}),
+            &c,
+        )
+        .unwrap();
+    assert!(out.contains("ignorando espaços"), "{out}");
+    assert!(std::fs::read_to_string(&f).unwrap().contains(
+        "    let total = soma(a, c);
+    println!"
+    ));
+    let miss = r
+        .call(
+            "edit_file",
+            &json!({"path": "m.rs", "old_string": "let total = soma(x, y, z);", "new_string": "x"}),
+            &c,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        miss.contains("linhas mais parecidas") && miss.contains("2	    let total = soma(a, c);"),
+        "{miss}"
+    );
+}
+
+#[test]
 fn glob_and_grep_walk_the_tree_and_skip_target() {
     let dir = scratch();
     std::fs::create_dir_all(dir.path().join("src/sub")).unwrap();

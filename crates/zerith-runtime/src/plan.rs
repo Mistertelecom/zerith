@@ -498,7 +498,9 @@ fn run_one(
         model,
         raw_model: Some(raw_model),
         def: Some(resolved.def),
-        skills_root: zerith_skills::Library::open(paths.skills()).ok(),
+        skills_root: zerith_skills::Library::open(paths.skills())
+            .ok()
+            .map(|l| l.with_plugins(&paths.root().join("plugins"))),
         scope: scope.cloned(),
         max_steps: steps,
         depth: 1,

@@ -105,6 +105,38 @@ impl Library {
         })
     }
 
+    /// Adds the skill folders of the plugins enabled in `<plugins>/plugins.json`
+    /// (what `zerith-plugins` writes), for a host that does not load the
+    /// plugin library itself (plan runner, `zerith skills list`). Skills need
+    /// the plugin enabled, not trusted: they run no code.
+    // ponytail: reads two fields of plugins.json by hand to avoid a crate
+    // cycle (zerith-plugins depends on zerith-skills); keep in sync with it.
+    pub fn with_plugins(self, plugins_root: &Path) -> Self {
+        let dirs = std::fs::read_to_string(plugins_root.join("plugins.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .map(|v| {
+                v["plugins"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|p| p["status"] == "enabled")
+                    .flat_map(|p| {
+                        let dir = PathBuf::from(p["dir"].as_str().unwrap_or_default());
+                        p["manifest"]["skills"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|s| s.as_str())
+                            .map(|s| dir.join(s))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        self.with_extra(dirs)
+    }
+
     pub fn with_extra(mut self, dirs: impl IntoIterator<Item = PathBuf>) -> Self {
         self.extra = dirs.into_iter().collect();
         self
@@ -685,6 +717,37 @@ mod tests {
         assert!(validate_dir_name("../evil").is_err());
         assert!(validate_dir_name("Demo").is_err());
         assert!(validate_dir_name("ok-name-1").is_ok());
+    }
+
+    #[test]
+    fn with_plugins_reads_the_skills_of_enabled_plugins_only() {
+        let tmp = tempfile::tempdir_in(scratch()).unwrap();
+        let plugins = tmp.path().join("plugins");
+        let on = plugins.join("installed").join("on");
+        let off = plugins.join("installed").join("off");
+        write_skill(&on.join("skills").join("a"), "skill-on", "corpo on");
+        write_skill(&off.join("skills").join("b"), "skill-off", "corpo off");
+        let row = |dir: &Path, status: &str, skill: &str| {
+            serde_json::json!({"manifest": {"name": "p", "skills": [skill]},
+                               "status": status, "dir": dir, "trusted": false})
+        };
+        std::fs::write(
+            plugins.join("plugins.json"),
+            serde_json::json!({"plugins": [row(&on, "enabled", "skills/a"), row(&off, "disabled", "skills/b")]})
+                .to_string(),
+        )
+        .unwrap();
+        let lib = Library::open(tmp.path().join("skills"))
+            .unwrap()
+            .with_plugins(&plugins);
+        let names: Vec<String> = lib.enabled().unwrap().into_iter().map(|s| s.name).collect();
+        assert_eq!(names, ["skill-on"]);
+        assert_eq!(lib.skill_dir("skill-on"), Some(on.join("skills").join("a")));
+        // No index at all: no extra skills, no error.
+        let bare = Library::open(tmp.path().join("skills"))
+            .unwrap()
+            .with_plugins(&tmp.path().join("nada"));
+        assert!(bare.enabled().unwrap().is_empty());
     }
 
     #[test]

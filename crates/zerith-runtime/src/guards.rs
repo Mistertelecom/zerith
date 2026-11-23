@@ -283,7 +283,7 @@ impl Guards {
 /// What a `Tool(specifier)` matcher sees: the command, path or URL.
 pub fn tool_subject(tool: &str, args: &Value) -> Option<String> {
     let key = match tool {
-        "shell" => "command",
+        "shell" | "monitor" => "command",
         "read_file" | "write_file" | "edit_file" | "multi_edit" | "list_dir" | "glob" | "grep" => {
             "path"
         }

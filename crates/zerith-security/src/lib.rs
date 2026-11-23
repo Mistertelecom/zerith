@@ -844,7 +844,7 @@ impl Policy {
                 Some(Action::Read(path(s("path").unwrap_or("."))))
             }
             "write_file" | "edit_file" | "multi_edit" => Some(Action::Write(path(s("path")?))),
-            "shell" => Some(Action::Shell(s("command")?.to_string())),
+            "shell" | "monitor" => Some(Action::Shell(s("command")?.to_string())),
             _ => None,
         }
     }

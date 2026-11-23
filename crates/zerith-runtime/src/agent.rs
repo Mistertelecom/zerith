@@ -124,9 +124,11 @@ pub fn approval_grant_key(tool: &str, args: &Value) -> String {
             "web_fetch".to_string()
         };
     }
-    if tool != "shell" {
+    if tool != "shell" && tool != "monitor" {
         return tool.to_string();
     }
+    // `monitor` runs a shell command: the same grant covers both.
+    let tool = "shell";
     let Some(raw) = args.get("command").and_then(Value::as_str) else {
         return tool.to_string();
     };
@@ -2276,6 +2278,20 @@ mod shrink_tests {
 #[cfg(test)]
 mod approval_grant_tests {
     use super::*;
+
+    /// `monitor` runs a shell command: the grant the user gave `shell` for
+    /// `git status *` covers it, and one given to the monitor covers shell.
+    #[test]
+    fn a_monitor_shares_the_shell_grant() {
+        assert_eq!(
+            approval_grant_key("monitor", &json!({"command": "git status -s"})),
+            approval_grant_key("shell", &json!({"command": "git status -s"}))
+        );
+        assert_ne!(
+            approval_grant_key("monitor", &json!({"command": "git status && rm -rf /"})),
+            approval_grant_key("monitor", &json!({"command": "git status"}))
+        );
+    }
 
     #[test]
     fn shell_prefix_scopes_simple_commands_and_isolates_chained_ones() {

@@ -245,7 +245,7 @@ fn subject_hits(tool: &str, spec: &str, subject: &str) -> bool {
                 && glob_match(&spec, text.rsplit('/').next().unwrap_or(text)))
     };
     let lower = subject.to_lowercase();
-    if tool == "shell" {
+    if tool == "shell" || tool == "monitor" {
         let a = crate::shellparse::analyze(&lower);
         one(&lower) || a.raw.iter().chain(&a.inner).any(|p| one(p))
     } else {

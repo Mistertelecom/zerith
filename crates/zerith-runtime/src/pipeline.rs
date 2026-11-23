@@ -680,7 +680,7 @@ fn remote_access(tool: &str, args: &Value) -> bool {
     ];
     let owned;
     let cmd = match tool {
-        "shell" | "terminal_open" => args["command"].as_str().unwrap_or(""),
+        "shell" | "monitor" | "terminal_open" => args["command"].as_str().unwrap_or(""),
         // Every line typed into an ssh/telnet session reaches the router.
         "terminal_send" | "terminal_batch" => {
             owned = zerith_tools::terminal_program(args["id"].as_str().unwrap_or(""))
@@ -803,6 +803,15 @@ mod remote_tests {
         assert!(!sh("git status"));
         assert!(!remote_access("read_file", &json!({ "path": "ssh" })));
         assert!(remote_access("net_connect", &json!({ "device": "core-1" })));
+        // A monitor is a shell command too: `ssh` there is just as remote.
+        assert!(remote_access(
+            "monitor",
+            &json!({ "command": "ssh admin@10.0.0.1 ping 8.8.8.8" })
+        ));
+        assert!(!remote_access(
+            "monitor",
+            &json!({ "command": "tail -f app.log" })
+        ));
     }
 }
 

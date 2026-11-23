@@ -103,6 +103,14 @@ pub struct ToolTrace {
     pub error: String,
 }
 
+impl ToolTrace {
+    /// Refused by this session's permission policy, not a failure of the
+    /// tool: what was allowed here says nothing about the next session.
+    pub fn denied(&self) -> bool {
+        !self.ok && self.error.starts_with("negado")
+    }
+}
+
 /// What a turn did, collected from its events. Cheap to build while the turn
 /// streams; the gate and the review only read it.
 #[derive(Debug, Clone, Default)]
@@ -204,7 +212,7 @@ fn words(text: &str) -> Vec<String> {
 fn recovered(tools: &[ToolTrace]) -> bool {
     tools
         .iter()
-        .position(|t| !t.ok)
+        .position(|t| !t.ok && !t.denied())
         .is_some_and(|i| tools[i + 1..].iter().any(|t| t.ok))
 }
 
@@ -312,7 +320,7 @@ Regras:
 - memory: só o que o USUÁRIO disse sobre si, como quer ser atendido, ou regras que deu. instruction = regra que o agente deve seguir; preference = gosto ou estilo; fact = fato pessoal duradouro. Uma frase curta e autônoma por item, na língua do usuário, em terceira pessoa ("O usuário prefere ...").
 - Nunca guarde: estado ou progresso da tarefa, listas de arquivos, valores de uso único (ids, caminhos, versões, números), o conteúdo da resposta do agente, segredos, senhas, tokens, chaves.
 - Sem duplicatas: se um item de "Memória existente" (#id) já diz o mesmo, não repita. Se o usuário corrigiu ou detalhou um item existente, use "update" com o id dele e o texto completo novo.
-- skill: só para um procedimento reutilizável, armadilha ou correção descoberto PELO TRABALHO deste turno (por exemplo: um comando falhou e outro funcionou). Nome de classe do problema ("windows-path-quoting"), nunca número de PR, mensagem de erro literal ou nome de arquivo do usuário. A descrição começa com "Use when".
+- skill: só para um procedimento reutilizável, armadilha ou correção descoberto PELO TRABALHO deste turno (por exemplo: um comando falhou e outro funcionou). Chamada "negada pela política desta sessão" não é lição: as permissões mudam de uma sessão para outra; nunca crie nem altere skill sobre o que foi negado ou permitido. Nome de classe do problema ("windows-path-quoting"), nunca número de PR, mensagem de erro literal ou nome de arquivo do usuário. A descrição começa com "Use when".
 - Prefira "patch" numa skill de "Skills da IA" quando o assunto for o mesmo. Em patch, "instructions" traz SÓ as lições novas (tópicos curtos) que serão acrescentadas ao fim; não reescreva a skill.
 - Em create, "instructions" é o corpo completo em markdown: quando usar, passos, armadilhas. Sem caminhos da pasta pessoal e sem segredos."#;
 
@@ -469,6 +477,11 @@ fn render(d: &TurnDigest, signals: &[&str], pass: &Pass) -> (String, HashSet<i64
         for t in d.tools.iter().take(40) {
             if t.ok {
                 turn.push_str(&format!("- {}: ok\n", t.name));
+            } else if t.denied() {
+                turn.push_str(&format!(
+                    "- {}: negado pela política desta sessão\n",
+                    t.name
+                ));
             } else {
                 turn.push_str(&format!(
                     "- {}: ERRO: {}\n",
@@ -912,6 +925,19 @@ mod tests {
             gate(&work).is_empty(),
             "failure without recovery is no lesson"
         );
+        // A call the session's policy refused, then another that ran: the
+        // lesson would be about this session's permissions, not the work.
+        let denied = ToolTrace {
+            name: "shell".into(),
+            ok: false,
+            error: "negado: precisa de aprovação (shell: x > f) e não há quem aprove".into(),
+        };
+        work.tools = vec![denied.clone(), tool("shell", true)];
+        assert!(
+            gate(&work).is_empty(),
+            "a refusal is not a recovered failure"
+        );
+        assert!(denied.denied() && !tool("shell", false).denied());
         work.tools.clear();
         work.steps = MIN_STEPS;
         assert!(!gate(&work).is_empty());

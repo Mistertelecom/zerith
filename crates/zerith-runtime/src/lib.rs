@@ -1476,6 +1476,11 @@ fn auto_inline_skills(
                 out.push_str("\n\n## ");
                 out.push_str(name);
                 out.push('\n');
+                if let Some(dir) = lib.skill_dir(name) {
+                    let line = format!("[Pasta da skill: {}]\n", dir.display());
+                    spent += line.len();
+                    out.push_str(&line);
+                }
                 out.push_str(take.trim());
                 spent += take.len() + name.len() + 6;
                 added = true;

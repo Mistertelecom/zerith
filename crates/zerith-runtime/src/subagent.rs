@@ -1199,9 +1199,17 @@ impl Services for Runtime {
             .skills_root
             .as_ref()
             .ok_or_else(|| "nenhuma biblioteca de skills neste turno".to_string())?;
-        let body = lib
+        let mut body = lib
             .skill_body(name)
             .ok_or_else(|| format!("skill não encontrada ou desativada: {name}"))?;
+        // Bodies cite `scripts/x.py` relative to their folder; without it the
+        // model runs them from the workspace and they are not there.
+        if let Some(dir) = lib.skill_dir(name) {
+            body = format!(
+                "[Pasta da skill: {} (caminhos como scripts/ e references/ citados abaixo são relativos a ela)]\n\n{body}",
+                dir.display()
+            );
+        }
         Ok(SkillLoad {
             body,
             allowed_tools: lib.allowed_tools(name).ok().flatten(),

@@ -388,6 +388,19 @@ impl Library {
         Err(InstallError::Missing(name.to_string()))
     }
 
+    /// Folder of an enabled skill (user library or plugin): where its
+    /// `scripts/` and `references/` live. Bodies cite them relative to it.
+    pub fn skill_dir(&self, name: &str) -> Option<PathBuf> {
+        let m = self.manifest().ok()?;
+        if let Some(row) = m.skills.iter().find(|s| s.name == name) {
+            return Some(self.root.join(&row.dir));
+        }
+        self.extra
+            .iter()
+            .find(|d| scan(d).is_ok_and(|sk| sk.frontmatter.name == name))
+            .cloned()
+    }
+
     /// Parsed header of one installed skill, read from disk on each call.
     pub fn frontmatter(&self, name: &str) -> Result<crate::Frontmatter> {
         let text = self.load_body(name)?;

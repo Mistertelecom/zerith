@@ -1152,6 +1152,15 @@ fn the_skill_tool_loads_a_body_on_demand_and_records_allowed_tools() {
     );
     assert!(r.text.contains("CORPO-SECRETO"), "{}", r.text);
     assert!(r.text.contains("allowed-tools: Read, Grep"), "{}", r.text);
+    // `scripts/x.py` in a body is relative to the skill's folder: say where.
+    let dir = lib.skill_dir("demo").unwrap();
+    assert!(
+        r.text
+            .contains(&format!("[Pasta da skill: {}", dir.display())),
+        "{}",
+        r.text
+    );
+    assert!(dir.join("SKILL.md").is_file());
     assert_eq!(
         reg.host().skill_allowed_tools("demo"),
         Some(vec!["Read".to_string(), "Grep".to_string()])

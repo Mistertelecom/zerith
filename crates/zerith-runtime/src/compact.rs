@@ -846,6 +846,7 @@ fn is_synthetic_raw(raw: Option<&serde_json::Value>) -> bool {
         || obj.contains_key("hook_context")
         || obj.contains_key("hook_stop")
         || obj.contains_key("subagents_joined")
+        || obj.contains_key("monitor")
         || obj.contains_key("summary")
 }
 
@@ -1044,6 +1045,7 @@ mod tests {
             "hook_context",
             "hook_stop",
             "subagents_joined",
+            "monitor",
         ] {
             store
                 .append(
@@ -1068,7 +1070,7 @@ mod tests {
             .unwrap();
 
         let replayed = replay(&store.recent_messages(&sid, 50).unwrap());
-        assert_eq!(replayed.len(), 7);
+        assert_eq!(replayed.len(), 8);
         assert!(
             !replayed[0].synthetic,
             "plain user message is not synthetic"

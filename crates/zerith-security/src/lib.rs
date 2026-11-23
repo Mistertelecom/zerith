@@ -1028,19 +1028,27 @@ pub fn redact(text: &str) -> String {
     // `snmp-server community x`, `secret 5 $1$...`.
     let mut hide_next = false;
     let mut prev = String::new();
+    // In RouterOS `/snmp community add name=X`, the community IS the name.
+    let mut snmp_line = false;
     for token in text.split_inclusive(char::is_whitespace) {
         let body = token.trim_end();
         let trail = &token[body.len()..];
         let lower = body.to_ascii_lowercase();
         if body.is_empty() {
-        } else if hide_next && is_cipher_type(&lower) {
+        } else if hide_next && (is_cipher_type(&lower) || is_routeros_verb(&lower, &prev)) {
+            // `md5 1`, `secret 5`, `/ppp secret add`: the word after the key
+            // is still a type or a command, the secret comes later.
             out.push_str(body);
+            if is_routeros_verb(&lower, &prev) {
+                hide_next = false;
+            }
         } else if hide_next {
             out.push_str("[redacted]");
             hide_next = false;
         } else if let Some(i) = body.find(['=', ':']).filter(|&i| {
             i + 1 < body.len()
-                && (is_password_key(&lower[..i], &prev)
+                && ((snmp_line && &lower[..i] == "name" && prev != "community")
+                    || is_password_key(&lower[..i], &prev)
                     || (is_secret_name(&lower[..i])
                         && !body[i + 1..]
                             .trim_matches(|c: char| !c.is_ascii_alphanumeric())
@@ -1054,10 +1062,14 @@ pub fn redact(text: &str) -> String {
             hide_next = is_password_key(&lower, &prev);
         }
         if !body.is_empty() {
+            if prev == "/snmp" && lower == "community" {
+                snmp_line = true;
+            }
             prev = lower;
         }
         if trail.contains('\n') {
             hide_next = false;
+            snmp_line = false;
         }
         out.push_str(trail);
     }
@@ -1068,6 +1080,7 @@ pub fn redact(text: &str) -> String {
 /// `sshpass`: elsewhere it is a port (`ssh -p 22`) or `mkdir -p`.
 fn is_password_key(w: &str, prev: &str) -> bool {
     let w = w.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+    let prev = prev.trim_matches(|c: char| !c.is_ascii_alphanumeric());
     matches!(
         w,
         "password"
@@ -1078,11 +1091,43 @@ fn is_password_key(w: &str, prev: &str) -> bool {
             | "community"
             | "key-string"
             | "pre-shared-key"
+            | "wpa-pre-shared-key"
+            | "wpa2-pre-shared-key"
             | "psk"
             | "auth-key"
             | "authentication-key"
+            | "plain-text-password-value"
+            | "encrypted-password"
             | "bearer"
     ) || (w == "p" && prev == "sshpass")
+        // `md5 <key>` after an OSPF/RIP digest key, `auth md5 <key>`.
+        || (w == "md5" && !matches!(prev, "authentication" | "area" | "hash" | "algorithm"))
+        // `tacacs-server key X`, `radius-server host h key X`,
+        // `crypto isakmp key X`, `ntp authentication-key`: a bare `key`
+        // after a server/crypto keyword (not `key chain`, `key 1`).
+        || (w == "key"
+            && matches!(
+                prev,
+                "tacacs-server" | "radius-server" | "isakmp" | "server-key" | "auth-port" | "acct-port"
+            ))
+        || (w == "key" && is_host_like(prev))
+}
+
+/// `radius-server host 10.0.0.5 key X`: the word before `key` is an address.
+fn is_host_like(w: &str) -> bool {
+    w.contains('.')
+        && w.split('.')
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+}
+
+/// RouterOS menus where the word after `secret`/`community` is the command
+/// (`/ppp secret add`, `/snmp community set`), not the secret.
+fn is_routeros_verb(w: &str, prev: &str) -> bool {
+    matches!(prev, "secret" | "community")
+        && matches!(
+            w,
+            "add" | "set" | "remove" | "print" | "export" | "edit" | "disable" | "enable"
+        )
 }
 
 /// A `name=value` / `"name":` key that holds a credential, any spelling:
@@ -1338,6 +1383,59 @@ mod tests {
             bare_program("\"C:/Program Files/PuTTY/plink.exe\" -batch h"),
             "plink -batch h"
         );
+    }
+
+    /// What `show run` / `/export` print: every device secret goes, and the
+    /// lines around it stay readable (the model still needs the config).
+    #[test]
+    fn device_config_secrets_are_redacted_and_the_config_stays_readable() {
+        for (input, gone) in [
+            (" ip ospf message-digest-key 1 md5 OspfK3y!", "OspfK3y!"),
+            ("tacacs-server key T4cacsKey", "T4cacsKey"),
+            ("radius-server host 10.0.0.5 key RadKey99", "RadKey99"),
+            (
+                "crypto isakmp key IkeKey123 address 203.0.113.9",
+                "IkeKey123",
+            ),
+            (
+                "set security-profiles default wpa2-pre-shared-key=WifiPass2026",
+                "WifiPass2026",
+            ),
+            (
+                "authentication plain-text-password-value \"JunosPw1\"",
+                "JunosPw1",
+            ),
+            ("authentication encrypted-password \"$6$abc$def\"", "$6$abc"),
+            (" authentication-key 0 Isis#Key", "Isis#Key"),
+            (
+                "set protocols bgp group x authentication-key \"BgpJ\"",
+                "BgpJ",
+            ),
+            (" mac-address-table static auth md5 Rt0!", "Rt0!"),
+        ] {
+            let out = redact(input);
+            assert!(!out.contains(gone), "{input} -> {out}");
+        }
+        // The command words next to a secret are not the secret.
+        let out = redact("/ppp secret add name=cliente01 password=PppPass123 service=pppoe");
+        assert!(out.starts_with("/ppp secret add name=cliente01"), "{out}");
+        assert!(!out.contains("PppPass123"), "{out}");
+        // Renaming a community: the new name is the new secret.
+        let out = redact("/snmp community set public name=publico");
+        assert_eq!(out, "/snmp community set public name=[redacted]");
+        let out = redact("/snmp community add name=s3cr3tRW addresses=10.0.0.0/8");
+        assert!(!out.contains("s3cr3tRW"), "{out}");
+        for plain in [
+            " ip address 10.50.255.1 255.255.255.252",
+            " description link-para-cliente-XYZ",
+            " network 10.50.254.1 0.0.0.0 area 0",
+            "interface GigabitEthernet0/0/1",
+            " area 1 authentication message-digest",
+            "show ip ospf neighbor",
+            "key chain OSPF-KEYS",
+        ] {
+            assert_eq!(redact(plain), plain);
+        }
     }
 
     #[test]

@@ -360,9 +360,10 @@ impl Library {
     ///
     /// - Plugins removed or disabled by the user stay untouched (tracked in
     ///   `bundled-seen.json`).
-    /// - If an already-installed enabled bundled plugin gained new skills or
-    ///   agents in a newer app release, its files are refreshed in place while
-    ///   preserving its status and trust flag.
+    /// - If an already-installed enabled bundled plugin changed in a newer app
+    ///   release (another version in its manifest, or more skills), its files
+    ///   are refreshed in place while preserving its status and trust flag.
+    ///   Counting skills alone missed edits to a skill's text (0.3.8 → 0.3.9).
     pub fn seed_enabled(&self, bundle: &Path) -> Result<(Vec<String>, Vec<String>)> {
         let seen_path = self.root.join("bundled-seen.json");
         let mut seen: Vec<String> = std::fs::read(&seen_path)
@@ -388,13 +389,16 @@ impl Library {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
             if seen.contains(&folder) {
-                // Refresh in-place if the user kept it enabled and the bundle has new skills.
+                // Refresh in place if the user kept it enabled and the bundle changed.
                 if let Ok(existing) = self.get(&folder) {
                     let bundle_skills = std::fs::read_dir(dir.join("skills"))
                         .map(|rd| rd.flatten().filter(|e| e.path().is_dir()).count())
                         .unwrap_or(0);
+                    let bundle_version = bundle_version(&dir);
+                    let newer =
+                        !bundle_version.is_empty() && bundle_version != existing.manifest.version;
                     if existing.status == Status::Enabled
-                        && bundle_skills > existing.manifest.skills.len()
+                        && (newer || bundle_skills > existing.manifest.skills.len())
                     {
                         let was_trusted = existing.trusted;
                         let _ = self.remove(&existing.manifest.name);
@@ -499,6 +503,19 @@ impl Library {
             &plugin.manifest.args,
         )?)
     }
+}
+
+/// The `version` a bundled plugin declares (Claude Code layout or Zerith's
+/// root `plugin.json`); empty when it declares none.
+fn bundle_version(dir: &Path) -> String {
+    [
+        dir.join(".claude-plugin").join(MANIFEST),
+        dir.join(MANIFEST),
+    ]
+    .iter()
+    .find_map(|p| read_json(p).ok())
+    .and_then(|v| v["version"].as_str().map(str::to_string))
+    .unwrap_or_default()
 }
 
 fn read_manifest(path: &Path) -> Result<Manifest> {

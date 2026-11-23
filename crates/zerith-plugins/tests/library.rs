@@ -214,3 +214,58 @@ fn contributions_helpers_expose_skills_agents_and_hooks() {
     assert_eq!(settings.hooks.pre_compact.len(), 1);
     assert_eq!(settings.hooks.session_end.len(), 1);
 }
+
+/// One bundled plugin in Claude Code layout, `version` and a `demo` skill whose
+/// body is `text`.
+fn bundled(root: &std::path::Path, version: &str, text: &str) -> PathBuf {
+    let d = root.join("zerith-demo");
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(d.join(".claude-plugin")).unwrap();
+    std::fs::write(
+        d.join(".claude-plugin").join("plugin.json"),
+        format!(r#"{{"name":"zerith-demo","version":"{version}","description":"d"}}"#),
+    )
+    .unwrap();
+    std::fs::create_dir_all(d.join("skills").join("demo")).unwrap();
+    std::fs::write(
+        d.join("skills").join("demo").join("SKILL.md"),
+        format!("---\nname: demo\ndescription: \"d\"\n---\n\n{text}\n"),
+    )
+    .unwrap();
+    d
+}
+
+/// 0.3.8 → 0.3.9 kept 15 skills but changed two of them: the update only
+/// checked whether the skill count grew, so the new text never arrived.
+#[test]
+fn a_new_bundle_version_refreshes_skills_with_the_same_count() {
+    let t = tempfile::Builder::new().tempdir_in(scratch()).unwrap();
+    let lib = Library::open(&t.path().join("plugins")).unwrap();
+    let bundle = t.path().join("bundle");
+    bundled(&bundle, "0.3.8", "texto antigo");
+    lib.seed_enabled(&bundle).unwrap();
+    let skill = |lib: &Library| {
+        let p = lib.get("zerith-demo").unwrap();
+        std::fs::read_to_string(p.dir.join("skills").join("demo").join("SKILL.md")).unwrap()
+    };
+    assert!(skill(&lib).contains("texto antigo"));
+
+    // same version: nothing is rewritten
+    bundled(&bundle, "0.3.8", "edição local que não deve vencer");
+    lib.seed_enabled(&bundle).unwrap();
+    assert!(skill(&lib).contains("texto antigo"));
+
+    // new version, same number of skills: the new text arrives, still enabled
+    bundled(&bundle, "0.3.9", "texto novo");
+    lib.seed_enabled(&bundle).unwrap();
+    assert!(skill(&lib).contains("texto novo"), "{}", skill(&lib));
+    let p = lib.get("zerith-demo").unwrap();
+    assert_eq!(p.status, Status::Enabled);
+    assert_eq!(p.manifest.version, "0.3.9");
+
+    // a plugin the user disabled is left alone
+    lib.set_status("zerith-demo", Status::Disabled).unwrap();
+    bundled(&bundle, "0.4.0", "texto mais novo");
+    lib.seed_enabled(&bundle).unwrap();
+    assert!(skill(&lib).contains("texto novo"));
+}

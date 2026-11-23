@@ -1960,7 +1960,69 @@ pub(crate) fn is_orchestrator_root_tool(name: &str) -> bool {
 /// schemas (`browser_*`, `lsp_*`, media generation, skill/agent authoring)
 /// when the prompt or recent conversation mentions them.
 pub(crate) fn should_include_tool_schema(name: &str, context_lower: &str) -> bool {
-    if name.starts_with("browser_") {
+    // Network/terminal tools: ~3.8k tokens of schema, useless while coding.
+    // Any sign of a device, a client network or a live session brings them.
+    if name.starts_with("net_") || name.starts_with("terminal_") || name == "serial_ports" {
+        return [
+            "ssh",
+            "telnet",
+            "serial",
+            "console",
+            "roteador",
+            "router",
+            "switch",
+            "olt",
+            "onu",
+            "mikrotik",
+            "routeros",
+            "huawei",
+            "cisco",
+            "juniper",
+            "zte",
+            "fiberhome",
+            "parks",
+            "vsol",
+            "fortigate",
+            "ubiquiti",
+            "proxmox",
+            "pve",
+            "bgp",
+            "ospf",
+            "mpls",
+            "vlan",
+            "pppoe",
+            "cgnat",
+            "gpon",
+            "equipamento",
+            "inventário",
+            "inventario",
+            "cliente",
+            "vpn",
+            "wireguard",
+            "rede do",
+            "ping",
+            "traceroute",
+            "mtr",
+            "latência",
+            "latencia",
+            "perda de pacote",
+            "backup",
+            "net_",
+            "terminal_",
+            "term-",
+            "servidor",
+            "server",
+            "vm ",
+            "máquina virtual",
+            "noc",
+            "zabbix",
+            "snmp",
+            "netflow",
+        ]
+        .iter()
+        .any(|kw| context_lower.contains(kw));
+    }
+    if name == "browser" || name.starts_with("browser_") {
         return [
             "browser",
             "navegador",
@@ -2015,7 +2077,10 @@ pub(crate) fn should_include_tool_schema(name: &str, context_lower: &str) -> boo
         .iter()
         .any(|kw| context_lower.contains(kw));
     }
-    if matches!(name, "image_generate" | "tts_speak" | "audio_transcribe") {
+    if matches!(
+        name,
+        "generate_image" | "image_generate" | "tts_speak" | "audio_transcribe"
+    ) {
         return [
             "gerar imagem",
             "crie uma imagem",
@@ -2193,6 +2258,32 @@ mod approval_grant_tests {
         assert!(!should_include_tool_schema("lsp_hover", netops_ctx));
         assert!(!should_include_tool_schema("image_generate", netops_ctx));
         assert!(!should_include_tool_schema("create_skill", netops_ctx));
+
+        // Real tool names: `browser` and `generate_image` used to slip
+        // through, and net/terminal schemas rode along on coding turns.
+        let code_ctx = "os testes estão falhando, corrija o código em netcalc/";
+        for t in [
+            "net_connect",
+            "net_inventory",
+            "terminal_send",
+            "browser",
+            "generate_image",
+        ] {
+            assert!(!should_include_tool_schema(t, code_ctx), "{t}");
+        }
+        assert!(should_include_tool_schema("read_file", code_ctx));
+        assert!(should_include_tool_schema(
+            "net_inventory",
+            "cadastre o roteador do cliente acme"
+        ));
+        assert!(should_include_tool_schema(
+            "browser",
+            "abra o painel do grafana"
+        ));
+        assert!(should_include_tool_schema(
+            "generate_image",
+            "crie uma imagem de um gato"
+        ));
 
         let browser_ctx = "abra o navegador em https://10.0.0.1 e tire um screenshot";
         assert!(should_include_tool_schema("browser_open", browser_ctx));

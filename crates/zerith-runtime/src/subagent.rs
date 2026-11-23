@@ -364,6 +364,9 @@ pub enum ChildError {
     Cancelled,
     TimedOut,
     Failed(String),
+    /// Stopped at the step limit: it did not finish, but what it spent is
+    /// real and counts for the turn that delegated.
+    StepLimit(String, Saved),
 }
 
 impl std::fmt::Display for ChildError {
@@ -371,7 +374,7 @@ impl std::fmt::Display for ChildError {
         match self {
             ChildError::Cancelled => f.write_str("cancelado"),
             ChildError::TimedOut => f.write_str("tempo esgotado"),
-            ChildError::Failed(m) => f.write_str(m),
+            ChildError::Failed(m) | ChildError::StepLimit(m, _) => f.write_str(m),
         }
     }
 }
@@ -687,10 +690,21 @@ pub(crate) fn run_child_with(
         }),
         Ok(Err(e)) => Err(fail(e.to_string())),
         Ok(Ok(report)) => {
-            if report.text.starts_with("[parado: limite") {
+            let saved = Saved {
+                rtk: report.saved_rtk_tokens,
+                ponytail: report.saved_ponytail_tokens,
+                caveman: report.saved_caveman_tokens,
+                prompt: report.prompt_tokens,
+                completion: report.completion_tokens,
+                cache_read: report.cache_read_tokens,
+                cache_write: report.cache_write_tokens,
+            };
+            // The loop's own verdict: a child that obeyed the wrap-up request
+            // ends with a summary, not the `[parado: limite` note.
+            if report.stop_reason == "max_steps" {
                 // The note is not an answer: hand back what the child did say.
                 let partial = last_real_text(&store, &session.id).unwrap_or_default();
-                return Err(fail(format!(
+                let msg = format!(
                     "o subagente atingiu o limite de {} passos sem concluir{}",
                     spec.max_steps,
                     if partial.is_empty() {
@@ -698,7 +712,11 @@ pub(crate) fn run_child_with(
                     } else {
                         format!("; último texto: {partial}")
                     }
-                )));
+                );
+                let ChildError::Failed(msg) = fail(msg) else {
+                    unreachable!()
+                };
+                return Err(ChildError::StepLimit(msg, saved));
             }
             let mut text = report.text;
             if let Some(wt_note) = wt_guard.and_then(WorktreeGuard::finish) {
@@ -708,15 +726,7 @@ pub(crate) fn run_child_with(
                 text,
                 session_id: session.id,
                 // The child's report already holds its own children.
-                saved: Saved {
-                    rtk: report.saved_rtk_tokens,
-                    ponytail: report.saved_ponytail_tokens,
-                    caveman: report.saved_caveman_tokens,
-                    prompt: report.prompt_tokens,
-                    completion: report.completion_tokens,
-                    cache_read: report.cache_read_tokens,
-                    cache_write: report.cache_write_tokens,
-                },
+                saved,
             })
         }
     }
@@ -1134,6 +1144,11 @@ impl Services for Runtime {
                     Ok(o.text)
                 }
                 Err(e) => {
+                    if let ChildError::StepLimit(_, s) = &e {
+                        if let Ok(mut t) = totals.lock() {
+                            t.add(*s);
+                        }
+                    }
                     let state = if e == ChildError::Cancelled {
                         "cancelled"
                     } else {

@@ -2146,3 +2146,59 @@ fn verify_on_stop_sends_an_unchecked_code_edit_back_once() {
         tested.last().unwrap()
     );
 }
+
+/// A child that hits its step limit did not finish, but it spent tokens:
+/// they count for the turn that delegated (the orchestrator's cost used to
+/// leave them out).
+#[test]
+fn a_child_stopped_at_its_step_limit_still_counts_in_the_total() {
+    let url = serve(|b| match prompt_of(b).as_str() {
+        "PAI" if tool_msgs(b).is_empty() => calls(&[(
+            "c1",
+            "agent",
+            json!({"description": "x", "prompt": "FILHO", "agent": "curto"}),
+        )]),
+        "PAI" => text("ok"),
+        // The child keeps calling tools, 50 output tokens a request.
+        _ => Reply::Whole(format!(
+            "{HEAD}{}{}data: [DONE]\n\n",
+            chunk(
+                &json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"l","function":{"name":"list_dir","arguments":"{}"}}]}}]})
+            ),
+            chunk(
+                &json!({"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":50,"total_tokens":60}})
+            )
+        )),
+    });
+    let e = env(Mode::Bypass);
+    let agents = e.dir.path().join(".zerith").join("agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(
+        agents.join("curto.md"),
+        "---\nname: curto\ndescription: teste\nmaxTurns: 2\n---\nvai\n",
+    )
+    .unwrap();
+    let reg = Registry::new();
+    let r = turn(
+        &e,
+        &url,
+        &reg,
+        AgentOptions {
+            subagents: subs(2),
+            ..AgentOptions::default()
+        },
+        TurnContext {
+            project_dir: Some(e.dir.path()),
+            ..TurnContext::default()
+        },
+        "PAI",
+        &Cancel::default(),
+        |_| {},
+    )
+    .unwrap();
+    assert!(
+        r.completion_tokens >= 100,
+        "two child requests of 50: {}",
+        r.completion_tokens
+    );
+}

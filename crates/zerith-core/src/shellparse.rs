@@ -187,6 +187,14 @@ pub fn split_compound(cmd: &str, d: Dialect) -> Vec<String> {
                 }
                 // `2>&1` and `&>` are redirections, not separators.
                 '&' if cur.ends_with('>') || chars.get(i + 1) == Some(&'>') => cur.push(c),
+                // A quoted heredoc's body is data fed to the command, not
+                // commands: jump to the end of its closing line.
+                '\n' if sh => {
+                    if let Some(end) = heredoc_body_end(&chars, i, &cur) {
+                        i = end;
+                    }
+                    flush(&mut cur, &mut out);
+                }
                 '&' | '|' | ';' | '\n' | '\r' | '(' | ')' => flush(&mut cur, &mut out),
                 _ => cur.push(c),
             },
@@ -195,6 +203,50 @@ pub fn split_compound(cmd: &str, d: Dialect) -> Vec<String> {
     }
     flush(&mut cur, &mut out);
     out
+}
+
+/// `cur` ends a line with `<<'END'`, `<<"END"` or `<<-'END'` and the text
+/// after `nl` (a newline) holds the closing `END` line: the index of the
+/// newline ending that line (or the text's end). Only a quoted delimiter
+/// counts: an unquoted one expands `$(..)` in the body, which then runs.
+// ponytail: one heredoc per line; a second `<<` on the same line falls back
+// to reading the body as commands (asks). Add a queue if models need it.
+fn heredoc_body_end(chars: &[char], nl: usize, cur: &str) -> Option<usize> {
+    let at = cur.rfind("<<")?;
+    if cur[..at].ends_with('<') || cur[at + 2..].starts_with('<') {
+        return None; // `<<<` is a here-string, not a heredoc
+    }
+    let spec = cur[at + 2..].trim_start();
+    let (strip_tabs, spec) = match spec.strip_prefix('-') {
+        Some(s) => (true, s.trim_start()),
+        None => (false, spec),
+    };
+    let q = spec.chars().next().filter(|c| *c == '\'' || *c == '"')?;
+    let rest = &spec[1..];
+    let close = rest.find(q)?;
+    let delim = &rest[..close];
+    if delim.is_empty() || !rest[close + 1..].trim().is_empty() {
+        return None;
+    }
+    let mut start = nl + 1;
+    while start <= chars.len() {
+        let end = chars[start..]
+            .iter()
+            .position(|&c| c == '\n')
+            .map_or(chars.len(), |p| start + p);
+        let line: String = chars[start..end].iter().collect();
+        let line = line.trim_end_matches('\r');
+        let line = if strip_tabs {
+            line.trim_start_matches('\t')
+        } else {
+            line
+        };
+        if line == delim {
+            return Some(end);
+        }
+        start = end + 1;
+    }
+    None
 }
 
 /// Text up to the `)` that closes an already-open `(`, and the index after it.
@@ -714,6 +766,30 @@ mod tests {
 
     fn strip_wrappers_sh(part: &str) -> String {
         strip_wrappers(part, Dialect::Sh)
+    }
+
+    #[test]
+    fn a_quoted_heredoc_body_is_data_not_commands() {
+        assert_eq!(
+            split_compound_sh("./zl A <<'FIM'\nshow run\nrm -rf x\nFIM"),
+            vec!["./zl A <<'FIM'"]
+        );
+        assert_eq!(
+            split_compound_sh("cat <<-\"E\"\n\tx\n\tE\nls"),
+            vec!["cat <<-\"E\"", "ls"]
+        );
+        // unquoted: the body expands `$(..)`, so its lines stay commands
+        assert!(split_compound_sh("cat <<E\n$(rm x)\nE").len() > 1);
+        // no closing line: nothing is skipped
+        assert_eq!(
+            split_compound_sh("cat <<'E'\nrm -rf x"),
+            vec!["cat <<'E'", "rm -rf x"]
+        );
+        // here-string is not a heredoc
+        assert_eq!(
+            split_compound_sh("cat <<<'E'\nrm x\nE"),
+            vec!["cat <<<'E'", "rm x", "E"]
+        );
     }
 
     #[test]

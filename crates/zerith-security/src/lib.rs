@@ -1431,6 +1431,27 @@ mod tests {
         );
     }
 
+    /// `shell(./zl *)` allowed (a lab runner): the model fed commands with a
+    /// heredoc and every call was refused. A quoted heredoc's body is data
+    /// for the allowed command; a command after the closing line is not.
+    #[test]
+    fn an_allow_rule_covers_a_quoted_heredoc() {
+        let dir = scratch_dir();
+        let mut p = Policy::new(
+            preset("workspace-write").unwrap(),
+            Mode::AcceptEdits,
+            dir.path(),
+        );
+        p.rules = vec![Rule::parse(RuleKind::Allow, "shell(./zl *)").unwrap()];
+        let sh = |c: &str| p.check_tool("shell", &Action::Shell(c.into()));
+        assert_eq!(
+            sh("./zl ASR <<'FIM'\nshow ip route\nshow run\nFIM"),
+            Verdict::Allow
+        );
+        assert_ne!(sh("./zl ASR <<'FIM'\nx\nFIM\nrm -rf y"), Verdict::Allow);
+        assert_ne!(sh("./zl ASR <<FIM\n$(rm -rf y)\nFIM"), Verdict::Allow);
+    }
+
     #[test]
     fn modes_decide_how_often_the_user_is_asked() {
         let dir = scratch_dir();

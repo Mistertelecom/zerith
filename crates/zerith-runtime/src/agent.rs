@@ -786,6 +786,10 @@ fn turn_body(
     // Skills already named to the model this turn (by the prompt's ranking or
     // by a hint below): each is suggested once.
     let mut skill_hinted = false;
+    // Code files the turn edited since its last check, and whether it was
+    // already sent back once to verify them (verify-on-stop).
+    let mut unverified: Vec<String> = Vec::new();
+    let mut verify_nudged = false;
 
     for step in 1..=max_steps {
         on_event(RunEvent::Step { n: step });
@@ -997,6 +1001,29 @@ fn turn_body(
                     continue;
                 }
             }
+            // Edited code and checked nothing: back once to run the tests or
+            // say why not (after Hermes Agent's verify-on-stop, MIT).
+            if step < max_steps
+                && !verify_nudged
+                && !unverified.is_empty()
+                && ctx.settings.is_none_or(|s| s.context.verify_on_stop)
+            {
+                verify_nudged = true;
+                let msg = verify_nudge(&unverified);
+                let id = store.append(
+                    session_id,
+                    &NewMessage {
+                        raw: Some(json!({"tool_context": true})),
+                        ..NewMessage::new(Role::User, msg.clone())
+                    },
+                )?;
+                log.emit(
+                    "verify/nudge",
+                    json!({"message_id": id, "files": unverified.len()}),
+                );
+                hist.push(ChatMessage::synthetic_user(msg), id);
+                continue;
+            }
             if step < max_steps {
                 if let Some(st) = ctx.settings {
                     let stop_out = run_hooks(
@@ -1204,6 +1231,9 @@ fn turn_body(
                     }
                 }
                 record(store, session_id, call, &outcome.output, &mut hist)?;
+                if outcome.ok {
+                    track_verification(&call.name, &p_args(&call.arguments), &mut unverified);
+                }
                 if outcome.ok && call.name == "view_image" {
                     if let Some(msg) = image_message(&outcome.output) {
                         images.push(msg);
@@ -1554,6 +1584,113 @@ fn image_message(output: &str) -> Option<String> {
         "{} ![imagem](<{path}>)",
         zerith_tools::IMAGE_MARKER
     ))
+}
+
+fn p_args(raw: &str) -> Value {
+    serde_json::from_str(raw).unwrap_or(Value::Null)
+}
+
+/// Files whose edit has nothing to run: prose, data, config text.
+fn is_prose(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    let name = lower.rsplit(['/', '\\']).next().unwrap_or(&lower);
+    [
+        ".md",
+        ".markdown",
+        ".mdx",
+        ".rst",
+        ".txt",
+        ".adoc",
+        ".log",
+        ".csv",
+        ".tsv",
+        ".json",
+        ".toml",
+        ".yaml",
+        ".yml",
+        ".ini",
+        ".cfg",
+        ".conf",
+        ".rsc",
+        ".html",
+        ".css",
+        ".svg",
+        ".png",
+        ".jpg",
+    ]
+    .iter()
+    .any(|e| name.ends_with(e))
+        || matches!(
+            name,
+            "license" | "licence" | "notice" | "authors" | "changelog" | "codeowners"
+        )
+}
+
+/// A shell command that checks code: tests, build, lint, type check, or
+/// running the program itself.
+fn is_check(cmd: &str) -> bool {
+    let c = cmd.to_ascii_lowercase();
+    [
+        "test",
+        "pytest",
+        "cargo check",
+        "cargo build",
+        "cargo clippy",
+        "go build",
+        "go vet",
+        "tsc",
+        "eslint",
+        "ruff",
+        "mypy",
+        "flake8",
+        "npm run",
+        "pnpm",
+        "yarn",
+        "make",
+        "mvn",
+        "gradle",
+        "dotnet build",
+        "python ",
+        "python3 ",
+        "node ",
+        "go run",
+        "cargo run",
+        "bash ",
+        "sh ",
+        "pwsh",
+        "powershell",
+        "./",
+    ]
+    .iter()
+    .any(|k| c.contains(k))
+}
+
+/// Updates the list of code files edited since the last check.
+fn track_verification(tool: &str, args: &Value, unverified: &mut Vec<String>) {
+    match tool {
+        "write_file" | "edit_file" | "multi_edit" => {
+            if let Some(p) = args["path"].as_str().filter(|p| !is_prose(p)) {
+                if !unverified.iter().any(|u| u == p) {
+                    unverified.push(p.to_string());
+                }
+            }
+        }
+        "shell" | "monitor" if args["command"].as_str().is_some_and(is_check) => unverified.clear(),
+        "execute_code" | "lsp_diagnostics" | "diagnostics" => unverified.clear(),
+        _ => {}
+    }
+}
+
+/// What sends the model back to verify. Shown once per turn.
+fn verify_nudge(files: &[String]) -> String {
+    let mut list: Vec<String> = files.iter().take(8).map(|f| format!("- `{f}`")).collect();
+    if files.len() > 8 {
+        list.push(format!("- ... e mais {}", files.len() - 8));
+    }
+    format!(
+        "[Verificação] Você editou código neste turno e não rodou nada para conferir:\n{}\nRode agora o teste, build ou lint que cobre essa mudança (ou execute o programa), leia o resultado e corrija o que falhar. Se não for possível verificar, diga o motivo concreto em vez de dar o trabalho como pronto.\n[aviso automático do Zerith, não escrito pelo usuário]",
+        list.join("\n")
+    )
 }
 
 /// Longest a `sleep` may wait.

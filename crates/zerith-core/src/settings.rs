@@ -165,12 +165,18 @@ impl RemoteSettings {
 #[serde(default)]
 pub struct ContextSettings {
     pub billion_context: bool,
+    /// A turn that edited code and ran nothing to check it is sent back
+    /// once to run the tests (or say why it cannot). `[context]
+    /// verify_on_stop = false` turns it off.
+    #[serde(default = "default_true")]
+    pub verify_on_stop: bool,
 }
 
 impl Default for ContextSettings {
     fn default() -> Self {
         Self {
             billion_context: true,
+            verify_on_stop: true,
         }
     }
 }

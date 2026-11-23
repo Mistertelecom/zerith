@@ -2077,3 +2077,68 @@ fn sleep_wakes_when_a_monitor_prints() {
     assert!(joined.contains("um monitor tem linhas novas"), "{joined}");
     assert!(joined.contains("pronto"), "{joined}");
 }
+
+/// Edited code and ran nothing: the turn goes back once to verify. Editing
+/// prose, or running the tests after the edit, ends the turn as before.
+#[test]
+fn verify_on_stop_sends_an_unchecked_code_edit_back_once() {
+    let run = |calls_list: Vec<(&'static str, &'static str, Value)>| {
+        let seen: Arc<Mutex<Vec<String>>> = Default::default();
+        let s2 = seen.clone();
+        let steps = Arc::new(calls_list);
+        let url = serve(move |b| {
+            let all = serde_json::to_string(&messages(b)).unwrap();
+            s2.lock().unwrap().push(all);
+            let n = tool_msgs(b).len();
+            match steps.get(n) {
+                Some((id, name, args)) => calls(&[(id, name, args.clone())]),
+                None => text("pronto"),
+            }
+        });
+        let e = env(Mode::Bypass);
+        let reg = Registry::new();
+        turn(
+            &e,
+            &url,
+            &reg,
+            AgentOptions::default(),
+            TurnContext::default(),
+            "x",
+            &Cancel::default(),
+            |_| {},
+        )
+        .unwrap();
+        let v = seen.lock().unwrap().clone();
+        v
+    };
+    let code = run(vec![(
+        "w",
+        "write_file",
+        json!({"path": "calc.py", "content": "x = 1\n"}),
+    )]);
+    let nudges = code.last().unwrap().matches("[Verificação]").count();
+    assert_eq!(
+        nudges,
+        1,
+        "one nudge, then the turn may end: {:?}",
+        code.last()
+    );
+    assert!(code.last().unwrap().contains("calc.py"));
+
+    let prose = run(vec![(
+        "w",
+        "write_file",
+        json!({"path": "NOTAS.md", "content": "oi"}),
+    )]);
+    assert!(!prose.last().unwrap().contains("[Verificação]"));
+
+    let tested = run(vec![
+        (
+            "w",
+            "write_file",
+            json!({"path": "calc.py", "content": "x = 1\n"}),
+        ),
+        ("t", "shell", json!({"command": "python calc.py"})),
+    ]);
+    assert!(!tested.last().unwrap().contains("[Verificação]"));
+}

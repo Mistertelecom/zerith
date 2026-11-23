@@ -67,4 +67,5 @@ IOS-XR trabalha com **configuração em duas fases**: nada vale até o `commit`.
        address ipv4 10.250.0.0/24
   ```
 - LPTS (`lpts pifib hardware police`) limita a taxa de pacotes para a CPU. Taxa de SSH muito baixa deixa o SSH lento ou recusando sob carga; confira com `show lpts pifib hardware police location all | include SSH`.
+- **Uma mudança de gerência por commit.** Tire a ACL num passo, confirme e meça. Só depois, e só se ainda houver queda nos contadores de SSH do LPTS, ajuste a taxa num passo separado e com o valor medido. Juntando ACL e LPTS no mesmo commit, você não sabe qual dos dois resolveu nem qual quebrou, e o rollback desfaz os dois.
 - Antes de mudar ACL/management-plane: tenha console (ou o outro RSP) e use `commit confirmed`.

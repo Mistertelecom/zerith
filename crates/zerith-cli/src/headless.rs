@@ -743,6 +743,20 @@ fn stream_event_json(e: RunEvent) -> Option<serde_json::Value> {
             "type": "skills_loaded",
             "names": names,
         }),
+        RunEvent::Subagent {
+            id,
+            name,
+            state,
+            summary,
+            model,
+        } => serde_json::json!({
+            "type": "subagent",
+            "id": id,
+            "name": name,
+            "state": state,
+            "summary": summary,
+            "model": model,
+        }),
         _ => return None,
     })
 }
@@ -984,6 +998,18 @@ mod tests {
         assert_eq!(saved["before_bytes"], 2000);
         assert_eq!(saved["after_bytes"], 400);
         assert_eq!(saved["filter"], "git-diff");
+
+        let child = stream_event_json(RunEvent::Subagent {
+            id: "sub-1".into(),
+            name: "executor: corrigir testes".into(),
+            state: "running".into(),
+            summary: "passo 2 de 40 · edit_file".into(),
+            model: "claude-sonnet-5-5".into(),
+        })
+        .expect("subagents must reach stream-json");
+        assert_eq!(child["type"], "subagent");
+        assert_eq!(child["state"], "running");
+        assert_eq!(child["summary"], "passo 2 de 40 · edit_file");
 
         let report = TurnReport {
             session_id: "s1".into(),

@@ -219,6 +219,8 @@ pub struct Headless {
     pub json_schema: Option<String>,
     pub no_tools: bool,
     pub remote: Option<String>,
+    /// `off`/`low`..`max`, lowered per provider like the window's selector.
+    pub effort: Option<String>,
 }
 
 pub fn is_headless(args: &[String]) -> bool {
@@ -269,6 +271,7 @@ pub fn parse_headless(args: &[String]) -> Result<Headless, String> {
         json_schema: None,
         no_tools: false,
         remote: None,
+        effort: None,
     };
     let mut prompt = None;
     let mut i = 0;
@@ -330,6 +333,18 @@ pub fn parse_headless(args: &[String]) -> Result<Headless, String> {
             }
             "--json-schema" => out.json_schema = Some(value()?),
             "--remote" => out.remote = Some(value()?),
+            "--effort" => {
+                let v = value()?.trim().to_ascii_lowercase();
+                if !matches!(
+                    v.as_str(),
+                    "off" | "low" | "medium" | "high" | "xhigh" | "max"
+                ) {
+                    return Err(format!(
+                        "--effort inválido: {v} (use off, low, medium, high, xhigh ou max)"
+                    ));
+                }
+                out.effort = Some(v);
+            }
             other => return Err(format!("argumento desconhecido: {other}")),
         }
         i += 2;
@@ -656,6 +671,8 @@ mod tests {
             "--json-schema",
             "{\"type\":\"object\"}",
             "--no-tools",
+            "--effort",
+            "High",
         ]);
         assert!(is_headless(&args));
         let h = parse_headless(&args).unwrap();
@@ -673,6 +690,8 @@ mod tests {
         assert_eq!(h.disallowed_tools, ["write_file"]);
         assert_eq!(h.permission_mode, Some(Permission::AcceptEdits));
         assert!(h.json_schema.is_some() && h.no_tools);
+        assert_eq!(h.effort.as_deref(), Some("high"));
+        assert!(parse_headless(&v(&["-p", "x", "--effort", "turbo"])).is_err());
         assert_eq!(
             parse_headless(&v(&["-p", "x"])).unwrap().format,
             OutputFormat::Text

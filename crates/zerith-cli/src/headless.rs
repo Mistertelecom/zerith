@@ -454,6 +454,7 @@ pub fn run(paths: &Paths, args: &[String]) -> Result<(), Boxed> {
     if let Some(n) = h.max_turns {
         opts.max_steps = n;
     }
+    opts.reasoning_effort = h.effort.clone();
 
     let format = h.format;
     let spent = Cell::new(0f64);

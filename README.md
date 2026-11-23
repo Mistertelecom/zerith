@@ -13,7 +13,7 @@
 
   <p>
     <a href="https://github.com/Mistertelecom/zerith/releases">
-      <img alt="Release v0.3.6" src="https://img.shields.io/badge/version-v0.3.6-111827?style=flat-square" />
+      <img alt="Release v0.3.7" src="https://img.shields.io/badge/version-v0.3.7-111827?style=flat-square" />
     </a>
     <a href="https://github.com/Mistertelecom/zerith/actions/workflows/zerith.yml">
       <img alt="CI Status" src="https://github.com/Mistertelecom/zerith/actions/workflows/zerith.yml/badge.svg" />
@@ -69,7 +69,7 @@ It combines a **pure-SVG Visual Workflows Studio** (`zerith-workflows`), **Stric
 
 ---
 
-## What's Inside (v0.3.6)
+## What's Inside (v0.3.7)
 
 ### 1. Bots Workbench, Visual Workflows Studio & Global Channels (`zerith-workflows`)
 - **Autonomous Bot Loop & Deduplication:** Workflow `AI Agent` nodes now support bounded **Agent Loop mode** (`use_tools`, `max_turns`, `tool_mode`) with full Skills, Plugins, MCP tools, and SQLite memory access, plus persistent **Deduplication (`workflow_seen` / `dedup_lines`)** and a 1-click **"Create Routine (Heartbeat)"** generator on every Bot screen (staying quiet when scheduled cron runs find nothing new).

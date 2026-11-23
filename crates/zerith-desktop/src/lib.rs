@@ -89,7 +89,7 @@ fn seed_bundled_plugins(root: &std::path::Path) {
         });
     let Some(bundle) = bundle else { return };
     let lib = zerith_plugins::Library::open(&root.join("plugins"));
-    // Merged into `zerith-infra` in 0.4; left installed they would duplicate its skills.
+    // Merged into `zerith-infra` in 0.3.7; left installed they would duplicate its skills.
     if let Ok(l) = &lib {
         for old in [
             "zerith-netops",

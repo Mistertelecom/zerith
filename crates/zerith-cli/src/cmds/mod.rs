@@ -570,8 +570,8 @@ pub fn plugin_cmd(paths: &Paths, args: &[String]) -> Res {
             let n = name("enable")?;
             lib.set_status(&n, PluginStatus::Enabled)?;
             println!("{n} ativado");
-            if !lib.get(&n)?.trusted {
-                println!("ainda não revisado: nada dele carrega até `zerith plugin trust {n}`");
+            for line in enable_notice(&lib.get(&n)?) {
+                println!("{line}");
             }
         }
         Some("disable") => {
@@ -638,6 +638,25 @@ fn market_cmd(lib: &Plugins, args: &[String]) -> Res {
         Some(o) => return Err(format!("comando desconhecido: plugin marketplace {o}").into()),
     }
     Ok(())
+}
+
+/// What `plugin enable` tells the person. Skills and agents load as soon as
+/// the plugin is enabled; only code it runs (MCP, hooks, a command) waits
+/// for `trust`. The old line said "nothing loads until trust" for every
+/// untrusted plugin, which was false for a skills-only one.
+fn enable_notice(p: &zerith_plugins::Plugin) -> Vec<String> {
+    let m = &p.manifest;
+    let mut out = Vec::new();
+    if !m.skills.is_empty() || !m.agents.is_empty() {
+        out.push("a IA já usa as skills e os agentes dele quando o assunto aparece".to_string());
+    }
+    if !p.trusted && zerith_plugins::market::runs_code(p) {
+        out.push(format!(
+            "ele também roda código (MCP/hooks): essa parte fica desligada até `zerith plugin trust {} --yes`",
+            m.name
+        ));
+    }
+    out
 }
 
 fn print_review(p: &zerith_plugins::Plugin) {
@@ -902,6 +921,32 @@ mod tests {
 
     fn v(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A skills-only plugin is in use as soon as it is enabled: the notice
+    /// must not say "nothing loads until trust" (the old text did).
+    #[test]
+    fn enabling_a_skills_only_plugin_says_its_skills_are_in_use() {
+        let t = TestDir::new();
+        let src = t.0.join("src").join("zerith-demo");
+        std::fs::create_dir_all(src.join(".claude-plugin")).unwrap();
+        std::fs::write(
+            src.join(".claude-plugin").join("plugin.json"),
+            r#"{"name":"zerith-demo","version":"1","description":"d"}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(src.join("skills").join("demo")).unwrap();
+        std::fs::write(
+            src.join("skills").join("demo").join("SKILL.md"),
+            "---\nname: demo\ndescription: \"d\"\n---\n\ncorpo\n",
+        )
+        .unwrap();
+        let lib = zerith_plugins::Library::open(&t.0.join("plugins")).unwrap();
+        let p = lib.install(&src).unwrap();
+        let text = enable_notice(&p).join("\n");
+        assert!(text.contains("já usa as skills"), "{text}");
+        assert!(!text.contains("trust"), "{text}");
+        assert!(!text.contains("nada dele carrega"), "{text}");
     }
 
     #[test]

@@ -1423,7 +1423,15 @@ fn auto_inline_skills(
             if chosen.len() >= 2 {
                 break;
             }
-            let strong = hit.score >= 3.5 || hit.matched.len() >= 2;
+            // Two distinct words of the request, not one: "testes" alone
+            // matched a 22 KB security-audit skill on every "fix the tests".
+            // A word and its glossary twin ("teste"/"test") count once.
+            let distinct: std::collections::HashSet<String> = hit
+                .matched
+                .iter()
+                .map(|w| w.trim_end_matches('s').chars().take(4).collect())
+                .collect();
+            let strong = hit.score >= 3.5 && distinct.len() >= 2;
             if strong && !chosen.contains(&hit.name) {
                 chosen.push(hit.name);
             }
@@ -1701,6 +1709,67 @@ corpo
             !built.static_system.contains("CORPO-mikrotik-routeros-cli"),
             "o static_system deve permanecer invariável para preservar o prompt cache"
         );
+    }
+
+    #[test]
+    fn one_shared_word_does_not_preload_a_skill() {
+        let tmp = tempfile::tempdir_in(scratch()).unwrap();
+        let src = tmp.path().join("src");
+        let lib = zerith_skills::Library::open(tmp.path().join("skills")).unwrap();
+        for (name, desc) in [
+            (
+                "security-audit",
+                "Security review of codebases. Use for tests of APIs and vulnerability research.",
+            ),
+            (
+                "mikrotik-routeros-cli",
+                "Use when accessing a MikroTik RouterOS device via SSH.",
+            ),
+        ] {
+            let d = src.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(
+                d.join("SKILL.md"),
+                format!(
+                    "---
+name: {name}
+description: \"{desc}\"
+---
+
+CORPO-{name}
+"
+                ),
+            )
+            .unwrap();
+            lib.install(&d, "t").unwrap();
+        }
+        let catalog: Vec<(String, String)> = lib
+            .enabled()
+            .unwrap()
+            .into_iter()
+            .map(|s| (s.name, s.description))
+            .collect();
+        let fix = auto_inline_skills(
+            &lib,
+            &catalog,
+            "Os testes estão falhando, corrija o código",
+            3600,
+        );
+        assert!(!fix.contains("CORPO-security-audit"), "{fix}");
+        let ssh = auto_inline_skills(
+            &lib,
+            &catalog,
+            "Como entro numa MikroTik RouterOS por SSH?",
+            3600,
+        );
+        assert!(ssh.contains("CORPO-mikrotik-routeros-cli"), "{ssh}");
+        let named = auto_inline_skills(
+            &lib,
+            &catalog,
+            "use a skill security-audit nos testes",
+            3600,
+        );
+        assert!(named.contains("CORPO-security-audit"), "{named}");
     }
 
     #[test]

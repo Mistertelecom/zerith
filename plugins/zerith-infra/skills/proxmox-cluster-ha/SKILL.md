@@ -48,8 +48,11 @@ Sempre leia antes de mexer: `pvecm status`, `pvecm nodes`, `ha-manager status`, 
 - Corrija nos dois lados: `qm set <vmid> --agent enabled=1` **e** instale/ative o `qemu-guest-agent` dentro da VM (Linux: `systemctl enable --now qemu-guest-agent`; Windows: virtio-win).
 - Teste: `qm agent <vmid> ping` e `qm guest cmd <vmid> fsfreeze-status`.
 - `agent: 1` só vale depois de desligar e ligar a VM (não basta reiniciar o convidado).
+- Banco de dados (PostgreSQL, MySQL): o freeze dá um backup consistente de disco, não de transação. Para restore confiável, combine com o dump do próprio banco ou um hook do agent (`fsfreeze-hook`) que faça o checkpoint antes do freeze.
+- Até a correção chegar, o backup não precisa falhar: `qm set <vmid> --agent enabled=1,freeze-fs-on-backup=0` faz o backup seguir sem o freeze (cópia crash-consistent). Use só como ponte, documentado no chamado.
 
 ## 7. Conntrack no host
 - `nf_conntrack: table full, dropping packet` no host derruba conexões das VMs que passam pelo netfilter do host (pve-firewall, bridges com firewall, VM de NAT).
 - Veja uso: `sysctl net.netfilter.nf_conntrack_count net.netfilter.nf_conntrack_max`.
 - Ajuste em `/etc/sysctl.d/` (ex.: `net.netfilter.nf_conntrack_max = 1048576`) e aplique com `sysctl --system`. Ajuste também `nf_conntrack_buckets` se a tabela crescer muito.
+- **Confira o `pve-firewall` antes:** se ele estiver ativo e `/etc/pve/nodes/<nó>/host.fw` tiver `nf_conntrack_max` em `[OPTIONS]`, o firewall reaplica esse valor e desfaz o sysctl. Ajuste nos dois lugares (`grep -i conntrack /etc/pve/nodes/*/host.fw`; `pve-firewall status`).

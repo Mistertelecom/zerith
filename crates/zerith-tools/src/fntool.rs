@@ -113,5 +113,6 @@ pub(crate) fn extra() -> Vec<Box<dyn Tool>> {
     v.extend(crate::network::all());
     v.extend(crate::workflows::all());
     v.extend(crate::lsp::all());
+    v.push(crate::patch::tool());
     v
 }

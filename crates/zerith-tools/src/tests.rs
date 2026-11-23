@@ -640,3 +640,97 @@ fn read_file_reads_a_pdf_page_by_page() {
     );
     assert!(past.is_err());
 }
+
+/// A bound session with no services: enough for read-before-edit.
+struct NoServices;
+impl crate::host::Services for NoServices {
+    fn agent(
+        &self,
+        _: &str,
+        _: crate::host::AgentRequest,
+        _: &Cancel,
+        _: std::time::Instant,
+        _: crate::host::EventSink,
+    ) -> std::result::Result<String, String> {
+        Err("sem agentes".into())
+    }
+    fn agent_result(&self, _: &str, _: &str) -> std::result::Result<String, String> {
+        Err("sem agentes".into())
+    }
+    fn tasks(
+        &self,
+        _: &str,
+        _: &str,
+        _: &serde_json::Value,
+    ) -> std::result::Result<String, String> {
+        Err("sem tarefas".into())
+    }
+    fn skill(&self, _: &str) -> std::result::Result<crate::host::SkillLoad, String> {
+        Err("sem skills".into())
+    }
+}
+
+/// apply_patch: several files in one call, all or nothing; a file never read
+/// cannot be changed; a path the policy forbids stops the whole patch.
+#[test]
+fn apply_patch_is_all_or_nothing_and_follows_the_edit_rules() {
+    let dir = scratch();
+    let p = policy(dir.path(), Mode::Bypass);
+    let reg = Registry::new();
+    reg.host().bind("s-patch", std::sync::Arc::new(NoServices));
+    std::fs::write(dir.path().join("a.py"), "def f():\n    return 1\n").unwrap();
+    std::fs::write(dir.path().join("b.py"), "x = 1\n").unwrap();
+    for f in ["a.py", "b.py"] {
+        reg.call("read_file", &serde_json::json!({"path": f}), &ctx(&p))
+            .unwrap();
+    }
+    // One hunk does not match: nothing changes, not even the good one.
+    let bad = "*** Begin Patch\n*** Update File: a.py\n-    return 1\n+    return 2\n*** Update File: b.py\n-y = 9\n+y = 10\n*** End Patch\n";
+    assert!(reg
+        .call("apply_patch", &serde_json::json!({"patch": bad}), &ctx(&p))
+        .is_err());
+    assert!(std::fs::read_to_string(dir.path().join("a.py"))
+        .unwrap()
+        .contains("return 1"));
+    // All good: both change, one file added, one deleted.
+    let good = "*** Begin Patch\n*** Update File: a.py\n@@ def f():\n-    return 1\n+    return 2\n*** Add File: novo.txt\n+oi\n*** Delete File: b.py\n*** End Patch\n";
+    let out = reg
+        .call("apply_patch", &serde_json::json!({"patch": good}), &ctx(&p))
+        .unwrap();
+    assert!(
+        out.contains("M a.py") && out.contains("A novo.txt") && out.contains("D b.py"),
+        "{out}"
+    );
+    assert!(std::fs::read_to_string(dir.path().join("a.py"))
+        .unwrap()
+        .contains("return 2"));
+    assert!(!dir.path().join("b.py").exists());
+    // Never read: refused like edit_file.
+    std::fs::write(dir.path().join("c.py"), "z = 1\n").unwrap();
+    let unread = "*** Begin Patch\n*** Update File: c.py\n-z = 1\n+z = 2\n*** End Patch\n";
+    let e = reg
+        .call(
+            "apply_patch",
+            &serde_json::json!({"patch": unread}),
+            &ctx(&p),
+        )
+        .unwrap_err();
+    assert!(e.to_string().contains("read_file"), "{e}");
+    // A forbidden path anywhere in the patch stops all of it.
+    let mut strict = policy(dir.path(), Mode::Bypass);
+    strict.rules = vec![zerith_security::Rule::parse(
+        zerith_security::RuleKind::Deny,
+        "apply_patch(segredo.txt)",
+    )
+    .unwrap()];
+    let two =
+        "*** Begin Patch\n*** Add File: ok.txt\n+a\n*** Add File: segredo.txt\n+b\n*** End Patch\n";
+    assert!(reg
+        .call(
+            "apply_patch",
+            &serde_json::json!({"patch": two}),
+            &ctx(&strict)
+        )
+        .is_err());
+    assert!(!dir.path().join("ok.txt").exists() && !dir.path().join("segredo.txt").exists());
+}

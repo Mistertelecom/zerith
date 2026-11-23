@@ -14,7 +14,7 @@ root = Path(__file__).resolve().parent.parent
 meta = json.loads(
     subprocess.run(
         ["cargo", "metadata", "--format-version", "1", "--locked"],
-        cwd=root, check=True, capture_output=True, text=True,
+        cwd=root, check=True, capture_output=True, text=True, encoding="utf-8",
     ).stdout
 )
 members = set(meta["workspace_members"])

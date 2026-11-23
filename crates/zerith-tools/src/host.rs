@@ -270,6 +270,11 @@ impl Host {
         self.jobs.monitor_notices()
     }
 
+    /// Whether a `monitor` job has something new right now (no side effect).
+    pub fn monitors_have_news(&self) -> bool {
+        self.jobs.monitors_have_news()
+    }
+
     /// Whether a `monitor` job of this host still has something to report.
     pub fn monitors_pending(&self) -> bool {
         self.jobs.monitors_pending()

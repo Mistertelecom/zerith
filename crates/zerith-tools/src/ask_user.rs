@@ -87,7 +87,24 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
             parse_questions(a)?;
             Err(ToolError::Failed("o usuário não respondeu".into()))
         },
-    ), execute_code()]
+    ), execute_code(), sleep()]
+}
+
+/// `sleep`: the wait itself runs in the turn loop, which sees the inbox and
+/// the monitors and can wake early. Run outside a turn it fails closed.
+fn sleep() -> Box<dyn Tool> {
+    make(
+        "sleep",
+        "Espera sem gastar resposta do modelo: até `seconds` (máximo 3600), ou menos se o usuário mandar mensagem, um monitor imprimir algo novo ou a conversa for parada. Use para dar tempo a algo que você não consegue acompanhar com monitor (um equipamento reiniciando, uma propagação de BGP, um job externo) em vez de rodar `sleep` no shell ou ficar consultando.",
+        json!({"type": "object", "properties": {
+            "seconds": {"type": "integer", "description": "quanto esperar no máximo; padrão 60, máximo 3600"}
+        }}),
+        "quanto esperou e por que acordou",
+        Permission::Read,
+        3700,
+        false,
+        |_, _, _| Err(ToolError::Failed("sleep só roda dentro de um turno".into())),
+    )
 }
 
 /// `execute_code`: the schema here, the run in the turn loop (`zerith-runtime`

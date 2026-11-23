@@ -2033,3 +2033,47 @@ except ToolError as e:
     assert!(!r.text.contains("LEU O PROIBIDO"), "{}", r.text);
     assert!(r.text.contains("chamada(s) de ferramenta"), "{}", r.text);
 }
+
+/// `sleep` while a monitor runs: it wakes when the monitor prints, well
+/// before its own deadline, and the turn then hands the line over.
+#[test]
+fn sleep_wakes_when_a_monitor_prints() {
+    let seen: Arc<Mutex<Vec<String>>> = Default::default();
+    let s2 = seen.clone();
+    let url = serve(move |b| {
+        let all = serde_json::to_string(&messages(b)).unwrap();
+        s2.lock().unwrap().push(all.clone());
+        match tool_msgs(b).len() {
+            0 => calls(&[(
+                "m1",
+                "monitor",
+                json!({"command": "sleep 1 && echo pronto", "description": "espera", "timeout_secs": 30}),
+            )]),
+            1 => calls(&[("s1", "sleep", json!({"seconds": 120}))]),
+            _ if all.contains("terminou") => text("fim"),
+            _ => text("aguardando"),
+        }
+    });
+    let e = env(Mode::Bypass);
+    let reg = Registry::new();
+    let started = std::time::Instant::now();
+    let r = turn(
+        &e,
+        &url,
+        &reg,
+        AgentOptions::default(),
+        TurnContext::default(),
+        "x",
+        &Cancel::default(),
+        |_| {},
+    )
+    .unwrap();
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(60),
+        "did not sleep 120 s"
+    );
+    assert_eq!(r.text, "fim");
+    let joined = seen.lock().unwrap().join("\n");
+    assert!(joined.contains("um monitor tem linhas novas"), "{joined}");
+    assert!(joined.contains("pronto"), "{joined}");
+}

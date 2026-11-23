@@ -354,6 +354,30 @@ impl Jobs {
         kill_in(&self.jobs, id)
     }
 
+    /// Whether a monitor printed a whole new line, exited, or hit its
+    /// deadline since its last notice, without consuming anything.
+    pub fn monitors_have_news(&self) -> bool {
+        let Ok(mut jobs) = self.jobs.lock() else {
+            return false;
+        };
+        let mut news = false;
+        for (_, j) in jobs.iter_mut() {
+            let Some(w) = j.watch.as_ref().filter(|w| !w.closed) else {
+                continue;
+            };
+            let deadline = w.deadline;
+            let sent = w.sent;
+            let exited = j.exit.is_some() || matches!(j.jailed.child.try_wait(), Ok(Some(_)));
+            let line = j.out.lock().is_ok_and(|o| {
+                o.text.len() > sent
+                    && o.text.is_char_boundary(sent)
+                    && o.text[sent..].contains('\n')
+            });
+            news |= exited || line || Instant::now() >= deadline;
+        }
+        news
+    }
+
     /// Whether a monitor of this registry is still to report something.
     pub fn monitors_pending(&self) -> bool {
         self.jobs.lock().is_ok_and(|jobs| {

@@ -271,7 +271,7 @@ impl InboxSender {
 /// The turn's half. Messages sent while a turn runs are drained at the next
 /// step boundary (before the next model request, or before the turn would
 /// end) and appended as user messages, stored and logged like any other.
-pub struct InboxReceiver(Mutex<Option<mpsc::Receiver<String>>>);
+pub struct InboxReceiver(Mutex<Option<mpsc::Receiver<String>>>, Mutex<Vec<String>>);
 
 impl InboxReceiver {
     /// What arrived so far. `close` also drops the receiver, so a later
@@ -281,10 +281,21 @@ impl InboxReceiver {
         let Ok(mut slot) = self.0.lock() else {
             return Vec::new();
         };
-        let msgs = slot
-            .as_ref()
-            .map(|rx| rx.try_iter().filter(|s| !s.trim().is_empty()).collect())
+        // What `has_pending` already pulled out comes first, in order.
+        let mut msgs: Vec<String> = self
+            .1
+            .lock()
+            .map(|mut b| std::mem::take(&mut *b))
             .unwrap_or_default();
+        msgs.extend(
+            slot.as_ref()
+                .map(|rx| {
+                    rx.try_iter()
+                        .filter(|s| !s.trim().is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+        );
         if close {
             *slot = None;
         }
@@ -292,9 +303,34 @@ impl InboxReceiver {
     }
 }
 
+impl InboxReceiver {
+    /// Whether the person said something the turn has not read yet. What it
+    /// pulls out is kept for the next drain, so a `sleep` can wake on a
+    /// message without losing it.
+    pub(crate) fn has_pending(&self) -> bool {
+        let fresh: Vec<String> = self
+            .0
+            .lock()
+            .ok()
+            .and_then(|slot| {
+                slot.as_ref()
+                    .map(|rx| rx.try_iter().filter(|s| !s.trim().is_empty()).collect())
+            })
+            .unwrap_or_default();
+        let Ok(mut buf) = self.1.lock() else {
+            return false;
+        };
+        buf.extend(fresh);
+        !buf.is_empty()
+    }
+}
+
 pub fn inbox_channel() -> (InboxSender, InboxReceiver) {
     let (tx, rx) = mpsc::channel();
-    (InboxSender(tx), InboxReceiver(Mutex::new(Some(rx))))
+    (
+        InboxSender(tx),
+        InboxReceiver(Mutex::new(Some(rx)), Mutex::new(Vec::new())),
+    )
 }
 
 /// What the loop may use besides the conversation. `Default` is "no tools":
@@ -1066,6 +1102,11 @@ fn turn_body(
                         question::settle(agent.questions, &p.inv.args, cancel, on_event);
                     p.settled = Some(crate::pipeline::ToolOutcome::new(ok, text));
                 }
+                if p.settled.is_none() && p.inv.name == "sleep" {
+                    let secs = p.inv.args["seconds"].as_u64().unwrap_or(60);
+                    let text = sleep_until_woken(secs, agent, cancel);
+                    p.settled = Some(crate::pipeline::ToolOutcome::new(true, text));
+                }
                 // A script's tool calls go through this same pipeline (and may
                 // ask the person): it runs here, on the turn's thread.
                 if p.settled.is_none() && p.inv.name == "execute_code" && pipe.core.is_some() {
@@ -1513,6 +1554,34 @@ fn image_message(output: &str) -> Option<String> {
         "{} ![imagem](<{path}>)",
         zerith_tools::IMAGE_MARKER
     ))
+}
+
+/// Longest a `sleep` may wait.
+pub const SLEEP_MAX_SECS: u64 = 3600;
+
+/// `sleep`: waits without spending model turns, and wakes early when the
+/// person writes, a monitor prints, or the turn is stopped. Concept after
+/// Codex `sleep` (Apache-2.0) and Claude Code's wake-up idea; no code copied.
+fn sleep_until_woken(secs: u64, agent: &AgentOptions<'_>, cancel: &Cancel) -> String {
+    let secs = secs.clamp(1, SLEEP_MAX_SECS);
+    let start = Instant::now();
+    let end = start + Duration::from_secs(secs);
+    let why = loop {
+        if cancel.is_cancelled() {
+            break "cancelado";
+        }
+        if agent.inbox.is_some_and(|i| i.has_pending()) {
+            break "chegou mensagem do usuário";
+        }
+        if agent.tools.is_some_and(|r| r.host().monitors_have_news()) {
+            break "um monitor tem linhas novas";
+        }
+        if Instant::now() >= end {
+            break "tempo cumprido";
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    format!("esperou {}s de {secs}s ({why})", start.elapsed().as_secs())
 }
 
 /// Monitor notices as one context block, marked as coming from the system.
@@ -2335,6 +2404,34 @@ mod shrink_tests {
 #[cfg(test)]
 mod approval_grant_tests {
     use super::*;
+
+    /// A message wakes `sleep` early and is not lost: the next drain still
+    /// returns it, in order.
+    #[test]
+    fn sleep_wakes_on_a_message_and_keeps_it() {
+        let (tx, rx) = inbox_channel();
+        let agent = AgentOptions {
+            inbox: Some(&rx),
+            ..AgentOptions::default()
+        };
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            tx.send("pare e veja o log");
+            tx
+        });
+        let started = Instant::now();
+        let text = sleep_until_woken(30, &agent, &Cancel::default());
+        assert!(started.elapsed() < Duration::from_secs(5), "woke early");
+        assert!(text.contains("mensagem do usuário"), "{text}");
+        let _tx = sender.join().unwrap();
+        assert_eq!(rx.drain(false), vec!["pare e veja o log".to_string()]);
+        // Time runs out when nothing happens; a stop ends it at once.
+        let quiet = AgentOptions::default();
+        assert!(sleep_until_woken(1, &quiet, &Cancel::default()).contains("tempo cumprido"));
+        let c = Cancel::default();
+        c.cancel();
+        assert!(sleep_until_woken(30, &quiet, &c).contains("cancelado"));
+    }
 
     /// Only the exact line `view_image` writes becomes an attaching message.
     #[test]

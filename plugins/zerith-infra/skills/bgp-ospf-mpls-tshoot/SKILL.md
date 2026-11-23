@@ -26,6 +26,12 @@ Siga sempre uma ordem **somente-leitura primeiro** (Coleta → Correlação → 
 2. **IGP e Loopbacks (OSPF / IS-IS):**
    - Confirmar alcançabilidade `/32` ou `/128` da loopback do peer antes de investigar MPLS/iBGP.
    - Se OSPF travar em `ExStart`/`Exchange`, testar `ping` com bit DF (`do-not-fragment`) no tamanho do MTU da interface.
+   - Vizinho preso em `Init` (ou some e volta), compare **as duas pontas** antes de mudar qualquer lado; o lado certo é o que bate com o projeto:
+     - **Tipo de rede:** `point-to-point` de um lado e `broadcast` do outro sobe vizinho mas não fecha o SPF (IOS-XE `show ip ospf interface`, NX-OS `show ip ospf interface`, RouterOS `/routing/ospf/interface/print`).
+     - **Tipo de área:** `stub`/`nssa` precisa ser igual dos dois lados (E-bit no hello). No RouterOS 7 é `/routing/ospf/area set <area> type=stub`. Não remova o stub do ABR para "casar": acrescente no vizinho.
+     - **Hello/dead, área, autenticação e MTU** iguais; máscara igual em enlace broadcast.
+   - Rota externa (E1/E2) que o ASBR tem e os vizinhos não: no IOS clássico `redistribute` sem `subnets` só leva redes classful; no IOS-XE 16+ o `subnets` é automático, então procure o `route-map` da redistribuição.
+   - Rede anunciada no BGP com `network x mask y` só sai se existir rota **exata** na RIB: rota de apoio para `Null0` ou `aggregate-address`.
 3. **BGP (eBGP / iBGP / Route Reflector):**
    - Estados `Active`/`Connect`: validar TCP/179, ACLs de CoPP, `ebgp-multihop`, `update-source` e senha MD5/TCP-AO.
    - Prefixo ausente na FIB: conferir `next-hop-self`, `route-policy` / `route-map`, filtro RPKI (`roa-validation`) e limite `maximum-prefix`.

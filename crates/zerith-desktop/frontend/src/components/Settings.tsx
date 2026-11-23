@@ -572,6 +572,9 @@ export function Settings({
                   quotas={quotas}
                   busy={quotaBusy}
                   onRefresh={() => void loadQuotas()}
+                  onLogin={(tool, account) =>
+                    void login(tool, account).then(() => loadQuotas())
+                  }
                 />
               ) : null}
               {tab === "Delegação" ? (

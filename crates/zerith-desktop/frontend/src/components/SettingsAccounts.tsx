@@ -1155,11 +1155,16 @@ function QuotaBar({ label, w }: { label: string; w: QuotaWindow }) {
 }
 
 /** 9router's usage page: every OAuth account, every limit its plan reports. */
+/** The backend's wording for an account whose refresh token the provider
+ * no longer accepts: only a new login fixes it, so the card offers one. */
+const LOGIN_LOST = "o login desta conta expirou ou foi revogado";
+
 export function QuotaTab(p: {
   accounts: Account[];
   quotas: Record<string, Quota | string>;
   busy: boolean;
   onRefresh: () => void;
+  onLogin?: (tool: string, account: string) => void;
 }) {
   const subs = p.accounts
     .filter((a) => a.enabled && isOauth(a))
@@ -1210,7 +1215,18 @@ export function QuotaTab(p: {
           >
             {typeof q === "string" ? (
               <div className="quota-err">
-                <CircleAlert size={14} strokeWidth={2} /> {q}
+                <CircleAlert size={14} strokeWidth={2} />{" "}
+                {q.includes(LOGIN_LOST)
+                  ? "O login desta conta expirou ou foi revogado no provedor. A cota volta a aparecer depois de entrar de novo."
+                  : q}
+                {q.includes(LOGIN_LOST) && p.onLogin && a.oauth_tool ? (
+                  <button
+                    className="btn btn-sm"
+                    onClick={() => p.onLogin?.(a.oauth_tool as string, a.id)}
+                  >
+                    <LogIn size={14} strokeWidth={2} /> Entrar de novo
+                  </button>
+                ) : null}
               </div>
             ) : q ? (
               q.buckets.length === 0 ? (

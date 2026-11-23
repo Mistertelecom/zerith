@@ -563,6 +563,22 @@ pub fn is_read_only_in(part: &str, d: Dialect) -> bool {
             }
         }
         "rg" | "grep" | "egrep" | "fgrep" => !bad_arg(&["--pre", "--hostname-bin"]),
+        // POSIX find only lists unless an action runs or writes something.
+        // cmd's `find` is a text search and stays out (not in `READ_ONLY`).
+        "find" if d == Dialect::Sh => !args.iter().any(|a| {
+            matches!(
+                a.as_str(),
+                "-exec"
+                    | "-execdir"
+                    | "-ok"
+                    | "-okdir"
+                    | "-delete"
+                    | "-fprint"
+                    | "-fprint0"
+                    | "-fprintf"
+                    | "-fls"
+            )
+        }),
         "ip" => {
             let mut a = args;
             while let Some(f) = a.first() {
@@ -800,6 +816,27 @@ mod tests {
         for ok in ["grep '^a$' f.txt", "nslookup example.com", r#"echo "a\"b""#] {
             assert!(all_read_only_in(ok, sh), "{ok}");
         }
+    }
+
+    /// The agent's first move on an unknown project is `find . -type f | head`:
+    /// it was refused and the turn spent steps finding another way to list.
+    #[test]
+    fn find_lists_files_but_not_when_it_runs_or_writes() {
+        let sh = |c: &str| all_read_only_in(c, Dialect::Sh);
+        assert!(sh("find . -type f -not -path './.git/*' | head -100"));
+        assert!(sh("find . -path ./.git -prune -o -type f -print"));
+        assert!(sh("find configs -name '*.cfg'"));
+        for bad in [
+            "find . -exec rm {} ;",
+            "find . -name x -delete",
+            "find . -execdir sh -c x {} +",
+            "find . -fprint /tmp/list",
+            "find . -ok rm {} ;",
+        ] {
+            assert!(!sh(bad), "{bad}");
+        }
+        // cmd's find is another program (a text search): not covered.
+        assert!(!all_read_only_in("find \"x\" a.txt", Dialect::Cmd));
     }
 
     #[test]

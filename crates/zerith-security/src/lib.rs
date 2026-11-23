@@ -1455,6 +1455,21 @@ mod tests {
         let p = Policy::new(ws, Mode::Bypass, dir.path());
         assert_eq!(p.check(&shell), Verdict::Allow);
         assert_eq!(p.check(&read_out), Verdict::Allow);
+
+        // Listing the project never asks (it used to: `find` was unknown),
+        // while a find that deletes or runs still does.
+        if shellparse::Dialect::NATIVE() == shellparse::Dialect::Sh {
+            let p = Policy::new(ws, Mode::AcceptEdits, dir.path());
+            let sh = |c: &str| p.check(&Action::Shell(c.into()));
+            assert_eq!(
+                sh("find . -type f -not -path './.git/*' | head -100"),
+                Verdict::Allow
+            );
+            assert!(matches!(
+                sh("find . -name '*.pyc' -delete"),
+                Verdict::Ask(_)
+            ));
+        }
     }
 
     /// `type C:\Windows\win.ini` reads a file: the same guard as `read_file`,

@@ -1,6 +1,6 @@
 ---
 name: mudanca-segura
-description: "Use antes de qualquer alteração em equipamento de produção (roteador, switch, OLT, servidor Linux, Proxmox): janela de manutenção, GMUD/MOP, mudança de ACL, firewall, VLAN, rota, BGP, interface, bridge ou /etc/network/interfaces. Backup antes e depois, proteção do link de gerência, segundo acesso, rollback e pós-check."
+description: "Use antes de alterar configuração de roteador, switch, OLT, servidor Linux ou Proxmox, em produção, laboratório ou troubleshooting (corrigir defeito também é mudança): janela, GMUD/MOP, ACL, firewall, VLAN, rota, OSPF, BGP, interface, bridge, /etc/network/interfaces. Backup antes e depois, gerência protegida, rollback e pós-check."
 ---
 
 # Mudança segura
@@ -8,7 +8,7 @@ description: "Use antes de qualquer alteração em equipamento de produção (ro
 Nenhuma alteração em produção sem **backup**, **gerência protegida** e **rollback pronto**.
 
 ## 1. Backup antes
-- Rode `net_backup` no equipamento (ou `net_backup(client=...)` para todos os terminais abertos do cliente) **antes do primeiro comando de configuração**.
+- Rode `net_backup` no equipamento (ou `net_backup(client=...)` para todos os terminais abertos do cliente) **antes do primeiro comando de configuração**. Sem `net_backup` (acesso por outro script ou jump host), grave a saída de `show running-config` / `/export` / `cat` dos arquivos num arquivo do workspace antes de mudar: é ele que vira o diff e o rollback.
 - No Proxmox, faça snapshot da VM antes de mexer nela (`qm snapshot <vmid> pre-mudanca`) e copie o arquivo de rede antes de editar (`cp /etc/network/interfaces /root/interfaces.pre-mudanca`).
 - Colete também o estado que a mudança pode afetar: sessões BGP/OSPF, rotas dos prefixos envolvidos, ONUs online na PON e tráfego no uplink.
 

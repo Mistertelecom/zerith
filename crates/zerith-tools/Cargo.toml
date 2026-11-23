@@ -21,6 +21,8 @@ walkdir = "2"
 # Already in Cargo.lock (through other crates): grep patterns.
 regex = "1"
 ureq.workspace = true
+# `read_file` on a .pdf (datasheets, manuals): text by page, pure Rust, MIT.
+pdf-extract = "0.12"
 
 [target.'cfg(windows)'.dependencies]
 # ConPTY for `terminal_*` (already in Cargo.lock through zerith-security).

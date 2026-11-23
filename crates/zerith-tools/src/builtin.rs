@@ -88,7 +88,7 @@ pub(crate) fn all() -> Vec<Box<dyn crate::Tool>> {
     vec![
         tool(
             "read_file",
-            "Lê um arquivo de texto. Devolve linhas numeradas; use offset/limit para arquivos grandes.",
+            "Lê um arquivo de texto. Devolve linhas numeradas; use offset/limit para arquivos grandes. Também lê o texto de PDFs (datasheet, manual), página por página: aí offset/limit contam páginas.",
             json!({"type": "object", "properties": {
                 "path": {"type": "string"},
                 "offset": {"type": "integer", "description": "primeira linha (1 = início)"},
@@ -440,9 +440,55 @@ fn view_image(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String
     ))
 }
 
+/// A PDF's text, page by page, as `read_file` lines: `offset`/`limit` count
+/// pages here. Concept after opencode's `read` on PDFs (MIT); the text comes
+/// from the `pdf-extract` crate. Scanned PDFs (images only) come back empty.
+fn read_pdf(path: &std::path::Path, args: &Value, raw: &[u8]) -> Result<String> {
+    let pages = std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem_by_pages(raw))
+        .map_err(|_| ToolError::Failed("o leitor de PDF falhou neste arquivo".into()))?
+        .map_err(|e| ToolError::Failed(format!("não consegui ler o PDF: {e}")))?;
+    let total = pages.len();
+    let first = args["offset"].as_u64().unwrap_or(1).max(1) as usize;
+    let count = args["limit"].as_u64().map_or(20, |n| n as usize).max(1);
+    let mut out = format!("PDF {} ({total} páginas)\n", path.display());
+    let mut chars = 0usize;
+    let mut shown = 0usize;
+    for (i, text) in pages.iter().enumerate().skip(first - 1).take(count) {
+        let text = text.trim();
+        out.push_str(&format!("\n--- página {} ---\n", i + 1));
+        out.push_str(if text.is_empty() {
+            "[sem texto: página escaneada ou só imagem]"
+        } else {
+            text
+        });
+        out.push('\n');
+        chars += text.len();
+        shown = i + 1;
+        if chars > 60_000 {
+            break;
+        }
+    }
+    if shown == 0 {
+        return Err(ToolError::Failed(format!(
+            "o PDF tem {total} páginas; offset {first} passa do fim"
+        )));
+    }
+    if shown < total {
+        out.push_str(&format!(
+            "\n[mostradas até a página {shown} de {total}; continue com offset={}]\n",
+            shown + 1
+        ));
+    }
+    Ok(out)
+}
+
 fn read_file(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
     let path = ctx.resolve(str_arg(args, "path")?);
     let raw = std::fs::read(&path)?;
+    if raw.starts_with(b"%PDF-") {
+        exec.host.note_read(&path);
+        return read_pdf(&path, args, &raw);
+    }
     // Legacy pt-BR files are Latin-1/CP1252, not the console's OEM page:
     // decode them the same way multi_edit/edit_file write them back, so an
     // accented `old_string` copied from here is found there.

@@ -603,3 +603,40 @@ fn a_used_vault_value_never_comes_back_in_any_output() {
     assert!(!out.contains("S3nh@Olt!"), "{out}");
     assert!(out.contains("[redacted]") && out.contains("abc"), "{out}");
 }
+
+/// A PDF is read as text, page by page; offset/limit count pages.
+#[test]
+fn read_file_reads_a_pdf_page_by_page() {
+    let dir = scratch();
+    let pdf =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/manual.pdf");
+    std::fs::copy(&pdf, dir.path().join("manual.pdf")).unwrap();
+    let p = policy(dir.path(), Mode::Bypass);
+    let reg = Registry::new();
+    let all = reg
+        .call(
+            "read_file",
+            &serde_json::json!({"path": "manual.pdf"}),
+            &ctx(&p),
+        )
+        .unwrap();
+    assert!(all.contains("(3 páginas)"), "{all}");
+    assert!(
+        all.contains("--- página 2 ---") && all.contains("VLAN 100"),
+        "{all}"
+    );
+    let one = reg
+        .call(
+            "read_file",
+            &serde_json::json!({"path": "manual.pdf", "offset": 3, "limit": 1}),
+            &ctx(&p),
+        )
+        .unwrap();
+    assert!(one.contains("tres") && !one.contains("VLAN 100"), "{one}");
+    let past = reg.call(
+        "read_file",
+        &serde_json::json!({"path": "manual.pdf", "offset": 9}),
+        &ctx(&p),
+    );
+    assert!(past.is_err());
+}

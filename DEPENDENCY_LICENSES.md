@@ -4,22 +4,23 @@ Gerado por `python scripts/dependency-licenses.py` a partir de
 `cargo metadata --format-version 1` (grafo resolvido, todos os alvos).
 Não edite à mão: rode o script de novo depois de mudar `Cargo.lock`.
 
-Total: 480 pacotes de terceiros.
+Total: 510 pacotes de terceiros.
 
 ## Resumo por licença
 
 | Licença | Pacotes |
 | --- | --- |
-| `MIT OR Apache-2.0` | 229 |
-| `MIT` | 107 |
-| `Apache-2.0 OR MIT` | 36 |
+| `MIT OR Apache-2.0` | 243 |
+| `MIT` | 114 |
+| `Apache-2.0 OR MIT` | 37 |
+| `MIT/Apache-2.0` | 18 |
 | `Unicode-3.0` | 18 |
 | `Zlib OR Apache-2.0 OR MIT` | 17 |
-| `MIT/Apache-2.0` | 15 |
 | `Unlicense OR MIT` | 9 |
 | `MPL-2.0` | 7 |
 | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | 5 |
-| `Apache-2.0/MIT` | 3 |
+| `Apache-2.0/MIT` | 4 |
+| `(MIT OR Apache-2.0) AND Unicode-3.0` | 3 |
 | `BSD-3-Clause` | 3 |
 | `ISC` | 3 |
 | `Apache-2.0` | 2 |
@@ -31,7 +32,7 @@ Total: 480 pacotes de terceiros.
 | `MIT OR Zlib OR Apache-2.0` | 2 |
 | `Unlicense/MIT` | 2 |
 | `Zlib` | 2 |
-| `(MIT OR Apache-2.0) AND Unicode-3.0` | 1 |
+| `(Apache-2.0 OR MIT) AND BSD-3-Clause` | 1 |
 | `0BSD OR MIT OR Apache-2.0` | 1 |
 | `Apache-2.0 / MIT` | 1 |
 | `Apache-2.0 AND ISC` | 1 |
@@ -41,12 +42,15 @@ Total: 480 pacotes de terceiros.
 | `BSD-3-Clause AND MIT` | 1 |
 | `BSD-3-Clause/MIT` | 1 |
 | `CC0-1.0 OR MIT-0 OR Apache-2.0` | 1 |
+| `MIT / Apache-2.0` | 1 |
 
 ## Pacotes
 
 | Nome | Versão | Licença |
 | --- | --- | --- |
 | adler2 | 2.0.1 | `0BSD OR MIT OR Apache-2.0` |
+| adobe-cmap-parser | 0.4.1 | `MIT` |
+| aes | 0.8.4 | `MIT OR Apache-2.0` |
 | ahash | 0.8.12 | `MIT OR Apache-2.0` |
 | aho-corasick | 1.1.5 | `Unlicense OR MIT` |
 | alloc-no-stdlib | 3.0.0 | `BSD-3-Clause` |
@@ -68,6 +72,7 @@ Total: 480 pacotes de terceiros.
 | bitflags | 2.13.2 | `MIT OR Apache-2.0` |
 | block-buffer | 0.10.4 | `MIT OR Apache-2.0` |
 | block-buffer | 0.12.1 | `MIT OR Apache-2.0` |
+| block-padding | 0.3.3 | `MIT OR Apache-2.0` |
 | block2 | 0.6.2 | `MIT` |
 | brotli | 9.1.3 | `BSD-3-Clause AND MIT` |
 | brotli-decompressor | 6.3.2 | `BSD-3-Clause/MIT` |
@@ -82,12 +87,16 @@ Total: 480 pacotes de terceiros.
 | cargo-platform | 0.1.9 | `MIT OR Apache-2.0` |
 | cargo_metadata | 0.19.2 | `MIT` |
 | cargo_toml | 1.0.1 | `Apache-2.0 OR MIT` |
+| cbc | 0.1.2 | `MIT OR Apache-2.0` |
 | cc | 1.11.2 | `MIT OR Apache-2.0` |
 | cesu8 | 1.1.0 | `Apache-2.0/MIT` |
 | cfb | 0.14.0 | `MIT` |
+| cff-parser | 0.2.0 | `MIT OR Apache-2.0` |
 | cfg-expr | 0.15.8 | `MIT OR Apache-2.0` |
 | cfg-if | 1.0.5 | `MIT OR Apache-2.0` |
+| chacha20 | 0.10.2 | `MIT OR Apache-2.0` |
 | chrono | 0.4.45 | `MIT OR Apache-2.0` |
+| cipher | 0.4.4 | `MIT OR Apache-2.0` |
 | combine | 4.6.9 | `MIT` |
 | const-oid | 0.10.3 | `Apache-2.0 OR MIT` |
 | cookie | 0.18.2 | `MIT OR Apache-2.0` |
@@ -96,6 +105,7 @@ Total: 480 pacotes de terceiros.
 | core-foundation-sys | 0.8.7 | `MIT OR Apache-2.0` |
 | core-graphics | 0.25.0 | `MIT OR Apache-2.0` |
 | core-graphics-types | 0.2.0 | `MIT OR Apache-2.0` |
+| core_detect | 1.0.0 | `MIT/Apache-2.0` |
 | cpufeatures | 0.2.17 | `MIT OR Apache-2.0` |
 | cpufeatures | 0.3.1 | `MIT OR Apache-2.0` |
 | crc32fast | 1.5.5 | `MIT OR Apache-2.0` |
@@ -129,11 +139,14 @@ Total: 480 pacotes de terceiros.
 | dtoa-short | 0.3.5 | `MPL-2.0` |
 | dunce | 1.0.5 | `CC0-1.0 OR MIT-0 OR Apache-2.0` |
 | dyn-clone | 1.0.20 | `MIT OR Apache-2.0` |
+| ecb | 0.1.2 | `MIT` |
 | embed-resource | 3.0.12 | `MIT` |
 | embed_plist | 1.2.2 | `MIT OR Apache-2.0` |
+| encoding_rs | 0.8.44 | `(Apache-2.0 OR MIT) AND BSD-3-Clause` |
 | equivalent | 1.0.3 | `Apache-2.0 OR MIT` |
 | erased-serde | 0.4.11 | `MIT OR Apache-2.0` |
 | errno | 0.3.15 | `MIT OR Apache-2.0` |
+| euclid | 0.20.14 | `MIT / Apache-2.0` |
 | fallible-iterator | 0.3.0 | `MIT/Apache-2.0` |
 | fallible-streaming-iterator | 0.1.9 | `MIT/Apache-2.0` |
 | fastrand | 2.5.0 | `Apache-2.0 OR MIT` |
@@ -208,6 +221,7 @@ Total: 480 pacotes de terceiros.
 | indexmap | 1.9.3 | `Apache-2.0 OR MIT` |
 | indexmap | 2.14.2 | `Apache-2.0 OR MIT` |
 | infer | 0.22.0 | `MIT` |
+| inout | 0.1.4 | `MIT OR Apache-2.0` |
 | ipnet | 2.12.2 | `MIT OR Apache-2.0` |
 | itoa | 1.0.19 | `MIT OR Apache-2.0` |
 | javascriptcore-rs | 1.1.2 | `MIT` |
@@ -239,8 +253,10 @@ Total: 480 pacotes de terceiros.
 | litemap | 0.8.3 | `Unicode-3.0` |
 | lock_api | 0.4.14 | `MIT OR Apache-2.0` |
 | log | 0.4.35 | `MIT OR Apache-2.0` |
+| lopdf | 0.42.0 | `MIT` |
 | markup5ever | 0.39.0 | `MIT OR Apache-2.0` |
 | markup5ever | 0.40.0 | `MIT OR Apache-2.0` |
+| md-5 | 0.10.6 | `MIT OR Apache-2.0` |
 | memchr | 2.8.3 | `Unlicense OR MIT` |
 | memoffset | 0.9.1 | `MIT` |
 | mime | 0.3.18 | `MIT OR Apache-2.0` |
@@ -248,10 +264,12 @@ Total: 480 pacotes de terceiros.
 | miniz_oxide | 0.9.1 | `MIT OR Zlib OR Apache-2.0` |
 | mio | 1.2.5 | `MIT` |
 | muda | 0.20.0 | `Apache-2.0 OR MIT` |
+| multiversion_no_op | 1.0.0 | `Apache-2.0 OR MIT` |
 | ndk | 0.9.0 | `MIT OR Apache-2.0` |
 | ndk-context | 0.1.1 | `MIT OR Apache-2.0` |
 | ndk-sys | 0.6.0+11769913 | `MIT OR Apache-2.0` |
 | new_debug_unreachable | 1.0.6 | `MIT` |
+| nom | 8.0.0 | `MIT` |
 | num-conv | 0.2.2 | `MIT OR Apache-2.0` |
 | num-traits | 0.2.19 | `MIT OR Apache-2.0` |
 | num_enum | 0.7.6 | `BSD-3-Clause OR MIT OR Apache-2.0` |
@@ -279,6 +297,7 @@ Total: 480 pacotes de terceiros.
 | pango-sys | 0.18.0 | `MIT` |
 | parking_lot | 0.12.5 | `MIT OR Apache-2.0` |
 | parking_lot_core | 0.9.12 | `MIT OR Apache-2.0` |
+| pdf-extract | 0.12.1 | `MIT` |
 | percent-encoding | 2.3.2 | `MIT OR Apache-2.0` |
 | phf | 0.13.1 | `MIT` |
 | phf | 0.14.0 | `MIT` |
@@ -294,8 +313,10 @@ Total: 480 pacotes de terceiros.
 | pkg-config | 0.3.34 | `MIT OR Apache-2.0` |
 | plist | 1.10.4 | `MIT` |
 | png | 0.18.1 | `MIT OR Apache-2.0` |
+| pom | 1.1.0 | `MIT` |
 | portable-atomic | 1.15.0 | `Apache-2.0 OR MIT` |
 | portable-atomic-util | 0.2.8 | `Apache-2.0 OR MIT` |
+| postscript | 0.14.1 | `Apache-2.0/MIT` |
 | potential_utf | 0.1.6 | `Unicode-3.0` |
 | powerfmt | 0.2.1 | `MIT OR Apache-2.0` |
 | precomputed-hash | 0.1.1 | `MIT` |
@@ -309,6 +330,9 @@ Total: 480 pacotes de terceiros.
 | quote | 1.0.47 | `MIT OR Apache-2.0` |
 | r-efi | 5.3.0 | `MIT OR Apache-2.0 OR LGPL-2.1-or-later` |
 | r-efi | 6.0.0 | `MIT OR Apache-2.0 OR LGPL-2.1-or-later` |
+| rand | 0.10.4 | `MIT OR Apache-2.0` |
+| rand_core | 0.10.1 | `MIT OR Apache-2.0` |
+| rangemap | 1.8.0 | `MIT/Apache-2.0` |
 | raw-window-handle | 0.6.2 | `MIT OR Apache-2.0 OR Zlib` |
 | redox_syscall | 0.5.18 | `MIT` |
 | redox_users | 0.5.3 | `MIT` |
@@ -358,6 +382,7 @@ Total: 480 pacotes de terceiros.
 | sha2 | 0.11.1 | `MIT OR Apache-2.0` |
 | shlex | 2.0.1 | `MIT OR Apache-2.0` |
 | simd-adler32 | 0.3.10 | `MIT` |
+| simdutf8 | 0.1.5 | `MIT OR Apache-2.0` |
 | siphasher | 1.0.4 | `MIT OR Apache-2.0` |
 | slab | 0.4.12 | `MIT` |
 | smallvec | 1.16.5 | `MIT OR Apache-2.0` |
@@ -371,6 +396,7 @@ Total: 480 pacotes de terceiros.
 | string_cache | 0.9.0 | `MIT OR Apache-2.0` |
 | string_cache_codegen | 0.11.2 | `MIT OR Apache-2.0` |
 | string_cache_codegen | 0.6.1 | `MIT OR Apache-2.0` |
+| stringprep | 0.1.5 | `MIT/Apache-2.0` |
 | strsim | 0.11.1 | `MIT` |
 | subtle | 2.6.1 | `BSD-3-Clause` |
 | swift-rs | 1.0.9 | `MIT OR Apache-2.0` |
@@ -422,9 +448,14 @@ Total: 480 pacotes de terceiros.
 | tracing-core | 0.1.36 | `MIT` |
 | tray-icon | 0.25.1 | `MIT OR Apache-2.0` |
 | try-lock | 0.2.5 | `MIT` |
+| ttf-parser | 0.25.1 | `MIT OR Apache-2.0` |
+| type1-encoding-parser | 0.1.1 | `MIT` |
 | typeid | 1.0.3 | `MIT OR Apache-2.0` |
 | typenum | 1.20.1 | `MIT OR Apache-2.0` |
+| unicode-bidi | 0.3.18 | `MIT OR Apache-2.0` |
 | unicode-ident | 1.0.27 | `(MIT OR Apache-2.0) AND Unicode-3.0` |
+| unicode-normalization | 0.1.26 | `(MIT OR Apache-2.0) AND Unicode-3.0` |
+| unicode-properties | 0.1.5 | `(MIT OR Apache-2.0) AND Unicode-3.0` |
 | unicode-segmentation | 1.13.3 | `MIT OR Apache-2.0` |
 | untrusted | 0.9.0 | `ISC` |
 | ureq | 2.12.1 | `MIT OR Apache-2.0` |
@@ -459,6 +490,7 @@ Total: 480 pacotes de terceiros.
 | webview2-com | 0.39.1 | `MIT` |
 | webview2-com-macros | 0.8.1 | `MIT` |
 | webview2-com-sys | 0.39.1 | `MIT` |
+| weezl | 0.1.12 | `MIT OR Apache-2.0` |
 | winapi | 0.3.9 | `MIT/Apache-2.0` |
 | winapi-i686-pc-windows-gnu | 0.4.0 | `MIT/Apache-2.0` |
 | winapi-util | 0.1.11 | `Unlicense OR MIT` |

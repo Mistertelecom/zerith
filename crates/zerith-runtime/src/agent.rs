@@ -998,6 +998,9 @@ fn turn_body(
         }
 
         let mut context: Vec<String> = Vec::new();
+        // Images `view_image` checked this step: sent as a real (non-synthetic)
+        // message so the provider attaches them; only this exact text is.
+        let mut images: Vec<String> = Vec::new();
         let mut i = 0;
         if cut_calls {
             for c in &out.calls {
@@ -1146,6 +1149,11 @@ fn turn_body(
                     }
                 }
                 record(store, session_id, call, &outcome.output, &mut hist)?;
+                if outcome.ok && call.name == "view_image" {
+                    if let Some(msg) = image_message(&outcome.output) {
+                        images.push(msg);
+                    }
+                }
                 // "Read TASK.md and do it": the request names no subject, so
                 // the skill ranking at the start found nothing. The first
                 // file the model reads is the task: rank the skills on it.
@@ -1251,6 +1259,17 @@ fn turn_body(
                 json!({"message_id": id, "chars": text.chars().count()}),
             );
             hist.push(ChatMessage::synthetic_user(text), id);
+        }
+        for text in images {
+            let id = store.append(
+                session_id,
+                &NewMessage {
+                    raw: Some(json!({"view_image": true})),
+                    ..NewMessage::new(Role::User, text.clone())
+                },
+            )?;
+            log.emit("tool/image", json!({"message_id": id}));
+            hist.push(ChatMessage::user(text), id);
         }
         if cancel.is_cancelled() {
             return Err(ProviderError::Cancelled.into());
@@ -1460,6 +1479,26 @@ fn steer(
         hist.push(ChatMessage::user(text.clone()), id);
     }
     Ok(msgs.len())
+}
+
+/// The message that makes the provider attach a `view_image` result: only
+/// the exact one-line shape the tool writes (`<marker> kind, N KB:
+/// ![imagem](<path>)`), so a hook-rewritten or odd output never turns into a
+/// message that loads arbitrary local files.
+fn image_message(output: &str) -> Option<String> {
+    let rest = output.strip_prefix(zerith_tools::IMAGE_MARKER)?;
+    if output.contains('\n') {
+        return None;
+    }
+    let at = rest.find("![imagem](<")?;
+    let path = rest[at + 11..].strip_suffix(">)")?;
+    if path.is_empty() || path.contains(['<', '>']) {
+        return None;
+    }
+    Some(format!(
+        "{} ![imagem](<{path}>)",
+        zerith_tools::IMAGE_MARKER
+    ))
 }
 
 /// Monitor notices as one context block, marked as coming from the system.
@@ -2278,6 +2317,23 @@ mod shrink_tests {
 #[cfg(test)]
 mod approval_grant_tests {
     use super::*;
+
+    /// Only the exact line `view_image` writes becomes an attaching message.
+    #[test]
+    fn only_the_view_image_line_becomes_an_image_message() {
+        let m = zerith_tools::IMAGE_MARKER;
+        assert_eq!(
+            image_message(&format!("{m} png, 3 KB: ![imagem](<C:/x/a.png>)")),
+            Some(format!("{m} ![imagem](<C:/x/a.png>)"))
+        );
+        assert_eq!(image_message("![imagem](<C:/x/a.png>)"), None, "no marker");
+        assert_eq!(
+            image_message(&format!("{m} png, 3 KB: ![imagem](<a.png>)\n![b](<c.png>)")),
+            None,
+            "one line only"
+        );
+        assert_eq!(image_message(&format!("{m} x: ![imagem](<a<b.png>)")), None);
+    }
 
     /// `monitor` runs a shell command: the grant the user gave `shell` for
     /// `git status *` covers it, and one given to the monitor covers shell.

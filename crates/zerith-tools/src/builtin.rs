@@ -101,6 +101,18 @@ pub(crate) fn all() -> Vec<Box<dyn crate::Tool>> {
             read_file,
         ),
         tool(
+            "view_image",
+            "Mostra para você uma imagem do disco (png, jpeg, gif ou webp, até 20 MB): print de tela, foto de equipamento, diagrama de topologia, gráfico. A imagem chega anexada logo depois do resultado.",
+            json!({"type": "object", "properties": {
+                "path": {"type": "string", "description": "caminho da imagem"}
+            }, "required": ["path"]}),
+            "confirmação; a imagem vem anexada na mensagem seguinte",
+            Permission::Read,
+            10,
+            read_action,
+            view_image,
+        ),
+        tool(
             "write_file",
             "Cria ou sobrescreve um arquivo com o conteúdo dado.",
             json!({"type": "object", "properties": {
@@ -378,6 +390,54 @@ fn oem(bytes: &[u8]) -> String {
             .to_string_lossy()
             .into_owned()
     }
+}
+
+/// Marker that starts a `view_image` result: the turn loop attaches the image
+/// named after it to the next request.
+pub const IMAGE_MARKER: &str = "[imagem anexada para você ver]";
+
+/// `view_image`: checks the file is a real image the model may read and says
+/// where it is; the turn loop attaches it (images cannot ride inside a tool
+/// result in every API). Concept from Codex `view_image` and Goose
+/// `read_image` (both Apache-2.0); no code copied.
+fn view_image(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
+    const CAP: u64 = 20 * 1024 * 1024;
+    let path = ctx.resolve(str_arg(args, "path")?);
+    let meta = std::fs::metadata(&path)?;
+    if !meta.is_file() {
+        return Err(ToolError::Failed(format!(
+            "não é um arquivo: {}",
+            path.display()
+        )));
+    }
+    if meta.len() > CAP {
+        return Err(ToolError::Failed(format!(
+            "imagem grande demais ({} MB; limite 20 MB)",
+            meta.len() / (1024 * 1024)
+        )));
+    }
+    let mut head = [0u8; 12];
+    let n = std::fs::File::open(&path)?.read(&mut head)?;
+    let b = &head[..n];
+    let kind = if b.starts_with(b"\x89PNG") {
+        "png"
+    } else if b.starts_with(&[0xff, 0xd8, 0xff]) {
+        "jpeg"
+    } else if b.starts_with(b"GIF8") {
+        "gif"
+    } else if n == 12 && &b[..4] == b"RIFF" && &b[8..12] == b"WEBP" {
+        "webp"
+    } else {
+        return Err(ToolError::Failed(
+            "não é uma imagem png, jpeg, gif ou webp".into(),
+        ));
+    };
+    exec.host.note_read(&path);
+    let shown = path.display().to_string().replace('\\', "/");
+    Ok(format!(
+        "{IMAGE_MARKER} {kind}, {} KB: ![imagem](<{shown}>)",
+        meta.len().div_ceil(1024)
+    ))
 }
 
 fn read_file(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {

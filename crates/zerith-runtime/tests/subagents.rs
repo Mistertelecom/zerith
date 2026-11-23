@@ -1907,3 +1907,56 @@ fn device_secrets_in_tool_output_never_reach_the_model() {
         .collect();
     assert!(!stored.contains("OspfK3y!"), "the history keeps no secret");
 }
+
+/// `view_image`: the model sees the picture in the next request, as a real
+/// image part (not text), right after the tool result; a non-image refuses.
+#[test]
+fn view_image_attaches_the_picture_to_the_next_request() {
+    let seen: Arc<Mutex<Vec<Value>>> = Default::default();
+    let s2 = seen.clone();
+    let url = serve(move |b| {
+        s2.lock().unwrap().push(b.clone());
+        match tool_msgs(b).len() {
+            0 => calls(&[("v1", "view_image", json!({"path": "shot.png"}))]),
+            1 => calls(&[("v2", "view_image", json!({"path": "notas.txt"}))]),
+            _ => text("vi"),
+        }
+    });
+    let e = env(Mode::Bypass);
+    // 1x1 PNG.
+    let png: &[u8] = &[
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6,
+        0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 218, 99, 252, 207, 192, 80,
+        15, 0, 4, 133, 1, 128, 132, 169, 140, 33, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+    ];
+    std::fs::write(e.dir.path().join("shot.png"), png).unwrap();
+    std::fs::write(e.dir.path().join("notas.txt"), "texto").unwrap();
+    let reg = Registry::new();
+    turn(
+        &e,
+        &url,
+        &reg,
+        AgentOptions::default(),
+        TurnContext::default(),
+        "veja",
+        &Cancel::default(),
+        |_| {},
+    )
+    .unwrap();
+    let seen = seen.lock().unwrap();
+    let parts: Vec<Value> = messages(&seen[1])
+        .into_iter()
+        .filter_map(|m| m["content"].as_array().cloned())
+        .flatten()
+        .collect();
+    assert!(
+        parts.iter().any(|p| p["type"] == "image_url"
+            && p["image_url"]["url"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("data:image/png;base64,")),
+        "{parts:?}"
+    );
+    let refused = serde_json::to_string(&tool_msgs(&seen[2])[1]).unwrap();
+    assert!(refused.contains("não é uma imagem"), "{refused}");
+}

@@ -39,7 +39,7 @@ use zerith_security::{Action, Policy, Verdict};
 
 pub use ask_user::{parse_questions, Question, QuestionOption};
 pub use authoring::{tools as authoring_tools, Authoring};
-pub use builtin::shell_command;
+pub use builtin::{shell_command, IMAGE_MARKER};
 pub use host::{AgentRequest, EventSink, Host, HostEvent, LiveHook, Services, SkillLoad};
 pub use jobs::{
     background_job_tail, background_jobs, kill_all_jobs, stop_background_job, BackgroundJob,

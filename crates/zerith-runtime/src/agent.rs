@@ -745,6 +745,9 @@ fn turn_body(
     let mut cut_resumes = 0u8;
     let mut exec_counts: std::collections::HashMap<(String, String), u8> =
         std::collections::HashMap::new();
+    // Skills already named to the model this turn (by the prompt's ranking or
+    // by a hint below): each is suggested once.
+    let mut skill_hinted = false;
 
     for step in 1..=max_steps {
         on_event(RunEvent::Step { n: step });
@@ -1124,6 +1127,18 @@ fn turn_body(
                     }
                 }
                 record(store, session_id, call, &outcome.output, &mut hist)?;
+                // "Read TASK.md and do it": the request names no subject, so
+                // the skill ranking at the start found nothing. The first
+                // file the model reads is the task: rank the skills on it.
+                if !skill_hinted && outcome.ok && call.name == "read_file" && skill_tool {
+                    if let Some(hint) = ctx
+                        .skills
+                        .and_then(|lib| crate::skill_hint(lib, &outcome.output, prompt))
+                    {
+                        skill_hinted = true;
+                        context.push(hint);
+                    }
+                }
                 let sig = (call.name.clone(), call.arguments.clone());
                 // Edit, then rerun the same test: that is the fix loop, not a stuck one.
                 if outcome.ok

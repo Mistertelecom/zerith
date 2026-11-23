@@ -1158,6 +1158,83 @@ fn the_skill_tool_loads_a_body_on_demand_and_records_allowed_tools() {
     );
 }
 
+/// "Read TAREFA.md and do it": the prompt names no subject, so the skills
+/// ranked at the start are not the ones the task needs (the lab benchmark:
+/// zero skill calls in 100 steps of OSPF/Nexus work). After the first file
+/// read, the turn names the matching skills once.
+#[test]
+fn reading_the_task_file_suggests_the_matching_skills_once() {
+    let seen: Arc<Mutex<Vec<String>>> = Default::default();
+    let s2 = seen.clone();
+    let url = serve(move |b| {
+        let all = serde_json::to_string(&messages(b)).unwrap();
+        s2.lock().unwrap().push(all);
+        match tool_msgs(b).len() {
+            0 => calls(&[("r1", "read_file", json!({"path": "TAREFA.md"}))]),
+            1 => calls(&[("r2", "read_file", json!({"path": "NOTAS.md"}))]),
+            _ => text("ok"),
+        }
+    });
+    let e = env(Mode::Default);
+    std::fs::write(
+        e.dir.path().join("TAREFA.md"),
+        "Troubleshooting: vizinho OSPF preso em Init entre o Nexus e o roteador, \
+         área stub, tronco VLAN sem a VLAN 20 e relay DHCP do Nexus NX-OS apontando errado.",
+    )
+    .unwrap();
+    std::fs::write(e.dir.path().join("NOTAS.md"), "OSPF Nexus VLAN stub relay").unwrap();
+    let lib = zerith_skills::Library::open(e.dir.path().join("skills")).unwrap();
+    for (name, desc) in [
+        (
+            "ospf-tshoot",
+            "Use para troubleshooting de OSPF: vizinho preso em Init, área stub, tipo de rede",
+        ),
+        (
+            "nexus-nxos",
+            "Use para Cisco Nexus NX-OS: tronco VLAN, SVI, relay DHCP, OSPF na interface",
+        ),
+        (
+            "bolo-de-cenoura",
+            "Use para receitas de bolo de cenoura com cobertura de chocolate",
+        ),
+    ] {
+        let src = e.dir.path().join(format!("src-{name}"));
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {desc}\n---\n\ncorpo\n"),
+        )
+        .unwrap();
+        lib.install(&src, "t").unwrap();
+    }
+    let reg = Registry::new();
+    turn(
+        &e,
+        &url,
+        &reg,
+        AgentOptions::default(),
+        TurnContext {
+            skills: Some(&lib),
+            ..TurnContext::default()
+        },
+        "Leia TAREFA.md e execute.",
+        &Cancel::default(),
+        |_| {},
+    )
+    .unwrap();
+    let seen = seen.lock().unwrap();
+    let after_first = &seen[1];
+    assert!(after_first.contains("[Skills]"), "{after_first}");
+    assert!(after_first.contains("`ospf-tshoot`"), "{after_first}");
+    assert!(after_first.contains("`nexus-nxos`"), "{after_first}");
+    assert!(!after_first.contains("`bolo-de-cenoura`"), "{after_first}");
+    assert_eq!(
+        seen[2].matches("[Skills]").count(),
+        1,
+        "suggested once per turn"
+    );
+}
+
 #[test]
 fn an_unknown_skill_is_a_tool_error() {
     let url = serve(|b| {

@@ -1319,6 +1319,34 @@ pub(crate) fn tool_guidance(tools: &zerith_tools::Registry) -> String {
 /// The section changes with the request only for libraries past the budget;
 /// recalled memory already varies per turn just above it, so the provider's
 /// prefix cache is not made worse.
+/// Skills that fit a task the model just read from a file, as one reminder
+/// line, or `None` when nothing fits better than the prompt already did.
+/// Only skills that match at least three distinct words of the text count:
+/// one shared word ("rede", "config") is noise.
+// ponytail: first 6000 chars of the file, fixed thresholds; tune with the
+// benchmark if hints fire on unrelated files.
+pub fn skill_hint(lib: &zerith_skills::Library, text: &str, prompt: &str) -> Option<String> {
+    let head: String = text.chars().take(6000).collect();
+    let already: Vec<String> = zerith_skills::search::search(lib, prompt, 3)
+        .into_iter()
+        .map(|h| h.name)
+        .collect();
+    let hits = zerith_skills::search::search(lib, &head, 4);
+    let best = hits.first()?.score;
+    let names: Vec<String> = hits
+        .into_iter()
+        .filter(|h| h.matched.len() >= 3 && h.score >= best / 3.0 && !already.contains(&h.name))
+        .take(3)
+        .map(|h| format!("`{}`", h.name))
+        .collect();
+    (!names.is_empty()).then(|| {
+        format!(
+            "[Skills] O que você acabou de ler descreve a tarefa. Skills ligadas a ela: {}. Carregue com a ferramenta `skill` as que se aplicam antes de agir.",
+            names.join(", ")
+        )
+    })
+}
+
 pub fn skills_index(lib: &zerith_skills::Library, prompt: &str, budget: usize) -> String {
     let Ok(catalog) = lib.catalog() else {
         return String::new();

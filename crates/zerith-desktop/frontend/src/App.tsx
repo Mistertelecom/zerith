@@ -1984,7 +1984,9 @@ export default function App() {
                 </div>
               ) : (
                 <Transcript
-                  key={selected ?? "new"}
+                  // Not the Composer's key: siblings sharing a key left the old
+                  // transcript in the DOM under the hero after "Nova conversa".
+                  key={"t:" + (selected ?? "new")}
                   blocks={surface}
                   tail={tail}
                   sessionId={selected}

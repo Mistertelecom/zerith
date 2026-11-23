@@ -87,5 +87,23 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
             parse_questions(a)?;
             Err(ToolError::Failed("o usuário não respondeu".into()))
         },
-    )]
+    ), execute_code()]
+}
+
+/// `execute_code`: the schema here, the run in the turn loop (`zerith-runtime`
+/// `code_exec`), which owns the pipeline every script call goes through. Run
+/// outside a turn it fails closed. Concept after Hermes Agent (MIT).
+fn execute_code() -> Box<dyn Tool> {
+    make(
+        "execute_code",
+        "Roda um script Python que chama as ferramentas do Zerith e devolve só o que ele imprime. Use quando precisar de 3 ou mais chamadas com lógica entre elas: o mesmo comando em vários equipamentos, filtrar uma saída enorme antes de ela entrar no contexto, laço com nova tentativa. Para uma chamada só, use a ferramenta direto. No script já estão disponíveis, sem import: shell, read_file, grep, glob, list_dir, write_file, edit_file, web_fetch, web_search, net_inventory, net_probe, net_path, net_diff, terminal_open, terminal_send, terminal_batch, terminal_close, json_parse e ToolError; cada função recebe os mesmos argumentos nomeados da ferramenta (ex.: `shell(command=\"ping -c1 10.0.0.1\")`) e devolve o texto do resultado, ou levanta ToolError. Cada chamada segue as mesmas regras, aprovações e mascaramento de segredos de uma chamada normal. Limites: 5 minutos, 50 chamadas por script, 50 KB de saída (início e fim).",
+        json!({"type": "object", "properties": {
+            "code": {"type": "string", "description": "script Python; imprima o resultado final com print()"}
+        }, "required": ["code"]}),
+        "o que o script imprimiu, e o número de chamadas feitas",
+        Permission::Shell,
+        330,
+        false,
+        |_, _, _| Err(ToolError::Failed("execute_code só roda dentro de um turno".into())),
+    )
 }

@@ -1960,3 +1960,76 @@ fn view_image_attaches_the_picture_to_the_next_request() {
     let refused = serde_json::to_string(&tool_msgs(&seen[2])[1]).unwrap();
     assert!(refused.contains("não é uma imagem"), "{refused}");
 }
+
+/// `execute_code`: the script calls Zerith tools in a loop and only what it
+/// prints comes back; each call goes through the model's own path, so a deny
+/// rule stops it inside the script too and a secret is masked there as well.
+#[test]
+fn execute_code_runs_tools_through_the_normal_path() {
+    let seen: Arc<Mutex<Vec<String>>> = Default::default();
+    let s2 = seen.clone();
+    let url = serve(move |b| {
+        s2.lock()
+            .unwrap()
+            .push(serde_json::to_string(&messages(b)).unwrap());
+        if tool_msgs(b).is_empty() {
+            // No import: the tool functions come preloaded. Accent and emoji
+            // in print must not crash on a cp1252 console.
+            let code = r#"
+n = 0
+for f in ["a.cfg", "b.cfg", "c.cfg"]:
+    if "OSPF" in read_file(path=f):
+        n += 1
+print("arquivos com OSPF:", n, "ação ✅")
+print("segredo:", read_file(path="b.cfg").splitlines()[1])
+try:
+    read_file(path="proibido.txt")
+    print("LEU O PROIBIDO")
+except ToolError as e:
+    print("bloqueado:", str(e)[:40])
+"#;
+            calls(&[("x1", "execute_code", json!({"code": code}))])
+        } else {
+            text(tool_msgs(b)[0]["content"].as_str().unwrap())
+        }
+    });
+    let mut e = env(Mode::Bypass);
+    e.policy.rules = vec![zerith_security::Rule::parse(
+        zerith_security::RuleKind::Deny,
+        "read_file(proibido.txt)",
+    )
+    .unwrap()];
+    for (f, body) in [
+        ("a.cfg", "router ospf 1\n! OSPF area 0"),
+        ("b.cfg", "! OSPF\nsnmp-server community PublicRO123 RO"),
+        ("c.cfg", "router bgp 65000"),
+        ("proibido.txt", "nada"),
+    ] {
+        std::fs::write(e.dir.path().join(f), body).unwrap();
+    }
+    let reg = Registry::new();
+    let r = turn(
+        &e,
+        &url,
+        &reg,
+        AgentOptions::default(),
+        TurnContext::default(),
+        "conte",
+        &Cancel::default(),
+        |_| {},
+    )
+    .unwrap();
+    assert!(r.text.contains("arquivos com OSPF: 2"), "{}", r.text);
+    assert!(
+        !r.text.contains("PublicRO123"),
+        "secret masked inside the script: {}",
+        r.text
+    );
+    assert!(
+        r.text.contains("bloqueado"),
+        "deny rule applies in the script: {}",
+        r.text
+    );
+    assert!(!r.text.contains("LEU O PROIBIDO"), "{}", r.text);
+    assert!(r.text.contains("chamada(s) de ferramenta"), "{}", r.text);
+}

@@ -116,6 +116,12 @@ pub(crate) struct Pipeline<'a> {
 }
 
 impl Pipeline<'_> {
+    /// The turn's policy. Callers check `core` first; a pipeline without
+    /// tools never reaches the code that asks.
+    pub(crate) fn policy(&self) -> &Policy {
+        self.core.map(|(_, p)| p).expect("pipeline with tools")
+    }
+
     fn ctx<'c>(&'c self, policy: &'c Policy) -> CallCtx<'c> {
         CallCtx {
             workspace: &policy.workspace,

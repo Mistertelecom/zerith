@@ -1066,6 +1066,20 @@ fn turn_body(
                         question::settle(agent.questions, &p.inv.args, cancel, on_event);
                     p.settled = Some(crate::pipeline::ToolOutcome::new(ok, text));
                 }
+                // A script's tool calls go through this same pipeline (and may
+                // ask the person): it runs here, on the turn's thread.
+                if p.settled.is_none() && p.inv.name == "execute_code" && pipe.core.is_some() {
+                    let code = p.inv.args["code"].as_str().unwrap_or("");
+                    let out = if code.trim().is_empty() {
+                        crate::code_exec::Outcome {
+                            ok: false,
+                            output: "erro: `code` precisa ter o script Python".into(),
+                        }
+                    } else {
+                        crate::code_exec::run(&pipe, &p.inv.cwd, code, cancel, on_event)
+                    };
+                    p.settled = Some(crate::pipeline::ToolOutcome::new(out.ok, out.output));
+                }
             }
             let ran = if cancel.is_cancelled() {
                 vec![None; prepared.len()]

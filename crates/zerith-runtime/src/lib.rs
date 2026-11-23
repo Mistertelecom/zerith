@@ -368,6 +368,31 @@ pub struct PromptContext {
 /// `_title` is intentionally omitted from `static_system` (and only omitted when
 /// no dynamic reminder is needed) so renaming or generating a session title
 /// never busts the provider's prefix cache.
+/// What the model can generate with the models the user chose; empty when
+/// none is set (the tools do not exist then either).
+fn media_section(m: &zerith_core::settings::MediaSettings) -> String {
+    let mut kinds = Vec::new();
+    if m.image.configured() {
+        kinds.push(format!(
+            "imagens com `generate_image` ({})",
+            m.image.model.trim()
+        ));
+    }
+    if m.video.configured() {
+        kinds.push(format!(
+            "vídeos com `generate_video` ({})",
+            m.video.model.trim()
+        ));
+    }
+    if kinds.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n\n# Mídia\nVocê pode gerar {} usando o modelo que o usuário escolheu. Quando pedirem uma imagem ou um vídeo, use a ferramenta; não diga que não consegue gerar.",
+        kinds.join(" e ")
+    )
+}
+
 pub fn build_prompt_context(
     _title: &str,
     ctx: TurnContext<'_>,
@@ -391,6 +416,15 @@ pub fn build_prompt_context(
     if let Some(a) = ctx.agent {
         static_system.push_str(&format!("\n\n# Agente: {}\n\n{}", a.name, a.instructions));
     }
+    // Asked for a picture with a model configured, the model said it had no
+    // way to make one. The section changes only with the settings, so the
+    // prompt cache holds.
+    let media = &ctx
+        .settings
+        .cloned()
+        .unwrap_or_else(|| zerith_core::Settings::load(&paths, None).settings)
+        .media;
+    static_system.push_str(&media_section(media));
     if let Some(st) = ctx.settings {
         if let Some(pt) = tokensaver::ponytail_prompt(st.token_saver.ponytail) {
             static_system.push_str("\n\n");
@@ -1554,6 +1588,37 @@ fn names_skill(prompt: &str, name: &str) -> bool {
 #[cfg(test)]
 mod skills_tests {
     use super::*;
+
+    /// With a model chosen, the prompt says the model can generate it; with
+    /// none, nothing is said (the tool does not exist then).
+    #[test]
+    fn the_prompt_tells_the_model_which_media_it_can_generate() {
+        let mut st = zerith_core::Settings::default();
+        let ctx = |st: &zerith_core::Settings| {
+            build_prompt_context(
+                "t",
+                TurnContext {
+                    settings: Some(st),
+                    no_project_instructions: true,
+                    ..TurnContext::default()
+                },
+                false,
+                "s",
+                "gere a imagem de um gato",
+            )
+            .static_system
+        };
+        assert!(!ctx(&st).contains("# Mídia"));
+        st.media.image.model = "recraft/recraft-v4".into();
+        let s = ctx(&st);
+        assert!(
+            s.contains("# Mídia") && s.contains("`generate_image` (recraft/recraft-v4)"),
+            "{s}"
+        );
+        assert!(!s.contains("generate_video"));
+        st.media.video.model = "veo-3".into();
+        assert!(ctx(&st).contains("`generate_video` (veo-3)"));
+    }
 
     fn scratch() -> std::path::PathBuf {
         let p =

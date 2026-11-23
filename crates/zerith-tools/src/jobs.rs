@@ -76,7 +76,31 @@ struct Job {
     /// The session whose turn started it.
     session: Option<String>,
     started: Instant,
+    /// Set for a `monitor` job: its new lines are pushed to the turn.
+    watch: Option<Watch>,
 }
+
+/// What a `monitor` job adds to a background job: who is told, until when,
+/// and how much it has said (flood guard).
+struct Watch {
+    description: String,
+    deadline: Instant,
+    /// Bytes of output already turned into notices.
+    sent: usize,
+    /// Consecutive collections cut at the per-notice cap.
+    strikes: u8,
+    /// The final notice (exit, deadline, stop or flood) was delivered.
+    closed: bool,
+}
+
+/// Lines of output one monitor notice carries at most.
+pub const MONITOR_LINES: usize = 20;
+/// Characters one monitor notice carries at most.
+pub const MONITOR_CHARS: usize = 2000;
+/// Consecutive collections that overflow before the monitor is stopped.
+const MONITOR_STRIKES: u8 = 3;
+/// Longest a monitor may run.
+pub const MONITOR_MAX_SECS: u64 = 1800;
 
 type Table = Mutex<Vec<(String, Job)>>;
 
@@ -197,6 +221,39 @@ impl Jobs {
         policy: &Policy,
         session: Option<String>,
     ) -> Result<String> {
+        self.spawn(command, cwd, policy, session, None)
+    }
+
+    /// Starts a `monitor` job: a background job whose new output lines the
+    /// turn receives on its own ([`Jobs::monitor_notices`]) until the command
+    /// exits, `secs` pass (capped at [`MONITOR_MAX_SECS`]) or it is stopped.
+    pub fn start_monitor(
+        &self,
+        command: &str,
+        description: &str,
+        secs: u64,
+        cwd: &Path,
+        policy: &Policy,
+        session: Option<String>,
+    ) -> Result<String> {
+        let watch = Watch {
+            description: description.to_string(),
+            deadline: Instant::now() + Duration::from_secs(secs.clamp(1, MONITOR_MAX_SECS)),
+            sent: 0,
+            strikes: 0,
+            closed: false,
+        };
+        self.spawn(command, cwd, policy, session, Some(watch))
+    }
+
+    fn spawn(
+        &self,
+        command: &str,
+        cwd: &Path,
+        policy: &Policy,
+        session: Option<String>,
+        watch: Option<Watch>,
+    ) -> Result<String> {
         let mut to_join = Vec::new();
         let id = {
             let mut jobs = self.jobs.lock().map_err(|_| poisoned())?;
@@ -209,9 +266,14 @@ impl Jobs {
                     "já há {MAX_JOBS} jobs em segundo plano; encerre um com shell_kill"
                 )));
             }
-            // Finished jobs whose output was read can go; keep the table small.
+            // Finished jobs whose output was read (or, for a monitor, whose
+            // final notice went out) can go; keep the table small.
             jobs.retain(|(_, j)| {
-                j.exit.is_none() || j.out.lock().is_ok_and(|o| o.seen < o.text.len())
+                j.exit.is_none()
+                    || match &j.watch {
+                        Some(w) => !w.closed,
+                        None => j.out.lock().is_ok_and(|o| o.seen < o.text.len()),
+                    }
             });
             let jail = Jail::for_policy(policy);
             let mut cmd = shell_command(command);
@@ -237,6 +299,7 @@ impl Jobs {
                     exit: None,
                     session,
                     started: Instant::now(),
+                    watch,
                 },
             ));
             id
@@ -289,6 +352,96 @@ impl Jobs {
 
     pub fn kill(&self, id: &str) -> Result<String> {
         kill_in(&self.jobs, id)
+    }
+
+    /// Whether a monitor of this registry is still to report something.
+    pub fn monitors_pending(&self) -> bool {
+        self.jobs.lock().is_ok_and(|jobs| {
+            jobs.iter()
+                .any(|(_, j)| j.watch.as_ref().is_some_and(|w| !w.closed))
+        })
+    }
+
+    /// One notice per monitor with something new: the complete lines it
+    /// printed since the last call (at most [`MONITOR_LINES`] /
+    /// [`MONITOR_CHARS`], the rest counted), and a final notice when it
+    /// exits, hits its deadline, is stopped, or keeps flooding.
+    pub fn monitor_notices(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut to_join = Vec::new();
+        let Ok(mut jobs) = self.jobs.lock() else {
+            return out;
+        };
+        for (id, j) in jobs.iter_mut() {
+            if j.watch.as_ref().is_none_or(|w| w.closed) {
+                continue;
+            }
+            to_join.extend(refresh(j));
+            let expired = j.exit.is_none()
+                && j.watch
+                    .as_ref()
+                    .is_some_and(|w| Instant::now() >= w.deadline);
+            if expired {
+                j.jailed.kill_tree();
+                to_join.extend(std::mem::take(&mut j.readers));
+                j.exit = Some("prazo do monitor esgotado".into());
+            }
+            let finished = j.exit.clone();
+            let Ok(o) = j.out.lock() else { continue };
+            let w = j.watch.as_mut().expect("checked above");
+            // Only whole lines while it runs; the tail too once it ended.
+            let start = w.sent.min(o.text.len());
+            let mut end = if finished.is_some() {
+                o.text.len()
+            } else {
+                o.text[start..].rfind('\n').map_or(start, |i| start + i + 1)
+            };
+            while !o.text.is_char_boundary(end) {
+                end += 1;
+            }
+            let fresh = &o.text[start..end];
+            w.sent = end;
+            let lines: Vec<&str> = fresh.lines().filter(|l| !l.trim().is_empty()).collect();
+            let mut body = String::new();
+            let mut shown = 0;
+            for l in &lines {
+                if shown == MONITOR_LINES || body.len() + l.len() > MONITOR_CHARS {
+                    break;
+                }
+                body.push_str(l);
+                body.push('\n');
+                shown += 1;
+            }
+            let cut = lines.len() - shown;
+            if cut > 0 {
+                body.push_str(&format!("[+{cut} linhas omitidas]\n"));
+                w.strikes += 1;
+            } else if !lines.is_empty() {
+                w.strikes = 0;
+            }
+            let flooding = finished.is_none() && w.strikes >= MONITOR_STRIKES;
+            let head = format!("[Monitor {id}: {}]", w.description);
+            if !body.is_empty() {
+                out.push(format!("{head}\n{body}").trim_end().to_string());
+            }
+            drop(o);
+            if flooding {
+                j.jailed.kill_tree();
+                to_join.extend(std::mem::take(&mut j.readers));
+                j.exit = Some("parado: saída demais".into());
+                out.push(format!(
+                    "{head} parado: imprimiu mais de {MONITOR_LINES} linhas em {MONITOR_STRIKES} leituras seguidas. Filtre a saída (grep --line-buffered) e inicie de novo."
+                ));
+            } else if let Some(why) = finished {
+                out.push(format!("{head} terminou ({why})."));
+            }
+            if let Some(w) = j.watch.as_mut() {
+                w.closed = j.exit.is_some();
+            }
+        }
+        drop(jobs);
+        join_readers_with_grace(to_join, Duration::from_millis(150));
+        out
     }
 }
 
@@ -406,7 +559,48 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
             false,
             |a, _, e| e.host.jobs().kill(str_arg(a, "id")?),
         ),
+        monitor_tool(),
     ]
+}
+
+/// The `monitor` tool. Concept from Claude Code's Monitor (each output line
+/// reaches the model on its own); batching and flood guard after Hermes
+/// Agent's watch notifications (MIT) and Goose's shell streaming (Apache-2.0).
+/// No code copied. Same permission as `shell`: the command goes through the
+/// same `Action::Shell` check, so a rule that blocks `shell(x)` blocks this.
+pub(crate) fn monitor_tool() -> Box<dyn Tool> {
+    crate::fntool::make_with(
+        "monitor",
+        "Roda um comando em segundo plano e te avisa sozinho, a cada passo, das linhas novas que ele imprime, até ele terminar, o prazo acabar ou você parar com shell_kill. Use para acompanhar algo demorado (build, deploy, log, ping contínuo) sem ficar perguntando: continue trabalhando e reaja quando o aviso chegar. Cada linha de stdout é um evento: filtre só o que importa, incluindo as falhas (ex.: `tail -f app.log | grep --line-buffered -E \"ERROR|ready|Traceback\"`); um monitor que imprime demais é parado. Para esperar uma condição única, prefira um comando que termina quando ela acontece (`until curl -s x; do sleep 2; done`).",
+        json!({"type": "object", "properties": {
+            "command": {"type": "string", "description": "comando de shell; cada linha que ele imprime vira um aviso"},
+            "description": {"type": "string", "description": "o que está sendo acompanhado, curto (aparece em cada aviso)"},
+            "timeout_secs": {"type": "integer", "description": "prazo máximo; padrão 300, máximo 1800"}
+        }, "required": ["command", "description"]}),
+        "o id do monitor; as linhas chegam depois, sozinhas, como avisos [Monitor ...]",
+        Permission::Shell,
+        10,
+        false,
+        |a, _| Ok(Some(zerith_security::Action::Shell(str_arg(a, "command")?.to_string()))),
+        |a, ctx, e| {
+            let command = str_arg(a, "command")?;
+            let description = str_arg(a, "description")?;
+            let secs = a["timeout_secs"].as_u64().unwrap_or(300);
+            e.host.before_shell(command, ctx.workspace);
+            let id = e.host.jobs().start_monitor(
+                command,
+                description,
+                secs,
+                ctx.workspace,
+                ctx.policy,
+                e.host.session(),
+            )?;
+            Ok(format!(
+                "{id} monitorando \"{description}\" (prazo {}s). As linhas novas chegam sozinhas como avisos [Monitor {id}: ...]; não fique consultando. Para parar: shell_kill {id}.",
+                secs.clamp(1, MONITOR_MAX_SECS)
+            ))
+        },
+    )
 }
 
 /// Called by `shell` itself for `run_in_background`.
@@ -431,6 +625,7 @@ mod tests {
 
     #[test]
     fn the_window_lists_and_stops_the_jobs_of_any_registry() {
+        let _serial = serial();
         let root =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-scratch");
         std::fs::create_dir_all(&root).unwrap();
@@ -466,6 +661,124 @@ mod tests {
         );
         kill_all_jobs();
         assert!(listed(&b).is_none(), "closing the app stops the jobs");
+    }
+
+    /// Jobs are process-global (`kill_all_jobs` stops every table): the
+    /// tests that start them run one at a time.
+    static SERIAL: Mutex<()> = Mutex::new(());
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn scratch_policy() -> (tempfile::TempDir, Policy) {
+        let root =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-scratch");
+        std::fs::create_dir_all(&root).unwrap();
+        let dir = tempfile::Builder::new().tempdir_in(root).unwrap();
+        let policy = Policy::new(preset("workspace-write").unwrap(), Mode::Bypass, dir.path());
+        (dir, policy)
+    }
+
+    /// Collects notices until `done` holds or ~10 s pass.
+    fn collect(jobs: &Jobs, done: impl Fn(&[String]) -> bool) -> Vec<String> {
+        let mut all = Vec::new();
+        for _ in 0..200 {
+            all.extend(jobs.monitor_notices());
+            if done(&all) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        all
+    }
+
+    #[test]
+    fn a_monitor_reports_each_new_line_then_its_exit_once() {
+        let _serial = serial();
+        let (dir, policy) = scratch_policy();
+        let jobs = Jobs::default();
+        let id = jobs
+            .start_monitor(
+                "echo um && echo dois",
+                "teste",
+                60,
+                dir.path(),
+                &policy,
+                None,
+            )
+            .unwrap();
+        assert!(jobs.monitors_pending());
+        let all = collect(&jobs, |n| n.iter().any(|s| s.contains("terminou")));
+        let text = all.join("\n");
+        assert!(text.contains(&format!("[Monitor {id}: teste]")), "{text}");
+        assert!(text.contains("um") && text.contains("dois"), "{text}");
+        assert!(text.contains("terminou (exit 0)"), "{text}");
+        assert_eq!(text.matches("terminou").count(), 1, "{text}");
+        assert!(
+            !jobs.monitors_pending(),
+            "a closed monitor has nothing left"
+        );
+        assert!(
+            jobs.monitor_notices().is_empty(),
+            "nothing is reported twice"
+        );
+    }
+
+    #[test]
+    fn a_monitor_stops_at_its_deadline() {
+        let _serial = serial();
+        let (dir, policy) = scratch_policy();
+        let long = if cfg!(windows) {
+            "ping -n 30 127.0.0.1 >nul"
+        } else {
+            "sleep 30"
+        };
+        let jobs = Jobs::default();
+        let id = jobs
+            .start_monitor(long, "longo", 1, dir.path(), &policy, None)
+            .unwrap();
+        let all = collect(&jobs, |n| n.iter().any(|s| s.contains("prazo")));
+        assert!(
+            all.join("\n").contains("prazo do monitor esgotado"),
+            "{all:?}"
+        );
+        assert!(
+            background_jobs().iter().all(|j| j.id != id),
+            "the process is gone"
+        );
+    }
+
+    #[test]
+    fn a_flooding_monitor_is_cut_then_stopped() {
+        let _serial = serial();
+        let (dir, policy) = scratch_policy();
+        // 60 lines per second, forever.
+        let flood = "while true; do for i in $(seq 1 60); do echo linha $i; done; sleep 1; done";
+        let jobs = Jobs::default();
+        let id = jobs
+            .start_monitor(flood, "barulho", 60, dir.path(), &policy, None)
+            .unwrap();
+        let mut all = Vec::new();
+        for _ in 0..40 {
+            all.extend(jobs.monitor_notices());
+            if all.iter().any(|s| s.contains("parado")) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1100));
+        }
+        let text = all.join("\n");
+        assert!(text.contains("linhas omitidas"), "{text}");
+        assert!(
+            text.contains("saída demais") || text.contains("imprimiu mais de"),
+            "{text}"
+        );
+        for n in &all {
+            assert!(
+                n.lines().count() <= MONITOR_LINES + 2,
+                "a notice stays small: {n}"
+            );
+        }
+        assert!(background_jobs().iter().all(|j| j.id != id));
     }
 
     #[test]

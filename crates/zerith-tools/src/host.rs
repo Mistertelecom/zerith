@@ -239,6 +239,17 @@ impl Host {
         &self.jobs
     }
 
+    /// New output of this host's `monitor` jobs, one notice per monitor, and
+    /// their final notices. The turn loop calls it at each step boundary.
+    pub fn monitor_notices(&self) -> Vec<String> {
+        self.jobs.monitor_notices()
+    }
+
+    /// Whether a `monitor` job of this host still has something to report.
+    pub fn monitors_pending(&self) -> bool {
+        self.jobs.monitors_pending()
+    }
+
     // --- read-before-edit -------------------------------------------------
 
     fn key(path: &Path) -> PathBuf {

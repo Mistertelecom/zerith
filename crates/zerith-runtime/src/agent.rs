@@ -941,6 +941,23 @@ fn turn_body(
                     hist.push(ChatMessage::synthetic_user(text), id);
                     continue;
                 }
+                // A monitor still running: the turn does not end with it
+                // unseen. It waits for the next lines and hands them over.
+                if let Some(text) = agent.tools.and_then(|r| wait_monitor(r, cancel)) {
+                    if cancel.is_cancelled() {
+                        return Err(ProviderError::Cancelled.into());
+                    }
+                    let id = store.append(
+                        session_id,
+                        &NewMessage {
+                            raw: Some(json!({"monitor": true})),
+                            ..NewMessage::new(Role::User, text.clone())
+                        },
+                    )?;
+                    log.emit("monitor/notice", json!({"message_id": id}));
+                    hist.push(ChatMessage::synthetic_user(text), id);
+                    continue;
+                }
             }
             if step < max_steps {
                 if let Some(st) = ctx.settings {
@@ -1206,6 +1223,11 @@ fn turn_body(
             }
             i = j;
         }
+        // Lines the turn's monitors printed meanwhile: after every result of
+        // the step, like any extra context, so tool pairing stays intact.
+        if let Some(r) = agent.tools {
+            context.extend(monitor_report(r.host().monitor_notices()));
+        }
         // One request left: ask for a wrap-up instead of stopping mid-sentence.
         if step + 1 == max_steps && max_steps > 1 {
             context.push(format!(
@@ -1436,6 +1458,32 @@ fn steer(
         hist.push(ChatMessage::user(text.clone()), id);
     }
     Ok(msgs.len())
+}
+
+/// Monitor notices as one context block, marked as coming from the system.
+fn monitor_report(notices: Vec<String>) -> Option<String> {
+    (!notices.is_empty()).then(|| {
+        format!(
+            "{}\n[aviso automático do Zerith, não escrito pelo usuário]",
+            notices.join("\n\n")
+        )
+    })
+}
+
+/// Waits (up to the monitors' own deadlines) until a monitor of `tools` has
+/// something new, showing nothing meanwhile. `None` once no monitor is left
+/// or the turn was stopped.
+fn wait_monitor(tools: &zerith_tools::Registry, cancel: &Cancel) -> Option<String> {
+    while tools.host().monitors_pending() {
+        if cancel.is_cancelled() {
+            return None;
+        }
+        if let Some(r) = monitor_report(tools.host().monitor_notices()) {
+            return Some(r);
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    monitor_report(tools.host().monitor_notices())
 }
 
 /// What the model reads when background children finish after its answer.

@@ -1766,3 +1766,89 @@ fn a_delegating_turn_reports_what_its_children_saved() {
         "parent + child output"
     );
 }
+
+/// The model starts a monitor and ends its answer: the turn does not end with
+/// the monitor unseen. It waits, hands over the new lines and the exit as an
+/// automatic notice (not a user message), and the model answers again.
+#[test]
+fn a_monitor_reports_its_lines_and_exit_before_the_turn_ends() {
+    let seen: Arc<Mutex<Vec<String>>> = Default::default();
+    let s2 = seen.clone();
+    let url = serve(move |b| {
+        let all = serde_json::to_string(&messages(b)).unwrap();
+        s2.lock().unwrap().push(all.clone());
+        if tool_msgs(b).is_empty() {
+            calls(&[(
+                "m1",
+                "monitor",
+                json!({"command": "echo pronto-1 && echo pronto-2", "description": "build", "timeout_secs": 30}),
+            )])
+        } else if all.contains("terminou (exit 0)") {
+            text("viu o fim")
+        } else {
+            text("esperando o monitor")
+        }
+    });
+    let e = env(Mode::Bypass);
+    let reg = Registry::new();
+    let r = turn(
+        &e,
+        &url,
+        &reg,
+        AgentOptions::default(),
+        TurnContext::default(),
+        "acompanhe o build",
+        &Cancel::default(),
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(r.text, "viu o fim");
+    let seen = seen.lock().unwrap();
+    let last = seen.last().unwrap();
+    assert!(last.contains("[Monitor job-"), "{last}");
+    assert!(
+        last.contains("pronto-1") && last.contains("pronto-2"),
+        "{last}"
+    );
+    assert!(last.contains("aviso automático do Zerith"), "{last}");
+    assert!(!reg.host().monitors_pending());
+}
+
+/// `monitor` runs a shell command: a rule that blocks `shell(x)` blocks it.
+#[test]
+fn a_shell_deny_rule_also_blocks_the_monitor() {
+    let url = serve(move |b| {
+        if tool_msgs(b).is_empty() {
+            calls(&[(
+                "m1",
+                "monitor",
+                json!({"command": "rm -rf alvo", "description": "x"}),
+            )])
+        } else {
+            text(tool_msgs(b)[0]["content"].as_str().unwrap())
+        }
+    });
+    let mut e = env(Mode::Bypass);
+    e.policy.rules =
+        vec![
+            zerith_security::Rule::parse(zerith_security::RuleKind::Deny, "monitor(rm *)").unwrap(),
+        ];
+    let reg = Registry::new();
+    let r = turn(
+        &e,
+        &url,
+        &reg,
+        AgentOptions::default(),
+        TurnContext::default(),
+        "x",
+        &Cancel::default(),
+        |_| {},
+    )
+    .unwrap();
+    assert!(
+        r.text.contains("negado") || r.text.contains("bloqueado"),
+        "{}",
+        r.text
+    );
+    assert!(!reg.host().monitors_pending(), "nothing started");
+}

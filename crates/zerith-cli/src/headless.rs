@@ -456,6 +456,14 @@ pub fn run(paths: &Paths, args: &[String]) -> Result<(), Boxed> {
     }
     opts.reasoning_effort = h.effort.clone();
     opts.orchestrator = h.orchestrator;
+    let extra_agents = contrib.as_ref().map(|c| c.agents.as_slice()).unwrap_or(&[]);
+    let agent_def = match h.agent.as_deref() {
+        Some(name) => Some(
+            zerith_core::agents::find_with_extra(paths, Some(&workspace), extra_agents, name)
+                .ok_or_else(|| format!("agente desconhecido: {name} (veja `zerith agents`)"))?,
+        ),
+        None => None,
+    };
 
     let format = h.format;
     let spent = Cell::new(0f64);
@@ -469,6 +477,7 @@ pub fn run(paths: &Paths, args: &[String]) -> Result<(), Boxed> {
             scope: Some(&scope),
             skills: skills.as_ref(),
             settings: Some(&settings),
+            agent: agent_def.as_ref(),
             ..TurnContext::default()
         },
         opts,

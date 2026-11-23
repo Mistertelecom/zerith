@@ -223,6 +223,8 @@ pub struct Headless {
     pub effort: Option<String>,
     /// The window's Orchestrator mode: the main model plans and delegates.
     pub orchestrator: bool,
+    /// A named agent or bot (`noc-engineer`): its instructions join the prompt.
+    pub agent: Option<String>,
 }
 
 pub fn is_headless(args: &[String]) -> bool {
@@ -275,6 +277,7 @@ pub fn parse_headless(args: &[String]) -> Result<Headless, String> {
         remote: None,
         effort: None,
         orchestrator: false,
+        agent: None,
     };
     let mut prompt = None;
     let mut i = 0;
@@ -341,6 +344,7 @@ pub fn parse_headless(args: &[String]) -> Result<Headless, String> {
             }
             "--json-schema" => out.json_schema = Some(value()?),
             "--remote" => out.remote = Some(value()?),
+            "--agent" => out.agent = Some(value()?.trim().trim_start_matches('@').to_string()),
             "--effort" => {
                 let v = value()?.trim().to_ascii_lowercase();
                 if !matches!(
@@ -682,6 +686,8 @@ mod tests {
             "--effort",
             "High",
             "--orchestrator",
+            "--agent",
+            "@noc-engineer",
         ]);
         assert!(is_headless(&args));
         let h = parse_headless(&args).unwrap();
@@ -701,6 +707,7 @@ mod tests {
         assert!(h.json_schema.is_some() && h.no_tools);
         assert_eq!(h.effort.as_deref(), Some("high"));
         assert!(h.orchestrator);
+        assert_eq!(h.agent.as_deref(), Some("noc-engineer"));
         assert!(parse_headless(&v(&["-p", "x", "--effort", "turbo"])).is_err());
         assert_eq!(
             parse_headless(&v(&["-p", "x"])).unwrap().format,

@@ -581,6 +581,14 @@ impl Pipeline<'_> {
         for m in self.middleware {
             m.after(&p.inv, &mut outcome);
         }
+        // A `show run`, an `/export` or a `.env` read carries passwords,
+        // communities and keys: they never reach the model, the history or
+        // the spill file. After the hooks, so a hook still sees the raw text.
+        // Idea from Hermes Agent's terminal-output redaction (MIT); the rules
+        // are Zerith's own `redact`.
+        if redacts_output(&p.inv.name) {
+            outcome.output = zerith_security::redact(&outcome.output);
+        }
         let spilled = self.finalize(&p.inv.id, &mut outcome.output);
         (outcome, spilled)
     }
@@ -601,6 +609,16 @@ impl Pipeline<'_> {
         *output = zerith_tools::truncate(full, OUTPUT_CAP_CHARS);
         None
     }
+}
+
+/// Tools whose output can carry device or service secrets. Edits are left
+/// out on purpose: the model must see what it wrote to edit it again, and it
+/// wrote that text itself.
+fn redacts_output(tool: &str) -> bool {
+    !matches!(
+        tool,
+        "write_file" | "edit_file" | "multi_edit" | "task_create" | "task_update" | "task_list"
+    )
 }
 
 /// Classifies commands sent to an active remote/network terminal session.

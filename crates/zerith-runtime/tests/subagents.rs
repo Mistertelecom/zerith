@@ -1852,3 +1852,58 @@ fn a_shell_deny_rule_also_blocks_the_monitor() {
     );
     assert!(!reg.host().monitors_pending(), "nothing started");
 }
+
+/// `show run` / `cat .env` through any tool: the passwords never reach the
+/// model (the next request) nor the history, the rest of the output does.
+#[test]
+fn device_secrets_in_tool_output_never_reach_the_model() {
+    let seen: Arc<Mutex<Vec<String>>> = Default::default();
+    let s2 = seen.clone();
+    let url = serve(move |b| {
+        s2.lock()
+            .unwrap()
+            .push(serde_json::to_string(&messages(b)).unwrap());
+        if tool_msgs(b).is_empty() {
+            calls(&[("r1", "read_file", json!({"path": "router.cfg"}))])
+        } else {
+            text("lido")
+        }
+    });
+    let e = env(Mode::Bypass);
+    std::fs::write(
+        e.dir.path().join("router.cfg"),
+        "hostname CORE-1\nsnmp-server community PublicRO123 RO\n ip ospf message-digest-key 1 md5 OspfK3y!\ntacacs-server key T4cacsKey\n ip address 10.0.0.1 255.255.255.0\n",
+    )
+    .unwrap();
+    let reg = Registry::new();
+    turn(
+        &e,
+        &url,
+        &reg,
+        AgentOptions::default(),
+        TurnContext::default(),
+        "leia",
+        &Cancel::default(),
+        |_| {},
+    )
+    .unwrap();
+    let after = seen.lock().unwrap()[1].clone();
+    for secret in ["PublicRO123", "OspfK3y!", "T4cacsKey"] {
+        assert!(
+            !after.contains(secret),
+            "{secret} reached the model: {after}"
+        );
+    }
+    assert!(
+        after.contains("hostname CORE-1") && after.contains("10.0.0.1 255.255.255.0"),
+        "{after}"
+    );
+    let stored: String = e
+        .store
+        .messages(&e.sid, 1000, 0)
+        .unwrap()
+        .into_iter()
+        .map(|m| m.content)
+        .collect();
+    assert!(!stored.contains("OspfK3y!"), "the history keeps no secret");
+}

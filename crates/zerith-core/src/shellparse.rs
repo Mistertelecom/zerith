@@ -326,6 +326,36 @@ fn tokens(part: &str, d: Dialect) -> Vec<String> {
     out
 }
 
+/// Files a simple command writes by redirection (`> f`, `>> f`, `2>f`,
+/// `&> f`); `>&1`-style fd duplications are not files. `/dev/null` is left
+/// out: discarding output writes nothing.
+pub fn redirect_targets(part: &str, d: Dialect) -> Vec<PathBuf> {
+    let t = tokens(part, d);
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < t.len() {
+        let tok = t[i].as_str();
+        // the operator, possibly glued to its fd (`2>>`) or its target (`>f`)
+        if let Some(pos) = tok.find('>').filter(|_| !tok.starts_with(['"', '\''])) {
+            let after = tok[pos..].trim_start_matches('>');
+            let target = if after.is_empty() {
+                i += 1;
+                t.get(i).cloned()
+            } else {
+                Some(after.to_string())
+            };
+            if let Some(f) = target.filter(|f| !f.starts_with('&')) {
+                let f = unquote(&f);
+                if f != "/dev/null" && !f.eq_ignore_ascii_case("nul") {
+                    out.push(PathBuf::from(f));
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 fn unquote(t: &str) -> String {
     let b = t.as_bytes();
     if b.len() >= 2 && (b[0] == b'"' || b[0] == b'\'') && b[b.len() - 1] == b[0] {

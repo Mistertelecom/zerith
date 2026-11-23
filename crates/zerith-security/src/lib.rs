@@ -776,6 +776,11 @@ impl Policy {
                 } else {
                     let mut all_ok = true;
                     for (raw, inner) in a.raw.iter().zip(&a.inner) {
+                        if self.redirects_out(raw) {
+                            other_denied_allow = true;
+                            all_ok = false;
+                            continue;
+                        }
                         if allows(raw) || allows(inner) || self.cd_inside(inner) {
                             continue;
                         }
@@ -953,6 +958,17 @@ impl Policy {
             }
             _ => false,
         }
+    }
+
+    /// A simple command that writes a file outside the workspace by
+    /// redirection (`> ~/.bashrc`, `>> ../x`, `2> $HOME/x`).
+    fn redirects_out(&self, part: &str) -> bool {
+        shellparse::redirect_targets(part, shellparse::Dialect::NATIVE())
+            .iter()
+            .any(|f| {
+                f.to_string_lossy().starts_with(['~', '$', '%'])
+                    || !self.inside_workspace(&self.workspace.join(f))
+            })
     }
 
     pub fn inside_workspace(&self, path: &Path) -> bool {
@@ -1450,6 +1466,30 @@ mod tests {
         );
         assert_ne!(sh("./zl ASR <<'FIM'\nx\nFIM\nrm -rf y"), Verdict::Allow);
         assert_ne!(sh("./zl ASR <<FIM\n$(rm -rf y)\nFIM"), Verdict::Allow);
+    }
+
+    /// `shell(x *)` blesses what x does, not a file the same line writes:
+    /// `x > ~/.bashrc` used to pass on the rule alone. Into the workspace
+    /// (where the model may write anyway) it still passes.
+    #[test]
+    fn an_allow_rule_does_not_cover_a_redirect_out_of_the_workspace() {
+        let dir = scratch_dir();
+        std::fs::create_dir_all(dir.path().join("evidence")).unwrap();
+        let mut p = Policy::new(
+            preset("workspace-write").unwrap(),
+            Mode::AcceptEdits,
+            dir.path(),
+        );
+        p.rules = vec![Rule::parse(RuleKind::Allow, "shell(./zl *)").unwrap()];
+        let sh = |c: &str| p.check_tool("shell", &Action::Shell(c.into()));
+        assert_eq!(sh("./zl A \"x\" > evidence/r.txt"), Verdict::Allow);
+        assert_eq!(sh("./zl A \"x\" >> evidence/r.txt 2>&1"), Verdict::Allow);
+        assert_eq!(sh("./zl A \"x\" 2>/dev/null"), Verdict::Allow);
+        let out = outside("x.txt").display().to_string();
+        assert_ne!(sh(&format!("./zl A \"x\" > {out}")), Verdict::Allow);
+        assert_ne!(sh("./zl A \"x\" > ../x.txt"), Verdict::Allow);
+        assert_ne!(sh("./zl A \"x\" >~/.bashrc"), Verdict::Allow);
+        assert_ne!(sh("./zl A \"x\" 2>> $HOME/x"), Verdict::Allow);
     }
 
     #[test]

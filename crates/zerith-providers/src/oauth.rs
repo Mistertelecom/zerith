@@ -29,6 +29,12 @@ pub enum OAuthError {
     Parse(String),
     #[error("credencial sem refresh_token; rode `zerith login` de novo")]
     NoRefreshToken,
+    /// The provider no longer accepts the refresh token (revoked, rotated by
+    /// another login, or expired): only a new login brings the account back.
+    #[error(
+        "o login desta conta expirou ou foi revogado no provedor; entre de novo (Contas › Entrar)"
+    )]
+    LoginLost,
     #[error("io: {0}")]
     Io(String),
 }
@@ -499,7 +505,7 @@ pub fn refresh(tool: OAuthTool, cred: &OAuthCredential) -> Result<OAuthCredentia
                 "refresh_token": refresh_token,
                 "client_id": client_id(tool),
             }),
-        )?,
+        ),
         Encoding::Form => post_form(
             p.token_url,
             &[
@@ -507,9 +513,22 @@ pub fn refresh(tool: OAuthTool, cred: &OAuthCredential) -> Result<OAuthCredentia
                 ("refresh_token", refresh_token),
                 ("client_id", &client_id(tool)),
             ],
-        )?,
-    };
+        ),
+    }
+    .map_err(login_lost)?;
     credential_from_body_keeping(&body, p.refresh_encoding, cred, now_secs())
+}
+
+/// OAuth's answer to a dead refresh token (RFC 6749 §5.2): `400` with
+/// `invalid_grant`. Retrying cannot fix it, and the raw JSON says nothing to
+/// the person: name the way out instead.
+fn login_lost(e: OAuthError) -> OAuthError {
+    match e {
+        OAuthError::Http(400 | 401, body) if body.contains("invalid_grant") => {
+            OAuthError::LoginLost
+        }
+        other => other,
+    }
 }
 
 pub fn credential_from_body(
@@ -1436,6 +1455,27 @@ mod tests {
         let c = credential_from_body(form, Encoding::Form, OAuthTool::Codex, now).unwrap();
         assert_eq!(c.tool, OAuthTool::Codex);
         assert_eq!(c.expires_at, now + 60);
+    }
+
+    /// The quota screen showed `http 400: {"error": "invalid_grant", ...}` raw
+    /// and kept asking: a dead refresh token is a login to redo, said plainly.
+    #[test]
+    fn a_dead_refresh_token_reads_as_login_lost() {
+        let raw = r#"{"error": "invalid_grant", "error_description": "Refresh token not found or invalid"}"#;
+        let e = login_lost(OAuthError::Http(400, raw.into()));
+        assert!(matches!(e, OAuthError::LoginLost), "{e}");
+        let msg = e.to_string();
+        assert!(msg.contains("entre de novo"), "{msg}");
+        assert!(!msg.contains("invalid_grant"), "{msg}");
+        // other failures keep their own message (a network error is not a lost login)
+        assert!(matches!(
+            login_lost(OAuthError::Http(500, "x".into())),
+            OAuthError::Http(500, _)
+        ));
+        assert!(matches!(
+            login_lost(OAuthError::Io("timeout".into())),
+            OAuthError::Io(_)
+        ));
     }
 
     #[test]

@@ -1231,8 +1231,15 @@ fn turn_body(
                     }
                 }
                 record(store, session_id, call, &outcome.output, &mut hist)?;
-                if outcome.ok {
-                    track_verification(&call.name, &p_args(&call.arguments), &mut unverified);
+                if outcome.ok || call.name == "shell" {
+                    track_verification(
+                        &call.name,
+                        &p_args(&call.arguments),
+                        &outcome.output,
+                        outcome.ok,
+                        &cwd,
+                        &mut unverified,
+                    );
                 }
                 if outcome.ok && call.name == "view_image" {
                     if let Some(msg) = image_message(&outcome.output) {
@@ -1626,57 +1633,53 @@ fn is_prose(path: &str) -> bool {
         )
 }
 
-/// A shell command that checks code: tests, build, lint, type check, or
-/// running the program itself.
-fn is_check(cmd: &str) -> bool {
-    let c = cmd.to_ascii_lowercase();
-    [
-        "test",
-        "pytest",
-        "cargo check",
-        "cargo build",
-        "cargo clippy",
-        "go build",
-        "go vet",
-        "tsc",
-        "eslint",
-        "ruff",
-        "mypy",
-        "flake8",
-        "npm run",
-        "pnpm",
-        "yarn",
-        "make",
-        "mvn",
-        "gradle",
-        "dotnet build",
-        "python ",
-        "python3 ",
-        "node ",
-        "go run",
-        "cargo run",
-        "bash ",
-        "sh ",
-        "pwsh",
-        "powershell",
-        "./",
-    ]
-    .iter()
-    .any(|k| c.contains(k))
-}
-
-/// Updates the list of code files edited since the last check.
-fn track_verification(tool: &str, args: &Value, unverified: &mut Vec<String>) {
+/// Updates the list of code files edited since the last check. A shell line
+/// clears it only when [`crate::verify::is_verification`] says it checked the
+/// code (a project command or an edited script, its own exit status, 0).
+fn track_verification(
+    tool: &str,
+    args: &Value,
+    output: &str,
+    ok: bool,
+    cwd: &std::path::Path,
+    unverified: &mut Vec<String>,
+) {
     match tool {
-        "write_file" | "edit_file" | "multi_edit" => {
+        "write_file" | "edit_file" | "multi_edit" if ok => {
             if let Some(p) = args["path"].as_str().filter(|p| !is_prose(p)) {
                 if !unverified.iter().any(|u| u == p) {
                     unverified.push(p.to_string());
                 }
             }
         }
-        "shell" | "monitor" if args["command"].as_str().is_some_and(is_check) => unverified.clear(),
-        "execute_code" | "lsp_diagnostics" | "diagnostics" => unverified.clear(),
+        "apply_patch" if ok => {
+            for l in args["patch"].as_str().unwrap_or("").lines() {
+                let p = ["*** Add File: ", "*** Update File: ", "*** Move to: "]
+                    .iter()
+                    .find_map(|h| l.strip_prefix(h))
+                    .map(str::trim);
+                if let Some(p) = p.filter(|p| !is_prose(p)) {
+                    if !unverified.iter().any(|u| u == p) {
+                        unverified.push(p.to_string());
+                    }
+                }
+            }
+        }
+        "shell" if !unverified.is_empty() => {
+            let (Some(line), Some(exit)) =
+                (args["command"].as_str(), crate::verify::exit_of(output))
+            else {
+                return;
+            };
+            let project = crate::verify::project_root(cwd)
+                .map(|r| crate::verify::project_commands(&r))
+                .unwrap_or_default();
+            if crate::verify::is_verification(line, exit, &project, unverified) {
+                unverified.clear();
+            }
+        }
+        // Diagnostics read the code itself: a check of its own.
+        "lsp_diagnostics" | "diagnostics" if ok => unverified.clear(),
         _ => {}
     }
 }

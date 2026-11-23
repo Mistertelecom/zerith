@@ -2140,5 +2140,9 @@ fn verify_on_stop_sends_an_unchecked_code_edit_back_once() {
         ),
         ("t", "shell", json!({"command": "python calc.py"})),
     ]);
-    assert!(!tested.last().unwrap().contains("[Verificação]"));
+    assert!(
+        !tested.last().unwrap().contains("[Verificação]"),
+        "{}",
+        tested.last().unwrap()
+    );
 }

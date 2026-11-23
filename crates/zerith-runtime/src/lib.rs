@@ -27,6 +27,7 @@ pub mod spill;
 pub mod subagent;
 mod tasks;
 pub mod tokensaver;
+mod verify;
 
 pub use agent::{
     approval_channel, approval_channel_with_grants, approval_grant_key, inbox_channel,

@@ -940,7 +940,9 @@ export function installMock(theme: string) {
           state.jobs = state.jobs.filter((j) => j.id !== a.id);
           return `${a.id} encerrado`;
         default:
-          return null;
+          // A list command nobody mocked yet (`terminals_list` blanked the
+          // whole preview: `null.some`) answers an empty list, not null.
+          return cmd.endsWith("_list") || cmd.endsWith("s_history") ? [] : null;
       }
     },
     { shouldMockEvents: true },

@@ -743,9 +743,16 @@ fn denial_hint(tool: &str, why: &str) -> &'static str {
     let cmd = why.strip_prefix("shell: ").unwrap_or(why);
     let writes =
         cmd.contains("<<") || cmd.contains("> ") || cmd.contains(">>") || cmd.contains("tee ");
+    // `for f in a b; do cat -n $f; done` reads several files: the loop is what
+    // got it refused, and read_file can be called once per file instead.
     let reads = ["cat ", "cat -n", "head ", "tail ", "type ", "Get-Content"]
         .iter()
-        .any(|p| cmd.trim_start().starts_with(p) || cmd.contains(&format!("; {p}")));
+        .any(|p| {
+            cmd.trim_start().starts_with(p)
+                || cmd.contains(&format!("; {p}"))
+                || cmd.contains(&format!("do {p}"))
+                || cmd.contains(&format!("&& {p}"))
+        });
     let deletes = ["rm ", "del ", "Remove-Item"]
         .iter()
         .any(|p| cmd.contains(p));
@@ -768,6 +775,12 @@ mod denial_hint_tests {
     fn a_refused_file_command_points_at_the_file_tool() {
         assert!(denial_hint("shell", "shell: cat > a.py <<'EOF'\nx\nEOF").contains("write_file"));
         assert!(denial_hint("shell", "shell: cat -n billing/money.py").contains("read_file"));
+        // a loop over files is still just reading them
+        assert!(denial_hint(
+            "shell",
+            "shell: for f in README.md pve1/etc/pve/corosync.conf; do cat -n $f; done"
+        )
+        .contains("read_file"));
         assert!(denial_hint("shell", "shell: rm _scratch.py; ls").contains("Não apague"));
         assert!(denial_hint("shell", "shell: curl http://x").contains("Não tente outra forma"));
         assert_eq!(denial_hint("write_file", "escrever /x"), "");

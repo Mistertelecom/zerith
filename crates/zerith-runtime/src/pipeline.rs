@@ -340,7 +340,8 @@ impl Pipeline<'_> {
     ) -> Result<(), String> {
         let Some(gate) = self.approvals else {
             return Err(format!(
-                "negado: precisa de aprovação ({why}) e não há quem aprove"
+                "negado: precisa de aprovação ({why}) e não há quem aprove{}",
+                denial_hint(tool, &why)
             ));
         };
         if !forced && gate.granted(grant_key) {
@@ -728,6 +729,48 @@ fn run_caught(run: impl FnOnce() -> zerith_tools::Result<String>) -> (bool, Stri
         Ok(Ok(o)) => (true, o),
         Ok(Err(e)) => (false, format!("erro: {e}")),
         Err(_) => (false, PANICKED.into()),
+    }
+}
+
+/// What to do instead of a refused shell line that only writes, reads or
+/// deletes a file. In the benchmarks the model kept retrying `cat > f <<EOF`
+/// and `cat -n f` through the shell, each one another denied step, while
+/// `write_file`/`read_file` were already allowed.
+fn denial_hint(tool: &str, why: &str) -> &'static str {
+    if tool != "shell" {
+        return "";
+    }
+    let cmd = why.strip_prefix("shell: ").unwrap_or(why);
+    let writes =
+        cmd.contains("<<") || cmd.contains("> ") || cmd.contains(">>") || cmd.contains("tee ");
+    let reads = ["cat ", "cat -n", "head ", "tail ", "type ", "Get-Content"]
+        .iter()
+        .any(|p| cmd.trim_start().starts_with(p) || cmd.contains(&format!("; {p}")));
+    let deletes = ["rm ", "del ", "Remove-Item"]
+        .iter()
+        .any(|p| cmd.contains(p));
+    if writes {
+        ". Para criar ou mudar arquivo, use write_file, edit_file ou multi_edit em vez do shell."
+    } else if deletes {
+        ". Não apague pelo shell: deixe o arquivo ou diga ao usuário para apagar."
+    } else if reads {
+        ". Para ler arquivo, use read_file, glob ou grep em vez do shell."
+    } else {
+        ". Não tente outra forma do mesmo comando: use as ferramentas liberadas ou diga ao usuário o que falta."
+    }
+}
+
+#[cfg(test)]
+mod denial_hint_tests {
+    use super::denial_hint;
+
+    #[test]
+    fn a_refused_file_command_points_at_the_file_tool() {
+        assert!(denial_hint("shell", "shell: cat > a.py <<'EOF'\nx\nEOF").contains("write_file"));
+        assert!(denial_hint("shell", "shell: cat -n billing/money.py").contains("read_file"));
+        assert!(denial_hint("shell", "shell: rm _scratch.py; ls").contains("Não apague"));
+        assert!(denial_hint("shell", "shell: curl http://x").contains("Não tente outra forma"));
+        assert_eq!(denial_hint("write_file", "escrever /x"), "");
     }
 }
 

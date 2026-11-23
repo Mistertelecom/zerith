@@ -52,12 +52,16 @@ const USER_MARKERS: &[&str] = &[
     "não use",
     "não quero",
     "não gosto",
-    "errado",
-    "errada",
+    "está errado",
+    "está errada",
+    "tá errado",
+    "você errou",
     "na verdade",
     "prefiro",
-    "sempre",
-    "nunca",
+    "sempre use",
+    "sempre faça",
+    "nunca use",
+    "nunca faça",
     "pare de",
     "lembre",
     "lembra",
@@ -883,8 +887,17 @@ mod tests {
             "I prefer tabs",
             "don't use emojis",
             "pare de pedir confirmação",
+            "está errado, o arquivo é outro",
+            "nunca use print para log",
         ] {
             assert!(!gate(&TurnDigest::new(msg)).is_empty(), "{msg}");
+        }
+        // Describing the bug is not a correction of the assistant.
+        for msg in [
+            "diga o que estava errado no código",
+            "o loop nunca termina, corrija",
+        ] {
+            assert!(gate(&TurnDigest::new(msg)).is_empty(), "{msg}");
         }
         let mut work = TurnDigest::new("rode os testes");
         work.tools = (0..MIN_TOOL_CALLS).map(|_| tool("shell", true)).collect();

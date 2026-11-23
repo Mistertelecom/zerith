@@ -269,6 +269,36 @@ impl Registry {
         self.find(name).map(|t| t.spec())
     }
 
+    /// Models sometimes send an array or object argument as a JSON string
+    /// (`"edits": "[{...}]"`). Where the tool's schema asks for an array or an
+    /// object and the string parses to one, use the parsed value; anything
+    /// else is left for the tool to judge.
+    pub fn coerce_args(&self, name: &str, args: &mut Value) {
+        let (Some(spec), Some(obj)) = (self.get(name), args.as_object_mut()) else {
+            return;
+        };
+        let Some(props) = spec.parameters.get("properties").and_then(Value::as_object) else {
+            return;
+        };
+        for (key, val) in obj.iter_mut() {
+            let want = props
+                .get(key)
+                .and_then(|p| p.get("type"))
+                .and_then(Value::as_str);
+            let Some(text) = val
+                .as_str()
+                .filter(|_| matches!(want, Some("array" | "object")))
+            else {
+                continue;
+            };
+            match serde_json::from_str::<Value>(text.trim()) {
+                Ok(v @ Value::Array(_)) if want == Some("array") => *val = v,
+                Ok(v @ Value::Object(_)) if want == Some("object") => *val = v,
+                _ => {}
+            }
+        }
+    }
+
     fn find(&self, name: &str) -> Option<&dyn Tool> {
         self.tools
             .iter()

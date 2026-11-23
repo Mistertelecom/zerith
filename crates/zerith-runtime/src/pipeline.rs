@@ -175,6 +175,7 @@ impl Pipeline<'_> {
                 )
             }
         };
+        tools.coerce_args(&inv.name, &mut inv.args);
 
         // `mcp_call` naming a deferred tool IS that tool from here on: its
         // rules, hooks, approval card and "allow for the session" are the

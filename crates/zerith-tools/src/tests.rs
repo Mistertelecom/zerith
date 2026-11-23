@@ -547,3 +547,22 @@ fn at_file_mentions_attach_workspace_files_only() {
     let outside = super::expand_file_mentions("@../fora.txt", &dir.path().join("src"));
     assert_eq!(outside, "@../fora.txt");
 }
+
+#[test]
+fn array_arguments_sent_as_json_text_are_decoded() {
+    let r = Registry::new();
+    let mut args = json!({
+        "path": "a.txt",
+        "edits": "[{\"old_string\": \"a\", \"new_string\": \"b\"}]"
+    });
+    r.coerce_args("multi_edit", &mut args);
+    assert_eq!(args["edits"][0]["new_string"], "b");
+    // a string field stays a string, even if it looks like JSON
+    let mut w = json!({"path": "x.json", "content": "[1, 2]"});
+    r.coerce_args("write_file", &mut w);
+    assert_eq!(w["content"], "[1, 2]");
+    // text that is not JSON is left for the tool to refuse
+    let mut bad = json!({"path": "a.txt", "edits": "[{nope"});
+    r.coerce_args("multi_edit", &mut bad);
+    assert_eq!(bad["edits"], "[{nope");
+}

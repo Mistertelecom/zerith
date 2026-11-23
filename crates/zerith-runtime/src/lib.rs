@@ -184,6 +184,16 @@ pub const SKILLS_BUDGET_CHARS: usize = 4000;
 /// request names, then the best BM25 matches.
 pub const SKILLS_TOP_K: usize = 12;
 
+/// What the model reads above the skill list. In the benchmarks the model
+/// called a skill once in 13 runs, never `security-audit` on a security
+/// review: a bare "to use one, call `skill`" reads as optional. Like Hermes,
+/// the rule is to load a matching skill before acting, but only a matching
+/// one: loading everything costs tokens and adds noise.
+const SKILLS_HEADER: &str = "# Skills disponíveis\nAntes de agir, confira a lista: se uma skill \
+corresponde ao pedido, mesmo em parte, carregue com a ferramenta `skill` e siga as instruções \
+dela, ainda que você saiba fazer sozinho, porque a skill traz o jeito certo de fazer aqui. Siga \
+sem skill só se nenhuma tiver relação.";
+
 /// A ranked line's description is cut here, so twelve fit in the budget.
 const SKILL_DESC_CHARS: usize = 160;
 
@@ -406,7 +416,7 @@ pub fn build_prompt_context(
             if !catalog.is_empty() {
                 let full_len: usize = catalog.iter().map(|(n, d)| n.len() + d.len() + 5).sum();
                 let header = if skill_tool {
-                    "# Skills disponíveis\nPara usar uma, chame a ferramenta `skill` com o nome e siga as instruções que ela devolver."
+                    SKILLS_HEADER
                 } else {
                     "# Skills disponíveis"
                 };
@@ -1313,9 +1323,7 @@ pub fn skills_index(lib: &zerith_skills::Library, prompt: &str, budget: usize) -
         return String::new();
     }
     let total = catalog.len();
-    let mut out = String::from(
-        "# Skills disponíveis\nPara usar uma, chame a ferramenta `skill` com o nome e siga as instruções que ela devolver.",
-    );
+    let mut out = String::from(SKILLS_HEADER);
     let footer = format!(
         "\nHá {total} skills instaladas; use skill_search para achar outras (palavras-chave em inglês e português)."
     );
@@ -1601,6 +1609,10 @@ mod skills_tests {
         let idx = skills_index(&lib, "qualquer coisa", SKILLS_BUDGET_CHARS);
         assert!(idx.contains("- demo: d-demo"), "{idx}");
         assert!(!idx.contains("skill_search"));
+        // The list must tell the model to load a matching skill before acting,
+        // not just how to (it treated "to use one, call skill" as optional).
+        assert!(idx.contains("Antes de agir"), "{idx}");
+        assert!(idx.contains("mesmo em parte"), "{idx}");
     }
 
     #[test]

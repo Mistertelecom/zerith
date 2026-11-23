@@ -2087,6 +2087,8 @@ pub(crate) fn is_orchestrator_root_tool(name: &str) -> bool {
             | "channel_list"
             | "enter_plan_mode"
             | "exit_plan_mode"
+            | "generate_image"
+            | "generate_video"
     )
 }
 
@@ -2213,10 +2215,12 @@ pub(crate) fn should_include_tool_schema(name: &str, context_lower: &str) -> boo
         .iter()
         .any(|kw| context_lower.contains(kw));
     }
-    if matches!(
-        name,
-        "generate_image" | "image_generate" | "tts_speak" | "audio_transcribe"
-    ) {
+    // They exist only when the user picked a model for them (media.rs), and
+    // a keyword list missed "gere a imagem": always offered.
+    if matches!(name, "generate_image" | "generate_video") {
+        return true;
+    }
+    if matches!(name, "image_generate" | "tts_speak" | "audio_transcribe") {
         return [
             "gerar imagem",
             "crie uma imagem",
@@ -2440,13 +2444,7 @@ mod approval_grant_tests {
         // Real tool names: `browser` and `generate_image` used to slip
         // through, and net/terminal schemas rode along on coding turns.
         let code_ctx = "os testes estão falhando, corrija o código em netcalc/";
-        for t in [
-            "net_connect",
-            "net_inventory",
-            "terminal_send",
-            "browser",
-            "generate_image",
-        ] {
+        for t in ["net_connect", "net_inventory", "terminal_send", "browser"] {
             assert!(!should_include_tool_schema(t, code_ctx), "{t}");
         }
         assert!(should_include_tool_schema("read_file", code_ctx));
@@ -2458,10 +2456,17 @@ mod approval_grant_tests {
             "browser",
             "abra o painel do grafana"
         ));
-        assert!(should_include_tool_schema(
-            "generate_image",
-            "crie uma imagem de um gato"
-        ));
+        // Media tools exist only with a model chosen, so they always go:
+        // "gere a imagem" fell through the old keyword list.
+        for p in [
+            "gere a imagem de um gato segurando uma espaço nave",
+            "faça um vídeo curto do pôr do sol",
+            "crie uma imagem de um gato",
+        ] {
+            assert!(should_include_tool_schema("generate_image", p), "{p}");
+            assert!(should_include_tool_schema("generate_video", p), "{p}");
+        }
+        assert!(is_orchestrator_root_tool("generate_image"));
 
         let browser_ctx = "abra o navegador em https://10.0.0.1 e tire um screenshot";
         assert!(should_include_tool_schema("browser_open", browser_ctx));

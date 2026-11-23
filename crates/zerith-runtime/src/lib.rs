@@ -1402,41 +1402,23 @@ pub fn preloaded_skill_names(reminder: &str) -> Vec<String> {
         .collect()
 }
 
-/// Automatically pre-loads up to 2 high-confidence skills into the transient
-/// `<system-reminder>` on tool-enabled turns so the model follows the right
-/// operational procedure immediately on Step 1 without burning a separate
-/// `skill` tool-call round-trip.
+/// Pre-loads, into the transient `<system-reminder>`, up to 2 skills the
+/// prompt names (`use a skill X`, the `/` popup). Like Hermes Agent, nothing
+/// is pre-loaded by keyword guess: the model sees the catalog (or the BM25
+/// shortlist) and loads what fits with `skill`. A guess cost a 22 KB
+/// `security-audit` body on every "fix the failing tests".
 fn auto_inline_skills(
     lib: &zerith_skills::Library,
     catalog: &[(String, String)],
     prompt: &str,
     budget: usize,
 ) -> String {
-    let mut chosen: Vec<String> = catalog
+    let chosen: Vec<String> = catalog
         .iter()
         .filter(|(n, _)| names_skill(prompt, n))
         .map(|(n, _)| n.clone())
         .take(2)
         .collect();
-    if chosen.len() < 2 {
-        for hit in zerith_skills::search::search(lib, prompt, 3) {
-            if chosen.len() >= 2 {
-                break;
-            }
-            // Two distinct words of the request, not one: "testes" alone
-            // matched a 22 KB security-audit skill on every "fix the tests".
-            // A word and its glossary twin ("teste"/"test") count once.
-            let distinct: std::collections::HashSet<String> = hit
-                .matched
-                .iter()
-                .map(|w| w.trim_end_matches('s').chars().take(4).collect())
-                .collect();
-            let strong = hit.score >= 3.5 && distinct.len() >= 2;
-            if strong && !chosen.contains(&hit.name) {
-                chosen.push(hit.name);
-            }
-        }
-    }
     if chosen.is_empty() {
         return String::new();
     }
@@ -1683,7 +1665,7 @@ corpo
     }
 
     #[test]
-    fn high_confidence_skill_is_auto_inlined_in_dynamic_reminder_on_tool_turns() {
+    fn a_relevant_skill_is_shortlisted_not_inlined_until_named() {
         let tmp = tempfile::tempdir_in(scratch()).unwrap();
         let lib = big_library(tmp.path());
         let ctx = TurnContext {
@@ -1700,19 +1682,33 @@ corpo
         );
         let rem = built
             .dynamic_reminder
-            .expect("deve gerar dynamic_reminder com a skill pré-carregada");
+            .expect("a lista curta vai no lembrete");
+        assert!(rem.contains("- mikrotik-routeros-cli:"), "{rem}");
         assert!(
-            rem.contains("CORPO-mikrotik-routeros-cli"),
-            "deve injetar o corpo da skill relevante no reminder sem quebrar o static_system: {rem}"
+            !rem.contains("CORPO-mikrotik-routeros-cli"),
+            "o modelo carrega com `skill`; palavra-chave não injeta o corpo: {rem}"
         );
+        let named = build_prompt_context(
+            "NetOps",
+            TurnContext {
+                skills: Some(&lib),
+                no_project_instructions: true,
+                ..TurnContext::default()
+            },
+            true,
+            "s1",
+            "use a skill mikrotik-routeros-cli para entrar por SSH",
+        );
+        let rem = named.dynamic_reminder.unwrap();
+        assert!(rem.contains("CORPO-mikrotik-routeros-cli"), "{rem}");
         assert!(
-            !built.static_system.contains("CORPO-mikrotik-routeros-cli"),
+            !named.static_system.contains("CORPO-mikrotik-routeros-cli"),
             "o static_system deve permanecer invariável para preservar o prompt cache"
         );
     }
 
     #[test]
-    fn one_shared_word_does_not_preload_a_skill() {
+    fn only_a_named_skill_is_preloaded() {
         let tmp = tempfile::tempdir_in(scratch()).unwrap();
         let src = tmp.path().join("src");
         let lib = zerith_skills::Library::open(tmp.path().join("skills")).unwrap();
@@ -1762,7 +1758,7 @@ CORPO-{name}
             "Como entro numa MikroTik RouterOS por SSH?",
             3600,
         );
-        assert!(ssh.contains("CORPO-mikrotik-routeros-cli"), "{ssh}");
+        assert!(ssh.is_empty(), "só pelo nome: {ssh}");
         let named = auto_inline_skills(
             &lib,
             &catalog,

@@ -1481,13 +1481,25 @@ fn skills(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Erro
             if found.is_empty() {
                 println!("(no skills in {})", paths.skills().display());
             }
+            // What the model sees: enabled user skills and those of enabled plugins.
+            let lib = zerith_skills::Library::open(paths.skills())?
+                .with_plugins(&paths.root().join("plugins"));
+            let on: Vec<_> = lib.enabled().unwrap_or_default();
             for s in found {
+                let state = if on.iter().any(|e| e.name == s.frontmatter.name) {
+                    "ativa"
+                } else {
+                    "desativada"
+                };
                 println!(
-                    "{}  scripts:{}  findings:{}",
+                    "{}  {state}  scripts:{}  findings:{}",
                     s.frontmatter.name,
                     s.scripts.len(),
                     s.findings.len()
                 );
+            }
+            for s in on.iter().filter(|s| s.source.starts_with("plugin:")) {
+                println!("{}  ativa (plugin)", s.name);
             }
         }
         "validate" | "show" => {

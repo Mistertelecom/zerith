@@ -98,6 +98,7 @@ usage:
   zerith -p <prompt> [--output-format text|json|stream-json] [--model M]
         [--session ID | --resume [id|name] | --continue] [--fork]
         [--max-turns N] [--effort <off|low|medium|high|xhigh|max>]
+        [--orchestrator]
         [--max-budget-usd X --price-in P --price-out P]
         [--allowed-tools a,b] [--disallowed-tools a,b] [--permission-mode MODE]
         [--json-schema <json|file>] [--no-tools] [--remote <uri|alias>]

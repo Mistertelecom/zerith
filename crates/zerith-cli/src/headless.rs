@@ -455,6 +455,7 @@ pub fn run(paths: &Paths, args: &[String]) -> Result<(), Boxed> {
         opts.max_steps = n;
     }
     opts.reasoning_effort = h.effort.clone();
+    opts.orchestrator = h.orchestrator;
 
     let format = h.format;
     let spent = Cell::new(0f64);

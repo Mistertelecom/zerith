@@ -221,6 +221,8 @@ pub struct Headless {
     pub remote: Option<String>,
     /// `off`/`low`..`max`, lowered per provider like the window's selector.
     pub effort: Option<String>,
+    /// The window's Orchestrator mode: the main model plans and delegates.
+    pub orchestrator: bool,
 }
 
 pub fn is_headless(args: &[String]) -> bool {
@@ -272,6 +274,7 @@ pub fn parse_headless(args: &[String]) -> Result<Headless, String> {
         no_tools: false,
         remote: None,
         effort: None,
+        orchestrator: false,
     };
     let mut prompt = None;
     let mut i = 0;
@@ -282,6 +285,11 @@ pub fn parse_headless(args: &[String]) -> Result<Headless, String> {
         let a = args[i].as_str();
         if a == "--no-tools" {
             out.no_tools = true;
+            i += 1;
+            continue;
+        }
+        if a == "--orchestrator" {
+            out.orchestrator = true;
             i += 1;
             continue;
         }
@@ -673,6 +681,7 @@ mod tests {
             "--no-tools",
             "--effort",
             "High",
+            "--orchestrator",
         ]);
         assert!(is_headless(&args));
         let h = parse_headless(&args).unwrap();
@@ -691,6 +700,7 @@ mod tests {
         assert_eq!(h.permission_mode, Some(Permission::AcceptEdits));
         assert!(h.json_schema.is_some() && h.no_tools);
         assert_eq!(h.effort.as_deref(), Some("high"));
+        assert!(h.orchestrator);
         assert!(parse_headless(&v(&["-p", "x", "--effort", "turbo"])).is_err());
         assert_eq!(
             parse_headless(&v(&["-p", "x"])).unwrap().format,

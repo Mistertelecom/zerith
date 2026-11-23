@@ -384,12 +384,17 @@ pub struct ChildOutput {
     pub saved: Saved,
 }
 
-/// Token Saver totals of one turn, by source.
+/// Token Saver totals of one turn, by source, plus what it spent: a turn
+/// that delegated must report its children's cost, not only its own.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Saved {
     pub rtk: u64,
     pub ponytail: u64,
     pub caveman: u64,
+    pub prompt: u64,
+    pub completion: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
 }
 
 impl Saved {
@@ -397,6 +402,10 @@ impl Saved {
         self.rtk += o.rtk;
         self.ponytail += o.ponytail;
         self.caveman += o.caveman;
+        self.prompt += o.prompt;
+        self.completion += o.completion;
+        self.cache_read += o.cache_read;
+        self.cache_write += o.cache_write;
     }
 }
 
@@ -698,10 +707,15 @@ pub(crate) fn run_child_with(
             Ok(ChildOutput {
                 text,
                 session_id: session.id,
+                // The child's report already holds its own children.
                 saved: Saved {
                     rtk: report.saved_rtk_tokens,
                     ponytail: report.saved_ponytail_tokens,
                     caveman: report.saved_caveman_tokens,
+                    prompt: report.prompt_tokens,
+                    completion: report.completion_tokens,
+                    cache_read: report.cache_read_tokens,
+                    cache_write: report.cache_write_tokens,
                 },
             })
         }

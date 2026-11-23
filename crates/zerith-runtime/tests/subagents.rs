@@ -1662,4 +1662,21 @@ fn a_delegating_turn_reports_what_its_children_saved() {
         r.saved_tokens,
         r.saved_rtk_tokens + r.saved_ponytail_tokens + r.saved_caveman_tokens
     );
+    // And what the child spent: the report used to show the root's requests
+    // only, so a delegating turn looked cheaper than it was.
+    let (prompt, completion): (i64, i64) = e
+        .store
+        .conn()
+        .query_row(
+            "SELECT SUM(prompt_tokens), SUM(completion_tokens) FROM usage_records",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert!(completion >= 100, "the child's 100 tokens are in the table");
+    assert_eq!(r.prompt_tokens as i64, prompt, "parent + child prompt");
+    assert_eq!(
+        r.completion_tokens as i64, completion,
+        "parent + child output"
+    );
 }

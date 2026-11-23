@@ -1235,12 +1235,17 @@ fn turn_body(
     // last drain is stored (the next turn reads it), never acked and lost.
     steer(store, session_id, agent, &mut hist, log, on_event, true)?;
 
-    // What the subagents saved counts for the turn that delegated; their own
-    // usage rows already hold it, so only the report adds it up.
+    // What the subagents saved and spent counts for the turn that delegated;
+    // their own usage rows already hold it, so only the report adds it up.
+    // `last_prompt_tokens` stays the root's: it measures this window.
     if let Some(k) = kids_saved.and_then(|k| k.lock().ok().map(|k| *k)) {
         total_saved_rtk_tokens += k.rtk;
         total_saved_ponytail_tokens += k.ponytail;
         total_saved_caveman_tokens += k.caveman;
+        prompt_tokens += k.prompt;
+        completion_tokens += k.completion;
+        cache_read_tokens += k.cache_read;
+        cache_write_tokens += k.cache_write;
     }
     on_event(RunEvent::Done {
         stored: Some(last.0),

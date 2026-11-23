@@ -776,7 +776,7 @@ impl Policy {
                 } else {
                     let mut all_ok = true;
                     for (raw, inner) in a.raw.iter().zip(&a.inner) {
-                        if allows(raw) || allows(inner) {
+                        if allows(raw) || allows(inner) || self.cd_inside(inner) {
                             continue;
                         }
                         if !shellparse::has_env_mutation(raw) && shellparse::is_read_only(inner) {
@@ -935,6 +935,23 @@ impl Policy {
                 }
                 _ => return (clean, true),
             }
+        }
+    }
+
+    /// `cd <dir>` that stays inside the workspace runs nothing and moves only
+    /// within what the agent may already touch, so it does not stop an allow
+    /// rule from matching `cd sub && python -m pytest`. A `cd` out of the
+    /// workspace, to `~`, `-` or a `$VAR` is not covered: the next piece
+    /// would run somewhere the rule was not written for.
+    fn cd_inside(&self, part: &str) -> bool {
+        let t: Vec<&str> = part.split_whitespace().collect();
+        match t.as_slice() {
+            ["cd" | "pushd", dir] => {
+                let d = dir.trim_matches(['"', '\'']);
+                !d.starts_with(['~', '-', '$', '%'])
+                    && self.inside_workspace(&self.workspace.join(d))
+            }
+            _ => false,
         }
     }
 
@@ -1384,6 +1401,34 @@ mod tests {
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-scratch");
         std::fs::create_dir_all(&scratch).unwrap();
         tempfile::Builder::new().tempdir_in(scratch).unwrap()
+    }
+
+    /// `shell(python *)` allowed, and the model wrote `cd . && python -m
+    /// unittest`: refused, a wasted step. A `cd` inside the workspace is now
+    /// transparent to the allow rule; a `cd` out of it still is not.
+    #[test]
+    fn a_cd_inside_the_workspace_does_not_block_an_allow_rule() {
+        let dir = scratch_dir();
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+        let mut p = Policy::new(
+            preset("workspace-write").unwrap(),
+            Mode::AcceptEdits,
+            dir.path(),
+        );
+        p.rules = vec![Rule::parse(RuleKind::Allow, "shell(python *)").unwrap()];
+        let sh = |c: &str| p.check_tool("shell", &Action::Shell(c.into()));
+        assert_eq!(sh("python -m unittest"), Verdict::Allow);
+        assert_eq!(sh("cd . && python -m unittest"), Verdict::Allow);
+        assert_eq!(sh("cd sub && python x.py"), Verdict::Allow);
+        let out = outside("x").parent().unwrap().display().to_string();
+        assert_ne!(sh(&format!("cd {out} && python x.py")), Verdict::Allow);
+        assert_ne!(sh("cd ~ && python x.py"), Verdict::Allow);
+        assert_ne!(sh("cd .. && python x.py"), Verdict::Allow);
+        assert_ne!(
+            sh("cd . && rm -rf x"),
+            Verdict::Allow,
+            "the rest still needs the rule"
+        );
     }
 
     #[test]

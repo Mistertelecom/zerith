@@ -30,6 +30,8 @@ const STEM: usize = 5;
 const STEM_WEIGHT: f64 = 0.5;
 /// The metadata field against the body.
 const META_WEIGHT: f64 = 2.0;
+/// A query word found in the body but not in the name or description.
+const BODY_ONLY_WEIGHT: f64 = 0.15;
 
 /// One ranked skill.
 #[derive(Debug, Clone, PartialEq)]
@@ -227,8 +229,15 @@ impl Index {
                 let best = alts
                     .iter()
                     .map(|(w, st)| {
-                        let s = META_WEIGHT * field(&d.meta, self.avg_meta, w, st)
-                            + field(&d.body, self.avg_body, w, st);
+                        let meta = field(&d.meta, self.avg_meta, w, st);
+                        // A word only in the body (a step, an example) says
+                        // little about what the skill is for: a fraction.
+                        let body = field(&d.body, self.avg_body, w, st);
+                        let s = if meta > 0.0 {
+                            META_WEIGHT * meta + body
+                        } else {
+                            BODY_ONLY_WEIGHT * body
+                        };
                         (s, w)
                     })
                     .max_by(|a, b| a.0.total_cmp(&b.0));
@@ -320,13 +329,204 @@ fn stem_term(t: &str) -> String {
 
 /// Words that say nothing about which skill fits (English and Portuguese).
 const STOP: &[&str] = &[
-    "an", "and", "are", "as", "at", "be", "by", "for", "from", "how", "in", "into", "is", "it",
-    "of", "on", "or", "the", "this", "to", "use", "used", "using", "when", "with", "you", "your",
-    "skill", "skills", "want", "wants", "user", "do", "da", "de", "das", "dos", "em", "no", "na",
-    "nos", "nas", "ao", "aos", "um", "uma", "para", "pra", "por", "com", "sem", "que", "como",
-    "se", "eu", "me", "meu", "minha", "voce", "numa", "num", "isso", "este", "esta", "essa",
-    "esse", "usar", "faca", "preciso", "quero", "certa", "certo", "qual", "oi", "ola", "ok", "so",
-    "sim", "nao", "responda", "resposta", "obrigado", "hi", "hello", "thanks", "please", "yes",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "for",
+    "from",
+    "how",
+    "in",
+    "into",
+    "is",
+    "it",
+    "of",
+    "on",
+    "or",
+    "the",
+    "this",
+    "to",
+    "use",
+    "used",
+    "using",
+    "when",
+    "with",
+    "you",
+    "your",
+    "skill",
+    "skills",
+    "want",
+    "wants",
+    "user",
+    "do",
+    "da",
+    "de",
+    "das",
+    "dos",
+    "em",
+    "no",
+    "na",
+    "nos",
+    "nas",
+    "ao",
+    "aos",
+    "um",
+    "uma",
+    "para",
+    "pra",
+    "por",
+    "com",
+    "sem",
+    "que",
+    "como",
+    "se",
+    "eu",
+    "me",
+    "meu",
+    "minha",
+    "voce",
+    "numa",
+    "num",
+    "isso",
+    "este",
+    "esta",
+    "essa",
+    "esse",
+    "usar",
+    "faca",
+    "preciso",
+    "quero",
+    "certa",
+    "certo",
+    "qual",
+    "oi",
+    "ola",
+    "ok",
+    "so",
+    "sim",
+    "nao",
+    "responda",
+    "resposta",
+    "obrigado",
+    "hi",
+    "hello",
+    "thanks",
+    "please",
+    "yes",
+    // articles and connectives
+    "a",
+    "o",
+    "e",
+    "os",
+    "as",
+    "ou",
+    "mas",
+    "nem",
+    "ate",
+    "apos",
+    "sobre",
+    "entre",
+    "pelo",
+    "pela",
+    "pelos",
+    "pelas",
+    "cada",
+    "todo",
+    "toda",
+    "todos",
+    "tudo",
+    "outro",
+    "outros",
+    "mais",
+    "menos",
+    "muito",
+    "pouco",
+    "tambem",
+    "ja",
+    "ainda",
+    "aqui",
+    "ali",
+    "onde",
+    "quando",
+    "depois",
+    "antes",
+    "sempre",
+    "nunca",
+    "final",
+    "seu",
+    "sua",
+    "seus",
+    "suas",
+    "isto",
+    "aquilo",
+    "ele",
+    "ela",
+    "eles",
+    "elas",
+    "vai",
+    "vou",
+    "tem",
+    "ter",
+    "ser",
+    "estar",
+    "estao",
+    "esta",
+    "foi",
+    "sao",
+    "pode",
+    "podem",
+    "deve",
+    "devem",
+    "existir",
+    "tipo",
+    "linhas",
+    "linha",
+    "pocas",
+    "poucas",
+    "parecido",
+    "qualquer",
+    "nada",
+    "algo",
+    "coisa",
+    "coisas",
+    // how a request is phrased, not what it is about
+    "leia",
+    "ler",
+    "rode",
+    "rodar",
+    "execute",
+    "corrija",
+    "corrigir",
+    "altere",
+    "alterar",
+    "mude",
+    "mudar",
+    "entregue",
+    "entregar",
+    "diga",
+    "liste",
+    "listar",
+    "resuma",
+    "resumo",
+    "explique",
+    "mostre",
+    "veja",
+    "ver",
+    "faz",
+    "fazer",
+    "crie",
+    "criar",
+    "procure",
+    "encontre",
+    "passar",
+    "passe",
+    "funcionar",
+    "precisa",
+    "favor",
+    "obrigada",
 ];
 
 /// A tiny Portuguese ↔ English glossary, applied to the query both ways, so a
@@ -522,6 +722,37 @@ mod tests {
         let both = &search(&lib, "roteador router", 1)[0];
         assert_eq!(both.matched.len(), 1, "{both:?}");
         assert_eq!(search(&lib, "ssh", 2).len(), 2);
+    }
+
+    /// A long request is mostly phrasing ("leia", "corrija", "até passar"):
+    /// those words used to pile up on a skill whose body shares them, and a
+    /// CI skill outranked the security one on a security review.
+    #[test]
+    fn phrasing_words_do_not_outrank_what_the_request_is_about() {
+        let tmp = tempfile::tempdir_in(scratch()).unwrap();
+        let lib = Library::open(tmp.path().join("skills")).unwrap();
+        add(
+            &lib,
+            tmp.path(),
+            "ci-no-loop",
+            "Use quando o CI falhar ou os checks do PR ficarem vermelhos.",
+            "# CI\nLeia o log, corrija o código, rode os testes até passar e diga o que mudou.",
+        );
+        add(
+            &lib,
+            tmp.path(),
+            "security-audit",
+            "Security review of codebases and APIs: injection, path traversal, secrets.",
+            "# Security audit\nReview the service before production.",
+        );
+        let q = "Leia o código, corrija até os testes passarem e revise a segurança contra \
+                 injection e path traversal antes de ir para produção. Diga o que mudou.";
+        assert_eq!(
+            names(&lib, q)[0],
+            "security-audit",
+            "{:?}",
+            search(&lib, q, 3)
+        );
     }
 
     #[test]

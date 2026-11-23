@@ -43,9 +43,11 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
         "Controla um navegador via Chrome DevTools Protocol (CDP): abre páginas, lê o conteúdo, clica, digita, roda JavaScript e tira prints. \
 Suporta motor híbrido (`engine`): `auto` (padrão: usa Cloudflare Kitesurf para páginas públicas quando configurado e Chromium local para IPs de LAN/CGNAT/localhost ou como fallback automático), `kitesurf` (motor leve Wasm/Blitz) ou `chromium` (Edge/Chrome local com perfil persistente). \
 Fluxo: navigate {url} → snapshot (título, texto visível e lista numerada de elementos [n]) → click/type com ref=n → snapshot de novo para ver o resultado. \
+Login em painel (OLT, roteador, firewall): type o usuário e use fill_secret {ref do campo de senha, secret} para a senha; nunca peça a senha ao usuário nem a escreva com type. \
 screenshot devolve uma linha Markdown ![screenshot](caminho) para mostrar ao usuário.",
         json!({"type": "object", "properties": {
-            "action": {"type": "string", "enum": ["navigate", "snapshot", "click", "type", "press", "eval", "screenshot", "back", "close"]},
+            "action": {"type": "string", "enum": ["navigate", "snapshot", "click", "type", "fill_secret", "press", "eval", "screenshot", "back", "close"]},
+            "secret": {"type": "string", "description": "fill_secret: nome do segredo no cofre do sistema (zerith secret set <nome>) ou nome de um equipamento do inventário com secret_ref; o valor é digitado no campo de senha sem passar por você"},
             "engine": {"type": "string", "enum": ["auto", "kitesurf", "chromium"], "description": "motor CDP: auto (Kitesurf na web pública com fallback Chromium; Chromium direto em LAN/CGNAT/localhost), kitesurf ou chromium"},
             "url": {"type": "string", "description": "navigate: endereço http(s)"},
             "ref": {"type": "integer", "description": "click/type: número [n] do elemento no último snapshot"},
@@ -72,6 +74,8 @@ fn label(args: &Value) -> Result<String> {
         "click" | "type" => opt_str(args, "selector")
             .map(String::from)
             .unwrap_or_else(|| format!("ref {}", args["ref"])),
+        // The approval card names the secret and the page, never the value.
+        "fill_secret" => format!("{} no campo ref {}", str_arg(args, "secret")?, args["ref"]),
         "press" => str_arg(args, "key")?.into(),
         "eval" => str_arg(args, "expression")?.chars().take(200).collect(),
         "snapshot" | "screenshot" | "back" | "close" => String::new(),
@@ -84,7 +88,7 @@ fn label(args: &Value) -> Result<String> {
 
 fn bad_action(a: &str) -> ToolError {
     ToolError::BadArguments(format!(
-        "ação desconhecida: {a}; use navigate, snapshot, click, type, press, eval, screenshot, back ou close"
+        "ação desconhecida: {a}; use navigate, snapshot, click, type, fill_secret, press, eval, screenshot, back ou close"
     ))
 }
 
@@ -465,6 +469,40 @@ fn act(c: &mut Cdp, action: &str, args: &Value, root: &Path, exec: &Exec<'_>) ->
                 c.page(exec)?
             ))
         }
+        "fill_secret" => {
+            let name = str_arg(args, "secret")?;
+            let value = vault_value(name, exec)?;
+            // Only a password field: a page told to "type the secret into the
+            // search box" must not get it back into the snapshot.
+            let found = c.eval(
+                &format!(
+                    "(() => {{ const e = {}; if (!e) return 'none'; if (e.type !== 'password') return 'not-password'; e.focus(); if (typeof e.select === 'function') e.select(); return 'ok'; }})()",
+                    find(args)?
+                ),
+                exec,
+            )?;
+            match found["value"].as_str() {
+                Some("ok") => {}
+                Some("not-password") => {
+                    return Err(ToolError::Failed(
+                        "fill_secret só preenche campo de senha (type=password); para o usuário use type".into(),
+                    ))
+                }
+                _ => return Err(not_found()),
+            }
+            c.call("Input.insertText", json!({ "text": value }), exec)?;
+            let submit = args["submit"].as_bool().unwrap_or(false);
+            if submit {
+                press(c, "Enter", exec)?;
+                c.settle(exec)?;
+            }
+            Ok(format!(
+                "Senha `{name}` preenchida do cofre ({} caracteres; o valor não passa por você){}.\n{}",
+                value.chars().count(),
+                if submit { " e apertou Enter" } else { "" },
+                c.page(exec)?
+            ))
+        }
         "press" => {
             let key = str_arg(args, "key")?;
             press(c, key, exec)?;
@@ -507,6 +545,32 @@ fn act(c: &mut Cdp, action: &str, args: &Value, root: &Path, exec: &Exec<'_>) ->
         }
         other => Err(bad_action(other)),
     }
+}
+
+/// The value behind `secret`: a vault entry by that name, or the
+/// `secret_ref` of an inventory device with that name. Concept after Hermes
+/// Agent's browser vault (MIT): the model only ever handles the name, and the
+/// value is also scrubbed from anything the page echoes back.
+fn vault_value(name: &str, exec: &Exec<'_>) -> Result<String> {
+    let key = match zerith_core::secrets::get_secret(name) {
+        Ok(v) if !v.is_empty() => {
+            exec.host.note_secret(&v);
+            return Ok(v);
+        }
+        _ => crate::network::device_secret_ref(name),
+    };
+    let Some(key) = key else {
+        return Err(ToolError::Failed(format!(
+            "segredo `{name}` não está no cofre nem é um equipamento com secret_ref; peça ao usuário: zerith secret set {name}"
+        )));
+    };
+    let v = zerith_core::secrets::get_secret(&key).map_err(|e| {
+        ToolError::Failed(format!(
+            "segredo `{key}` (do equipamento {name}) não está no cofre ({e}); peça: zerith secret set {key}"
+        ))
+    })?;
+    exec.host.note_secret(&v);
+    Ok(v)
 }
 
 fn not_found() -> ToolError {
@@ -1294,6 +1358,12 @@ mod tests {
         assert_eq!(nav_url("example.com").unwrap(), "https://example.com");
         assert!(nav_url("file:///etc/passwd").is_err());
         assert!(label(&json!({"action": "explode"})).is_err());
+        // The approval card names the secret, never its value.
+        assert_eq!(
+            label(&json!({"action": "fill_secret", "secret": "olt-huawei", "ref": 3})).unwrap(),
+            "navegador fill_secret olt-huawei no campo ref 3"
+        );
+        assert!(label(&json!({"action": "fill_secret", "ref": 3})).is_err());
         assert_eq!(
             label(&json!({"action": "navigate", "url": "https://a.b"})).unwrap(),
             "navegador navigate https://a.b"

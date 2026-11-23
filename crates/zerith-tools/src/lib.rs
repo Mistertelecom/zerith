@@ -370,7 +370,10 @@ impl Registry {
             host: &self.host,
         };
         exec.check()?;
+        // A vault value a tool typed (browser `fill_secret`) never comes back
+        // in any output, whatever the page or the command echoes.
         tool.run(args, ctx, &exec)
+            .map(|out| self.host.scrub_secrets(&out))
     }
 
     /// Whether this exact call may run beside other safe calls. Unknown tool: no.

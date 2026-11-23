@@ -164,6 +164,10 @@ pub struct Host {
     bound: Mutex<Option<Bound>>,
     events: EventSink,
     skills: Mutex<HashMap<String, Option<Vec<String>>>>,
+    /// Vault values a tool typed somewhere (browser `fill_secret`): scrubbed
+    /// from every later output of this host, so a page that echoes the
+    /// password back never hands it to the model.
+    secrets: Mutex<Vec<String>>,
     jobs: crate::jobs::Jobs,
 }
 
@@ -233,6 +237,27 @@ impl Host {
     /// narrow the tool set with it.
     pub fn skill_allowed_tools(&self, name: &str) -> Option<Vec<String>> {
         self.skills.lock().ok()?.get(name)?.clone()
+    }
+
+    /// Remembers a vault value this host used, to scrub it from outputs.
+    pub fn note_secret(&self, value: &str) {
+        if value.chars().count() < 4 {
+            return;
+        }
+        if let Ok(mut s) = self.secrets.lock() {
+            if !s.iter().any(|v| v == value) {
+                s.push(value.to_string());
+            }
+        }
+    }
+
+    /// `text` with every vault value this host used replaced.
+    pub fn scrub_secrets(&self, text: &str) -> String {
+        let Ok(s) = self.secrets.lock() else {
+            return text.to_string();
+        };
+        s.iter()
+            .fold(text.to_string(), |t, v| t.replace(v.as_str(), "[redacted]"))
     }
 
     pub(crate) fn jobs(&self) -> &crate::jobs::Jobs {

@@ -566,3 +566,40 @@ fn array_arguments_sent_as_json_text_are_decoded() {
     r.coerce_args("multi_edit", &mut bad);
     assert_eq!(bad["edits"], "[{nope");
 }
+
+/// A vault value a tool used (browser `fill_secret`) is scrubbed from every
+/// later output of the same host: a page echoing the password back, a `shell`
+/// that prints it. Short values are not tracked (too many false hits).
+#[test]
+fn a_used_vault_value_never_comes_back_in_any_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = Registry::new();
+    reg.host().note_secret("S3nh@Olt!");
+    reg.host().note_secret("abc");
+    let policy = Policy::new(
+        zerith_security::preset("workspace-write").unwrap(),
+        zerith_security::Mode::Bypass,
+        dir.path(),
+    );
+    std::fs::write(
+        dir.path().join("eco.txt"),
+        "login ok, senha S3nh@Olt! aceita; abc",
+    )
+    .unwrap();
+    let ctx = CallCtx {
+        workspace: dir.path(),
+        policy: &policy,
+        memory: None,
+        scope: None,
+    };
+    let out = reg
+        .run_raw(
+            "read_file",
+            &serde_json::json!({"path": "eco.txt"}),
+            &ctx,
+            &Cancel::default(),
+        )
+        .unwrap();
+    assert!(!out.contains("S3nh@Olt!"), "{out}");
+    assert!(out.contains("[redacted]") && out.contains("abc"), "{out}");
+}

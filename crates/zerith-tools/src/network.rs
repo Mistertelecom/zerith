@@ -285,6 +285,18 @@ pub fn load_inventory(
         .collect())
 }
 
+/// The `secret_ref` of the inventory device called `name` (global inventory
+/// and the current folder's), for a login that must not show the password.
+pub fn device_secret_ref(name: &str) -> Option<String> {
+    let root = zerith_core::Paths::resolve().root().to_path_buf();
+    let cwd = std::env::current_dir().ok()?;
+    load_inventory(&cwd, Some(&root))
+        .ok()?
+        .into_iter()
+        .find(|d| d.name.eq_ignore_ascii_case(name))
+        .and_then(|d| d.secret_ref)
+}
+
 pub fn derive_secret_ref_name(client: Option<&str>, name: &str) -> String {
     let sanitize = |s: &str| -> String {
         s.trim()

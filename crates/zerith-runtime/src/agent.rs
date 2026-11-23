@@ -592,17 +592,7 @@ fn turn_body(
                 .filter(|s| !s.is_empty())
         })
         .unwrap_or(model);
-    let orch_block = is_root_orchestrator.then(|| {
-        format!(
-            "# Modo Orquestrador Ativo (Pensamento: `{model}` → Execução: `{exec_label}`)\n\
-             Você é o **Modelo de Pensamento (Arquiteto/Orquestrador)**. Você tem acesso direto somente-leitura (`list_dir`, `read_file`, `grep`, `glob`, `skill`, `net_inventory`) para inspecionar o projeto antes de agir; as ferramentas de mutação e execução (`shell`, `edit_file`, `write_file`, `multi_edit`, `net_connect`, `terminal_batch`) rodam nos subagentes executores (**`{exec_label}`**).\n\
-             Regras obrigatórias de segurança e fluxo:\n\
-             1. **Inspecione antes de delegar:** Use `list_dir`/`read_file` para verificar se já existem arquivos do usuário no destino. NUNCA mande sobrescrever um arquivo existente sem antes ler o atual e pedir ao Executor para preservá-lo/fazer backup ou editar incrementalmente.\n\
-             2. **Delegue com contexto exato:** Chame `agent` (`\"executor\"`, `\"explore\"`, etc.) com um `prompt` claro e autossuficiente. Para tarefas independentes, dispare em paralelo.\n\
-             3. **Abrir apps GUI ou servidores contínuos:** Instrua explicitamente o Executor a chamar `shell` com `run_in_background: true` **uma única vez** e encerrar sem esperar nem repetir.\n\
-             4. **Audite e Conclua:** Revise o resultado do subagente, atualize `task_update` e entregue uma resposta clara ao usuário."
-        )
-    });
+    let orch_block = is_root_orchestrator.then(|| orchestrator_block(model, exec_label));
     let merged_dyn = match (
         agent
             .dynamic_context
@@ -1939,6 +1929,20 @@ fn request(
     ))
 }
 
+/// The rules the orchestrator root reads each turn: what it may touch and
+/// how to hand work to its executors.
+fn orchestrator_block(model: &str, exec_label: &str) -> String {
+    format!(
+    "# Modo Orquestrador Ativo (Pensamento: `{model}` → Execução: `{exec_label}`)\n\
+     Você é o **Modelo de Pensamento (Arquiteto/Orquestrador)**. Você tem acesso direto somente-leitura (`list_dir`, `read_file`, `grep`, `glob`, `skill`, `net_inventory`) para inspecionar o projeto antes de agir; as ferramentas de mutação e execução (`shell`, `edit_file`, `write_file`, `multi_edit`, `net_connect`, `terminal_batch`) rodam nos subagentes executores (**`{exec_label}`**).\n\
+     Regras obrigatórias de segurança e fluxo:\n\
+     1. **Inspecione antes de delegar:** Use `list_dir`/`read_file` para verificar se já existem arquivos do usuário no destino. NUNCA mande sobrescrever um arquivo existente sem antes ler o atual e pedir ao Executor para preservá-lo/fazer backup ou editar incrementalmente.\n\
+     2. **Delegue o objetivo, não o conteúdo:** Chame `agent` (`\"executor\"`, `\"explore\"`, etc.) com um `prompt` autossuficiente que diga o que fazer, quais arquivos ler, as regras e como saber que terminou (ex.: o comando de teste que deve passar). NÃO escreva no prompt o código, o documento ou o diagnóstico prontos: o executor lê os arquivos e escreve. Pensar tudo aqui e ditar gasta sua saída inteira e o executor só copia. Para tarefas independentes, dispare em paralelo.\n\
+     3. **Abrir apps GUI ou servidores contínuos:** Instrua explicitamente o Executor a chamar `shell` com `run_in_background: true` **uma única vez** e encerrar sem esperar nem repetir.\n\
+     4. **Audite e Conclua:** Revise o resultado do subagente, atualize `task_update` e entregue uma resposta clara ao usuário."
+    )
+}
+
 /// Tools the root Thinking/Brain model retains in Strict Orchestrator Mode.
 /// All operational execution tools (`shell`, `edit_file`, `write_file`,
 /// `net_connect`, `terminal_batch`, `net_broadcast`, `read_file`, `grep`, etc.)
@@ -2251,6 +2255,17 @@ mod approval_grant_tests {
         let (_tx2, gate2) = approval_channel_with_grants(shared);
         assert!(gate2.granted("shell:prefix:git commit *"));
         assert!(!gate2.granted("shell:exact:git commit -m x && rm -rf ."));
+    }
+
+    /// In the network benchmark the orchestrator spent ~30k output tokens
+    /// writing the diagnosis and the plan into its `agent` prompts (12k chars)
+    /// and the executor only copied them. It must hand over the goal.
+    #[test]
+    fn the_orchestrator_hands_over_the_goal_not_the_finished_content() {
+        let b = orchestrator_block("claude-sonnet-5-5", "claude-sonnet-5-5");
+        assert!(b.contains("Delegue o objetivo, não o conteúdo"), "{b}");
+        assert!(b.contains("NÃO escreva no prompt o código"), "{b}");
+        assert!(b.contains("como saber que terminou"), "{b}");
     }
 
     #[test]

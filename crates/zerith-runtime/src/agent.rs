@@ -986,10 +986,15 @@ fn turn_body(
                     continue;
                 }
                 // A monitor still running: the turn does not end with it
-                // unseen. It waits for the next lines and hands them over.
-                if let Some(text) = agent.tools.and_then(|r| wait_monitor(r, cancel)) {
+                // unseen. It waits for the next lines and hands them over;
+                // a message from the person ends the wait too (the next step
+                // reads it), so the chat is never stuck behind a monitor.
+                if let Some(text) = agent.tools.and_then(|r| wait_monitor(r, agent, cancel)) {
                     if cancel.is_cancelled() {
                         return Err(ProviderError::Cancelled.into());
+                    }
+                    if text.is_empty() {
+                        continue;
                     }
                     let id = store.append(
                         session_id,
@@ -1737,12 +1742,20 @@ fn monitor_report(notices: Vec<String>) -> Option<String> {
 }
 
 /// Waits (up to the monitors' own deadlines) until a monitor of `tools` has
-/// something new, showing nothing meanwhile. `None` once no monitor is left
-/// or the turn was stopped.
-fn wait_monitor(tools: &zerith_tools::Registry, cancel: &Cancel) -> Option<String> {
+/// something new or the person writes. `Some("")` for a message (the next
+/// step drains it), `None` once no monitor is left or the turn was stopped.
+fn wait_monitor(
+    tools: &zerith_tools::Registry,
+    agent: &AgentOptions<'_>,
+    cancel: &Cancel,
+) -> Option<String> {
     while tools.host().monitors_pending() {
         if cancel.is_cancelled() {
             return None;
+        }
+        // The person wrote: stop waiting; empty means "read the inbox".
+        if agent.inbox.is_some_and(|i| i.has_pending()) {
+            return Some(String::new());
         }
         if let Some(r) = monitor_report(tools.host().monitor_notices()) {
             return Some(r);

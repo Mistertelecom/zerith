@@ -2202,3 +2202,55 @@ fn a_child_stopped_at_its_step_limit_still_counts_in_the_total() {
         r.completion_tokens
     );
 }
+
+/// A long monitor keeps the turn open, but a message from the person ends
+/// the wait at once: the chat is never stuck behind a monitor.
+#[test]
+fn a_message_ends_the_wait_on_a_quiet_monitor() {
+    let seen: Arc<Mutex<Vec<String>>> = Default::default();
+    let s2 = seen.clone();
+    let url = serve(move |b| {
+        let all = serde_json::to_string(&messages(b)).unwrap();
+        s2.lock().unwrap().push(all.clone());
+        if tool_msgs(b).is_empty() {
+            calls(&[(
+                "m1",
+                "monitor",
+                json!({"command": "sleep 120", "description": "silencio", "timeout_secs": 120}),
+            )])
+        } else if all.contains("pare de esperar") {
+            calls(&[("k1", "shell_kill", json!({"id": "job-1"}))])
+        } else {
+            text("esperando")
+        }
+    });
+    let e = env(Mode::Bypass);
+    let reg = Registry::new();
+    let (tx, rx) = zerith_runtime::inbox_channel();
+    let sender = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        tx.send("pare de esperar");
+        tx
+    });
+    let started = std::time::Instant::now();
+    let _ = turn(
+        &e,
+        &url,
+        &reg,
+        AgentOptions {
+            inbox: Some(&rx),
+            ..AgentOptions::default()
+        },
+        TurnContext::default(),
+        "acompanhe",
+        &Cancel::default(),
+        |_| {},
+    );
+    let _tx = sender.join().unwrap();
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(60),
+        "did not wait the monitor out"
+    );
+    let joined = seen.lock().unwrap().join("\n");
+    assert!(joined.contains("pare de esperar"), "{joined}");
+}

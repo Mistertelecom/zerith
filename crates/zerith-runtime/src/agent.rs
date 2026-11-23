@@ -750,6 +750,9 @@ fn turn_body(
     let mut reason = "done";
     let mut fail_counts: std::collections::HashMap<(String, String), u8> =
         std::collections::HashMap::new();
+    // Text answers the output cap cut that the turn resumed: a long plan or
+    // file pasted as text would otherwise end the task mid-sentence.
+    let mut cut_resumes = 0u8;
     let mut exec_counts: std::collections::HashMap<(String, String), u8> =
         std::collections::HashMap::new();
 
@@ -887,6 +890,20 @@ fn turn_body(
                 .with_thinking_blocks(out.thinking_blocks),
             id,
         );
+        if out.calls.is_empty() && cut && !cut_calls && step < max_steps && cut_resumes < 2 {
+            cut_resumes += 1;
+            let note = "[Limite de saída] Sua última resposta foi cortada no limite de tokens e o                         trabalho não terminou. Não repita o que já escreveu: continue de onde parou.                         Para arquivos grandes, crie com write_file em partes (um arquivo curto e                         depois edit_file) em vez de colar tudo no texto."
+                .to_string();
+            let id = store.append(
+                session_id,
+                &NewMessage {
+                    raw: Some(json!({"cut_resume": true})),
+                    ..NewMessage::new(Role::User, note.clone())
+                },
+            )?;
+            hist.push(ChatMessage::synthetic_user(note), id);
+            continue;
+        }
         if out.calls.is_empty() {
             // Told something while the answer streamed: the turn is not over.
             if step < max_steps

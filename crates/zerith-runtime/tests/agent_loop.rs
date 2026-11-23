@@ -525,6 +525,51 @@ fn a_tool_call_cut_by_the_output_cap_is_not_run() {
         .contains("escreva o arquivo em partes"));
 }
 
+/// A text answer cut by the output cap used to end the turn with the work
+/// half done (a 32k-token plan in one step). The turn now asks the model to
+/// continue in parts, and the final answer is the continuation.
+#[test]
+fn a_text_answer_cut_by_the_output_cap_resumes_instead_of_ending() {
+    let dir = workspace();
+    let fake = serve(vec![
+        anthropic_sse(&[
+            json!({"type":"message_start","message":{"usage":{"input_tokens":7}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"plano muito long"}}),
+            json!({"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":32000}}),
+            json!({"type":"message_stop"}),
+        ]),
+        anthropic_sse(&[
+            json!({"type":"message_start","message":{"usage":{"input_tokens":20}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"terminei em partes"}}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}),
+            json!({"type":"message_stop"}),
+        ]),
+    ]);
+    let store = Store::open_in_memory().unwrap();
+    let sid = session(&store);
+    let policy = Policy::new(
+        preset("workspace-write").unwrap(),
+        Mode::Default,
+        dir.path(),
+    );
+    let report = turn(
+        &store,
+        &client(&fake.url, Protocol::Anthropic),
+        &policy,
+        &sid,
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(report.text, "terminei em partes");
+    let seen = fake.seen.lock().unwrap();
+    assert_eq!(seen.len(), 2, "the cut answer must be resumed");
+    let msgs = seen[1].1["messages"].as_array().unwrap();
+    let last = msgs.last().unwrap().to_string();
+    assert!(last.contains("continue de onde parou"), "{last}");
+}
+
 #[test]
 fn a_429_is_retried_before_anything_streams() {
     let fake = serve(vec![

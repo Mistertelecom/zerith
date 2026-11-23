@@ -551,7 +551,7 @@ pub fn run(paths: &Paths, args: &[String]) -> Result<(), Boxed> {
             );
         }
 
-        let stopped_at_limit = report.text.starts_with("[parado: limite de");
+        let stopped_at_limit = report.stop_reason == "max_steps";
         let structured = schema
             .as_ref()
             .map(|s| match schema::extract_json(&report.text) {

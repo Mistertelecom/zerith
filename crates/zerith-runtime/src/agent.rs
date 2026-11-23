@@ -895,6 +895,11 @@ fn turn_body(
             continue;
         }
         if out.calls.is_empty() {
+            // The answer to the wrap-up asked one step ago: the step limit cut
+            // the task, however finished the summary reads.
+            if step == max_steps && max_steps > 1 {
+                reason = "max_steps";
+            }
             // Told something while the answer streamed: the turn is not over.
             if step < max_steps
                 && steer(store, session_id, agent, &mut hist, log, on_event, false)? > 0
@@ -1260,6 +1265,7 @@ fn turn_body(
             saved_tokens: total_saved_tokens,
             account_id: last_account_id,
             model_used: last_model_used,
+            stop_reason: reason,
         },
         reason,
     ))

@@ -747,6 +747,64 @@ fn the_step_limit_stops_a_model_that_never_stops_calling_tools() {
         "{}",
         report.text
     );
+    assert_eq!(report.stop_reason, "max_steps");
+}
+
+/// On the next-to-last step the turn asks for a wrap-up; a model that obeys
+/// answers with a tidy summary and no tool call. The task was still cut, and
+/// the report must say so even though the text reads like a finished answer.
+#[test]
+fn a_wrap_up_on_the_last_step_still_reports_the_step_limit() {
+    let dir = workspace();
+    std::fs::write(dir.path().join("a.txt"), "A").unwrap();
+    let c = || calls(&[("c", "read_file", json!({"path": "a.txt"}))]);
+    let fake = serve(vec![c(), text("Fiz metade. Para continuar: …")]);
+    let store = Store::open_in_memory().unwrap();
+    let sid = session(&store);
+    let policy = Policy::new(
+        preset("workspace-write").unwrap(),
+        Mode::Default,
+        dir.path(),
+    );
+    let reg = Registry::new();
+    let report = run_agent_turn(
+        &store,
+        &client(&fake.url, Protocol::OpenAi),
+        TurnContext::default(),
+        AgentOptions {
+            tools: Some(&reg),
+            policy: Some(&policy),
+            max_steps: 2,
+            ..Default::default()
+        },
+        &sid,
+        "m",
+        "tarefa longa",
+        &Cancel::default(),
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(report.stop_reason, "max_steps", "{}", report.text);
+}
+
+#[test]
+fn a_turn_that_ends_by_itself_reports_done() {
+    let fake = serve(vec![text("olá")]);
+    let store = Store::open_in_memory().unwrap();
+    let sid = session(&store);
+    let report = run_agent_turn(
+        &store,
+        &client(&fake.url, Protocol::OpenAi),
+        TurnContext::default(),
+        AgentOptions::default(),
+        &sid,
+        "m",
+        "oi",
+        &Cancel::default(),
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(report.stop_reason, "done");
 }
 
 fn anthropic_sse(events: &[Value]) -> String {

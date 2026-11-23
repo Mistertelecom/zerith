@@ -241,6 +241,10 @@ pub struct TurnReport {
     pub saved_tokens: u64,
     pub account_id: Option<String>,
     pub model_used: Option<String>,
+    /// Why the loop ended: `done`, or `max_steps` when the step limit cut the
+    /// task. The text alone cannot tell: on the last step the model is asked
+    /// for a wrap-up, so a cut turn ends with a tidy summary.
+    pub stop_reason: &'static str,
 }
 
 /// Runs one turn and appends the answer.

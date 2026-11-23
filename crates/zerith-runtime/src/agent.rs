@@ -409,10 +409,12 @@ impl Default for AgentOptions<'_> {
 }
 
 impl AgentOptions<'_> {
-    /// No tools, with the history window of an execution profile.
+    /// No tools, with the history window and step limit of an execution profile.
     pub fn for_profile(p: zerith_core::settings::Profile) -> Self {
+        let l = p.limits();
         Self {
-            history: p.limits().history_window,
+            history: l.history_window,
+            max_steps: l.max_steps,
             ..Self::default()
         }
     }

@@ -637,6 +637,9 @@ pub struct ProfileLimits {
     pub history_window: usize,
     /// Entries kept by in-memory caches (models list, recall results).
     pub cache_entries: usize,
+    /// Model requests one turn may make before it stops. 80 cut a network
+    /// troubleshooting lab at 15 minutes, half done.
+    pub max_steps: usize,
 }
 
 impl Profile {
@@ -646,16 +649,19 @@ impl Profile {
                 max_subagents: 1,
                 history_window: 20,
                 cache_entries: 64,
+                max_steps: 60,
             },
             Profile::Balanced => ProfileLimits {
                 max_subagents: 2,
                 history_window: 40,
                 cache_entries: 256,
+                max_steps: 150,
             },
             Profile::Performance => ProfileLimits {
                 max_subagents: 8,
                 history_window: 80,
                 cache_entries: 1024,
+                max_steps: 300,
             },
         }
     }
@@ -1199,6 +1205,14 @@ mod tests {
         assert!(rule_matches("shell(git *)", "shell", "git log"));
         assert!(!rule_matches("shell(git *)", "shell", "rm -rf /"));
         assert_eq!(Profile::Performance.limits().max_subagents, 8);
+        // A long troubleshooting turn needs room: more steps as the profile grows,
+        // the default well past the 80 that cut the network lab short.
+        let s = |p: Profile| p.limits().max_steps;
+        assert!(
+            s(Profile::Economy) < s(Profile::Balanced)
+                && s(Profile::Balanced) < s(Profile::Performance)
+        );
+        assert!(s(Profile::default()) > 80);
     }
 
     #[test]

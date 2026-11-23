@@ -616,7 +616,8 @@ pub fn run(paths: &Paths, args: &[String]) -> Result<(), Boxed> {
 }
 
 fn opts_steps(h: &Headless) -> usize {
-    h.max_turns.unwrap_or(zerith_runtime::DEFAULT_MAX_STEPS)
+    h.max_turns
+        .unwrap_or_else(|| zerith_runtime::active_profile().limits().max_steps)
 }
 
 /// Runs `zerith_runtime::learn` after a CLI turn when `[learning]` is on.

@@ -1056,3 +1056,12 @@ fn stop_hook_continue_false_runs_another_step_with_reason() {
             && m.raw == Some(json!({"hook_stop": true}))
     }));
 }
+
+/// A host built from the execution profile gets the profile's step limit.
+#[test]
+fn the_profile_sets_the_step_limit() {
+    use zerith_core::settings::Profile;
+    for p in [Profile::Economy, Profile::Balanced, Profile::Performance] {
+        assert_eq!(AgentOptions::for_profile(p).max_steps, p.limits().max_steps);
+    }
+}

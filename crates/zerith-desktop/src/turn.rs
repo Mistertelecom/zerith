@@ -386,6 +386,7 @@ pub fn run(
                 .collect(),
             spill_dir: Some(setup.root.join("spill")),
             history,
+            max_steps: limits.max_steps,
             inbox,
             reasoning_effort: setup.reasoning_effort.clone(),
             orchestrator: setup.orchestrator,

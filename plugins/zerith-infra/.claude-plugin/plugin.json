@@ -1,7 +1,7 @@
 {
   "name": "zerith-infra",
   "version": "0.3.8",
-  "description": "Especialista único de infraestrutura para provedores e empresas: roteamento e borda (BGP/OSPF/MPLS/CGNAT, Cisco, Huawei, Juniper, MikroTik), OLTs GPON/XGS-PON (Huawei, ZTE, Fiberhome, Parks, VSOL), servidores Linux, Proxmox VE/PBS e NOC (Zabbix, LibreNMS, NetFlow). Mudança segura com backup antes e depois e proteção do link de gerência.",
+  "description": "Especialista único de infraestrutura para provedores e empresas: roteamento e borda (BGP/OSPF/MPLS/CGNAT, Cisco ASR 9000/IOS-XR, Huawei, Juniper, MikroTik), OLTs GPON/XGS-PON (Huawei, ZTE, Fiberhome, Parks, VSOL), servidores Linux, cluster Proxmox VE (quorum, HA, ZFS, PBS) e NOC (Zabbix, LibreNMS, NetFlow). Mudança segura com backup antes e depois e proteção do link de gerência.",
   "author": {
     "name": "Joao Pedro Mota (Mistertelecom)"
   },

@@ -43,6 +43,7 @@ import {
   workflowsApi,
   type AgentView,
   type ChannelConfig,
+  type ChannelGroup,
   type ChannelKind,
   type NodeEvent,
   type NodeKind,
@@ -1883,13 +1884,23 @@ export function WorkflowsStudio(props: {
                   onTest={() => void runSingleNodeTest()}
                 />
               ) : (
-                <p className="pn-hint">
-                  {tr(
-                    lang,
-                    "Clique em qualquer bloco no canvas para configurá-lo.",
-                    "Click any block on the canvas to edit its settings.",
-                  )}
-                </p>
+                <>
+                  <p className="pn-hint">
+                    {tr(
+                      lang,
+                      "Clique em qualquer bloco no canvas para configurá-lo.",
+                      "Click any block on the canvas to edit its settings.",
+                    )}
+                  </p>
+                  {draft ? (
+                    <AlertSettings
+                      workflow={draft}
+                      channels={channels}
+                      lang={lang}
+                      onChange={(patch) => patchDraft((w) => ({ ...w, ...patch }), "alert")}
+                    />
+                  ) : null}
+                </>
               )}
             </div>
           ) : (
@@ -2489,6 +2500,36 @@ function NodeInspector(props: {
             />
             {renderVarChips("message")}
           </div>
+          <div className="wf-field">
+            <label>{tr(lang, "Anexar arquivo (opcional)", "Attach file (optional)")}</label>
+            <select
+              value={String(cfg.attach_node ?? "")}
+              onChange={(e) => setCfg({ attach_node: e.target.value || undefined })}
+            >
+              <option value="">{tr(lang, "-- Nenhum bloco Salvar arquivo --", "-- No Save file block --")}</option>
+              {props.allNodes
+                .filter((n) => n.kind === "save_file")
+                .map((n) => (
+                  <option key={n.id} value={n.id}>
+                    {n.label}
+                  </option>
+                ))}
+            </select>
+            {!cfg.attach_node ? (
+              <input
+                value={String(cfg.attachment ?? "")}
+                placeholder={tr(lang, "ou caminho / URL: reports/rel-{{date}}.pdf", "or path / URL: reports/rel-{{date}}.pdf")}
+                onChange={(e) => setCfg({ attachment: e.target.value })}
+              />
+            ) : null}
+            <p className="pn-hint">
+              {tr(
+                lang,
+                "Vai como arquivo na Evolution, WAHA e Telegram; nos outros canais só o texto.",
+                "Sent as a file on Evolution, WAHA and Telegram; other channels get the text only.",
+              )}
+            </p>
+          </div>
         </>
       ) : null}
 
@@ -2651,6 +2692,79 @@ function CronEditor(props: {
   );
 }
 
+/** Aviso de falha das execuções agendadas: canais, destino por canal e N. */
+function AlertSettings(props: {
+  workflow: Workflow;
+  channels: ChannelConfig[];
+  lang: Lang;
+  onChange: (patch: Partial<Workflow>) => void;
+}) {
+  const { workflow: wf, lang } = props;
+  const chosen = wf.alert_channels ?? [];
+  const targets = wf.alert_target ?? {};
+  const toggle = (id: string, on: boolean) => {
+    const next = on ? [...chosen, id] : chosen.filter((c) => c !== id);
+    const nextTargets = { ...targets };
+    if (!on) delete nextTargets[id];
+    props.onChange({ alert_channels: next, alert_target: nextTargets });
+  };
+  return (
+    <div className="wf-field">
+      <label>{tr(lang, "Alerta de falha", "Failure alert")}</label>
+      <p className="pn-hint">
+        {tr(
+          lang,
+          "Avisa uma vez quando falha e outra quando volta a funcionar. Sem canal marcado usa o canal padrão do servidor.",
+          "Alerts once on failure and once on recovery. With no channel checked, the server's default channel is used.",
+        )}
+      </p>
+      {props.channels.length ? null : (
+        <p className="pn-hint">{tr(lang, "Nenhum canal cadastrado.", "No channels yet.")}</p>
+      )}
+      {props.channels.map((ch) => {
+        const on = chosen.includes(ch.id);
+        return (
+          <div key={ch.id} style={{ display: "grid", gap: 4 }}>
+            <label className="pn-inline" style={{ fontWeight: 400 }}>
+              <input type="checkbox" checked={on} onChange={(e) => toggle(ch.id, e.target.checked)} />
+              <span>
+                {ch.name} ({ch.kind})
+              </span>
+            </label>
+            {on ? (
+              <input
+                aria-label={tr(lang, `Destino em ${ch.name}`, `Target on ${ch.name}`)}
+                value={targets[ch.id] ?? ""}
+                placeholder={String(ch.config.default_target ?? "") || tr(lang, "destino padrão do canal", "channel default target")}
+                onChange={(e) => {
+                  const next = { ...targets };
+                  if (e.target.value.trim()) next[ch.id] = e.target.value;
+                  else delete next[ch.id];
+                  props.onChange({ alert_target: next });
+                }}
+              />
+            ) : null}
+          </div>
+        );
+      })}
+      <label className="pn-inline" style={{ fontWeight: 400 }}>
+        <span>{tr(lang, "Avisar após", "Alert after")}</span>
+        <input
+          type="number"
+          min={1}
+          style={{ width: 64 }}
+          value={wf.alert_after_failures ?? 1}
+          onChange={(e) => {
+            const n = Math.max(1, Math.floor(Number(e.target.value) || 1));
+            props.onChange({ alert_after_failures: n === 1 ? null : n });
+          }}
+        />
+        <span>{tr(lang, "falha(s) seguida(s)", "failure(s) in a row")}</span>
+      </label>
+    </div>
+  );
+}
+
 function ChannelsModal(props: {
   channels: ChannelConfig[];
   lang: Lang;
@@ -2666,11 +2780,13 @@ function ChannelsModal(props: {
   );
   const [msg, setMsg] = useState<{ text: string; tone: "ok" | "err" | "" } | null>(null);
   const [busy, setBusy] = useState(false);
+  const [groups, setGroups] = useState<ChannelGroup[] | null>(null);
 
   const selectChannel = (ch: ChannelConfig) => {
     setSelectedId(ch.id);
     setDraft(structuredClone(ch));
     setMsg(null);
+    setGroups(null);
   };
 
   const createNew = () => {
@@ -2699,20 +2815,29 @@ function ChannelsModal(props: {
     }
   };
 
-  const test = async () => {
+  /** Salva o rascunho (o núcleo lê o canal do banco) e roda `action`. */
+  const withSaved = async (action: () => Promise<string | void>) => {
     setBusy(true);
     setMsg(null);
     try {
       await channelsApi.save({ ...draft, updated_at_ms: Date.now() });
-      const res = await channelsApi.test(draft.id);
+      const res = await action();
       props.onUpdated();
-      setMsg({ text: res, tone: "ok" });
+      if (res) setMsg({ text: res, tone: "ok" });
     } catch (e) {
       setMsg({ text: String(e), tone: "err" });
     } finally {
       setBusy(false);
     }
   };
+  const test = () => withSaved(() => channelsApi.test(draft.id));
+  const checkConnection = () => withSaved(() => channelsApi.check(draft.id));
+  const pickGroup = () =>
+    withSaved(async () => {
+      const list = await channelsApi.groups(draft.id);
+      setGroups(list);
+      if (!list.length) return tr(lang, "Nenhum grupo nesta instância.", "No groups in this instance.");
+    });
 
   const cfg = draft.config ?? {};
 
@@ -2805,13 +2930,52 @@ function ChannelsModal(props: {
                   />
                 </div>
                 <div className="wf-field">
-                  <label>{tr(lang, "Número / Grupo padrão", "Default target phone / group")}</label>
-                  <input
-                    value={String(cfg.default_target ?? "")}
-                    placeholder="5511999999999"
-                    onChange={(e) => setCfg({ default_target: e.target.value })}
-                  />
+                  <label>{tr(lang, "Número ou grupo padrão", "Default phone or group")}</label>
+                  <div className="pn-inline">
+                    <input
+                      value={String(cfg.default_target ?? "")}
+                      placeholder="11999999999 / 120363...@g.us"
+                      onChange={(e) => setCfg({ default_target: e.target.value })}
+                    />
+                    {draft.kind === "evolution_api" ? (
+                      <button type="button" className="btn btn-sm" disabled={busy} onClick={() => void pickGroup()}>
+                        {tr(lang, "Escolher grupo", "Pick group")}
+                      </button>
+                    ) : null}
+                  </div>
+                  <p className="pn-hint">
+                    {tr(
+                      lang,
+                      "Número com DDD (o 55 entra sozinho) ou o JID do grupo, terminado em @g.us.",
+                      "Phone with area code (Brazil's 55 is added) or the group JID ending in @g.us.",
+                    )}
+                  </p>
+                  {groups && groups.length ? (
+                    <select
+                      aria-label={tr(lang, "Grupos da instância", "Instance groups")}
+                      value=""
+                      onChange={(e) => {
+                        if (e.target.value) setCfg({ default_target: e.target.value });
+                        setGroups(null);
+                      }}
+                    >
+                      <option value="">{tr(lang, "-- Escolha o grupo --", "-- Select group --")}</option>
+                      {groups.map((g) => (
+                        <option key={g.id} value={g.id}>
+                          {g.name}
+                          {g.size ? ` (${g.size})` : ""}
+                        </option>
+                      ))}
+                    </select>
+                  ) : null}
                 </div>
+                <p className="pn-hint">
+                  {tr(
+                    lang,
+                    "Protocolo não oficial do WhatsApp: use um número dedicado, que pode ser banido. Guia em docs/whatsapp.md.",
+                    "Unofficial WhatsApp protocol: use a dedicated number, it may be banned. Guide in docs/whatsapp.md.",
+                  )}
+                </p>
               </>
             ) : null}
 
@@ -2836,8 +3000,41 @@ function ChannelsModal(props: {
                   <label>{tr(lang, "Número destino padrão", "Default recipient number")}</label>
                   <input
                     value={String(cfg.default_target ?? "")}
+                    placeholder="5511999999999"
                     onChange={(e) => setCfg({ default_target: e.target.value })}
                   />
+                </div>
+                <div className="wf-field">
+                  <label>{tr(lang, "Versão do Graph API", "Graph API version")}</label>
+                  <input
+                    value={String(cfg.graph_version ?? "")}
+                    placeholder="v26.0"
+                    onChange={(e) => setCfg({ graph_version: e.target.value })}
+                  />
+                </div>
+                <div className="wf-field">
+                  <label>{tr(lang, "Template aprovado (opcional)", "Approved template (optional)")}</label>
+                  <div className="pn-inline">
+                    <input
+                      value={String(cfg.template_name ?? "")}
+                      placeholder="alerta_zerith"
+                      onChange={(e) => setCfg({ template_name: e.target.value })}
+                    />
+                    <input
+                      style={{ maxWidth: 90 }}
+                      aria-label={tr(lang, "Idioma do template", "Template language")}
+                      value={String(cfg.template_language ?? "")}
+                      placeholder="pt_BR"
+                      onChange={(e) => setCfg({ template_language: e.target.value })}
+                    />
+                  </div>
+                  <p className="pn-hint">
+                    {tr(
+                      lang,
+                      "Fora da janela de 24 h a Meta só aceita template; o aviso vai na variável {{1}} do corpo. A Cloud API não envia para grupos.",
+                      "Outside the 24 h window Meta only accepts templates; the alert fills body variable {{1}}. The Cloud API cannot send to groups.",
+                    )}
+                  </p>
                 </div>
               </>
             ) : null}
@@ -2896,6 +3093,17 @@ function ChannelsModal(props: {
                 <Save size={13} />
                 <span>{tr(lang, "Salvar", "Save")}</span>
               </button>
+              {["evolution_api", "waha", "whatsapp_cloud", "telegram"].includes(draft.kind) ? (
+                <button
+                  type="button"
+                  className="btn btn-sm"
+                  onClick={() => void checkConnection()}
+                  disabled={busy}
+                >
+                  <RefreshCw size={13} />
+                  <span>{tr(lang, "Testar conexão", "Test connection")}</span>
+                </button>
+              ) : null}
               <button type="button" className="btn btn-sm" onClick={() => void test()} disabled={busy}>
                 <Send size={13} />
                 <span>{tr(lang, "Enviar Teste", "Send Test")}</span>

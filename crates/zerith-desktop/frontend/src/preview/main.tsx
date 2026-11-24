@@ -2,6 +2,7 @@
 // and drives it to one scene, so a headless browser can photograph it.
 //   ?scene=empty|chat|approval|question|settings  &tab=Contas  &open=anthropic  &theme=light
 //   Mídia: ?scene=settings&tab=Mídia (imagem) or &tab=Mídia&click=Vídeo (vídeo)
+//   Canais/alerta: ?scene=channels (&alert=1)
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { emit } from "@tauri-apps/api/event";
@@ -75,6 +76,15 @@ async function drive() {
     return;
   }
   if (scene === "empty") return;
+  // Automações: ?scene=channels abre o modal de canais e lista os grupos da
+  // Evolution; &alert=1 fica no editor (seção "Alerta de falha").
+  if (scene === "channels") {
+    (await until(() => byText("Automações")))?.click();
+    if (q.get("alert")) return;
+    (await until(() => byText("Canais")))?.click();
+    (await until(() => byText("Escolher grupo")))?.click();
+    return;
+  }
 
   (await until(() => byText("Migrar o cliente HTTP do provedor OpenAI")))?.click();
   await wait(300);

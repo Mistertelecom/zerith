@@ -1102,6 +1102,12 @@ export interface Workflow {
   last_run_at_ms?: number | null;
   last_status?: string | null;
   bot_name?: string | null;
+  /** Aviso de falha: N falhas seguidas (padrão 1). */
+  alert_after_failures?: number | null;
+  /** Ids de canal que recebem o aviso; vazio = canal padrão do servidor. */
+  alert_channels?: string[];
+  /** Destino por id de canal; sem entrada usa o destino padrão do canal. */
+  alert_target?: Record<string, string>;
 }
 
 export interface ChannelConfig {

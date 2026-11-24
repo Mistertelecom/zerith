@@ -621,6 +621,56 @@ const PREVIEW_CHANGES = [
   },
 ];
 
+const wfMock = {
+  channels: [
+    {
+      id: "ch-evo",
+      name: "WhatsApp empresa",
+      kind: "evolution_api",
+      enabled: true,
+      config: {
+        base_url: "http://10.8.0.1:8080",
+        instance: "empresa",
+        api_key: "••••",
+        default_target: "120363025246125486@g.us",
+      },
+      updated_at_ms: NOW * 1000,
+    },
+    {
+      id: "ch-tg",
+      name: "Telegram NOC",
+      kind: "telegram",
+      enabled: true,
+      config: { bot_token: "••••", default_target: "-1001234" },
+      updated_at_ms: NOW * 1000,
+    },
+  ],
+  workflows: [
+    {
+      id: "wf-backup",
+      name: "Backup diário dos roteadores",
+      description: "",
+      icon: "workflow",
+      enabled: true,
+      nodes: [
+        { id: "cron", kind: "trigger_cron", label: "Todo dia 02:00", x: 40, y: 80, config: { cron: "0 2 * * *" } },
+        { id: "ssh", kind: "ssh_command", label: "Exportar config", x: 320, y: 80, config: {} },
+        { id: "zap", kind: "notify_channel", label: "Avisar grupo", x: 600, y: 80, config: { channel_id: "ch-evo" } },
+      ],
+      edges: [
+        { id: "e1", from: "cron", to: "ssh" },
+        { id: "e2", from: "ssh", to: "zap" },
+      ],
+      created_at_ms: NOW * 1000,
+      updated_at_ms: NOW * 1000,
+      last_status: "error",
+      alert_after_failures: 2,
+      alert_channels: ["ch-evo"],
+      alert_target: { "ch-evo": "120363025246125486@g.us" },
+    },
+  ],
+};
+
 let state = {
   theme: "dark",
   memory_paused: false,
@@ -1055,6 +1105,28 @@ export function installMock(theme: string) {
         case "background_job_stop":
           state.jobs = state.jobs.filter((j) => j.id !== a.id);
           return `${a.id} encerrado`;
+        // Automações: um workflow com alerta e dois canais (cena `channels`).
+        case "workflow_list":
+          return wfMock.workflows;
+        case "workflow_save":
+          return a.workflow;
+        case "workflow_runs":
+          return [];
+        case "workflow_webhook_base_url":
+          return "http://127.0.0.1:47891/webhook/";
+        case "channel_list":
+          return wfMock.channels;
+        case "channel_save":
+          return a.channel;
+        case "channel_check":
+          return "Evolution API: instância 'empresa' conectada (open)";
+        case "channel_test":
+          return "WhatsApp enviado via Evolution API (empresa) → 120363025246125486@g.us";
+        case "channel_groups":
+          return [
+            { id: "120363025246125486@g.us", name: "Alertas TI", size: 12 },
+            { id: "120363111111111111@g.us", name: "Diretoria", size: 5 },
+          ];
         default:
           // A list command nobody mocked yet (`terminals_list` blanked the
           // whole preview: `null.some`) answers an empty list, not null.

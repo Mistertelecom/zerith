@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde_json::{json, Value};
-use zerith_core::Paths;
+use zerith_core::{Paths, Settings};
 use zerith_mcp::config::{add_server, set_enabled, set_extra};
 use zerith_mcp::{Extra, ServerConfig};
 use zerith_sessions::{NewMessage, Role, Session, SessionSource, Store};
@@ -109,6 +109,11 @@ pub(crate) enum Payload {
     Skill {
         source: String,
         generated: Option<(String, String)>,
+    },
+    /// Regras de permissão para a lista `list` (`allow`/`ask`/`deny`).
+    Rules {
+        list: &'static str,
+        rules: Vec<String>,
     },
     /// Arquivo novo a gravar em `dest`.
     File {
@@ -266,6 +271,7 @@ pub fn apply(items: &[Item], paths: &Paths) -> Report {
     apply_mcp(items, paths, &mut r);
     apply_skills(items, paths, &mut r);
     apply_files(items, Kind::Agent, &mut r);
+    apply_permissions(items, paths, &mut r);
     r
 }
 
@@ -346,6 +352,7 @@ pub fn plan(src: &ClaudeSource, paths: &Paths, opt: &Options) -> Vec<Item> {
         let mut agents = vec![src.home.join("agents")];
         agents.extend(proj(".claude/agents"));
         items.extend(plan_agents(&agents, paths));
+        items.extend(plan_permissions(&src.home, paths));
     }
     items
 }
@@ -1159,6 +1166,171 @@ pub fn apply_files(items: &[Item], kind: Kind, r: &mut Report) {
             .map_or(Ok(()), std::fs::create_dir_all)
             .and_then(|_| std::fs::write(dest, content));
         match done {
+            Ok(()) => r.tally(item.kind, Action::Import),
+            Err(e) => r.fail(item, e),
+        }
+    }
+}
+
+// ------------------------------------------------------------ permissões
+
+/// `settings.json` + `settings.local.json` do usuário, nessa ordem.
+fn claude_settings(home: &Path) -> Vec<(PathBuf, Value)> {
+    ["settings.json", "settings.local.json"]
+        .iter()
+        .map(|f| home.join(f))
+        .filter_map(|p| Some((p.clone(), read_json(&p)?)))
+        .collect()
+}
+
+/// Uma regra do Claude Code nas do Zerith (vazio: sem equivalente).
+pub fn map_permission(rule: &str) -> Vec<String> {
+    let rule = rule.trim();
+    let (tool, spec) = match rule.split_once('(') {
+        Some((t, rest)) => match rest.strip_suffix(')') {
+            Some(s) => (t.trim(), Some(s.trim())),
+            None => return Vec::new(),
+        },
+        None => (rule, None),
+    };
+    let with = |names: &[&str], s: Option<String>| -> Vec<String> {
+        names
+            .iter()
+            .map(|n| match &s {
+                Some(s) => format!("{n}({s})"),
+                None => n.to_string(),
+            })
+            .collect()
+    };
+    // `//abs` é absoluto no Claude Code; `/x` é relativo ao arquivo de
+    // configuração, sem equivalente aqui.
+    let path = |s: Option<&str>| -> Option<Option<String>> {
+        match s {
+            None => Some(None),
+            Some(p) if p.starts_with("//") => Some(Some(p[1..].to_string())),
+            Some(p) if p.starts_with('/') => None,
+            Some(p) => Some(Some(p.to_string())),
+        }
+    };
+    match tool {
+        "Bash" => match spec {
+            None => with(&["shell"], None),
+            Some(s) => {
+                let s = match s.strip_suffix(":*") {
+                    Some(prefix) => format!("{prefix} *"),
+                    None => s.to_string(),
+                };
+                with(&["shell"], Some(s))
+            }
+        },
+        "Read" => path(spec).map_or(Vec::new(), |s| with(&["read_file"], s)),
+        "Write" => path(spec).map_or(Vec::new(), |s| with(&["write_file"], s)),
+        // `Edit` vale para toda ferramenta que edita arquivo.
+        "Edit" | "MultiEdit" => path(spec).map_or(Vec::new(), |s| {
+            with(&["edit_file", "multi_edit", "write_file"], s)
+        }),
+        "WebFetch" => match spec {
+            None => with(&["web_fetch"], None),
+            Some(s) => match s.strip_prefix("domain:") {
+                Some(d) if !d.is_empty() => with(&["web_fetch"], Some(format!("https://{d}/*"))),
+                _ => Vec::new(),
+            },
+        },
+        "WebSearch" if spec.is_none() => with(&["web_search"], None),
+        "Glob" if spec.is_none() => with(&["glob"], None),
+        "Grep" if spec.is_none() => with(&["grep"], None),
+        "LS" if spec.is_none() => with(&["list_dir"], None),
+        t if t.starts_with("mcp__") && spec.is_none() => {
+            // `mcp__servidor` no Claude Code é o servidor inteiro.
+            if t.matches("__").count() == 1 {
+                vec![format!("{t}__*")]
+            } else {
+                vec![t.to_string()]
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Um item por regra de `permissions.allow/ask/deny`; sem equivalente fica
+/// como pular, com "não mapeado".
+pub(crate) fn plan_permissions(home: &Path, paths: &Paths) -> Vec<Item> {
+    let user = Settings::load_with_env(paths, None, |_| None)
+        .settings
+        .permissions;
+    let mut seen = HashSet::new();
+    let mut items = Vec::new();
+    for (file, v) in claude_settings(home) {
+        for list in ["allow", "ask", "deny"] {
+            let rules = v
+                .get("permissions")
+                .and_then(|p| p.get(list))
+                .and_then(Value::as_array);
+            for rule in rules.into_iter().flatten().filter_map(Value::as_str) {
+                let mapped = map_permission(rule);
+                let have = match list {
+                    "allow" => &user.allow,
+                    "ask" => &user.ask,
+                    _ => &user.deny,
+                };
+                let (action, desc) = if mapped.is_empty() {
+                    (Action::Skip, format!("{list} {rule}: não mapeado"))
+                } else if mapped.iter().all(|m| have.contains(m)) {
+                    (Action::Skip, format!("{list} {rule}: já existe"))
+                } else if !seen.insert((list, mapped.clone())) {
+                    (Action::Skip, format!("{list} {rule}: repetida"))
+                } else {
+                    (
+                        Action::Import,
+                        format!("{list} {rule} → {}", mapped.join(", ")),
+                    )
+                };
+                items.push(
+                    Item::new(Kind::Permission, &file, desc, action).with(Payload::Rules {
+                        list,
+                        rules: mapped,
+                    }),
+                );
+            }
+        }
+    }
+    items
+}
+
+/// Acrescenta as regras ao `settings.toml` do usuário (nunca ao projeto).
+pub fn apply_permissions(items: &[Item], paths: &Paths, r: &mut Report) {
+    let todo: Vec<&Item> = items
+        .iter()
+        .filter(|i| i.kind == Kind::Permission && i.action == Action::Import)
+        .collect();
+    for i in items
+        .iter()
+        .filter(|i| i.kind == Kind::Permission && i.action != Action::Import)
+    {
+        r.tally(i.kind, i.action);
+    }
+    if todo.is_empty() {
+        return;
+    }
+    let done = Settings::save_user(paths, |s| {
+        for item in &todo {
+            let Payload::Rules { list, rules } = &item.payload else {
+                continue;
+            };
+            let target = match *list {
+                "allow" => &mut s.permissions.allow,
+                "ask" => &mut s.permissions.ask,
+                _ => &mut s.permissions.deny,
+            };
+            for rule in rules {
+                if !target.contains(rule) {
+                    target.push(rule.clone());
+                }
+            }
+        }
+    });
+    for item in todo {
+        match &done {
             Ok(()) => r.tally(item.kind, Action::Import),
             Err(e) => r.fail(item, e),
         }
@@ -2100,6 +2272,84 @@ pub(crate) mod tests {
             p.iter().find(|i| i.kind == Kind::Agent).unwrap().action,
             Action::Conflict
         );
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    #[test]
+    fn permissions_map_to_zerith_rules_and_unmapped_are_listed() {
+        assert_eq!(map_permission("Bash(git:*)"), ["shell(git *)"]);
+        assert_eq!(
+            map_permission("Bash(npm run test *)"),
+            ["shell(npm run test *)"]
+        );
+        assert_eq!(map_permission("Bash"), ["shell"]);
+        assert_eq!(map_permission("Read(~/.ssh/**)"), ["read_file(~/.ssh/**)"]);
+        assert_eq!(
+            map_permission("Read(//etc/hosts)"),
+            ["read_file(/etc/hosts)"]
+        );
+        assert!(map_permission("Read(/src/**)").is_empty());
+        assert_eq!(
+            map_permission("Edit(src/**)"),
+            [
+                "edit_file(src/**)",
+                "multi_edit(src/**)",
+                "write_file(src/**)"
+            ]
+        );
+        assert_eq!(
+            map_permission("WebFetch(domain:docs.rs)"),
+            ["web_fetch(https://docs.rs/*)"]
+        );
+        assert_eq!(map_permission("mcp__github"), ["mcp__github__*"]);
+        assert_eq!(
+            map_permission("mcp__github__search"),
+            ["mcp__github__search"]
+        );
+        assert!(map_permission("NotebookEdit").is_empty());
+        assert!(map_permission("Task(Explore)").is_empty());
+
+        let t = scratch("cc-perm");
+        let home = t.join("claude");
+        write(
+            &home.join("settings.json"),
+            r#"{"permissions":{"allow":["Bash(git:*)","NotebookEdit"],"deny":["Read(./.env)"]}}"#,
+        );
+        write(
+            &home.join("settings.local.json"),
+            r#"{"permissions":{"allow":["Bash(git:*)","WebFetch(domain:docs.rs)"],"ask":["Bash(git push:*)"]}}"#,
+        );
+        let paths = Paths::with_root(t.join("zerith"));
+        let items = plan_permissions(&home, &paths);
+        let unmapped: Vec<_> = items
+            .iter()
+            .filter(|i| i.description.ends_with("não mapeado"))
+            .collect();
+        assert_eq!(unmapped.len(), 1);
+        assert!(unmapped[0].description.contains("NotebookEdit"));
+        let r = apply(&items, &paths);
+        assert_eq!(
+            r.counts[&Kind::Permission].imported,
+            4,
+            "{}",
+            render_plan(&items)
+        );
+        let s = Settings::load_with_env(&paths, None, |_| None)
+            .settings
+            .permissions;
+        assert_eq!(s.allow, ["shell(git *)", "web_fetch(https://docs.rs/*)"]);
+        assert_eq!(s.ask, ["shell(git push *)"]);
+        assert_eq!(s.deny, ["read_file(./.env)"]);
+        assert!(
+            zerith_security::Policy::from_settings(
+                &Settings::load_with_env(&paths, None, |_| None).settings,
+                &t
+            )
+            .is_ok(),
+            "regras válidas para a política"
+        );
+        let again = plan_permissions(&home, &paths);
+        assert!(again.iter().all(|i| i.action == Action::Skip));
         let _ = std::fs::remove_dir_all(&t);
     }
 

@@ -97,6 +97,195 @@ pub struct RunStarted {
     pub run_id: String,
 }
 
+// ------------------------------------------------------------ cliente
+
+#[derive(Debug)]
+pub enum RemoteError {
+    /// 409 no PUT: o servidor tem outra versão (vem junto, para mesclar).
+    Conflict(Box<crate::Workflow>),
+    /// Resposta HTTP de erro (mensagem do campo `error`, nunca o token).
+    Status(u16, String),
+    /// Rede, DNS, TLS do proxy, timeout ou JSON inesperado.
+    Transport(String),
+}
+
+impl std::fmt::Display for RemoteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Conflict(_) => write!(f, "o servidor tem uma versão mais nova do workflow"),
+            Self::Status(401, _) => {
+                write!(f, "token recusado (revogado ou errado); pareie de novo")
+            }
+            Self::Status(c, m) => write!(f, "servidor respondeu {c}: {m}"),
+            Self::Transport(m) => write!(f, "sem conexão com o servidor: {m}"),
+        }
+    }
+}
+
+impl std::error::Error for RemoteError {}
+
+pub type RemoteResult<T> = std::result::Result<T, RemoteError>;
+
+/// Cliente síncrono da API (`ureq`). Rode fora da thread de UI.
+pub struct RemoteClient {
+    base: String,
+    token: String,
+    agent: ureq::Agent,
+}
+
+impl std::fmt::Debug for RemoteClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteClient")
+            .field("base", &self.base)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RemoteClient {
+    pub fn new(url: &str, token: &str) -> Self {
+        Self {
+            base: url.trim_end_matches('/').to_string(),
+            token: token.to_string(),
+            agent: ureq::AgentBuilder::new()
+                .timeout_connect(std::time::Duration::from_secs(5))
+                .timeout(std::time::Duration::from_secs(30))
+                .redirects(0)
+                .build(),
+        }
+    }
+
+    pub fn from_pairing(pc: &PairingCode) -> Self {
+        Self::new(&pc.url, &pc.token)
+    }
+
+    fn req(&self, method: &str, path: &str) -> ureq::Request {
+        self.agent
+            .request(method, &format!("{}/v1{path}", self.base))
+            .set("Authorization", &format!("Bearer {}", self.token))
+    }
+
+    fn send<T: serde::de::DeserializeOwned>(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> RemoteResult<T> {
+        let r = self.req(method, path);
+        let res = match body {
+            Some(b) => r.send_json(b),
+            None => r.call(),
+        };
+        match res {
+            Ok(resp) => resp
+                .into_json()
+                .map_err(|e| RemoteError::Transport(e.to_string())),
+            Err(ureq::Error::Status(code, resp)) => {
+                let v: serde_json::Value = resp.into_json().unwrap_or_default();
+                if code == 409 {
+                    if let Ok(cur) = serde_json::from_value(v["current"].clone()) {
+                        return Err(RemoteError::Conflict(Box::new(cur)));
+                    }
+                }
+                let msg = v["error"].as_str().unwrap_or("").to_string();
+                Err(RemoteError::Status(code, msg))
+            }
+            Err(e) => Err(RemoteError::Transport(e.to_string())),
+        }
+    }
+
+    /// Sem token: confirma que é um Zerith e devolve a versão.
+    pub fn ping(&self) -> RemoteResult<String> {
+        let v: serde_json::Value = self
+            .agent
+            .get(&format!("{}/v1/ping", self.base))
+            .call()
+            .map_err(|e| RemoteError::Transport(e.to_string()))?
+            .into_json()
+            .map_err(|e| RemoteError::Transport(e.to_string()))?;
+        if v["name"] != "zerith" {
+            return Err(RemoteError::Transport(
+                "o endereço não é um servidor Zerith".into(),
+            ));
+        }
+        Ok(v["version"].as_str().unwrap_or("").to_string())
+    }
+
+    pub fn health(&self) -> RemoteResult<Health> {
+        self.send("GET", "/health", None)
+    }
+
+    pub fn list(&self) -> RemoteResult<Vec<crate::Workflow>> {
+        self.send("GET", "/workflows", None)
+    }
+
+    pub fn get(&self, id: &str) -> RemoteResult<crate::Workflow> {
+        self.send("GET", &format!("/workflows/{id}"), None)
+    }
+
+    /// `base_updated_at_ms`: o `updated_at_ms` visto por último (`None` = criar).
+    pub fn put(
+        &self,
+        wf: &crate::Workflow,
+        base_updated_at_ms: Option<i64>,
+    ) -> RemoteResult<crate::Workflow> {
+        let body = PutWorkflow {
+            workflow: wf.clone(),
+            base_updated_at_ms,
+        };
+        let body = serde_json::to_value(body).map_err(|e| RemoteError::Transport(e.to_string()))?;
+        self.send("PUT", &format!("/workflows/{}", wf.id), Some(body))
+    }
+
+    pub fn delete(&self, id: &str) -> RemoteResult<()> {
+        self.send::<serde_json::Value>("DELETE", &format!("/workflows/{id}"), None)
+            .map(|_| ())
+    }
+
+    pub fn set_enabled(&self, id: &str, enabled: bool) -> RemoteResult<crate::Workflow> {
+        self.send(
+            "POST",
+            &format!("/workflows/{id}/enabled"),
+            Some(serde_json::json!({ "enabled": enabled })),
+        )
+    }
+
+    pub fn run(&self, id: &str, input: Option<&str>) -> RemoteResult<String> {
+        let r: RunStarted = self.send(
+            "POST",
+            &format!("/workflows/{id}/run"),
+            Some(serde_json::json!({ "input": input })),
+        )?;
+        Ok(r.run_id)
+    }
+
+    pub fn runs(&self, id: &str, limit: usize) -> RemoteResult<Vec<crate::WorkflowRun>> {
+        self.send("GET", &format!("/workflows/{id}/runs?limit={limit}"), None)
+    }
+
+    pub fn run_get(&self, run_id: &str) -> RemoteResult<crate::WorkflowRun> {
+        self.send("GET", &format!("/runs/{run_id}"), None)
+    }
+
+    pub fn secret_names(&self) -> RemoteResult<Vec<String>> {
+        self.send("GET", "/secrets", None)
+    }
+
+    /// Só escrita: o servidor nunca devolve o valor.
+    pub fn secret_set(&self, name: &str, value: &str) -> RemoteResult<()> {
+        self.send::<serde_json::Value>(
+            "PUT",
+            &format!("/secrets/{name}"),
+            Some(serde_json::json!({ "value": value })),
+        )
+        .map(|_| ())
+    }
+
+    pub fn secret_delete(&self, name: &str) -> RemoteResult<()> {
+        self.send::<serde_json::Value>("DELETE", &format!("/secrets/{name}"), None)
+            .map(|_| ())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

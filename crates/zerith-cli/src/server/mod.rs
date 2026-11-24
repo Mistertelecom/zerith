@@ -690,6 +690,44 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn cliente_remote_contra_o_servidor() {
+        use zerith_workflows::remote::{PairingCode, RemoteClient, RemoteError};
+        let dir = tempfile::tempdir().unwrap();
+        let addr = start(dir.path());
+        let tok = auth::add_token(dir.path(), "pc").unwrap();
+        let code = PairingCode {
+            v: 1,
+            name: "teste".into(),
+            url: format!("http://{addr}"),
+            token: tok,
+        }
+        .encode();
+        let c = RemoteClient::from_pairing(&PairingCode::decode(&code).unwrap());
+        assert_eq!(c.ping().unwrap(), zerith_core::VERSION);
+        assert_eq!(c.health().unwrap().workflows_total, 0);
+        let wf: zerith_workflows::Workflow = serde_json::from_value(sample_wf("w1")).unwrap();
+        let saved = c.put(&wf, None).unwrap();
+        assert!(matches!(c.put(&wf, None), Err(RemoteError::Conflict(_))));
+        c.put(&saved, Some(saved.updated_at_ms)).unwrap();
+        assert_eq!(c.list().unwrap().len(), 1);
+        assert!(c.set_enabled("w1", true).unwrap().enabled);
+        let run_id = c.run("w1", Some("x")).unwrap();
+        for _ in 0..100 {
+            if c.run_get(&run_id).unwrap().status != "running" {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(c.runs("w1", 5).unwrap()[0].status, "ok");
+        c.secret_set("K", "v").unwrap();
+        assert_eq!(c.secret_names().unwrap(), ["K"]);
+        c.delete("w1").unwrap();
+        assert!(matches!(c.get("w1"), Err(RemoteError::Status(404, _))));
+        let bad = RemoteClient::new(&format!("http://{addr}"), "zt_errado");
+        assert!(matches!(bad.list(), Err(RemoteError::Status(401, _))));
+    }
+
+    #[test]
     fn eventos_sse_entregam_run_iniciado_e_terminado() {
         use std::io::BufRead;
         let dir = tempfile::tempdir().unwrap();

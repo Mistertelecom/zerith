@@ -13,6 +13,8 @@ ureq.workspace = true
 thiserror.workspace = true
 # Already in Cargo.lock (tauri/serde_with): OS local UTC offset incl. DST.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Código de pareamento do `zerith server` (remote.rs); já na árvore via ureq.
+base64 = "0.22"
 
 [dev-dependencies]
 tempfile.workspace = true

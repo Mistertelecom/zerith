@@ -14,7 +14,7 @@ const PAUSED_KEY: &str = "memory.paused";
 const EXCLUDE_PREFIX: &str = "memory.exclude:";
 
 pub struct SqliteMemory {
-    conn: Connection,
+    pub(crate) conn: Connection,
 }
 
 const COLUMNS: &str = "id, scope, kind, text, source, session_id, confidence,                        created_at, updated_at, superseded_by";
@@ -191,7 +191,7 @@ impl MemoryBackend for SqliteMemory {
             "INSERT INTO memory_facts(scope, kind, text, source, confidence, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
              ON CONFLICT(scope, text) WHERE deleted = 0
-             DO UPDATE SET updated_at = excluded.updated_at, superseded_by = NULL",
+             DO UPDATE SET updated_at = excluded.updated_at, superseded_by = NULL, archived_at = NULL",
             params![scope.write_for(kind), kind.as_str(), text, source, confidence.as_str(), ts],
         )?;
         let id: i64 = self.conn.query_row(
@@ -211,7 +211,7 @@ impl MemoryBackend for SqliteMemory {
                           f.created_at, f.updated_at, f.superseded_by, bm25(memory_fts) AS score
                    FROM memory_fts
                    JOIN memory_facts f ON f.id = memory_fts.rowid
-                   WHERE memory_fts MATCH ?1 AND (?2 = '*' OR instr('|' || ?2 || '|', '|' || f.scope || '|') > 0) AND f.deleted = 0 AND f.superseded_by IS NULL
+                   WHERE memory_fts MATCH ?1 AND (?2 = '*' OR instr('|' || ?2 || '|', '|' || f.scope || '|') > 0) AND f.deleted = 0 AND f.superseded_by IS NULL AND f.archived_at IS NULL
                    ORDER BY score LIMIT ?3";
         let mut st = self.conn.prepare(sql)?;
         let rows = st.query_map(params![query, scope.as_str(), fetch as i64], |r| {
@@ -249,7 +249,7 @@ impl MemoryBackend for SqliteMemory {
         self.select_where(
             &format!(
                 "SELECT {COLUMNS} FROM memory_facts
-                 WHERE (?1 = '*' OR instr('|' || ?1 || '|', '|' || scope || '|') > 0) AND deleted = 0 AND superseded_by IS NULL
+                 WHERE (?1 = '*' OR instr('|' || ?1 || '|', '|' || scope || '|') > 0) AND deleted = 0 AND superseded_by IS NULL AND archived_at IS NULL
                  ORDER BY updated_at DESC LIMIT ?2"
             ),
             &[&scope.as_str(), &(limit as i64)],
@@ -332,6 +332,17 @@ impl MemoryBackend for SqliteMemory {
 
     fn is_extraction_allowed(&self, session_id: &str) -> Result<bool> {
         SqliteMemory::is_extraction_allowed(self, session_id)
+    }
+
+    fn touch(&self, ids: &[i64]) -> Result<()> {
+        let ts = now_ms();
+        let mut st = self
+            .conn
+            .prepare_cached("UPDATE memory_facts SET last_used_at = ?1 WHERE id = ?2")?;
+        for id in ids {
+            st.execute(params![ts, id])?;
+        }
+        Ok(())
     }
 
     fn export(&self, scope: &Scope) -> Result<Vec<Fact>> {

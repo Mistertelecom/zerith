@@ -612,7 +612,7 @@ pub(crate) fn recall_block(memory: &dyn MemoryBackend, scope: &Scope, query: &st
     let mut seen = std::collections::HashSet::new();
     let mut block = String::from("# O que você já sabe sobre o usuário\n");
     let mut used = block.len();
-    let mut any = false;
+    let mut injected = Vec::new();
     for fact in rules.cloned().chain(hits.into_iter().map(|h| h.fact)) {
         if fact.superseded_by.is_some() || !seen.insert(fact.id) {
             continue;
@@ -623,9 +623,11 @@ pub(crate) fn recall_block(memory: &dyn MemoryBackend, scope: &Scope, query: &st
         }
         used += line.len();
         block.push_str(&line);
-        any = true;
+        injected.push(fact.id);
     }
-    if any {
+    // A curadoria arquiva o que não chega ao prompt há muito tempo.
+    let _ = memory.touch(&injected);
+    if !injected.is_empty() {
         block
     } else {
         String::new()

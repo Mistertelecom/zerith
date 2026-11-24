@@ -217,6 +217,12 @@ pub trait MemoryBackend {
         Ok(true)
     }
 
+    /// Marks facts as just used (they reached a prompt), for curation's
+    /// last_used_at. Backends without the column ignore it.
+    fn touch(&self, _ids: &[i64]) -> Result<()> {
+        Ok(())
+    }
+
     /// Recall across several scopes (e.g. user + project), merged by score.
     /// bm25 scores from one FTS index are comparable across scopes.
     fn recall_multi(&self, scopes: &[Scope], query: &str, limit: usize) -> Result<Vec<RecallHit>> {

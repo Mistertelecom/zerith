@@ -9,15 +9,39 @@ use rusqlite::Connection;
 /// Highest version this build knows. Migrations are applied by version number,
 /// not by "everything above the maximum", so a gap (v6 present, v5 not yet) is
 /// filled in later instead of being skipped forever.
-pub const CURRENT_VERSION: i32 = 10;
+pub const CURRENT_VERSION: i32 = 11;
 
 /// Sequential migrations. Index 0 is version 1.
 const MIGRATIONS: &[&str] = &[V1, V2, V3, V4];
 
 /// Migrations with an explicit version, applied after the sequential ones.
 /// Task list owns v5, checkpoints v6, usage/cooldowns v7, session folder v8,
-/// prompt cache & TTFT metrics v9, scheduled cron tasks v10.
-const VERSIONED: &[(i32, &str)] = &[(5, V5), (6, V6), (7, V7), (8, V8), (9, V9), (10, V10)];
+/// prompt cache & TTFT metrics v9, scheduled cron tasks v10, memory curation v11.
+const VERSIONED: &[(i32, &str)] = &[
+    (5, V5),
+    (6, V6),
+    (7, V7),
+    (8, V8),
+    (9, V9),
+    (10, V10),
+    (11, V11),
+];
+
+const V11: &str = r#"
+-- Memory curation (zerith memory curate): when a fact last reached a prompt,
+-- and when it was archived (reversible; NULL = active). Existing facts start
+-- their clock now, so the first curation does not archive everything.
+ALTER TABLE memory_facts ADD COLUMN last_used_at INTEGER;
+ALTER TABLE memory_facts ADD COLUMN archived_at INTEGER;
+UPDATE memory_facts SET last_used_at = CAST(strftime('%s', 'now') AS INTEGER) * 1000;
+-- Marking a fact used on every turn must not rewrite its FTS row: the index
+-- follows the text only.
+DROP TRIGGER memory_facts_au;
+CREATE TRIGGER memory_facts_au AFTER UPDATE OF text ON memory_facts BEGIN
+    INSERT INTO memory_fts(memory_fts, rowid, text) VALUES('delete', old.id, old.text);
+    INSERT INTO memory_fts(rowid, text) VALUES (new.id, new.text);
+END;
+"#;
 
 const V10: &str = r#"
 -- Scheduled cron jobs (`zerith schedule` / `zerith daemon`).

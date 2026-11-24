@@ -115,6 +115,10 @@ usage:
   zerith secret set <name> [value] | get <name> | delete <name>
   zerith login <claude-code|codex|antigravity> [--account <id>] [--import] [--no-browser]
   zerith import hermes [--profile <name>] [--jsonl <file>]
+  zerith import hermes --all [--dry-run] [--yes] [--overwrite] [--migrate-secrets]
+                       [--profile <nome>] [--only-pinned-visible] [--customized-skills]
+                       [--no-rebrand] [--only sessao,memoria,persona,credencial,skill,mcp,cron,telegram]
+                       [--home <pasta do Hermes>]   (migração inteira, com plano e backup)
   zerith import detect
   zerith import hermes-skills [nome..]   (copia skills do Hermes, ativas)
   zerith mcp import-hermes [nome..]      (servidores de config.yaml do Hermes)"
@@ -1553,6 +1557,9 @@ fn providers(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::E
 
 fn import_hermes(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let a = parse_import_hermes(args)?;
+    if a.all {
+        return import_hermes_all(paths, &a);
+    }
     paths.ensure()?;
     let store = Store::open(paths.db())?;
     let report: ImportReport = match &a.jsonl {
@@ -1591,6 +1598,96 @@ fn import_hermes(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::erro
     for f in &report.failed {
         eprintln!("failed: {f}");
     }
+    Ok(())
+}
+
+/// `zerith import hermes --all`: mostra o plano (nada gravado), pergunta, e
+/// só então aplica com backup. `--dry-run` para no plano; `--yes` não pergunta.
+fn import_hermes_all(
+    paths: &Paths,
+    a: &crate::args::ImportHermes,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use zerith_importers::hermes_migrate::{run, Options, KINDS};
+    let home = match &a.home {
+        Some(h) => std::path::PathBuf::from(h),
+        None => zerith_importers::hermes_setup::hermes_home().ok_or(
+            "Hermes não encontrado (HERMES_HOME, ~/.hermes, %LOCALAPPDATA%\\hermes); use --home",
+        )?,
+    };
+    if let Some(only) = &a.only {
+        if let Some(bad) = only.iter().find(|k| !KINDS.contains(&k.as_str())) {
+            return Err(format!("tipo desconhecido: {bad} (tipos: {})", KINDS.join(",")).into());
+        }
+    }
+    let mut opts = Options {
+        dry_run: true,
+        overwrite: a.overwrite,
+        migrate_secrets: a.migrate_secrets,
+        profile: a.profile.clone(),
+        only_pinned_visible: a.only_pinned_visible,
+        rebrand: !a.no_rebrand,
+        customized_skills: a.customized_skills,
+        kinds: a.only.as_ref().map(|k| k.iter().cloned().collect()),
+        // As credenciais às vezes ficam em ~/.hermes/creds mesmo com o home
+        // do Hermes em %LOCALAPPDATA%.
+        extra_creds: vec![home_dir().join(".hermes").join("creds")],
+    };
+    let vault = zerith_core::secrets::OsKeyring;
+    let plan = run(&home, paths, &opts, &vault)?;
+    print!("{}", plan.markdown());
+    let pending = plan
+        .items
+        .iter()
+        .any(|i| i.status != zerith_importers::plan::Status::Skipped);
+    if a.dry_run {
+        println!(
+            "
+(plano apenas: nada foi gravado)"
+        );
+        return Ok(());
+    }
+    if !pending {
+        println!(
+            "
+Nada a migrar."
+        );
+        return Ok(());
+    }
+    if !a.yes {
+        print!(
+            "
+Aplicar a migração? Um backup é feito antes. [s/N] "
+        );
+        std::io::Write::flush(&mut std::io::stdout())?;
+        let mut ans = String::new();
+        std::io::stdin().read_line(&mut ans)?;
+        if !matches!(
+            ans.trim().to_lowercase().as_str(),
+            "s" | "sim" | "y" | "yes"
+        ) {
+            println!("Nada foi gravado.");
+            return Ok(());
+        }
+    }
+    opts.dry_run = false;
+    let done = run(&home, paths, &opts, &vault)?;
+    let errors = done
+        .items
+        .iter()
+        .filter(|i| i.status == zerith_importers::plan::Status::Error)
+        .count();
+    println!(
+        "
+Migração aplicada{}. Relatório: {}
+Backup: {}",
+        if errors > 0 {
+            format!(" com {errors} erro(s)")
+        } else {
+            String::new()
+        },
+        done.report_dir.as_deref().unwrap_or("-"),
+        done.backup_dir.as_deref().unwrap_or("-")
+    );
     Ok(())
 }
 

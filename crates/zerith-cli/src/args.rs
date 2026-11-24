@@ -536,27 +536,76 @@ pub fn parse_rename(args: &[String]) -> Result<(String, String), String> {
     Ok((key.clone(), title))
 }
 
-/// `zerith import hermes [--profile P] [--jsonl FILE]`
-#[derive(Debug, PartialEq)]
+/// `zerith import hermes [--profile P] [--jsonl FILE]` e a migração inteira
+/// `zerith import hermes --all [--dry-run] [--yes] [--overwrite]
+/// [--migrate-secrets] [--only-pinned-visible] [--customized-skills]
+/// [--no-rebrand] [--only tipo,tipo] [--home DIR]`.
+#[derive(Debug, Default, PartialEq)]
 pub struct ImportHermes {
     pub profile: Option<String>,
     pub jsonl: Option<String>,
+    pub all: bool,
+    pub dry_run: bool,
+    pub yes: bool,
+    pub overwrite: bool,
+    pub migrate_secrets: bool,
+    pub only_pinned_visible: bool,
+    pub customized_skills: bool,
+    pub no_rebrand: bool,
+    pub only: Option<Vec<String>>,
+    pub home: Option<String>,
 }
 
 pub fn parse_import_hermes(args: &[String]) -> Result<ImportHermes, String> {
-    let mut out = ImportHermes {
-        profile: None,
-        jsonl: None,
-    };
+    let mut out = ImportHermes::default();
     let mut i = 2;
     while i < args.len() {
         let v = args.get(i + 1);
+        let mut step = 2;
         match args[i].as_str() {
             "--profile" => out.profile = Some(v.ok_or("--profile precisa de um valor")?.clone()),
             "--jsonl" => out.jsonl = Some(v.ok_or("--jsonl precisa de um arquivo")?.clone()),
-            other => return Err(format!("argumento desconhecido: {other}")),
+            "--home" => out.home = Some(v.ok_or("--home precisa de uma pasta")?.clone()),
+            "--only" => {
+                out.only = Some(
+                    v.ok_or("--only precisa de tipos (sessao,memoria,...)")?
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect(),
+                )
+            }
+            flag => {
+                step = 1;
+                match flag {
+                    "--all" => out.all = true,
+                    "--dry-run" => out.dry_run = true,
+                    "--yes" | "-y" => out.yes = true,
+                    "--overwrite" => out.overwrite = true,
+                    "--migrate-secrets" => out.migrate_secrets = true,
+                    "--only-pinned-visible" => out.only_pinned_visible = true,
+                    "--customized-skills" => out.customized_skills = true,
+                    "--no-rebrand" => out.no_rebrand = true,
+                    other => return Err(format!("argumento desconhecido: {other}")),
+                }
+            }
         }
-        i += 2;
+        i += step;
+    }
+    let full_only = out.dry_run
+        || out.yes
+        || out.overwrite
+        || out.migrate_secrets
+        || out.only_pinned_visible
+        || out.customized_skills
+        || out.no_rebrand
+        || out.only.is_some()
+        || out.home.is_some();
+    if !out.all && full_only {
+        return Err("essas opções são da migração completa: use --all".into());
+    }
+    if out.all && out.jsonl.is_some() {
+        return Err("--jsonl não combina com --all".into());
     }
     Ok(out)
 }
@@ -841,6 +890,19 @@ mod tests {
         assert_eq!(i.jsonl.as_deref(), Some("x.jsonl"));
         assert_eq!(i.profile.as_deref(), Some("p"));
         assert!(parse_import_hermes(&v(&["import", "hermes", "--jsonl"])).is_err());
+        let a = parse_import_hermes(&v(&[
+            "import",
+            "hermes",
+            "--all",
+            "--dry-run",
+            "--migrate-secrets",
+            "--only",
+            "memoria, skill",
+        ]))
+        .unwrap();
+        assert!(a.all && a.dry_run && a.migrate_secrets && !a.yes);
+        assert_eq!(a.only.unwrap(), ["memoria", "skill"]);
+        assert!(parse_import_hermes(&v(&["import", "hermes", "--dry-run"])).is_err());
     }
 
     #[test]

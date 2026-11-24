@@ -168,6 +168,9 @@ pub fn run(
     if opts.wants("credencial") {
         credentials(&mut ctx);
     }
+    if opts.wants("skill") {
+        skills(&mut ctx);
+    }
     if ctx.apply() {
         ctx.ledger.save(paths).map_err(|e| format!("ledger: {e}"))?;
         if let Some(dir) = &ctx.dir {
@@ -1043,6 +1046,248 @@ fn credential(ctx: &mut Ctx, path: &Path, inv_path: &Path) {
     }
     ctx.plan
         .push("credencial", src, dest, status, reason.join("; "));
+}
+
+// ------------------------------------------------------------------- skills
+
+/// De onde veio uma skill do home do Hermes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillOrigin {
+    /// Sem registro de origem: criada pela pessoa. Importada por padrão.
+    User,
+    /// Embutida (ou do hub) e alterada pela pessoa. Só com
+    /// `customized_skills`.
+    Customized,
+    /// Embutida e igual à original: o Zerith tem as suas.
+    Bundled,
+}
+
+/// Arquivos de uma skill que contam para o hash, como o Hermes faz
+/// (`tools/skills_sync.py::_dir_hash`): pula `__pycache__` e afins e o `.pyc`
+/// que tem `.py` ao lado.
+fn skill_files(dir: &Path) -> Vec<(String, PathBuf)> {
+    const CACHE: [&str; 4] = ["__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"];
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            let name = e.file_name().to_string_lossy().into_owned();
+            if p.is_dir() {
+                if !CACHE.contains(&name.as_str()) {
+                    walk(root, &p, out);
+                }
+                continue;
+            }
+            let pyc = p.extension().is_some_and(|x| x == "pyc" || x == "pyo")
+                && p.with_extension("py").is_file();
+            if !pyc {
+                let rel = p.strip_prefix(root).unwrap_or(&p);
+                out.push((rel.to_string_lossy().replace('\\', "/"), p.clone()));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, &mut out);
+    out
+}
+
+/// Os hashes md5 que o `.bundled_manifest` pode ter para esta pasta: o
+/// caminho relativo como o Python escreve no Linux/macOS (`a/b`, ordem
+/// binária) e no Windows (`a\b`, ordem sem caixa).
+pub fn bundled_hashes(dir: &Path) -> [String; 2] {
+    use md5::{Digest, Md5};
+    let mut files = skill_files(dir);
+    let digest = |files: &[(String, PathBuf)], sep: &str| {
+        let mut h = Md5::new();
+        for (rel, p) in files {
+            h.update(rel.replace('/', sep).as_bytes());
+            h.update(std::fs::read(p).unwrap_or_default());
+        }
+        plan::hex(&h.finalize())
+    };
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    let posix = digest(&files, "/");
+    files.sort_by_key(|a| a.0.to_lowercase());
+    [posix, digest(&files, "\\")]
+}
+
+/// O `content_hash` do `skills/.hub/lock.json` (`tools/skills_guard.py`):
+/// `sha256:` + 16 hex de sha256 sobre (caminho posix, `\0`, bytes) em ordem
+/// de string.
+pub fn hub_hash(dir: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let mut files = skill_files(dir);
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut h = Sha256::new();
+    for (rel, p) in &files {
+        h.update(rel.as_bytes());
+        h.update([0u8]);
+        h.update(std::fs::read(p).unwrap_or_default());
+    }
+    format!("sha256:{}", &plan::hex(&h.finalize())[..16])
+}
+
+/// Classifica cada skill do home pela origem: `.bundled_manifest`
+/// (`nome:md5`), `.hub/lock.json` (`installed.<nome>.content_hash`) e o que
+/// existe em `hermes-agent/skills` e `hermes-agent/optional-skills`.
+pub fn classify_skills(home: &Path) -> Vec<(crate::hermes_setup::HermesSkill, SkillOrigin)> {
+    let skills_dir = home.join("skills");
+    let manifest: std::collections::HashMap<String, String> =
+        std::fs::read_to_string(skills_dir.join(".bundled_manifest"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| {
+                let (n, h) = l.trim().split_once(':').unwrap_or((l.trim(), ""));
+                (!n.is_empty()).then(|| (n.trim().to_string(), h.trim().to_string()))
+            })
+            .collect();
+    let hub: serde_json::Value = std::fs::read_to_string(skills_dir.join(".hub/lock.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    let shipped: std::collections::HashMap<String, PathBuf> = ["skills", "optional-skills"]
+        .iter()
+        .flat_map(|d| crate::hermes_setup::scan_skills(&home.join("hermes-agent").join(d)))
+        .map(|s| (s.name, s.dir))
+        .collect();
+    let ecc = ecc_files(home);
+    crate::hermes_setup::scan_skills(&skills_dir)
+        .into_iter()
+        .map(|s| {
+            let origin = if let Some(h) = manifest.get(&s.name) {
+                // v1 do manifesto (sem hash): não dá para provar que é igual.
+                if !h.is_empty() && bundled_hashes(&s.dir).contains(h) {
+                    SkillOrigin::Bundled
+                } else {
+                    SkillOrigin::Customized
+                }
+            } else if let Some(h) = hub["installed"][&s.name]["content_hash"].as_str() {
+                if hub_hash(&s.dir) == h {
+                    SkillOrigin::Bundled
+                } else {
+                    SkillOrigin::Customized
+                }
+            } else if let Some(orig) = shipped.get(&s.name) {
+                if hub_hash(&s.dir) == hub_hash(orig) {
+                    SkillOrigin::Bundled
+                } else {
+                    SkillOrigin::Customized
+                }
+            } else if let Some(changed) = ecc_changed(&ecc, &s.dir) {
+                if changed {
+                    SkillOrigin::Customized
+                } else {
+                    SkillOrigin::Bundled
+                }
+            } else {
+                SkillOrigin::User
+            };
+            (s, origin)
+        })
+        .collect()
+}
+
+/// Arquivos que o pacote ECC (Everything Claude Code) instalou no home:
+/// `ecc-install-state.json`, `operations[].destinationPath` → `contentSha256`.
+/// O caminho é o do computador onde o ECC rodou; casa pelo trecho a partir
+/// de `skills/`.
+fn ecc_files(home: &Path) -> std::collections::HashMap<String, String> {
+    let v: serde_json::Value = std::fs::read_to_string(home.join("ecc-install-state.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    v["operations"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|op| {
+            let dest = op["destinationPath"].as_str()?.replace('\\', "/");
+            let rel = &dest[dest.find("/skills/")? + 1..];
+            Some((rel.to_string(), op["contentSha256"].as_str()?.to_string()))
+        })
+        .collect()
+}
+
+/// `Some(alterada?)` se a pasta foi instalada pelo ECC; `None` se não.
+fn ecc_changed(ecc: &std::collections::HashMap<String, String>, dir: &Path) -> Option<bool> {
+    let comps: Vec<String> = dir
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    let at = comps.iter().rposition(|c| c == "skills")?;
+    let prefix = format!("{}/", comps[at..].join("/"));
+    let mine: Vec<(&String, &String)> =
+        ecc.iter().filter(|(k, _)| k.starts_with(&prefix)).collect();
+    if mine.is_empty() {
+        return None;
+    }
+    let root = dir.ancestors().nth(comps.len() - at)?;
+    Some(mine.iter().any(|(rel, sha)| {
+        std::fs::read(root.join(rel)).map_or(true, |b| &plan::sha256_hex(&b) != *sha)
+    }))
+}
+
+fn skills(ctx: &mut Ctx) {
+    let installed: HashSet<String> =
+        std::fs::read_to_string(ctx.paths.skills().join("manifest.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str::<zerith_skills::install::Manifest>(&t).ok())
+            .map(|m| m.skills.into_iter().map(|s| s.name).collect())
+            .unwrap_or_default();
+    let lib = if ctx.apply() {
+        match zerith_skills::Library::open(ctx.paths.skills()) {
+            Ok(l) => Some(l),
+            Err(e) => {
+                ctx.plan
+                    .push("skill", "", "skills/", Status::Error, e.to_string());
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    let mut done: HashSet<String> = HashSet::new();
+    for (s, origin) in classify_skills(ctx.home) {
+        let src = if s.category.is_empty() {
+            s.name.clone()
+        } else {
+            format!("{}/{}", s.category, s.name)
+        };
+        let dest = format!("skills/{}", s.name);
+        let skip = |why: &str| (Status::Skipped, why.to_string());
+        let (status, reason) = if let Some(e) = &s.error {
+            (Status::Error, format!("SKILL.md inválido: {e}"))
+        } else if installed.contains(&s.name) || done.contains(&s.name) {
+            skip("já existe no Zerith")
+        } else {
+            match origin {
+                SkillOrigin::Bundled => skip("embutida no Hermes e sem alteração"),
+                SkillOrigin::Customized if !ctx.opts.customized_skills => {
+                    skip("embutida no Hermes, mas alterada; importe com --customized-skills")
+                }
+                SkillOrigin::Customized => (Status::Imported, "embutida e alterada".into()),
+                SkillOrigin::User => (Status::Imported, "criada no Hermes".into()),
+            }
+        };
+        let (status, reason) = match (&lib, status) {
+            (Some(lib), Status::Imported) => {
+                match lib.install(&s.dir, &format!("hermes:{}", s.dir.display())) {
+                    Ok(_) => (status, reason),
+                    Err(zerith_skills::install::InstallError::NameConflict(_)) => {
+                        skip("já existe no Zerith")
+                    }
+                    Err(e) => (Status::Error, e.to_string()),
+                }
+            }
+            _ => (status, reason),
+        };
+        if status == Status::Imported {
+            done.insert(s.name.clone());
+        }
+        ctx.plan.push("skill", src, dest, status, reason);
+    }
 }
 
 #[cfg(test)]

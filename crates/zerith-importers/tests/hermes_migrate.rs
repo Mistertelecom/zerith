@@ -110,6 +110,37 @@ fn fixture() -> Fx {
         &home.join("creds/acme-segredos.txt"),
         &format!("# lista\nwifi: {CRED_PW}4\n{CRED_PW}5\n"),
     );
+    let skill = |rel: &str, name: &str, body: &str| {
+        write(
+            &home.join("skills").join(rel).join("SKILL.md"),
+            &format!("---\nname: {name}\ndescription: d\n---\n{body}\n"),
+        )
+    };
+    skill("minha", "minha", "corpo"); // sem registro: da pessoa
+    skill("cat/bund", "bund", "corpo"); // embutida, igual
+    skill("cat/mexida", "mexida", "alterado"); // embutida, alterada
+    skill("hubby", "hubby", "corpo"); // do hub, igual
+    skill(".archive/velha", "velha", "corpo"); // ignorada
+    skill("eccy", "eccy", "corpo"); // instalada pelo pacote ECC, igual
+    let ecc_sha = zerith_importers::plan::sha256_hex(
+        &std::fs::read(home.join("skills/eccy/SKILL.md")).unwrap(),
+    );
+    write(
+        &home.join("ecc-install-state.json"),
+        &format!(
+            r#"{{"operations":[{{"destinationPath":"/Users/x/.hermes/skills/eccy/SKILL.md","contentSha256":"{ecc_sha}"}}]}}"#
+        ),
+    );
+    // md5("SKILL.md" + conteúdo), como o Hermes calcula.
+    write(
+        &home.join("skills/.bundled_manifest"),
+        "bund:0da84a1773e97d32ac025f5281046530\nmexida:0da84a1773e97d32ac025f5281046530\n",
+    );
+    let hub = zerith_importers::hermes_migrate::hub_hash(&home.join("skills/hubby"));
+    write(
+        &home.join("skills/.hub/lock.json"),
+        &format!(r#"{{"version":1,"installed":{{"hubby":{{"content_hash":"{hub}"}}}}}}"#),
+    );
     let paths = Paths::with_root(t.path().join("zerith"));
     Fx { _t: t, home, paths }
 }
@@ -126,6 +157,35 @@ fn count(plan: &ImportPlan, kind: &str, status: Status) -> usize {
         .iter()
         .filter(|i| i.kind == kind && i.status == status)
         .count()
+}
+
+#[test]
+fn only_user_skills_come_by_default() {
+    let fx = fixture();
+    let vault = Vault::default();
+    let plan = run(&fx.home, &fx.paths, &opts(false), &vault).unwrap();
+    let status = |n: &str| {
+        plan.items
+            .iter()
+            .find(|i| i.kind == "skill" && i.dest == format!("skills/{n}"))
+            .map(|i| i.status)
+    };
+    assert_eq!(status("minha"), Some(Status::Imported));
+    assert_eq!(status("bund"), Some(Status::Skipped));
+    assert_eq!(status("mexida"), Some(Status::Skipped));
+    assert_eq!(status("hubby"), Some(Status::Skipped));
+    assert_eq!(status("velha"), None);
+    assert_eq!(status("eccy"), Some(Status::Skipped));
+    assert!(fx.paths.skills().join("minha/SKILL.md").is_file());
+    assert!(!fx.paths.skills().join("bund").exists());
+    let o = Options {
+        dry_run: false,
+        customized_skills: true,
+        ..Default::default()
+    };
+    let plan = run(&fx.home, &fx.paths, &o, &vault).unwrap();
+    assert_eq!(count(&plan, "skill", Status::Imported), 1);
+    assert!(fx.paths.skills().join("mexida/SKILL.md").is_file());
 }
 
 const CRED_PW: &str = "Pw!secr3t";

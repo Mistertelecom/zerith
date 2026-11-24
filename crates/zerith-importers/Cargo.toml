@@ -21,6 +21,8 @@ thiserror.workspace = true
 sha2 = "0.10"
 # Já no Cargo.lock: valores secretos dentro de texto livre.
 regex = "1"
+# Já no Cargo.lock: o `.bundled_manifest` do Hermes guarda md5 por skill.
+md-5 = "0.10"
 
 [dev-dependencies]
 tempfile.workspace = true

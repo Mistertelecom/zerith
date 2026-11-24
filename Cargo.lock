@@ -5248,6 +5248,7 @@ dependencies = [
 name = "zerith-importers"
 version = "0.4.6"
 dependencies = [
+ "md-5",
  "regex",
  "rusqlite",
  "serde",

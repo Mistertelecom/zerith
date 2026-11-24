@@ -1242,3 +1242,58 @@ export function onBotWorkflowReport(
     handler(e.payload),
   ).catch(() => () => undefined);
 }
+
+// ------------------------------------------------------------ servidores
+
+/** `zerith server` pareado (Ajustes > Servidores). O token fica no cofre. */
+export interface ServerEntry {
+  id: string;
+  name: string;
+  url: string;
+  created_at_ms: number;
+  last_contact_ms?: number | null;
+}
+
+export interface DaemonStatus {
+  version: string;
+  started_at_ms: number;
+  last_cycle_ms: number;
+  hostname: string;
+  active_workflows: number;
+  next_run?: { workflow_id: string; at_ms: number } | null;
+  consecutive_failures: Record<string, number>;
+}
+
+export interface ServerHealth {
+  name: string;
+  version: string;
+  hostname: string;
+  uptime_secs: number;
+  workflows_total: number;
+  workflows_enabled: number;
+  failing_workflows: number;
+  runs_active: number;
+}
+
+/** green: daemon com ciclo < 2 min; yellow: API responde, daemon parado; red: sem resposta. */
+export type ServerColor = "green" | "yellow" | "red";
+
+export interface ServerStatus {
+  id: string;
+  color: ServerColor;
+  version?: string | null;
+  health?: ServerHealth | null;
+  daemon?: DaemonStatus | null;
+  error?: string | null;
+  checked_at_ms: number;
+  last_contact_ms?: number | null;
+}
+
+export const serversApi = {
+  list: () => invoke<ServerEntry[]>("servers_list"),
+  status: () => invoke<ServerStatus[]>("servers_status"),
+  add: (pairCode: string) => invoke<ServerEntry>("server_add", { pairCode }),
+  remove: (id: string) => invoke<void>("server_remove", { id }),
+  test: (id: string) => invoke<ServerStatus>("server_test", { id }),
+  health: (id: string) => invoke<ServerStatus>("server_health", { id }),
+};

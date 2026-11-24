@@ -17,6 +17,7 @@ pub mod migration;
 pub mod notify;
 pub mod prefs;
 pub mod providers;
+pub mod servers;
 pub mod skills;
 pub mod state;
 pub mod turn;
@@ -370,6 +371,12 @@ pub fn run() {
             workflows::channel_test,
             workflows::channel_check,
             workflows::channel_groups,
+            servers::servers_list,
+            servers::servers_status,
+            servers::server_add,
+            servers::server_remove,
+            servers::server_test,
+            servers::server_health,
             update::update_check,
             update::update_install,
         ])

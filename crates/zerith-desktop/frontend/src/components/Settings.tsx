@@ -22,6 +22,7 @@ import {
   CircleAlert,
   CircleCheck,
   Gauge,
+  HardDrive,
   History,
   Image,
   KeyRound,
@@ -54,6 +55,7 @@ const RoutingTab = lazy(() => import("./Routing").then((m) => ({ default: m.Rout
 const AccountsTab = lazy(() => import("./SettingsAccounts").then((m) => ({ default: m.AccountsTab })));
 const QuotaTab = lazy(() => import("./SettingsAccounts").then((m) => ({ default: m.QuotaTab })));
 const UsageTab = lazy(() => import("./SettingsAccounts").then((m) => ({ default: m.UsageTab })));
+const ServersTab = lazy(() => import("./Servers").then((m) => ({ default: m.ServersTab })));
 
 const TABS = [
   "Geral",
@@ -67,6 +69,7 @@ const TABS = [
   "Agentes",
   "Histórico",
   "Uso",
+  "Servidores",
 ] as const;
 export type SettingsTab = (typeof TABS)[number];
 type Tab = SettingsTab;
@@ -125,6 +128,16 @@ const NAV: {
       },
       { tab: "MCP", icon: Server, hint: "Servidores MCP: ferramentas externas do agente." },
       { tab: "Agentes", icon: Bot, hint: "Subagentes especializados." },
+    ],
+  },
+  {
+    group: "Automações",
+    items: [
+      {
+        tab: "Servidores",
+        icon: HardDrive,
+        hint: "Máquinas com o Zerith (zerith server) que rodam workflows 24 h.",
+      },
     ],
   },
   {
@@ -603,6 +616,7 @@ export function Settings({
               {tab === "Mídia" ? <MediaTab /> : null}
               {tab === "Agentes" ? <AgentsTab /> : null}
               {tab === "Histórico" ? <HistoryTab /> : null}
+              {tab === "Servidores" ? <ServersTab /> : null}
               {tab === "Uso" ? (
                 <UsageTab usage={usage} presets={presets} />
               ) : null}

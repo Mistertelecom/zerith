@@ -734,8 +734,7 @@ impl Origin {
                 }
                 parse_claude_session(&text)
             }
-            // O leitor do Codex entra no próximo commit.
-            Origin::Codex => None,
+            Origin::Codex => crate::codex::parse_codex_session(&text, path),
         })
     }
 }

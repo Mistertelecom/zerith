@@ -13,6 +13,7 @@
 //! upgrade must not lose data this crate has not learned about yet.
 
 pub mod claude_code;
+pub mod codex;
 mod hermes;
 mod hermes_jsonl;
 pub mod hermes_migrate;

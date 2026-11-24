@@ -104,6 +104,57 @@ pub fn due_workflows(
     due
 }
 
+/// Setting (em `workflow_meta`) com o fuso fixo do servidor, em minutos a
+/// leste de UTC (ex. `-180`).
+pub const TZ_OFFSET_KEY: &str = "workflows.tz_offset_minutes";
+
+/// Offset fixo de um nome de fuso (`TZ`). Tabela mínima: Brasil (sem horário
+/// de verão desde 2019) e UTC, além de `UTC-3`/`UTC+05:30`. Fora dela, `None`
+/// e vale o horário local do sistema (que em Linux com tzdata já lê `TZ`).
+/// ponytail: tabela só com fusos de offset fixo; para os demais instalar
+/// tzdata ou gravar `workflows.tz_offset_minutes`.
+pub fn tz_offset_from_name(name: &str) -> Option<i32> {
+    let name = name.trim().trim_start_matches(':');
+    let fixed = match name {
+        "UTC" | "Etc/UTC" | "GMT" | "Etc/GMT" | "Z" => Some(0),
+        "America/Noronha" | "Brazil/DeNoronha" => Some(-120),
+        "America/Sao_Paulo" | "Brazil/East" | "America/Bahia" | "America/Fortaleza"
+        | "America/Recife" | "America/Belem" | "America/Maceio" | "America/Araguaina"
+        | "America/Santarem" => Some(-180),
+        "America/Manaus"
+        | "Brazil/West"
+        | "America/Cuiaba"
+        | "America/Campo_Grande"
+        | "America/Porto_Velho"
+        | "America/Boa_Vista" => Some(-240),
+        "America/Rio_Branco" | "Brazil/Acre" | "America/Eirunepe" => Some(-300),
+        _ => None,
+    };
+    fixed.or_else(|| {
+        let rest = name
+            .strip_prefix("UTC")
+            .or_else(|| name.strip_prefix("GMT"))?;
+        let (sign, hm) = match rest.as_bytes().first()? {
+            b'+' => (1, &rest[1..]),
+            b'-' => (-1, &rest[1..]),
+            _ => return None,
+        };
+        let (h, m) = hm.split_once(':').unwrap_or((hm, "0"));
+        let (h, m) = (h.parse::<i32>().ok()?, m.parse::<i32>().ok()?);
+        (h <= 14 && m < 60).then_some(sign * (h * 60 + m))
+    })
+}
+
+/// Fuso padrão do servidor: setting `workflows.tz_offset_minutes`, senão a
+/// tabela de [`tz_offset_from_name`] para `TZ`, senão `None` (horário local do
+/// sistema). O fuso gravado no gatilho cron sempre vence este.
+pub fn server_tz_offset(setting: Option<&str>, tz_env: Option<&str>) -> Option<i32> {
+    setting
+        .and_then(|s| s.trim().parse::<i32>().ok())
+        .filter(|m| m.abs() <= 14 * 60)
+        .or_else(|| tz_env.and_then(tz_offset_from_name))
+}
+
 /// Quanto à frente [`next_run`] procura (8 dias cobre crons semanais).
 const NEXT_RUN_HORIZON_MIN: i64 = 8 * 24 * 60;
 
@@ -390,6 +441,27 @@ mod tests {
             Some(("hourly".to_string(), top_of_hour))
         );
         assert_eq!(next_run(&wfs[..1], T, None), None);
+    }
+
+    #[test]
+    fn server_tz_prefers_setting_then_tz_table() {
+        assert_eq!(
+            server_tz_offset(Some("-120"), Some("America/Sao_Paulo")),
+            Some(-120)
+        );
+        assert_eq!(
+            server_tz_offset(None, Some("America/Sao_Paulo")),
+            Some(-180)
+        );
+        assert_eq!(
+            server_tz_offset(Some("lixo"), Some(":America/Manaus")),
+            Some(-240)
+        );
+        assert_eq!(server_tz_offset(None, Some("UTC-3")), Some(-180));
+        assert_eq!(server_tz_offset(None, Some("UTC+05:30")), Some(330));
+        assert_eq!(server_tz_offset(None, Some("Europe/Lisbon")), None);
+        assert_eq!(server_tz_offset(Some("9999"), None), None);
+        assert_eq!(server_tz_offset(None, None), None);
     }
 
     #[test]

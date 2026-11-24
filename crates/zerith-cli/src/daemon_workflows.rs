@@ -88,7 +88,11 @@ impl WorkflowDaemon {
     /// Um ciclo: dispara os workflows vencidos, grava o sinal de vida e
     /// devolve as threads iniciadas.
     pub fn cycle(&self, now_secs: i64) -> Vec<JoinHandle<()>> {
-        let tz = None;
+        // Fuso da VPS: setting `workflows.tz_offset_minutes`, senão `TZ`
+        // (tabela de offsets fixos), senão horário local do sistema.
+        let setting = self.store.setting(scheduler::TZ_OFFSET_KEY).ok().flatten();
+        let tz =
+            scheduler::server_tz_offset(setting.as_deref(), std::env::var("TZ").ok().as_deref());
         let opts = TickOptions {
             data_root: self.root.clone(),
             now_secs,
@@ -222,6 +226,28 @@ mod tests {
         assert_eq!(next.workflow_id, "wf-vps");
         assert_eq!(next.at_ms, (t / 60 + 1) * 60_000);
         assert!(status.consecutive_failures.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn daemon_uses_server_tz_setting_for_triggers_without_tz() {
+        let dir = temp_root("tz");
+        let st = Store::open(&dir.join("workflows.db")).unwrap();
+        let mut wf = every_minute_wf(
+            "wf-8h",
+            node("t", NodeKind::Transform, json!({"template": "ok"})),
+        );
+        wf.nodes[0].config = json!({"cron": "0 8 * * *"});
+        st.save_workflow(&wf).unwrap();
+        st.set_setting(scheduler::TZ_OFFSET_KEY, "-180").unwrap();
+        let d = WorkflowDaemon::open(&Paths::with_root(&dir)).unwrap();
+        // 11:00 UTC = 08:00 em Brasília.
+        let t = 1_700_000_000;
+        let at11 = t - t % 86_400 + 11 * 3600;
+        d.cycle(at11).into_iter().for_each(|h| h.join().unwrap());
+        assert_eq!(st.list_runs("wf-8h", 5).unwrap().len(), 1);
+        let next = st.daemon_status().unwrap().unwrap().next_run.unwrap();
+        assert_eq!(next.at_ms, (at11 + 86_400) * 1000);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

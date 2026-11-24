@@ -23,7 +23,7 @@ use zerith_runtime::{
     approval_channel_with_grants, run_agent_turn, AgentOptions, Approval, ApprovalSender, RunEvent,
     SharedGrants, TurnContext,
 };
-use zerith_security::Policy;
+use zerith_security::{redact, Policy};
 use zerith_sessions::{SessionSource, Store};
 use zerith_skills::Library;
 use zerith_tools::Registry;
@@ -39,23 +39,320 @@ pub fn is_chat_allowed(allowed: &[i64], chat_id: i64) -> bool {
     !allowed.is_empty() && allowed.contains(&chat_id)
 }
 
-/// Parses inline-keyboard callback data in the form `"approve:<id>:once|session|deny"`.
-pub fn parse_callback_decision(data: &str) -> Option<(u64, Approval)> {
-    let mut parts = data.trim().split(':');
-    if parts.next()? != "approve" {
-        return None;
+/// De onde veio o pedido de aprovação: turno do próprio gateway (`approve:`)
+/// ou tarefa agendada do daemon (`sched:`), que espera a decisão pelo banco.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    Turn,
+    Schedule,
+}
+
+fn decision_code(d: Approval) -> &'static str {
+    match d {
+        Approval::AllowOnce => "once",
+        Approval::AllowSession => "session",
+        Approval::AllowProject => "project",
+        Approval::Deny => "deny",
     }
-    let id: u64 = parts.next()?.parse().ok()?;
-    let decision = match parts.next()? {
+}
+
+fn parse_decision_code(s: &str) -> Option<Approval> {
+    Some(match s {
         "once" => Approval::AllowOnce,
         "session" => Approval::AllowSession,
+        "project" => Approval::AllowProject,
         "deny" => Approval::Deny,
         _ => return None,
+    })
+}
+
+fn decision_label(d: Approval) -> &'static str {
+    match d {
+        Approval::AllowOnce => "Permitido uma vez",
+        Approval::AllowSession => "Permitido na sessão",
+        Approval::AllowProject => "Sempre neste projeto",
+        Approval::Deny => "Negado",
+    }
+}
+
+/// Parses inline-keyboard callback data in the form
+/// `"approve|sched:<id>:once|session|project|deny"`.
+pub fn parse_callback_decision(data: &str) -> Option<(Origin, u64, Approval)> {
+    let mut parts = data.trim().split(':');
+    let origin = match parts.next()? {
+        "approve" => Origin::Turn,
+        "sched" => Origin::Schedule,
+        _ => return None,
     };
+    let id: u64 = parts.next()?.parse().ok()?;
+    let decision = parse_decision_code(parts.next()?)?;
     if parts.next().is_some() {
         return None;
     }
-    Some((id, decision))
+    Some((origin, id, decision))
+}
+
+/// Teclado do pedido: "Sempre neste projeto" só quando o runtime ofereceu a
+/// regra (`always`). O `callback_data` cabe folgado nos 64 bytes da Bot API.
+fn approval_keyboard(origin: Origin, id: u64, always: Option<&str>) -> Value {
+    let prefix = match origin {
+        Origin::Turn => "approve",
+        Origin::Schedule => "sched",
+    };
+    let btn = |text: String, d: Approval| json!({"text": text, "callback_data": format!("{prefix}:{id}:{}", decision_code(d))});
+    let mut rows = vec![vec![
+        btn("Permitir uma vez".into(), Approval::AllowOnce),
+        btn("Permitir na sessão".into(), Approval::AllowSession),
+    ]];
+    if let Some(rule) = always {
+        rows.push(vec![btn(
+            format!("Sempre neste projeto ({})", cut(&redact(rule), 40)),
+            Approval::AllowProject,
+        )]);
+    }
+    rows.push(vec![btn("Negar".into(), Approval::Deny)]);
+    json!({ "inline_keyboard": rows })
+}
+
+fn cut(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+/// Programas que levam o comando a outra máquina (espelha `remote_access`
+/// do pipeline, que é privado ao runtime).
+const REMOTE_PROGS: &[&str] = &[
+    "ssh", "plink", "telnet", "sshpass", "scp", "sftp", "putty", "kitty",
+];
+
+/// Aviso em destaque para comando destrutivo de rede e acesso remoto.
+fn risk_banner(tool: &str, summary: &str) -> Option<&'static str> {
+    if summary.contains("COMANDO DESTRUTIVO DE REDE") {
+        return Some("⚠️ ATENÇÃO: comando destrutivo em equipamento de rede. Pode derrubar o acesso; confira antes de permitir.");
+    }
+    if summary.contains("[equipamento crítico]") {
+        return Some("⚠️ Equipamento crítico: o comando altera a configuração.");
+    }
+    let remote = tool == "net_connect"
+        || summary
+            .split(|c: char| c.is_whitespace() || ";|&()'\"`".contains(c))
+            .any(|w| {
+                let n = w
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .unwrap_or(w)
+                    .to_ascii_lowercase();
+                REMOTE_PROGS.contains(&n.strip_suffix(".exe").unwrap_or(&n))
+            });
+    remote.then_some("⚠️ Acesso remoto: o comando roda em outra máquina.")
+}
+
+/// Texto do pedido: ferramenta, aviso de risco, resumo sem segredos e cortado,
+/// a regra que "sempre neste projeto" grava e uma nota opcional.
+fn approval_text(tool: &str, summary: &str, always: Option<&str>, note: Option<&str>) -> String {
+    let mut msg = format!("Aprovação necessária\nFerramenta: {tool}");
+    if let Some(b) = risk_banner(tool, summary) {
+        msg.push_str(&format!("\n{b}"));
+    }
+    msg.push_str(&format!("\n\n{}", cut(&redact(summary), 1200)));
+    if let Some(rule) = always {
+        msg.push_str(&format!(
+            "\n\n\"Sempre neste projeto\" grava: {}",
+            cut(&redact(rule), 200)
+        ));
+    }
+    if let Some(n) = note {
+        msg.push_str(&format!("\n\n{n}"));
+    }
+    msg
+}
+
+/// Pedido pendente de um turno do gateway, guardado por `(chat, id)`.
+struct Pending {
+    sender: ApprovalSender,
+    has_rule: bool,
+    message_id: Option<i64>,
+    text: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Refusal {
+    ChatNotAllowed,
+    AlreadyDecided,
+}
+
+impl Refusal {
+    fn ack(&self) -> &'static str {
+        match self {
+            Refusal::ChatNotAllowed => "Chat não autorizado",
+            Refusal::AlreadyDecided => "Já decidido (ou expirou)",
+        }
+    }
+}
+
+/// Só o chat autorizado dono do pedido decide, pela mensagem que o mostrou,
+/// e uma vez: o pedido sai do mapa aqui, então callback repetido ou de turno
+/// encerrado vira "já decidido".
+fn claim_pending(
+    map: &mut HashMap<(i64, u64), Pending>,
+    allowed: &[i64],
+    chat_id: i64,
+    message_id: Option<i64>,
+    id: u64,
+) -> Result<Pending, Refusal> {
+    if !is_chat_allowed(allowed, chat_id) {
+        return Err(Refusal::ChatNotAllowed);
+    }
+    let same_msg = map
+        .get(&(chat_id, id))
+        .is_some_and(|p| p.message_id.is_none() || p.message_id == message_id);
+    if !same_msg {
+        return Err(Refusal::AlreadyDecided);
+    }
+    map.remove(&(chat_id, id)).ok_or(Refusal::AlreadyDecided)
+}
+
+/// "Sempre neste projeto" sem regra oferecida é só "na sessão" (o runtime faz
+/// o mesmo), e o rótulo não promete gravação que não houve.
+fn effective_decision(d: Approval, has_rule: bool) -> Approval {
+    if d == Approval::AllowProject && !has_rule {
+        Approval::AllowSession
+    } else {
+        d
+    }
+}
+
+// Aprovação de tarefa agendada: o daemon não pode ler getUpdates (só um
+// processo pode, e roubaria as mensagens do gateway). Ele grava o pedido no
+// banco (`pending:<chat>`), o gateway grava a decisão do botão e o daemon lê.
+
+const SCHED_KEY_PREFIX: &str = "telegram.approval.";
+/// Sem resposta nesse prazo, a tarefa agendada recebe "negado".
+pub const SCHEDULE_APPROVAL_TIMEOUT: Duration = Duration::from_secs(600);
+
+fn sched_key(key: u64) -> String {
+    format!("{SCHED_KEY_PREFIX}{key}")
+}
+
+fn sched_pending(chat_id: i64) -> String {
+    format!("pending:{chat_id}")
+}
+
+/// Lado do gateway: grava a decisão se o pedido ainda espera e foi mandado a
+/// este chat (uma vez só).
+fn claim_schedule(
+    store: &Store,
+    allowed: &[i64],
+    chat_id: i64,
+    key: u64,
+    decision: Approval,
+) -> Result<(), Refusal> {
+    if !is_chat_allowed(allowed, chat_id) {
+        return Err(Refusal::ChatNotAllowed);
+    }
+    let k = sched_key(key);
+    match store.setting(&k) {
+        Ok(Some(v)) if v == sched_pending(chat_id) => store
+            .set_setting(&k, decision_code(decision))
+            .map_err(|_| Refusal::AlreadyDecided),
+        _ => Err(Refusal::AlreadyDecided),
+    }
+}
+
+/// Lado do daemon: espera a decisão até `timeout` ou cancelamento (`None`).
+/// Apaga a chave ao sair, decidida ou não.
+fn wait_schedule_decision(
+    store: &Store,
+    key: u64,
+    timeout: Duration,
+    cancel: &Cancel,
+) -> Option<Approval> {
+    let k = sched_key(key);
+    let started = std::time::Instant::now();
+    let out = loop {
+        match store.setting(&k) {
+            Ok(Some(v)) if v.starts_with("pending:") => {}
+            Ok(Some(v)) => break parse_decision_code(&v),
+            _ => break None,
+        }
+        if cancel.is_cancelled() || started.elapsed() >= timeout {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    let _ = store.delete_setting(&k);
+    out
+}
+
+/// Pede aprovação de uma tarefa agendada no primeiro chat autorizado e espera
+/// até [`SCHEDULE_APPROVAL_TIMEOUT`]; sem resposta, sem gateway rodando ou sem
+/// como enviar, nega. Roda na thread do turno (o gate espera isso).
+// ponytail: chat de alerta = primeiro de `allowed_chats`; um campo próprio
+// (`alert_chat`) quando houver mais de um chat e o usuário quiser escolher.
+pub fn ask_schedule_approval(
+    paths: &Paths,
+    settings: &Settings,
+    job: &str,
+    tool: &str,
+    summary: &str,
+    always: Option<&str>,
+    cancel: &Cancel,
+) -> Approval {
+    let tg = &settings.gateway.telegram;
+    let Some(&chat_id) = tg.allowed_chats.first().filter(|_| tg.enabled) else {
+        return Approval::Deny;
+    };
+    let Ok(token) = secrets::get_secret(TELEGRAM_SECRET_KEY) else {
+        return Approval::Deny;
+    };
+    let token = token.trim();
+    let Ok(store) = Store::open(paths.db()) else {
+        return Approval::Deny;
+    };
+    // Único entre processos e reinícios: um clique num pedido velho nunca
+    // decide um novo.
+    let key = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+        ^ (u64::from(std::process::id()) << 48);
+    if store
+        .set_setting(&sched_key(key), &sched_pending(chat_id))
+        .is_err()
+    {
+        return Approval::Deny;
+    }
+    let mins = SCHEDULE_APPROVAL_TIMEOUT.as_secs() / 60;
+    let note = format!(
+        "Tarefa agendada: {job}. Sem resposta em {mins} min, nego. (Os botões precisam do `zerith gateway telegram run` ativo.)"
+    );
+    let text = approval_text(tool, summary, always, Some(&note));
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(15))
+        .build();
+    let keyboard = approval_keyboard(Origin::Schedule, key, always);
+    let message_id = match send_with_keyboard(&agent, token, chat_id, &text, &keyboard) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("zerith: {}", sanitize_err(token, e));
+            let _ = store.delete_setting(&sched_key(key));
+            return Approval::Deny;
+        }
+    };
+    let decided = wait_schedule_decision(&store, key, SCHEDULE_APPROVAL_TIMEOUT, cancel);
+    let decision = decided.map_or(Approval::Deny, |d| effective_decision(d, always.is_some()));
+    let label = match decided {
+        Some(_) => decision_label(decision).to_string(),
+        None => format!("Expirou ({mins} min ou tarefa encerrada): negado"),
+    };
+    if let Some(mid) = message_id {
+        let _ = edit_decided(&agent, token, chat_id, mid, &text, &label);
+    }
+    decision
 }
 
 /// Splits `text` into UTF-8 chunks each having at most `max_chars` Unicode
@@ -377,33 +674,50 @@ fn deliver_media(token: &str, chat_id: i64, paths: &[String], workspace: &Path, 
     }
 }
 
-fn send_approval_prompt(
+/// Manda o pedido com o teclado; devolve o `message_id` para editar depois.
+fn send_with_keyboard(
     agent: &ureq::Agent,
     token: &str,
     chat_id: i64,
-    approval_id: u64,
-    tool: &str,
-    summary: &str,
-) -> std::result::Result<(), String> {
-    let preview: String = summary.chars().take(1200).collect();
-    let msg = format!("Aprovação necessária (#{approval_id})\nFerramenta: {tool}\n\n{preview}");
-    let _ = post_json(
+    text: &str,
+    keyboard: &Value,
+) -> std::result::Result<Option<i64>, String> {
+    let sent = post_json(
         agent,
         token,
         "sendMessage",
         &json!({
             "chat_id": chat_id,
-            "text": msg,
-            "reply_markup": {
-                "inline_keyboard": [[
-                    {"text": "Permitir 1x", "callback_data": format!("approve:{approval_id}:once")},
-                    {"text": "Permitir sessão", "callback_data": format!("approve:{approval_id}:session")},
-                    {"text": "Negar", "callback_data": format!("approve:{approval_id}:deny")}
-                ]]
-            }
+            "text": cut(text, TELEGRAM_MAX_MSG),
+            "disable_web_page_preview": true,
+            "reply_markup": keyboard
         }),
     )?;
-    Ok(())
+    Ok(sent["message_id"].as_i64())
+}
+
+/// Reescreve o pedido com a decisão; sem `reply_markup`, os botões somem.
+fn edit_decided(
+    agent: &ureq::Agent,
+    token: &str,
+    chat_id: i64,
+    message_id: i64,
+    text: &str,
+    label: &str,
+) -> std::result::Result<(), String> {
+    let body = format!("{}\n\nDecisão: {label}", cut(text, TELEGRAM_MAX_MSG - 200));
+    post_json(
+        agent,
+        token,
+        "editMessageText",
+        &json!({
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": body,
+            "disable_web_page_preview": true
+        }),
+    )
+    .map(|_| ())
 }
 
 /// Sends an alert message to every chat in `settings.gateway.telegram.allowed_chats`
@@ -536,7 +850,7 @@ fn setup_cmd(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
-type PendingApprovals = Arc<Mutex<HashMap<(i64, u64), ApprovalSender>>>;
+type PendingApprovals = Arc<Mutex<HashMap<(i64, u64), Pending>>>;
 
 fn run_cmd(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut poll_secs: u64 = 25;
@@ -657,7 +971,7 @@ fn run_cmd(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Err
             }
 
             if let Some(cq) = upd.get("callback_query").filter(|v| !v.is_null()) {
-                handle_callback(&send_agent, &token, &allowed, &approvals, cq);
+                handle_callback(&send_agent, &token, &allowed, &approvals, &main_store, cq);
                 continue;
             }
 
@@ -813,45 +1127,64 @@ fn handle_callback(
     token: &str,
     allowed: &[i64],
     approvals: &PendingApprovals,
+    store: &Store,
     cq: &Value,
 ) {
     let cq_id = cq["id"].as_str().unwrap_or("");
-    let chat_id = cq["message"]["chat"]["id"]
-        .as_i64()
-        .or_else(|| cq["from"]["id"].as_i64());
-    let Some(chat_id) = chat_id.filter(|id| is_chat_allowed(allowed, *id)) else {
-        return;
-    };
-    let Some(data) = cq["data"].as_str() else {
-        return;
-    };
-    let Some((req_id, decision)) = parse_callback_decision(data) else {
+    let answer = |text: &str| {
         let _ = post_json(
             agent,
             token,
             "answerCallbackQuery",
-            &json!({"callback_query_id": cq_id, "text": "Ação inválida"}),
+            &json!({"callback_query_id": cq_id, "text": text}),
         );
+    };
+    // Só o chat onde o pedido apareceu conta; sem mensagem não há a quem
+    // atribuir o clique (fail closed).
+    let Some(chat_id) = cq["message"]["chat"]["id"].as_i64() else {
+        answer(Refusal::ChatNotAllowed.ack());
         return;
     };
-    let sender = approvals
-        .lock()
-        .ok()
-        .and_then(|mut m| m.remove(&(chat_id, req_id)));
-    let ack = match sender {
-        Some(s) if s.answer(req_id, decision) => match decision {
-            Approval::AllowOnce => "Permitido 1x",
-            Approval::AllowSession | Approval::AllowProject => "Permitido na sessão",
-            Approval::Deny => "Negado",
-        },
-        _ => "Solicitação expirada",
+    let message_id = cq["message"]["message_id"].as_i64();
+    let text = cq["message"]["text"].as_str().unwrap_or("");
+    if !is_chat_allowed(allowed, chat_id) {
+        eprintln!("zerith: callback ignorado de chat não autorizado ({chat_id})");
+        answer(Refusal::ChatNotAllowed.ack());
+        return;
+    }
+    let Some((origin, req_id, decision)) = cq["data"].as_str().and_then(parse_callback_decision)
+    else {
+        answer("Ação inválida");
+        return;
     };
-    let _ = post_json(
-        agent,
-        token,
-        "answerCallbackQuery",
-        &json!({"callback_query_id": cq_id, "text": ack}),
-    );
+    let decided = match origin {
+        Origin::Turn => {
+            let claimed = match approvals.lock() {
+                Ok(mut m) => claim_pending(&mut m, allowed, chat_id, message_id, req_id),
+                Err(_) => Err(Refusal::AlreadyDecided),
+            };
+            claimed.and_then(|p| {
+                let d = effective_decision(decision, p.has_rule);
+                if p.sender.answer(req_id, d) {
+                    Ok((d, p.text))
+                } else {
+                    Err(Refusal::AlreadyDecided)
+                }
+            })
+        }
+        Origin::Schedule => claim_schedule(store, allowed, chat_id, req_id, decision)
+            .map(|_| (decision, text.into())),
+    };
+    match decided {
+        Ok((d, original)) => {
+            answer(decision_label(d));
+            // A tarefa agendada edita a própria mensagem com o rótulo final.
+            if let (Origin::Turn, Some(mid)) = (origin, message_id) {
+                let _ = edit_decided(agent, token, chat_id, mid, &original, decision_label(d));
+            }
+        }
+        Err(r) => answer(r.ack()),
+    }
 }
 
 struct TelegramTurnArgs<'a> {
@@ -959,27 +1292,72 @@ fn run_telegram_turn(t: TelegramTurnArgs<'_>) -> std::result::Result<(), String>
                     generated.extend(generated_files(output_preview));
                 }
             }
-            if let RunEvent::ApprovalNeeded {
-                id, tool, summary, ..
-            } = e
-            {
-                if let Ok(mut map) = t.approvals.lock() {
-                    map.insert((t.chat_id, id), approver.clone());
+            match e {
+                RunEvent::ApprovalNeeded {
+                    id,
+                    tool,
+                    summary,
+                    always,
+                } => {
+                    let text = approval_text(&tool, &summary, always.as_deref(), None);
+                    // Registra antes de enviar: um clique rápido já encontra o pedido.
+                    if let Ok(mut map) = t.approvals.lock() {
+                        map.insert(
+                            (t.chat_id, id),
+                            Pending {
+                                sender: approver.clone(),
+                                has_rule: always.is_some(),
+                                message_id: None,
+                                text: text.clone(),
+                            },
+                        );
+                    }
+                    registered_ids.push(id);
+                    let keyboard = approval_keyboard(Origin::Turn, id, always.as_deref());
+                    match send_with_keyboard(t.agent, t.token, t.chat_id, &text, &keyboard) {
+                        Ok(mid) => {
+                            if let Ok(mut map) = t.approvals.lock() {
+                                if let Some(p) = map.get_mut(&(t.chat_id, id)) {
+                                    p.message_id = mid;
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!("zerith: {}", sanitize_err(t.token, err));
+                            if let Ok(mut map) = t.approvals.lock() {
+                                map.remove(&(t.chat_id, id));
+                            }
+                            approver.answer(id, Approval::Deny);
+                        }
+                    }
                 }
-                registered_ids.push(id);
-                if let Err(err) =
-                    send_approval_prompt(t.agent, t.token, t.chat_id, id, &tool, &summary)
-                {
-                    eprintln!("zerith: {}", sanitize_err(t.token, err));
-                    approver.answer(id, Approval::Deny);
+                // Regra "sempre neste projeto" gravada (ou não), e onde.
+                RunEvent::Notice { text } => {
+                    let _ = send_message(t.agent, t.token, t.chat_id, &text);
                 }
+                _ => {}
             }
         },
     );
 
-    if let Ok(mut map) = t.approvals.lock() {
-        for id in registered_ids {
-            map.remove(&(t.chat_id, id));
+    // Pedidos sem resposta morrem com o turno: tira os botões e avisa.
+    let expired: Vec<Pending> = match t.approvals.lock() {
+        Ok(mut map) => registered_ids
+            .iter()
+            .filter_map(|id| map.remove(&(t.chat_id, *id)))
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    for p in expired {
+        if let Some(mid) = p.message_id {
+            let _ = edit_decided(
+                t.agent,
+                t.token,
+                t.chat_id,
+                mid,
+                &p.text,
+                "Expirou com o fim do turno",
+            );
         }
     }
 
@@ -1008,22 +1386,212 @@ mod tests {
 
     #[test]
     fn callback_decision_parses_all_variants_and_rejects_malformed() {
+        use Origin::*;
+        let p = parse_callback_decision;
+        assert_eq!(p("approve:42:once"), Some((Turn, 42, Approval::AllowOnce)));
         assert_eq!(
-            parse_callback_decision("approve:42:once"),
-            Some((42, Approval::AllowOnce))
+            p("approve:7:session"),
+            Some((Turn, 7, Approval::AllowSession))
         );
         assert_eq!(
-            parse_callback_decision("approve:7:session"),
-            Some((7, Approval::AllowSession))
+            p("approve:9:project"),
+            Some((Turn, 9, Approval::AllowProject))
+        );
+        assert_eq!(p("approve:0:deny"), Some((Turn, 0, Approval::Deny)));
+        assert_eq!(
+            p("sched:123:project"),
+            Some((Schedule, 123, Approval::AllowProject))
+        );
+        for bad in [
+            "approve:abc:once",
+            "approve:1:always",
+            "approve:1:once:extra",
+            "approve:-1:once",
+            "approve::once",
+            "approve:1",
+            "approve:1:",
+            "APPROVE:1:once",
+            "sched:1:Project",
+            "other",
+            "",
+        ] {
+            assert_eq!(p(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn keyboard_offers_project_only_with_rule_and_fits_callback_limit() {
+        let flat = |kb: &Value| -> Vec<(String, String)> {
+            kb["inline_keyboard"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|r| r.as_array().unwrap().clone())
+                .map(|b| {
+                    (
+                        b["text"].as_str().unwrap().to_string(),
+                        b["callback_data"].as_str().unwrap().to_string(),
+                    )
+                })
+                .collect()
+        };
+        let without = flat(&approval_keyboard(Origin::Turn, 5, None));
+        let datas: Vec<&str> = without.iter().map(|(_, d)| d.as_str()).collect();
+        assert_eq!(
+            datas,
+            ["approve:5:once", "approve:5:session", "approve:5:deny"]
+        );
+
+        let with = flat(&approval_keyboard(
+            Origin::Schedule,
+            u64::MAX,
+            Some("shell(cargo test:*)"),
+        ));
+        assert_eq!(with.len(), 4);
+        let (label, data) = &with[2];
+        assert_eq!(label, "Sempre neste projeto (shell(cargo test:*))");
+        assert_eq!(data, &format!("sched:{}:project", u64::MAX));
+        // Cada botão volta pelo parser; Bot API limita callback_data a 64 bytes.
+        for (_, d) in with.iter().chain(&without) {
+            assert!(d.len() <= 64, "{d}");
+            assert!(parse_callback_decision(d).is_some(), "{d}");
+        }
+    }
+
+    #[test]
+    fn approval_text_redacts_cuts_and_warns_on_remote_and_destructive() {
+        let t = approval_text(
+            "shell",
+            "shell: curl -H 'Authorization: Bearer sk-abcdefghijklmnopqrstuvwxyz123456' x",
+            Some("shell(curl:*)"),
+            None,
+        );
+        assert!(!t.contains("sk-abcdefghijklmnopqrstuvwxyz123456"), "{t}");
+        assert!(t.contains("Ferramenta: shell"));
+        assert!(t.contains("grava: shell(curl:*)"));
+        assert!(!t.contains("⚠️"));
+
+        let long = "x".repeat(5000);
+        assert!(approval_text("shell", &long, None, None).chars().count() < 1400);
+
+        assert!(
+            approval_text("shell", "shell: ssh admin@10.0.0.1 uptime", None, None)
+                .contains("Acesso remoto")
+        );
+        assert!(
+            approval_text("shell", "shell: C:\\bin\\plink.exe -batch r1", None, None)
+                .contains("Acesso remoto")
+        );
+        assert!(
+            approval_text("net_connect", "conectar core-1", None, None).contains("Acesso remoto")
+        );
+        assert!(approval_text(
+            "net_exec",
+            "⚠️ COMANDO DESTRUTIVO DE REDE: reload",
+            None,
+            None
+        )
+        .contains("ATENÇÃO: comando destrutivo"));
+        assert!(!approval_text("shell", "shell: cat sshd_config", None, None).contains("⚠️"));
+    }
+
+    #[test]
+    fn pending_claim_refuses_other_chats_repeats_and_stale_messages() {
+        let (sender, _gate) = zerith_runtime::approval_channel();
+        let pending = |mid| Pending {
+            sender: sender.clone(),
+            has_rule: false,
+            message_id: mid,
+            text: String::new(),
+        };
+        let mut map = HashMap::new();
+        map.insert((10, 1), pending(Some(100)));
+        map.insert((20, 1), pending(Some(200)));
+        let allowed = [10, 20];
+
+        let err = |r: Result<Pending, Refusal>| r.err().unwrap();
+        assert_eq!(
+            err(claim_pending(&mut map, &allowed, 99, Some(100), 1)),
+            Refusal::ChatNotAllowed
         );
         assert_eq!(
-            parse_callback_decision("approve:0:deny"),
-            Some((0, Approval::Deny))
+            err(claim_pending(&mut map, &[], 10, Some(100), 1)),
+            Refusal::ChatNotAllowed
         );
-        assert_eq!(parse_callback_decision("approve:abc:once"), None);
-        assert_eq!(parse_callback_decision("approve:1:always"), None);
-        assert_eq!(parse_callback_decision("approve:1:once:extra"), None);
-        assert_eq!(parse_callback_decision("other"), None);
+        // Pedido do chat 10 não é decidido pelo chat 20 nem por outra mensagem.
+        assert_eq!(
+            err(claim_pending(&mut map, &allowed, 10, Some(200), 1)),
+            Refusal::AlreadyDecided
+        );
+        assert_eq!(
+            err(claim_pending(&mut map, &allowed, 10, Some(100), 2)),
+            Refusal::AlreadyDecided
+        );
+        assert!(claim_pending(&mut map, &allowed, 10, Some(100), 1).is_ok());
+        assert_eq!(
+            err(claim_pending(&mut map, &allowed, 10, Some(100), 1)),
+            Refusal::AlreadyDecided
+        );
+        assert!(map.contains_key(&(20, 1)));
+
+        assert_eq!(
+            effective_decision(Approval::AllowProject, false),
+            Approval::AllowSession
+        );
+        assert_eq!(
+            effective_decision(Approval::AllowProject, true),
+            Approval::AllowProject
+        );
+        assert_eq!(effective_decision(Approval::Deny, false), Approval::Deny);
+    }
+
+    #[test]
+    fn schedule_approval_round_trip_once_and_timeout() {
+        let store = Store::open_in_memory().unwrap();
+        let cancel = Cancel::default();
+        let allowed = [10, 20];
+        store
+            .set_setting(&sched_key(7), &sched_pending(10))
+            .unwrap();
+        assert_eq!(
+            claim_schedule(&store, &allowed, 99, 7, Approval::AllowOnce),
+            Err(Refusal::ChatNotAllowed)
+        );
+        // Mandado ao chat 10: o 20, mesmo autorizado, não decide.
+        assert_eq!(
+            claim_schedule(&store, &allowed, 20, 7, Approval::AllowOnce),
+            Err(Refusal::AlreadyDecided)
+        );
+        assert_eq!(
+            claim_schedule(&store, &allowed, 10, 7, Approval::AllowProject),
+            Ok(())
+        );
+        assert_eq!(
+            claim_schedule(&store, &allowed, 10, 7, Approval::Deny),
+            Err(Refusal::AlreadyDecided)
+        );
+        assert_eq!(
+            wait_schedule_decision(&store, 7, Duration::from_secs(5), &cancel),
+            Some(Approval::AllowProject)
+        );
+        assert_eq!(store.setting(&sched_key(7)).unwrap(), None);
+        // Depois de lido, clique atrasado não acha nada.
+        assert_eq!(
+            claim_schedule(&store, &allowed, 10, 7, Approval::AllowOnce),
+            Err(Refusal::AlreadyDecided)
+        );
+
+        store
+            .set_setting(&sched_key(8), &sched_pending(10))
+            .unwrap();
+        assert_eq!(
+            wait_schedule_decision(&store, 8, Duration::ZERO, &cancel),
+            None
+        );
+        assert_eq!(
+            claim_schedule(&store, &allowed, 10, 8, Approval::AllowOnce),
+            Err(Refusal::AlreadyDecided)
+        );
     }
 
     #[test]

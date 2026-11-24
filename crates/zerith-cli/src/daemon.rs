@@ -2,7 +2,9 @@
 //! (`zerith daemon [--once] [--poll-secs N]`).
 //!
 //! `no_agent` schedules execute shell commands directly with zero LLM tokens and
-//! zero provider calls; agent schedules run fail-closed (`approvals: None`).
+//! zero provider calls; agent schedules ask approvals in the Telegram alert
+//! chat when the gateway is configured (denied after 10 min without answer)
+//! and run fail-closed (`approvals: None`) otherwise.
 //! Failed jobs, agent responses starting with `"ALERTA:"`, agent turns cut at
 //! the step limit and jobs longer than [`LONG_JOB`] dispatch a short Telegram
 //! summary (name, status, duration, first lines) when `gateway.telegram` is
@@ -21,7 +23,7 @@ use zerith_mcp::McpRegistry;
 use zerith_memory::{MemoryBackend, Scope, SqliteMemory};
 use zerith_providers::{Cancel, Client};
 use zerith_runtime::guards::Guards;
-use zerith_runtime::{run_agent_turn, AgentOptions, TurnContext};
+use zerith_runtime::{approval_channel, run_agent_turn, AgentOptions, RunEvent, TurnContext};
 use zerith_security::Policy;
 use zerith_sessions::migrations::now_ms;
 use zerith_sessions::schedules::{CronExpr, NewSchedule, Schedule};
@@ -724,10 +726,14 @@ fn run_agent_schedule(
         }
     });
 
+    // Com Telegram configurado, o pedido vai ao chat e espera a decisão
+    // (expira negando); sem ele, fail closed como antes.
+    let tg = &settings.gateway.telegram;
+    let relay = (tg.enabled && !tg.allowed_chats.is_empty()).then(approval_channel);
     let opts = AgentOptions {
         tools: Some(&tools),
         policy: Some(&policy),
-        approvals: None, // Fail closed in unattended cron execution.
+        approvals: relay.as_ref().map(|(_, gate)| gate),
         middleware: vec![Box::new(guards)],
         spill_dir: Some(paths.root().join("spill")),
         ..AgentOptions::for_profile(zerith_runtime::active_profile())
@@ -749,7 +755,29 @@ fn run_agent_schedule(
         &model,
         prompt,
         cancel,
-        |_| {},
+        |e| match e {
+            RunEvent::ApprovalNeeded {
+                id,
+                tool,
+                summary,
+                always,
+            } => {
+                if let Some((approver, _)) = &relay {
+                    let d = telegram::ask_schedule_approval(
+                        paths,
+                        settings,
+                        &s.name,
+                        &tool,
+                        &summary,
+                        always.as_deref(),
+                        cancel,
+                    );
+                    approver.answer(id, d);
+                }
+            }
+            RunEvent::Notice { text } => maybe_alert_telegram(settings, &text),
+            _ => {}
+        },
     )
     .map_err(|e| e.to_string())?;
 

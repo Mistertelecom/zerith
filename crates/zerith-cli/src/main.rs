@@ -27,7 +27,8 @@ use zerith_skills::{discover, scan, Library, Status};
 use zerith_tools::{CallCtx, Registry};
 
 use crate::args::{
-    parse_chat, parse_import_hermes, parse_rename, parse_repl, select_session, SessionArgs, Target,
+    parse_chat, parse_import_external, parse_import_hermes, parse_rename, parse_repl,
+    select_session, SessionArgs, Target,
 };
 use crate::headless::{load_settings, provider_config, resolve_model, ExitWith};
 
@@ -119,6 +120,8 @@ usage:
                        [--profile <nome>] [--only-pinned-visible] [--customized-skills]
                        [--no-rebrand] [--only sessao,memoria,persona,credencial,skill,mcp,cron,telegram]
                        [--home <pasta do Hermes>]   (migração inteira, com plano e backup)
+  zerith import claude-code [--dry-run] [--yes] [--sessions|--config|--all] [--all-sessions] [--visible]
+  zerith import codex       [mesmas opções]   (sessões, instruções, MCP, skills, ...)
   zerith import detect
   zerith import hermes-skills [nome..]   (copia skills do Hermes, ativas)
   zerith mcp import-hermes [nome..]      (servidores de config.yaml do Hermes)"
@@ -211,6 +214,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         ("chat", None) => repl(&paths, args)?,
         ("chat", _) => chat(&paths, args)?,
         ("import", Some("hermes")) => import_hermes(&paths, args)?,
+        ("import", Some("claude-code" | "codex")) => import_external(&paths, args)?,
         ("import", Some("hermes-skills")) => {
             let home =
                 zerith_importers::hermes_setup::hermes_home().ok_or("Hermes não encontrado")?;
@@ -1552,6 +1556,61 @@ fn providers(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::E
         }
         Some(other) => return Err(format!("comando desconhecido: providers {other}").into()),
     }
+    Ok(())
+}
+
+/// `zerith import claude-code|codex`: plano por tipo, confirmação, relatório.
+fn import_external(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use zerith_importers::claude_code::{self as cc, Action, Options};
+    let a = parse_import_external(args)?;
+    let project = std::env::current_dir().ok();
+    let opt = Options {
+        sessions: a.sessions,
+        config: a.config,
+        all_sessions: a.all_sessions,
+        visible: a.visible,
+        ..Options::default()
+    };
+    let (name, items) = match args.get(1).map(String::as_str) {
+        Some("codex") => {
+            let src = zerith_importers::codex::CodexSource::detect(project)
+                .ok_or("Codex não encontrado (~/.codex ou CODEX_HOME)")?;
+            ("Codex", zerith_importers::codex::plan(&src, paths, &opt))
+        }
+        _ => {
+            let src = cc::ClaudeSource::detect(project)
+                .ok_or("Claude Code não encontrado (~/.claude ou CLAUDE_CONFIG_DIR)")?;
+            ("Claude Code", cc::plan(&src, paths, &opt))
+        }
+    };
+    println!("Importar do {name} para {}\n", paths.root().display());
+    print!("{}", cc::render_plan(&items));
+    let todo = items
+        .iter()
+        .filter(|i| matches!(i.action, Action::Import | Action::Append))
+        .count();
+    if a.dry_run {
+        println!("\n(--dry-run: nada foi gravado)");
+        return Ok(());
+    }
+    if todo == 0 {
+        println!("\nNada a importar.");
+        return Ok(());
+    }
+    if !a.yes {
+        eprint!("\nAplicar {todo} itens? [s/N] ");
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        if !matches!(
+            line.trim().to_lowercase().as_str(),
+            "s" | "sim" | "y" | "yes"
+        ) {
+            println!("Cancelado.");
+            return Ok(());
+        }
+    }
+    let report = cc::apply(&items, paths);
+    println!("\n{}", report.render());
     Ok(())
 }
 

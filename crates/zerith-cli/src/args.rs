@@ -610,6 +610,42 @@ pub fn parse_import_hermes(args: &[String]) -> Result<ImportHermes, String> {
     Ok(out)
 }
 
+/// `zerith import claude-code|codex [--dry-run] [--yes] [--sessions|--config|--all]
+/// [--all-sessions] [--visible]`.
+#[derive(Debug, PartialEq)]
+pub struct ImportExternal {
+    pub dry_run: bool,
+    pub yes: bool,
+    pub sessions: bool,
+    pub config: bool,
+    pub all_sessions: bool,
+    pub visible: bool,
+}
+
+pub fn parse_import_external(args: &[String]) -> Result<ImportExternal, String> {
+    let mut out = ImportExternal {
+        dry_run: false,
+        yes: false,
+        sessions: true,
+        config: true,
+        all_sessions: false,
+        visible: false,
+    };
+    for a in args.iter().skip(2) {
+        match a.as_str() {
+            "--dry-run" => out.dry_run = true,
+            "--yes" | "-y" => out.yes = true,
+            "--sessions" => (out.sessions, out.config) = (true, false),
+            "--config" => (out.sessions, out.config) = (false, true),
+            "--all" => (out.sessions, out.config) = (true, true),
+            "--all-sessions" => out.all_sessions = true,
+            "--visible" => out.visible = true,
+            other => return Err(format!("argumento desconhecido: {other}")),
+        }
+    }
+    Ok(out)
+}
+
 /// `zerith skills update <name> [dir]`: without a directory the source
 /// recorded at install time is used.
 pub fn parse_skills_update(args: &[String]) -> Result<(String, Option<String>), String> {
@@ -903,6 +939,18 @@ mod tests {
         assert!(a.all && a.dry_run && a.migrate_secrets && !a.yes);
         assert_eq!(a.only.unwrap(), ["memoria", "skill"]);
         assert!(parse_import_hermes(&v(&["import", "hermes", "--dry-run"])).is_err());
+        let e = parse_import_external(&v(&["import", "codex", "--dry-run", "--sessions"])).unwrap();
+        assert!(e.dry_run && e.sessions && !e.config && !e.yes);
+        let e = parse_import_external(&v(&[
+            "import",
+            "claude-code",
+            "--config",
+            "--yes",
+            "--visible",
+        ]))
+        .unwrap();
+        assert!(!e.sessions && e.config && e.yes && e.visible);
+        assert!(parse_import_external(&v(&["import", "codex", "--x"])).is_err());
     }
 
     #[test]

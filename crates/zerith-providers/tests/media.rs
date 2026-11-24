@@ -234,11 +234,20 @@ fn image_req(p: BTreeMap<String, Value>) -> ImageRequest {
 fn model_list_becomes_typed_specs_and_is_searchable_without_a_key() {
     let fake = Fake::start(vec![
         ("GET /api/v1/images/models", h(|_| ok_json(image_models()))),
+        // Real per-image price; `other/draw` has no endpoint data (404).
+        (
+            "GET /api/v1/images/models/acme/pic-1/endpoints",
+            h(|_| {
+                ok_json(json!({"id": "acme/pic-1", "endpoints": [{"pricing": [
+                    {"billable": "output_image", "unit": "image", "cost_usd": 0.04},
+                    {"billable": "input_image", "unit": "image", "cost_usd": 0.008}]}]}))
+            }),
+        ),
         (
             "GET /api/v1/models?output_modalities=image",
             h(|_| {
                 ok_json(json!({"total_count": 2, "data": [
-                    {"id": "acme/pic-1", "pricing": {"image": "0.04"}},
+                    {"id": "acme/pic-1", "pricing": {"image": "0.008"}},
                     {"id": "other/draw", "pricing": {"image_output": "0.000004"}}]}))
             }),
         ),
@@ -251,7 +260,7 @@ fn model_list_becomes_typed_specs_and_is_searchable_without_a_key() {
         (m.id.as_str(), m.kind, m.created),
         ("acme/pic-1", Kind::Image, 5)
     );
-    assert_eq!(m.price_hint, "US$ 0.04/imagem");
+    assert_eq!(m.price_hint, "US$ 0,04/imagem");
     assert_eq!(m.max_references, 2);
     let spec = |name: &str| {
         m.params
@@ -268,7 +277,11 @@ fn model_list_becomes_typed_specs_and_is_searchable_without_a_key() {
     assert_eq!(spec("n"), ParamKind::Range { min: 1.0, max: 4.0 });
     assert_eq!(spec("seed"), ParamKind::Text);
     assert!(m.params.iter().all(|p| p.name != "input_references"));
-    assert_eq!(page.models[1].price_hint, "US$ 4/Mtok de imagem");
+    // Fallback: the generic listing's per-token price.
+    assert_eq!(
+        page.models[1].price_hint,
+        "US$ 4,00 por 1M tokens de imagem gerada"
+    );
 
     // Search, paging, and no Authorization header on the public lists.
     let q = or.models(Kind::Image, "OTHER draw", 0, 10).unwrap();
@@ -279,8 +292,17 @@ fn model_list_becomes_typed_specs_and_is_searchable_without_a_key() {
         .requests("GET /api/v1/images/models")
         .iter()
         .all(|r| r.header("authorization").is_none()));
-    // Cached: the second and third calls did not hit the list again.
-    assert_eq!(fake.requests("GET /api/v1/images/models").len(), 1);
+    // Cached: the second and third calls hit neither the list nor the prices.
+    assert_eq!(fake.requests("GET /api/v1/images/models?").len(), 0);
+    assert_eq!(
+        fake.requests("GET /api/v1/images/models")
+            .iter()
+            .filter(|r| r.path == "/api/v1/images/models")
+            .count(),
+        1
+    );
+    assert_eq!(fake.requests("GET /api/v1/images/models/acme").len(), 1);
+    assert_eq!(fake.requests("GET /api/v1/models?").len(), 1);
 }
 
 #[test]
@@ -310,7 +332,7 @@ fn video_list_builds_params_from_the_flat_fields() {
         ParamKind::Enum(vec!["3".into(), "5".into()])
     );
     assert_eq!(m.frame_images, ["first_frame"]);
-    assert!(m.price_hint.contains("0.01"), "{}", m.price_hint);
+    assert_eq!(m.price_hint, "US$ 0,01/s (720p)");
 }
 
 /// Shapes seen on the live lists on 2026-11-24: nulls everywhere, `-1` among

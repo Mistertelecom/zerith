@@ -40,6 +40,8 @@ const IMAGE_TIMEOUT: Duration = Duration::from_secs(300);
 const SUBMIT_TIMEOUT: Duration = Duration::from_secs(60);
 const CATALOG_TIMEOUT: Duration = Duration::from_secs(15);
 const CATALOG_TTL: Duration = Duration::from_secs(600);
+/// Parallel requests for the per-model image prices.
+const PRICE_WORKERS: usize = 8;
 /// A model this recent (by `created`) gets the "novo" badge.
 pub const NEW_WINDOW_SECS: i64 = 30 * 86_400;
 const REFERER: &str = "https://github.com/Mistertelecom/zerith";
@@ -104,7 +106,9 @@ pub struct MediaModel {
     pub name: String,
     pub kind: Kind,
     pub description: String,
-    /// Best-effort, never authoritative; empty when unknown.
+    /// Price line from the OpenRouter API (image: `/images/models/{id}/endpoints`,
+    /// else `/models`; video: `pricing_skus`). Never a figure from this code;
+    /// empty when the API gives none.
     pub price_hint: String,
     /// Parameters the model accepts. Excludes reference images / frames.
     pub params: Vec<ParamSpec>,
@@ -277,6 +281,8 @@ pub struct Plan {
 
 /// A model list and when it was fetched.
 type CachedList = (Instant, Arc<Vec<MediaModel>>);
+/// Image price hints by model id and when they were fetched.
+type CachedPrices = (Instant, Arc<HashMap<String, String>>);
 
 pub struct OpenRouter {
     key: Option<String>,
@@ -285,6 +291,7 @@ pub struct OpenRouter {
     poll: Duration,
     max_wait: Duration,
     cache: Mutex<HashMap<Kind, CachedList>>,
+    prices: Mutex<Option<CachedPrices>>,
 }
 
 impl std::fmt::Debug for OpenRouter {
@@ -320,6 +327,7 @@ impl OpenRouter {
             poll: VIDEO_POLL,
             max_wait: VIDEO_MAX_WAIT,
             cache: Mutex::new(HashMap::new()),
+            prices: Mutex::new(None),
         }
     }
 
@@ -438,9 +446,24 @@ impl OpenRouter {
                 words.iter().all(|w| hay.contains(w))
             })
             .collect();
+        let mut models: Vec<MediaModel> = hits
+            .iter()
+            .skip(offset)
+            .take(limit)
+            .copied()
+            .cloned()
+            .collect();
+        if kind == Kind::Image {
+            let prices = self.image_prices(&all);
+            for m in &mut models {
+                if let Some(h) = prices.get(&m.id) {
+                    m.price_hint = h.clone();
+                }
+            }
+        }
         Ok(ModelPage {
             total: hits.len(),
-            models: hits.into_iter().skip(offset).take(limit).cloned().collect(),
+            models,
         })
     }
 
@@ -460,30 +483,78 @@ impl OpenRouter {
             16 << 20,
             &none,
         )?;
-        let mut models = parse_list(kind, &typed)?;
-        if kind == Kind::Image {
-            // Prices live only in the generic listing. Best-effort.
-            if let Ok(prices) = self.image_prices() {
-                for m in &mut models {
-                    if let Some(h) = prices.get(&m.id) {
-                        m.price_hint = h.clone();
-                    }
-                }
-            }
-        }
-        let list = Arc::new(models);
+        let list = Arc::new(parse_list(kind, &typed)?);
         if let Ok(mut c) = self.cache.lock() {
             c.insert(kind, (Instant::now(), list.clone()));
         }
         Ok(list)
     }
 
-    fn image_prices(&self) -> Result<HashMap<String, String>> {
+    /// Image price per model id, cached like the lists. Only the model list
+    /// screen asks for it, never a generation. Video prices come inline
+    /// (`pricing_skus`) and need no extra request.
+    fn image_prices(&self, models: &[MediaModel]) -> Arc<HashMap<String, String>> {
+        if let Some((at, p)) = self.prices.lock().ok().and_then(|c| c.clone()) {
+            if at.elapsed() < CATALOG_TTL {
+                return p;
+            }
+        }
+        // Fallback first: the generic listing's per-token figure.
+        let mut out = self.generic_image_prices();
+        // Then the real per-image / per-megapixel prices, one small request
+        // per model (the typed list has none), a few at a time.
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let found = Mutex::new(Vec::new());
+        std::thread::scope(|s| {
+            for _ in 0..PRICE_WORKERS.min(models.len()) {
+                s.spawn(|| loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(m) = models.get(i) else { break };
+                    // The id goes into a URL path: nothing but a model slug.
+                    if !m
+                        .id
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || "/-._:".contains(c))
+                        || m.id.contains("..")
+                    {
+                        continue;
+                    }
+                    let Ok(v) = self.json(
+                        "GET",
+                        &format!("/images/models/{}/endpoints", m.id),
+                        false,
+                        None,
+                        CATALOG_TIMEOUT,
+                        4 << 20,
+                        &Cancel::default(),
+                    ) else {
+                        continue;
+                    };
+                    let hint = image_endpoint_price(&v["endpoints"]);
+                    if !hint.is_empty() {
+                        if let Ok(mut f) = found.lock() {
+                            f.push((m.id.clone(), hint));
+                        }
+                    }
+                });
+            }
+        });
+        out.extend(found.into_inner().unwrap_or_default());
+        let p = Arc::new(out);
+        if let Ok(mut c) = self.prices.lock() {
+            *c = Some((Instant::now(), p.clone()));
+        }
+        p
+    }
+
+    /// `pricing.image_output` (USD per image token) of `/models`. Its
+    /// `pricing.image` is the price of an INPUT image, so it is not used.
+    fn generic_image_prices(&self) -> HashMap<String, String> {
         let none = Cancel::default();
         let mut out = HashMap::new();
         let mut offset = 0usize;
         for _ in 0..5 {
-            let v = self.json(
+            let Ok(v) = self.json(
                 "GET",
                 &format!("/models?output_modalities=image&limit=200&offset={offset}"),
                 false,
@@ -491,11 +562,16 @@ impl OpenRouter {
                 CATALOG_TIMEOUT,
                 16 << 20,
                 &none,
-            )?;
+            ) else {
+                break;
+            };
             let data = v["data"].as_array().cloned().unwrap_or_default();
             for m in &data {
                 if let Some(id) = m["id"].as_str() {
-                    out.insert(id.to_string(), image_price_hint(id, &m["pricing"]));
+                    let hint = image_price_hint(id, &m["pricing"]);
+                    if !hint.is_empty() {
+                        out.insert(id.to_string(), hint);
+                    }
                 }
             }
             offset += data.len();
@@ -504,7 +580,7 @@ impl OpenRouter {
                 break;
             }
         }
-        Ok(out)
+        out
     }
 
     fn find_model(&self, kind: Kind, id: &str) -> Result<MediaModel> {
@@ -1123,28 +1199,85 @@ fn num(v: &Value) -> Option<f64> {
         .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
 }
 
+/// `US$ 0,05`, `US$ 0,0875`, `US$ 1,20`: pt-BR comma, at least two decimals,
+/// at most four.
 fn fmt_usd(x: f64) -> String {
     let s = if x >= 1.0 {
         format!("{x:.2}")
     } else {
         format!("{x:.4}")
     };
-    let s = if s.contains('.') {
-        s.trim_end_matches('0').trim_end_matches('.').to_string()
-    } else {
-        s
-    };
-    format!("US$ {s}")
+    let (int, dec) = s.split_once('.').unwrap_or((&s, "00"));
+    let mut dec = dec.trim_end_matches('0').to_string();
+    while dec.len() < 2 {
+        dec.push('0');
+    }
+    format!("US$ {int},{dec}")
 }
 
-/// `pricing.image` is per picture; `pricing.image_output` per token. Best
-/// effort: an unknown shape yields an empty hint.
-fn image_price_hint(id: &str, p: &Value) -> String {
-    if let Some(x) = num(&p["image"]).filter(|x| *x > 0.0) {
-        return format!("{}/imagem", fmt_usd(x));
+/// Most price lines carry a few variants; more than this is cut to `+N`.
+const PRICE_PARTS: usize = 3;
+
+/// `(price, variant)` pairs, in display order, as `a · b (x / y) · +2`.
+/// Variants sharing one price are merged; a price that also exists without a
+/// variant is shown plain.
+fn join_parts(parts: Vec<(String, String)>) -> String {
+    let mut merged: Vec<(String, Vec<String>, bool)> = Vec::new();
+    for (price, label) in parts {
+        let i = match merged.iter().position(|(p, ..)| *p == price) {
+            Some(i) => i,
+            None => {
+                merged.push((price, Vec::new(), false));
+                merged.len() - 1
+            }
+        };
+        let (_, labels, plain) = &mut merged[i];
+        if label.is_empty() {
+            *plain = true;
+        } else if !labels.contains(&label) {
+            labels.push(label);
+        }
     }
+    let extra = merged.len().saturating_sub(PRICE_PARTS);
+    let mut out: Vec<String> = merged
+        .into_iter()
+        .take(PRICE_PARTS)
+        .map(|(price, labels, plain)| {
+            if plain || labels.is_empty() {
+                price
+            } else {
+                format!("{price} ({})", labels.join(" / "))
+            }
+        })
+        .collect();
+    if extra > 0 {
+        out.push(format!("+{extra}"));
+    }
+    out.join(" · ")
+}
+
+/// `2k` -> `2K`, `low_1k` -> `low 1K`, `high_resolution` -> `high
+/// resolution`, `720p` as is.
+fn variant_label(v: &str) -> String {
+    v.trim()
+        .split('_')
+        .map(|w| {
+            if w.ends_with('k') && w[..w.len() - 1].parse::<f64>().is_ok() {
+                w.to_uppercase()
+            } else {
+                w.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Fallback from the generic `/models` listing: `pricing.image_output` is
+/// USD per generated image token. (`pricing.image` there is the price of an
+/// INPUT image, so it is never shown as the price of a picture.)
+fn image_price_hint(id: &str, p: &Value) -> String {
     if let Some(x) = num(&p["image_output"]).filter(|x| *x > 0.0) {
-        return format!("{}/Mtok de imagem", fmt_usd(x * 1e6));
+        return format!("{} por 1M tokens de imagem gerada", fmt_usd(x * 1e6));
     }
     if id.ends_with(":free") {
         return "grátis".into();
@@ -1152,28 +1285,181 @@ fn image_price_hint(id: &str, p: &Value) -> String {
     String::new()
 }
 
-/// Lowest per-second price among the SKUs whose unit is readable from the
-/// key (`*duration_seconds*` = USD, `cents_per_*second*` = cents). Estimate.
-fn video_price_hint(skus: &Value) -> String {
-    let best = skus
-        .as_object()
+/// Price of a generated image from `/images/models/{id}/endpoints`: the
+/// first endpoint's `output_image` entries, per image, per megapixel or per
+/// token, with their variant (`2K`, `high resolution`). Surcharges per
+/// request and input prices are left out. Empty when there is nothing.
+fn image_endpoint_price(endpoints: &Value) -> String {
+    let Some(ep) = endpoints.as_array().and_then(|a| {
+        a.iter().find(|e| {
+            e["pricing"]
+                .as_array()
+                .is_some_and(|p| p.iter().any(|x| x["billable"] == "output_image"))
+        })
+    }) else {
+        return String::new();
+    };
+    let out: Vec<&Value> = ep["pricing"]
+        .as_array()
         .into_iter()
         .flatten()
-        .filter_map(|(k, v)| {
-            let x = num(v).filter(|x| *x > 0.0)?;
-            if k.starts_with("cents_per") && k.contains("second") {
-                Some(x / 100.0)
-            } else if k.contains("duration_seconds") && !k.starts_with("minimum") {
-                Some(x)
-            } else {
-                None
-            }
+        .filter(|x| x["billable"] == "output_image")
+        .filter(|x| matches!(x["unit"].as_str(), Some("image" | "megapixel" | "token")))
+        .collect();
+    if out.is_empty() {
+        return String::new();
+    }
+    if out.iter().all(|x| num(&x["cost_usd"]) == Some(0.0)) {
+        return "grátis".into();
+    }
+    let mut parts: Vec<(String, String)> = out
+        .iter()
+        .filter_map(|x| {
+            let c = num(&x["cost_usd"]).filter(|c| *c > 0.0)?;
+            let variant = x["variant"].as_str().map(variant_label).unwrap_or_default();
+            let text = match x["unit"].as_str()? {
+                "image" => format!("{}/imagem", fmt_usd(c)),
+                // 1024x1024 is 1.048576 MP: the usual square, as a reference.
+                "megapixel" => format!(
+                    "{}/megapixel (~{} a 1024×1024)",
+                    fmt_usd(c),
+                    fmt_usd(c * 1.048_576)
+                ),
+                _ => format!("{} por 1M tokens de imagem gerada", fmt_usd(c * 1e6)),
+            };
+            Some((text, variant))
         })
-        .fold(None, |acc: Option<f64>, x| {
-            Some(acc.map_or(x, |a| a.min(x)))
-        });
-    best.map(|x| format!("a partir de ~{}/s (estimativa)", fmt_usd(x)))
-        .unwrap_or_default()
+        .collect();
+    // The plain price first, then the variants in the API's order.
+    parts.sort_by_key(|(_, v)| !v.is_empty());
+    join_parts(parts)
+}
+
+/// One readable SKU of a video model.
+struct Sku {
+    /// USD per unit (per token for the token SKUs).
+    usd: f64,
+    /// `/s`, `/megapixel·s` or `por 1M tokens de vídeo`.
+    unit: &'static str,
+    label: String,
+    /// A variant for a special case (long clips, references, continuation,
+    /// per input type) rather than the plain price.
+    secondary: bool,
+}
+
+/// Words of a SKU key around its unit, as pt-BR: `with_audio_4k` ->
+/// `com áudio, 4K`. Unknown words pass through.
+fn sku_label(rest: &str) -> String {
+    const PHRASES: [(&[&str], &str); 8] = [
+        (&["text", "to", "video"], "texto→vídeo"),
+        (&["image", "to", "video"], "imagem→vídeo"),
+        (&["with", "video", "input"], "com vídeo de entrada"),
+        (&["video", "continuation"], "continuação"),
+        (&["with", "audio"], "com áudio"),
+        (&["without", "audio"], "sem áudio"),
+        (&["long"], "longo"),
+        (&["reference"], "com referência"),
+    ];
+    let words: Vec<&str> = rest.split('_').filter(|w| !w.is_empty()).collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < words.len() {
+        match PHRASES.iter().find(|(p, _)| words[i..].starts_with(p)) {
+            Some((p, text)) => {
+                out.push((*text).to_string());
+                i += p.len();
+            }
+            None => {
+                out.push(variant_label(words[i]));
+                i += 1;
+            }
+        }
+    }
+    out.join(", ")
+}
+
+/// Splits a `pricing_skus` key into unit and variant. `None` for what is not
+/// the price of the generated video (input images, minimum charge).
+fn parse_sku(key: &str, value: &Value) -> Option<Sku> {
+    // (unit marker in the key, USD divisor, unit shown); first match wins.
+    const FORMS: [(&str, f64, &str); 6] = [
+        ("cents_per_megapixel_second", 100.0, "/megapixel·s"),
+        ("cents_per_video_output_second", 100.0, "/s"),
+        ("cents_per_second_output", 100.0, "/s"),
+        ("cents_per_second", 100.0, "/s"),
+        ("duration_seconds", 1.0, "/s"),
+        ("video_tokens", 1.0, " por 1M tokens de vídeo"),
+    ];
+    let x = num(value).filter(|x| *x > 0.0)?;
+    let k = key.to_ascii_lowercase();
+    if k.starts_with("minimum") || k.contains("image_input") || k.ends_with("images") {
+        return None;
+    }
+    let secondary = [
+        "long",
+        "reference",
+        "continuation",
+        "text_to",
+        "image_to",
+        "video_input",
+    ]
+    .iter()
+    .any(|w| k.contains(w));
+    FORMS.iter().find_map(|(marker, div, unit)| {
+        let pos = k.find(marker)?;
+        Some(Sku {
+            usd: x / div,
+            unit,
+            label: sku_label(&format!("{}_{}", &k[..pos], &k[pos + marker.len()..])),
+            secondary,
+        })
+    })
+}
+
+/// Price line of a video model from its `pricing_skus`, cheapest first:
+/// `US$ 0,05/s (1080p) · US$ 0,0875/s (2K)`. Per-token SKUs are shown raw
+/// and labelled as such (the token count of a clip is the provider's).
+/// Special-case variants (long, reference, continuation) are shown only
+/// when there is no plain price. A minimum charge is appended.
+fn video_price_hint(skus: &Value) -> String {
+    let Some(map) = skus.as_object() else {
+        return String::new();
+    };
+    let all: Vec<Sku> = map.iter().filter_map(|(k, v)| parse_sku(k, v)).collect();
+    let mut chosen: Vec<&Sku> = if all.iter().any(|s| !s.secondary) {
+        all.iter().filter(|s| !s.secondary).collect()
+    } else {
+        all.iter().collect()
+    };
+    chosen.sort_by(|a, b| {
+        (a.unit, a.usd)
+            .partial_cmp(&(b.unit, b.usd))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let parts = chosen
+        .into_iter()
+        .map(|s| {
+            let usd = if s.unit.starts_with(" por 1M") {
+                fmt_usd(s.usd * 1e6)
+            } else {
+                fmt_usd(s.usd)
+            };
+            (format!("{usd}{}", s.unit), s.label.clone())
+        })
+        .collect();
+    let mut line = join_parts(parts);
+    if let Some(min) = map
+        .iter()
+        .find(|(k, _)| k.starts_with("minimum_cents"))
+        .and_then(|(_, v)| num(v))
+        .filter(|x| *x > 0.0)
+    {
+        if !line.is_empty() {
+            line.push_str(" · ");
+        }
+        line.push_str(&format!("mínimo {} por vídeo", fmt_usd(min / 100.0)));
+    }
+    line
 }
 
 // --- parameter planning ---------------------------------------------------------
@@ -1493,22 +1779,149 @@ mod tests {
     }
 
     #[test]
-    fn price_hints_never_fail_on_odd_shapes() {
+    fn usd_is_written_the_pt_br_way() {
+        assert_eq!(fmt_usd(0.05), "US$ 0,05");
+        assert_eq!(fmt_usd(0.0875), "US$ 0,0875");
+        assert_eq!(fmt_usd(0.1), "US$ 0,10");
+        assert_eq!(fmt_usd(1.2), "US$ 1,20");
+        assert_eq!(fmt_usd(7.0), "US$ 7,00");
+        assert_eq!(fmt_usd(0.023172), "US$ 0,0232");
+    }
+
+    /// Fallback from `/models`: only `image_output` (per token) is a price
+    /// of the result; `image` there is an input price and is ignored.
+    #[test]
+    fn generic_listing_price_never_mistakes_the_input_price() {
         assert_eq!(
-            image_price_hint("a", &json!({"image":"0.008"})),
-            "US$ 0.008/imagem"
+            image_price_hint(
+                "bytedance-seed/seedream-5-5",
+                &json!({"image":"0.008","image_output":"0.00000479041916167665"})
+            ),
+            "US$ 4,79 por 1M tokens de imagem gerada"
         );
-        assert_eq!(
-            image_price_hint("a", &json!({"image_output":"0.0000038"})),
-            "US$ 3.8/Mtok de imagem"
-        );
-        assert_eq!(image_price_hint("a:free", &json!({"prompt":"0"})), "grátis");
+        assert_eq!(image_price_hint("a", &json!({"image":"0.008"})), "");
+        assert_eq!(image_price_hint("a:free", &json!({})), "grátis");
         assert_eq!(image_price_hint("a", &Value::Null), "");
+    }
+
+    /// Shapes of `/images/models/{id}/endpoints` seen on 2026-11-24.
+    #[test]
+    fn image_price_per_image_megapixel_and_token() {
+        // Per image with variants and an input price (left out).
+        let seedream = json!([{"pricing": [
+            {"billable": "output_image", "unit": "image", "cost_usd": 0.02},
+            {"billable": "output_image", "unit": "image", "cost_usd": 0.035, "variant": "high_resolution"},
+            {"billable": "input_image", "unit": "image", "cost_usd": 0.008}]}]);
         assert_eq!(
-            video_price_hint(&json!({"cents_per_second_output_720p":"1","duration_seconds":"0.5"})),
-            "a partir de ~US$ 0.01/s (estimativa)"
+            image_endpoint_price(&seedream),
+            "US$ 0,02/imagem · US$ 0,035/imagem (high resolution)"
         );
-        assert_eq!(video_price_hint(&json!({"video_tokens":"1"})), "");
+        // Variants only, plus a per-request surcharge (left out).
+        let krea = json!([{"pricing": [
+            {"billable": "output_image", "unit": "image", "cost_usd": 0.03, "variant": "1k"},
+            {"billable": "output_image", "unit": "image", "cost_usd": 0.06, "variant": "2k"},
+            {"billable": "output_image", "unit": "request", "cost_usd": 0.02, "variant": "high_thinking_surcharge"}]}]);
+        assert_eq!(
+            image_endpoint_price(&krea),
+            "US$ 0,03/imagem (1K) · US$ 0,06/imagem (2K)"
+        );
+        // One price for several variants is one entry.
+        let qwen = json!([{"pricing": [
+            {"billable": "output_image", "unit": "image", "cost_usd": 0.03, "variant": "1k"},
+            {"billable": "output_image", "unit": "image", "cost_usd": 0.03, "variant": "2k"},
+            {"billable": "output_image", "unit": "image", "cost_usd": 0.04, "variant": "low_2k"}]}]);
+        assert_eq!(
+            image_endpoint_price(&qwen),
+            "US$ 0,03/imagem (1K / 2K) · US$ 0,04/imagem (low 2K)"
+        );
+        // Per megapixel, with the 1024x1024 equivalent.
+        let flux = json!([{"pricing": [
+            {"billable": "output_image", "unit": "megapixel", "cost_usd": 0.03}]}]);
+        assert_eq!(
+            image_endpoint_price(&flux),
+            "US$ 0,03/megapixel (~US$ 0,0315 a 1024×1024)"
+        );
+        // Per token: raw, labelled.
+        let gpt = json!([{"pricing": [
+            {"billable": "input_text", "unit": "token", "cost_usd": 0.000005},
+            {"billable": "output_image", "unit": "token", "cost_usd": 0.00003}]}]);
+        assert_eq!(
+            image_endpoint_price(&gpt),
+            "US$ 30,00 por 1M tokens de imagem gerada"
+        );
+        // Free twin, empty list, odd shapes.
+        let free =
+            json!([{"pricing": [{"billable": "output_image", "unit": "image", "cost_usd": 0}]}]);
+        assert_eq!(image_endpoint_price(&free), "grátis");
+        assert_eq!(image_endpoint_price(&json!([])), "");
+        assert_eq!(image_endpoint_price(&Value::Null), "");
+        assert_eq!(image_endpoint_price(&json!([{"pricing": null}])), "");
+        // More than three variants are cut to +N.
+        let many = json!([{"pricing": (1..=5).map(|i| json!(
+            {"billable": "output_image", "unit": "image", "cost_usd": i as f64 / 100.0, "variant": format!("v{i}")}
+        )).collect::<Vec<_>>()}]);
+        assert!(image_endpoint_price(&many).ends_with(" · +2"));
+    }
+
+    /// One case per SKU family of `/videos/models` seen on 2026-11-24.
+    #[test]
+    fn video_price_from_every_sku_family() {
+        // USD per second by resolution, cheapest first.
+        assert_eq!(
+            video_price_hint(
+                &json!({"duration_seconds_2k": "0.0875", "duration_seconds_1080p": "0.05"})
+            ),
+            "US$ 0,05/s (1080p) · US$ 0,0875/s (2K)"
+        );
+        // Cents per second; the input-image SKU is not a price of the video.
+        assert_eq!(
+            video_price_hint(&json!({"cents_per_image_input": "1",
+                "cents_per_video_output_second_480p": "2",
+                "cents_per_video_output_second_720p": "3",
+                "cents_per_video_output_second_1080p": "14"})),
+            "US$ 0,02/s (480p) · US$ 0,03/s (720p) · US$ 0,14/s (1080p)"
+        );
+        // Plain per-second price plus a minimum charge.
+        assert_eq!(
+            video_price_hint(
+                &json!({"cents_per_second_output": "28", "minimum_cents_per_generation": "56"})
+            ),
+            "US$ 0,28/s · mínimo US$ 0,56 por vídeo"
+        );
+        // Per video token: raw value, clearly labelled; special cases hidden.
+        assert_eq!(
+            video_price_hint(&json!({"video_tokens": "0.000007",
+                "video_tokens_without_audio": "0.000007",
+                "video_tokens_with_video_input": "0.0000043"})),
+            "US$ 7,00 por 1M tokens de vídeo"
+        );
+        // Audio and resolution in one key.
+        assert_eq!(
+            video_price_hint(&json!({"duration_seconds_with_audio": "0.40",
+                "duration_seconds_with_audio_4k": "0.60",
+                "duration_seconds_without_audio": "0.20"})),
+            "US$ 0,20/s (sem áudio) · US$ 0,40/s (com áudio) · US$ 0,60/s (com áudio, 4K)"
+        );
+        // Per megapixel-second (upscaler): only variants exist, so they show.
+        assert_eq!(
+            video_price_hint(&json!({"cents_per_megapixel_second_precise": "3.5",
+                "cents_per_megapixel_second_creative": "5"})),
+            "US$ 0,035/megapixel·s (precise) · US$ 0,05/megapixel·s (creative)"
+        );
+        // Reference images are an input price.
+        assert_eq!(
+            video_price_hint(&json!({"duration_seconds": "0.13", "reference_images": "0.04"})),
+            "US$ 0,13/s"
+        );
+        // Long/reference variants hide behind the plain prices.
+        assert_eq!(
+            video_price_hint(&json!({"duration_seconds_480p": "0.02",
+                "long_duration_seconds_480p": "0.045",
+                "reference_duration_seconds_480p": "0.07"})),
+            "US$ 0,02/s (480p)"
+        );
+        assert_eq!(video_price_hint(&json!({"weird": "1"})), "");
+        assert_eq!(video_price_hint(&json!({"duration_seconds": "0"})), "");
         assert_eq!(video_price_hint(&Value::Null), "");
     }
 

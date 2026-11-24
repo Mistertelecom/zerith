@@ -378,6 +378,32 @@ impl Jobs {
         news
     }
 
+    /// Stops every monitor of this registry and drops what it had to say:
+    /// the person stopped the turn, and a notice must not revive it (Hermes
+    /// `kill_started_since(..., consume_output=True)`, same reason).
+    pub fn stop_monitors(&self) {
+        let ids: Vec<String> = self
+            .jobs
+            .lock()
+            .map(|jobs| {
+                jobs.iter()
+                    .filter(|(_, j)| j.watch.is_some())
+                    .map(|(i, _)| i.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for id in ids {
+            let _ = kill_in(&self.jobs, &id);
+        }
+        if let Ok(mut jobs) = self.jobs.lock() {
+            for (_, j) in jobs.iter_mut() {
+                if let Some(w) = j.watch.as_mut() {
+                    w.closed = true;
+                }
+            }
+        }
+    }
+
     /// Whether a monitor of this registry is still to report something.
     pub fn monitors_pending(&self) -> bool {
         self.jobs.lock().is_ok_and(|jobs| {

@@ -478,6 +478,13 @@ pub fn run_agent_turn(
             model: String::new(),
         });
     }
+    // Stopped by the person: its monitors stop too, or their next line would
+    // start a new turn in the conversation that was just stopped.
+    if matches!(result, Err(RunError::Provider(ProviderError::Cancelled))) {
+        if let Some(r) = agent.tools {
+            r.host().stop_monitors();
+        }
+    }
     match &result {
         Ok((_, reason)) => log.end(reason, None, None),
         Err(RunError::Provider(ProviderError::Cancelled)) => {

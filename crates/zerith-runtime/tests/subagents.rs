@@ -2254,3 +2254,42 @@ fn a_message_ends_the_wait_on_a_quiet_monitor() {
     let joined = seen.lock().unwrap().join("\n");
     assert!(joined.contains("pare de esperar"), "{joined}");
 }
+
+/// Stopping the turn stops its monitors too: their next line must not start
+/// a new turn in the conversation the person just stopped.
+#[test]
+fn a_stopped_turn_takes_its_monitors_with_it() {
+    let cancel = Cancel::default();
+    let c2 = cancel.clone();
+    let url = serve(move |b| {
+        if tool_msgs(b).is_empty() {
+            calls(&[(
+                "m1",
+                "monitor",
+                json!({"command": "sleep 60 && echo tarde", "description": "longo", "timeout_secs": 120}),
+            )])
+        } else {
+            c2.cancel();
+            text("...")
+        }
+    });
+    let e = env(Mode::Bypass);
+    let reg = Registry::new();
+    let _ = turn(
+        &e,
+        &url,
+        &reg,
+        AgentOptions::default(),
+        TurnContext::default(),
+        "x",
+        &cancel,
+        |_| {},
+    );
+    assert!(
+        !reg.host().monitors_pending(),
+        "no monitor left to wake the chat"
+    );
+    assert!(zerith_tools::background_jobs()
+        .iter()
+        .all(|j| !j.command.contains("echo tarde")));
+}

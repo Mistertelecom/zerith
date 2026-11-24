@@ -270,6 +270,12 @@ impl Host {
         self.jobs.monitor_notices()
     }
 
+    /// Stops this host's monitors without a final notice (the turn was
+    /// stopped by the person).
+    pub fn stop_monitors(&self) {
+        self.jobs.stop_monitors();
+    }
+
     /// Whether a `monitor` job has something new right now (no side effect).
     pub fn monitors_have_news(&self) -> bool {
         self.jobs.monitors_have_news()

@@ -1000,6 +1000,19 @@ export function installMock(theme: string) {
           return state.theme;
         case "background_jobs":
           return state.jobs;
+        case "memory_curate_plan":
+          return {
+            merges: [
+              {
+                keep: 1,
+                text: "O servidor de borda usa BGP com a AS 65001",
+                drop: [[3, "servidor de borda usa BGP, AS 65001"]],
+              },
+            ],
+            archives: [{ id: 2, text: "o roteador antigo era um 7200", idle_days: 45 }],
+          };
+        case "memory_curate_apply":
+          return { merged: 1, archived: 1 };
         case "btw_ask":
           return {
             text: "No NX-OS: `route-map NOME permit 10` e depois `match ip address prefix-list LISTA`.",

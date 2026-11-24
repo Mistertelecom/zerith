@@ -22,7 +22,7 @@ import {
   X,
   type LucideIcon,
 } from "lucide-react";
-import { api, type Fact, type FactKind } from "../lib/api";
+import { api, type CuratePlan, type Fact, type FactKind } from "../lib/api";
 import { Card, EmptyState, Row, Stat, Switch } from "./ui";
 
 const KINDS: [FactKind, string, LucideIcon, string][] = [
@@ -47,6 +47,9 @@ export function MemoryTab(props: { paused?: boolean; onPause?: (paused: boolean)
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [ownPaused, setOwnPaused] = useState(false);
+  // "Revisar memória": o plano aparece aqui e só é aplicado com confirmação.
+  const [plan, setPlan] = useState<CuratePlan | null>(null);
+  const [curating, setCurating] = useState(false);
 
   const load = useCallback(() => {
     setError(null);
@@ -157,6 +160,42 @@ export function MemoryTab(props: { paused?: boolean; onPause?: (paused: boolean)
     }
   };
 
+  const review = async () => {
+    setCurating(true);
+    try {
+      const p = await api.memoryCuratePlan();
+      if (!p.merges.length && !p.archives.length) {
+        setPlan(null);
+        setNotice("Memória em ordem: nada para fundir ou arquivar.");
+      } else {
+        setPlan(p);
+        setNotice(null);
+      }
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setCurating(false);
+    }
+  };
+
+  const applyPlan = async () => {
+    if (!plan) return;
+    setCurating(true);
+    try {
+      const done = await api.memoryCurateApply(plan);
+      setPlan(null);
+      load();
+      setNotice(
+        `${done.merged} fusão(ões) e ${done.archived} arquivado(s). Nada foi apagado: arquivados voltam com "zerith memory unarchive <id>".`,
+      );
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setCurating(false);
+    }
+  };
   if (!facts && error)
     return (
       <div className="page pn">
@@ -237,6 +276,9 @@ export function MemoryTab(props: { paused?: boolean; onPause?: (paused: boolean)
           </span>
         )}
         <span className="pn-spacer" />
+        <button className="btn btn-sm" disabled={curating} onClick={() => void review()}>
+          <Sparkles size={14} strokeWidth={2} /> Revisar memória
+        </button>
         <button className="btn btn-sm" onClick={() => void importHermes()}>
           <Import size={14} strokeWidth={2} /> Importar do Hermes
         </button>
@@ -254,6 +296,39 @@ export function MemoryTab(props: { paused?: boolean; onPause?: (paused: boolean)
           <CircleCheck size={16} strokeWidth={1.75} />
           <span>{notice}</span>
         </div>
+      ) : null}
+
+      {plan ? (
+        <Card
+          title="Revisão da memória"
+          icon={Sparkles}
+          description="Plano proposto. Nada muda até você aplicar; fundir e arquivar são reversíveis e nada é apagado."
+          actions={
+            <>
+              <button className="btn btn-sm btn-ghost" disabled={curating} onClick={() => setPlan(null)}>
+                <X size={14} strokeWidth={2} /> Descartar
+              </button>
+              <button className="btn btn-sm btn-primary" disabled={curating} onClick={() => void applyPlan()}>
+                <Check size={14} strokeWidth={2} /> Aplicar
+              </button>
+            </>
+          }
+        >
+          {plan.merges.map((m) => (
+            <Row
+              key={`m-${m.keep}`}
+              label={`Fundir #${[m.keep, ...m.drop.map((d) => d[0])].join(" + #")}`}
+              hint={m.drop.map((d) => `#${d[0]} sai: ${d[1]}`).join(" · ")}
+            >
+              <span className="pn-hint">{m.text}</span>
+            </Row>
+          ))}
+          {plan.archives.map((a) => (
+            <Row key={`a-${a.id}`} label={`Arquivar #${a.id}`} hint={`sem uso há ${a.idle_days} dias`}>
+              <span className="pn-hint">{a.text}</span>
+            </Row>
+          ))}
+        </Card>
       ) : null}
 
       {adding ? (

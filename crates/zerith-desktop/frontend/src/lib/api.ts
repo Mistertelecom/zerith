@@ -589,6 +589,12 @@ export interface ReportView {
   failed: string[];
 }
 
+/** Plano da curadoria da memória: fundir quase duplicatas, arquivar sem uso. */
+export interface CuratePlan {
+  merges: { keep: number; text: string; drop: [number, string][] }[];
+  archives: { id: number; text: string; idle_days: number }[];
+}
+
 /** Resposta de `/btw` (comando `btw_ask`). */
 export interface BtwAnswer {
   text: string;
@@ -684,6 +690,10 @@ export const api = {
   memoryAdd: (kind: FactKind, text: string) =>
     invoke<Fact>("memory_add", { kind, text }),
   memoryImportHermes: () => invoke<number>("memory_import_hermes"),
+  /** Curadoria: o plano (nada muda) e a aplicação do plano confirmado. */
+  memoryCuratePlan: () => invoke<CuratePlan>("memory_curate_plan"),
+  memoryCurateApply: (plan: CuratePlan) =>
+    invoke<{ merged: number; archived: number }>("memory_curate_apply", { plan }),
   skillsList: () => invoke<SkillView[]>("skills_list"),
   slashSkills: () => invoke<[string, string][]>("slash_skills"),
   skillsCatalog: (force = false) =>

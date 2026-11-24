@@ -277,6 +277,8 @@ pub fn run() {
             providers::usage_cost,
             providers::clear_cooldown,
             memory::memory_facts,
+            memory::memory_curate_plan,
+            memory::memory_curate_apply,
             memory::memory_search,
             memory::memory_update,
             memory::memory_forget,

@@ -175,6 +175,38 @@ pub async fn memory_import_hermes(state: State<'_, AppState>) -> Result<usize, S
     .map_err(|e| e.to_string())?
 }
 
+/// "Revisar memória": o plano da curadoria ([`zerith_memory::curate`]),
+/// sem aplicar nada.
+#[tauri::command]
+pub async fn memory_curate_plan(
+    state: State<'_, AppState>,
+) -> Result<zerith_memory::curate::Plan, String> {
+    let db = state.db().to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mem = open_at(&db)?;
+        zerith_memory::curate::plan(&mem, zerith_sessions::migrations::now_ms())
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Aplica o plano que a pessoa confirmou na tela (o mesmo que ela viu: um fato
+/// que mudou desde então é pulado).
+#[tauri::command]
+pub async fn memory_curate_apply(
+    state: State<'_, AppState>,
+    plan: zerith_memory::curate::Plan,
+) -> Result<zerith_memory::curate::Applied, String> {
+    let db = state.db().to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mem = open_at(&db)?;
+        zerith_memory::curate::apply(&mem, &plan).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 fn open_at(db: &std::path::Path) -> Result<SqliteMemory, String> {
     SqliteMemory::open(db).map_err(|e| e.to_string())
 }

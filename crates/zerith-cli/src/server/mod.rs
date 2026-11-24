@@ -519,11 +519,15 @@ pub(crate) mod tests {
         let a = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
         assert!(cmd(&paths, &a("server init --bind 0.0.0.0:7878")).is_err());
         assert!(!auth::config_path(dir.path()).exists());
-        cmd(&paths, &a("server init --name casa --bind 100.64.0.9:7878")).unwrap();
+        cmd(
+            &paths,
+            &a("server init --name casa --bind 198.18.251.1:7979"),
+        )
+        .unwrap();
         let cfg = auth::load_config(dir.path()).unwrap();
         assert_eq!(
             (cfg.name.as_str(), cfg.url.as_str()),
-            ("casa", "http://100.64.0.9:7878")
+            ("casa", "http://198.18.251.1:7979")
         );
         assert_eq!(auth::load_tokens(dir.path())[0].device, "desktop");
         assert!(cmd(&paths, &a("server init")).is_err(), "não sobrescreve");

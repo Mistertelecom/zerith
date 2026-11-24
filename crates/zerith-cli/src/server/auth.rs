@@ -22,7 +22,8 @@ const TOKEN_PREFIX: &str = "zt_";
 #[derive(Debug, PartialEq, Eq)]
 pub enum BindKind {
     Loopback,
-    /// 10/8, 172.16/12, 192.168/16, 100.64/10 (Tailscale/CGNAT), fd00::/8.
+    /// 10/8, 172.16/12, 192.168/16, 100.64/10 (Tailscale/CGNAT),
+    /// 198.18/15 (RFC 2544, WireGuard), fd00::/8.
     Private,
     /// 0.0.0.0, `::` ou endereço roteável na internet.
     Public,
@@ -38,6 +39,8 @@ pub fn classify(ip: IpAddr) -> BindKind {
                 || (o[0] == 172 && (16..=31).contains(&o[1]))
                 || (o[0] == 192 && o[1] == 168)
                 || (o[0] == 100 && (64..=127).contains(&o[1]))
+                // 198.18.0.0/15 (RFC 2544): nunca roteada na internet, comum em WireGuard.
+                || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
             {
                 BindKind::Private
             } else {
@@ -321,6 +324,9 @@ mod tests {
             "192.168.1.10",
             "100.64.0.1",
             "100.127.1.1",
+            "198.18.0.1",
+            "198.18.251.1",
+            "198.19.255.254",
             "fd7a:115c:a1e0::1",
         ] {
             assert_eq!(classify(ip(s)), BindKind::Private, "{s}");
@@ -331,6 +337,8 @@ mod tests {
             "8.8.8.8",
             "172.32.0.1",
             "100.128.0.1",
+            "198.17.255.1",
+            "198.20.0.1",
             "2001:db8::1",
         ] {
             assert_eq!(classify(ip(s)), BindKind::Public, "{s}");
@@ -341,6 +349,11 @@ mod tests {
     fn bind_publico_recusado_sem_flag() {
         assert!(check_bind("127.0.0.1:7878", false).is_ok());
         assert!(check_bind("100.101.102.103:7878", false).is_ok());
+        // WireGuard na faixa 198.18.0.0/15 (RFC 2544), porta escolhida.
+        assert_eq!(
+            check_bind("198.18.251.1:7979", false).unwrap().to_string(),
+            "198.18.251.1:7979"
+        );
         let e = check_bind("0.0.0.0:7878", false).unwrap_err().to_string();
         assert!(e.contains("--allow-public"));
         assert!(check_bind("203.0.113.5:7878", false).is_err());

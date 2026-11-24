@@ -49,7 +49,7 @@ Por isso o bind é fechado por padrão:
 | Endereço | Aceito |
 |---|---|
 | `127.0.0.1`, `::1` | sempre (padrão `127.0.0.1:7878`) |
-| `10/8`, `172.16/12`, `192.168/16`, `100.64/10` (Tailscale/CGNAT), `fd00::/8` | sem flag |
+| `10/8`, `172.16/12`, `192.168/16`, `100.64/10` (Tailscale/CGNAT), `198.18/15` (RFC 2544, comum em WireGuard; nunca roteada na internet), `fd00::/8` | sem flag |
 | `0.0.0.0`, `::`, IP público | só com `--allow-public` (fica `allow_public = true` no config) e um aviso forte a cada início |
 
 ## Instalação manual (Linux, systemd)
@@ -101,6 +101,33 @@ Quando o daemon passar a embutir o servidor (`server::spawn`), troque
 
 > Workflows com nós `shell`/`ssh_command` rodam como o usuário `zerith`, com
 > as permissões dele. Não rode o serviço como root.
+
+### Servidor numa VPS que já hospeda outros serviços
+
+O Zerith entra ao lado do que já roda, sem tocar em nada existente:
+
+1. **Usuário dedicado** `zerith` (sem shell, sem sudo) — como acima.
+2. **`ZERITH_HOME` próprio** (`/var/lib/zerith`): banco, tokens e config ficam
+   lá; nada em `/etc`, nada em home de outro usuário.
+3. **Escute só no IP do WireGuard**, nunca em `0.0.0.0`. Ex.: interface `wg0`
+   com `198.18.251.1/24`:
+
+   ```bash
+   ip -4 addr show wg0                     # confirme o IP do túnel
+   ss -ltnp | grep ':7878 '                # porta livre? (sem saída = livre)
+   sudo -u zerith env ZERITH_HOME=/var/lib/zerith \
+     zerith server init --name vps --bind 198.18.251.1:7878
+   ```
+
+   Porta ocupada por outro serviço? Escolha outra: `--bind 198.18.251.1:7979`
+   (o código de pareamento já sai com a URL certa).
+4. **Firewall e serviços existentes ficam como estão.** Como o servidor só
+   escuta no IP do túnel, ele não aparece na interface pública e não precisa
+   de regra nova. Não abra a porta no firewall público.
+5. Unit systemd como acima, com `After=wg-quick@wg0.service` e
+   `Requires=wg-quick@wg0.service` (o IP do túnel precisa existir antes do
+   bind; sem ele o início falha com "Cannot assign requested address" e o
+   systemd tenta de novo).
 
 ## Expor para o desktop
 

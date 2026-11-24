@@ -1946,7 +1946,7 @@ chamada; nada foi executado. Divida o conteúdo: escreva o arquivo em partes men
 /// Appended to a text answer the output cap cut short.
 const CUT_TEXT: &str = "\n\n_[resposta cortada pelo limite de saída do modelo]_";
 
-fn default_gateway(client: &Client, model: &str) -> Gateway {
+pub(crate) fn default_gateway(client: &Client, model: &str) -> Gateway {
     let cfg = client.config();
     let provider = if cfg.name.trim().is_empty() {
         cfg.kind.as_str().to_string()

@@ -1234,10 +1234,18 @@ fn turn_body(
                             cwd: cwd.clone(),
                         },
                         settled: Some(crate::pipeline::ToolOutcome::new(false, msg)),
+                        rewritten_from: None,
                     });
                     continue;
                 }
-                prepared.push(pipe.prepare(call, on_event));
+                let p = pipe.prepare(call, on_event);
+                if let Some(from) = &p.rewritten_from {
+                    log.emit(
+                        "tool/rewritten",
+                        json!({"id": call.id, "name": p.inv.name, "from": from, "to": p.inv.args}),
+                    );
+                }
+                prepared.push(p);
             }
             let prepared_len = prepared.len();
             // `ask_user` blocks on the person, so the loop answers it itself,

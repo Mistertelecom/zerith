@@ -16,7 +16,9 @@
 //! 2. Tools the policy cannot map to an action (MCP, skills, plugins): rules
 //!    `mcp__server__*` / `skill(name)`; an `mcp__*` tool with no rule asks
 //!    (denied in `dontAsk`, allowed in `bypassPermissions`).
-//! 3. `PreToolUse` hooks: deny, ask, rewrite arguments, inject context.
+//! 3. `PreToolUse` hooks: deny, ask, rewrite arguments, inject context. New
+//!    arguments go through step 2 again here, and through the policy and the
+//!    approval in the pipeline; the model is told they changed.
 //! 4. `PermissionRequest` hooks, when the call is about to ask the user: a
 //!    hook may deny it. (A hook cannot *approve*: `Middleware` can only make a
 //!    call stricter, so the prompt still appears.)
@@ -268,6 +270,30 @@ impl Guards {
         }
     }
 
+    /// Rules for the tools the policy cannot turn into an action (MCP,
+    /// skills, plugins). `Ok(Some(why))`: ask; `Err`: the refusal.
+    fn external_rules(&self, call: &ToolInvocation) -> Result<Option<String>, Flow> {
+        let builtin = self.policy.action_for(&call.name, &call.args).is_some();
+        if builtin || INTERNAL.contains(&call.name.as_str()) {
+            return Ok(None);
+        }
+        let subject = tool_subject(&call.name, &call.args);
+        match self.policy.check_rules(&call.name, subject.as_deref()) {
+            Some(Verdict::Deny(why)) => Err(Flow::Deny(why)),
+            Some(Verdict::Ask(why)) => Ok(Some(why)),
+            Some(Verdict::Allow) => Ok(None),
+            None if call.name.starts_with("mcp__") => match self.policy.mode() {
+                Mode::Bypass => Ok(None),
+                Mode::DontAsk => Err(Flow::Deny(format!(
+                    "modo dontAsk: ferramenta externa {} sem regra allow",
+                    call.name
+                ))),
+                _ => Ok(Some(format!("ferramenta externa: {}", call.name))),
+            },
+            None => Ok(None),
+        }
+    }
+
     fn exit_plan(&self, call: &ToolInvocation) -> Flow {
         if !self.gate.in_plan() {
             return Flow::Deny("exit_plan_mode só vale no modo plan".into());
@@ -298,43 +324,36 @@ impl Middleware for Guards {
         if call.name == EXIT_PLAN_MODE {
             return self.exit_plan(call);
         }
-        let mut ask: Option<String> = None;
-
-        // Tools the policy cannot turn into an action.
-        let builtin = self.policy.action_for(&call.name, &call.args).is_some();
-        if !builtin && !INTERNAL.contains(&call.name.as_str()) {
-            let subject = tool_subject(&call.name, &call.args);
-            match self.policy.check_rules(&call.name, subject.as_deref()) {
-                Some(Verdict::Deny(why)) => return Flow::Deny(why),
-                Some(Verdict::Ask(why)) => ask = Some(why),
-                Some(Verdict::Allow) => {}
-                None if call.name.starts_with("mcp__") => match self.policy.mode() {
-                    Mode::Bypass => {}
-                    Mode::DontAsk => {
-                        return Flow::Deny(format!(
-                            "modo dontAsk: ferramenta externa {} sem regra allow",
-                            call.name
-                        ))
-                    }
-                    _ => ask = Some(format!("ferramenta externa: {}", call.name)),
-                },
-                None => {}
-            }
-        }
+        let mut ask = match self.external_rules(call) {
+            Ok(a) => a,
+            Err(deny) => return deny,
+        };
 
         // PreToolUse.
         let pre = self.hooks(HookEvent::PreToolUse, call, None);
         if pre.blocked() {
             return Flow::Deny(reason(&pre, "bloqueado por hook PreToolUse"));
         }
-        if let Some(new_args) = pre.updated_input.clone() {
+        let mut context = pre.additional_context.clone();
+        if let Some(new_args) = pre.updated_input.clone().filter(|a| *a != call.args) {
             call.args = new_args;
+            // The new arguments face every check again: the rules here, the
+            // policy and the approval in the pipeline. A hook never waives one.
+            ask = match self.external_rules(call) {
+                Ok(a) => a,
+                Err(deny) => return deny,
+            };
+            // The model reads why the result is not what it asked for.
+            context.push(format!(
+                "[um hook PreToolUse alterou os argumentos desta chamada de {} para: {}]",
+                call.name, call.args
+            ));
         }
-        if !pre.additional_context.is_empty() {
+        if !context.is_empty() {
             if let Ok(mut p) = self.pending.lock() {
                 p.entry((call.session_id.clone(), call.id.clone()))
                     .or_default()
-                    .extend(pre.additional_context.iter().cloned());
+                    .extend(context);
             }
         }
         if pre.decision == Some(Decision::Ask) {

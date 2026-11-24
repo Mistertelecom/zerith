@@ -98,6 +98,9 @@ const PANICKED: &str = "erro interno na ferramenta (panic)";
 pub(crate) struct Prepared {
     pub inv: ToolInvocation,
     pub settled: Option<ToolOutcome>,
+    /// The arguments before middleware, when middleware (a `PreToolUse`
+    /// hook) changed them: the loop logs the rewrite.
+    pub rewritten_from: Option<Value>,
 }
 
 pub(crate) struct Pipeline<'a> {
@@ -158,6 +161,7 @@ impl Pipeline<'_> {
         let settle = |inv: ToolInvocation, ok: bool, text: String| Prepared {
             inv,
             settled: Some(ToolOutcome::new(ok, text)),
+            rewritten_from: None,
         };
         let Some((tools, policy)) = self.core else {
             return settle(
@@ -206,6 +210,7 @@ impl Pipeline<'_> {
         }
 
         let mut ask: Option<String> = None;
+        let original = inv.args.clone();
         for m in self.middleware {
             match m.before(&mut inv) {
                 Flow::Continue => {}
@@ -217,6 +222,12 @@ impl Pipeline<'_> {
             }
         }
 
+        let rewritten_from = (inv.args != original).then_some(original);
+        let settle = |inv: ToolInvocation, ok: bool, text: String| Prepared {
+            inv,
+            settled: Some(ToolOutcome::new(ok, text)),
+            rewritten_from: rewritten_from.clone(),
+        };
         // The policy sees the arguments middleware left, not the model's.
         let cctx = self.ctx(policy);
         let (verdict, action) = match tools.authorize(&inv.name, &inv.args, &cctx) {
@@ -323,7 +334,11 @@ impl Pipeline<'_> {
                     {
                         return settle(inv, false, refusal);
                     }
-                    return Prepared { inv, settled: None };
+                    return Prepared {
+                        inv,
+                        settled: None,
+                        rewritten_from,
+                    };
                 }
             }
         }
@@ -345,7 +360,11 @@ impl Pipeline<'_> {
                 return settle(inv, false, refusal);
             }
         }
-        Prepared { inv, settled: None }
+        Prepared {
+            inv,
+            settled: None,
+            rewritten_from,
+        }
     }
 
     /// Blocks on the user. `forced` (a middleware ask) is not waived by an

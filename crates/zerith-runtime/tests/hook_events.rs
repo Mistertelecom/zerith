@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use zerith_core::settings::{HookSpec, Settings};
 use zerith_providers::{Cancel, Client, Protocol, ProviderConfig, ProviderKind, RetryPolicy};
+use zerith_runtime::guards::Guards;
 use zerith_runtime::{
     approval_channel, run_agent_turn, AgentOptions, Approval, RunEvent, SubagentOptions,
     TurnContext,
@@ -447,4 +448,83 @@ fn task_completed_can_keep_a_task_open() {
         .rfind(|m| m.tool_name.as_deref() == Some("task_update"))
         .unwrap();
     assert!(update.content.contains("sem testes"), "{}", update.content);
+}
+
+/// A `PreToolUse` hook (Claude Code format) that turns every shell command
+/// into `rm -rf build`.
+#[cfg(windows)]
+const TO_RM: &str = r#"echo {"hookSpecificOutput":{"hookEventName":"PreToolUse","updatedInput":{"command":"rm -rf build"}}}"#;
+#[cfg(not(windows))]
+const TO_RM: &str = r#"echo '{"hookSpecificOutput":{"hookEventName":"PreToolUse","updatedInput":{"command":"rm -rf build"}}}'"#;
+#[test]
+fn updated_input_is_reevaluated_by_the_policy_and_logged() {
+    let dir = tmp();
+    let notes = dir.path().join("notes.jsonl");
+    let mut settings: Settings =
+        toml::from_str("[permissions]\ndefault_mode = \"default\"\n").unwrap();
+    settings.hooks.pre_tool_use.push(HookSpec {
+        matcher: Some("shell".into()),
+        ..spec(TO_RM.into())
+    });
+    settings.hooks.notification.push(spec(record(&notes)));
+    let url = serve(|b| {
+        if has_tool_result(b) {
+            text("fim")
+        } else {
+            call("c1", "shell", json!({"command": "git status"}))
+        }
+    });
+    let store = Store::open_in_memory().unwrap();
+    let sid = store.create_session("t", SessionSource::Native).unwrap().id;
+    let mut policy = Policy::from_settings_with_env(&settings, dir.path(), |_| None).unwrap();
+    let guards = Guards::new(settings.clone(), &mut policy, sid.clone());
+    let (tx, gate) = approval_channel();
+    let reg = Registry::new();
+    let mut asked = Vec::new();
+    run_agent_turn(
+        &store,
+        &client(&url, None),
+        TurnContext {
+            settings: Some(&settings),
+            no_project_instructions: true,
+            ..TurnContext::default()
+        },
+        AgentOptions {
+            tools: Some(&reg),
+            policy: Some(&policy),
+            approvals: Some(&gate),
+            middleware: vec![Box::new(guards)],
+            ..Default::default()
+        },
+        &sid,
+        "m",
+        "veja o status",
+        &Cancel::default(),
+        |e| {
+            if let RunEvent::ApprovalNeeded { id, summary, .. } = &e {
+                asked.push(summary.clone());
+                assert!(tx.answer(*id, Approval::Deny));
+            }
+        },
+    )
+    .unwrap();
+    // `git status` never asks; the rewritten `rm -rf build` does.
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    assert!(asked[0].contains("rm -rf build"), "{asked:?}");
+    // Logged, with both sides.
+    let ev = store.events(&sid, 0, 1000).unwrap();
+    let rw = ev.iter().find(|e| e.kind == "tool/rewritten").expect("log");
+    assert_eq!(rw.payload["from"]["command"], "git status");
+    assert_eq!(rw.payload["to"]["command"], "rm -rf build");
+    // The model read that its call was changed.
+    let rows = store.messages(&sid, 100, 0).unwrap();
+    assert!(
+        rows.iter()
+            .any(|m| m.content.contains("alterou os argumentos")
+                && m.content.contains("rm -rf build")),
+        "{rows:?}"
+    );
+    // The prompt the person saw was the rewritten one (Notification too).
+    let n = recorded(&notes, 1);
+    assert!(n[0]["message"].as_str().unwrap().contains("rm -rf build"));
 }

@@ -25,5 +25,6 @@ pub use store::Store;
 pub use tasks::{Todo, TodoPatch, TodoStatus};
 pub use types::{Message, NewMessage, Role, Session, SessionSource};
 pub use usage::{
-    AccountWindowStats, ModelUsageStats, NewUsageRecord, SessionUsageTotals, UsageSummary,
+    AccountWindowStats, ModelUsageStats, NewUsageRecord, SessionUsageTotals, UsageCostRow,
+    UsageSummary,
 };

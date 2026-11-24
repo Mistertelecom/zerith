@@ -138,6 +138,24 @@ pub struct SessionUsageTotals {
     pub requests: u64,
 }
 
+/// Tokens de um grupo (dia local, sessão, conta, modelo): a base do custo,
+/// que é calculado fora daqui (o preço vem do catálogo, não do banco).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageCostRow {
+    /// `AAAA-MM-DD` no fuso local.
+    pub day: String,
+    pub session_id: Option<String>,
+    pub session_title: Option<String>,
+    pub account_id: String,
+    pub provider: String,
+    pub model: String,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub requests: u64,
+}
+
 fn window_since_ms(window_hours: u32) -> i64 {
     if window_hours == 0 {
         0
@@ -390,6 +408,47 @@ impl Store {
                     })
                 },
             )
+            .map_err(Into::into)
+    }
+
+    /// Tokens agrupados por dia, sessão, conta e modelo desde `window_hours`
+    /// (`0` = tudo). Com `session`, só ela e os subagentes que ela abriu.
+    pub fn usage_cost_rows(
+        &self,
+        window_hours: u32,
+        session: Option<&str>,
+    ) -> Result<Vec<UsageCostRow>> {
+        let since = window_since_ms(window_hours);
+        let mut st = self.conn().prepare(
+            "SELECT date(u.created_at / 1000, 'unixepoch', 'localtime') AS day,
+                    u.session_id, s.title, u.account_id, u.provider, u.model,
+                    COALESCE(SUM(u.prompt_tokens), 0), COALESCE(SUM(u.completion_tokens), 0),
+                    COALESCE(SUM(u.cache_read_tokens), 0), COALESCE(SUM(u.cache_write_tokens), 0),
+                    COUNT(*)
+             FROM usage_records u LEFT JOIN sessions s ON s.id = u.session_id
+             WHERE u.created_at >= ?1
+               AND (?2 IS NULL OR u.session_id = ?2 OR u.session_id IN
+                   (SELECT id FROM sessions WHERE source = 'subagent' AND source_id = ?2))
+             GROUP BY day, u.session_id, u.account_id, u.provider, u.model
+             ORDER BY day, u.session_id, u.model",
+        )?;
+        let rows = st.query_map(params![since, session], |r| {
+            let n = |i| r.get::<_, i64>(i).map(from_sql_u64);
+            Ok(UsageCostRow {
+                day: r.get(0)?,
+                session_id: r.get(1)?,
+                session_title: r.get(2)?,
+                account_id: r.get(3)?,
+                provider: r.get(4)?,
+                model: r.get(5)?,
+                prompt_tokens: n(6)?,
+                completion_tokens: n(7)?,
+                cache_read_tokens: n(8)?,
+                cache_write_tokens: n(9)?,
+                requests: n(10)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
 
@@ -986,5 +1045,58 @@ mod tests {
         assert_eq!(totals.saved_tokens, 200);
         assert_eq!(totals.saved_rtk_tokens, 170);
         assert_eq!(totals.requests, 2);
+    }
+
+    #[test]
+    fn usage_cost_rows_group_by_day_session_and_model_including_subagents() {
+        let s = Store::open_in_memory().unwrap();
+        let sess = s
+            .create_session("principal", crate::SessionSource::Native)
+            .unwrap();
+        let child = s
+            .create_session("filho", crate::SessionSource::Native)
+            .unwrap();
+        s.conn()
+            .execute(
+                "UPDATE sessions SET source = 'subagent', source_id = ?1 WHERE id = ?2",
+                params![sess.id, child.id],
+            )
+            .unwrap();
+        let rec = |sid: &str, model: &str, p: u64| NewUsageRecord {
+            session_id: Some(sid.into()),
+            account_id: "acc".into(),
+            provider: "anthropic".into(),
+            model: model.into(),
+            prompt_tokens: p,
+            completion_tokens: 10,
+            cache_read_tokens: 5,
+            ..Default::default()
+        };
+        s.record_usage(&rec(&sess.id, "m1", 100)).unwrap();
+        s.record_usage(&rec(&sess.id, "m1", 200)).unwrap();
+        s.record_usage(&rec(&child.id, "m2", 50)).unwrap();
+        s.record_usage(&NewUsageRecord {
+            model: "m3".into(),
+            ..rec("", "", 7)
+        })
+        .unwrap();
+
+        let all = s.usage_cost_rows(0, None).unwrap();
+        assert_eq!(all.len(), 3);
+        let m1 = all.iter().find(|r| r.model == "m1").unwrap();
+        assert_eq!(
+            (m1.prompt_tokens, m1.completion_tokens, m1.cache_read_tokens),
+            (300, 20, 10)
+        );
+        assert_eq!(m1.requests, 2);
+        assert_eq!(m1.session_title.as_deref(), Some("principal"));
+        assert_eq!(m1.day.len(), 10);
+        assert!(all
+            .iter()
+            .any(|r| r.model == "m3" && r.session_id.is_none()));
+
+        let mine = s.usage_cost_rows(24, Some(&sess.id)).unwrap();
+        let models: Vec<&str> = mine.iter().map(|r| r.model.as_str()).collect();
+        assert_eq!(models, ["m1", "m2"]);
     }
 }

@@ -1064,6 +1064,7 @@ fn preview_hermes_jsonl(path: &Path) -> Result<zerith_importers::SourcePreview, 
             updated_at,
             message_count: p.message_count,
             archived: m.get("archived").is_some_and(truthy),
+            pinned: m.get("pinned").is_some_and(truthy),
         });
     }
 

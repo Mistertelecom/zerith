@@ -18,8 +18,8 @@ pub mod hermes_setup;
 pub mod plan;
 
 pub use hermes::{
-    detect, import, import_selected, preview, ImportReport, SessionPreview, SourceLayout,
-    SourcePreview,
+    detect, import, import_selected, import_with, preview, ImportReport, SessionOptions,
+    SessionPreview, SourceLayout, SourcePreview,
 };
 pub use hermes_jsonl::{import_jsonl, import_jsonl_from};
 

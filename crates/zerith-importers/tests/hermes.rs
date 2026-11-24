@@ -4,7 +4,9 @@
 //! `CARGO_TARGET_TMPDIR`, which Cargo only sets for integration tests.
 
 use std::path::{Path, PathBuf};
-use zerith_importers::{import, import_selected, preview, ImportError};
+use zerith_importers::{
+    import, import_selected, import_with, preview, ImportError, SessionOptions,
+};
 use zerith_sessions::{SessionSource, Store};
 
 fn tmp() -> tempfile::TempDir {
@@ -260,4 +262,44 @@ fn import_selected_filters_archived_and_only_ids() {
     assert_eq!(r.messages_imported, 2);
     assert!(store_both.session("hermes-default-h1").unwrap().is_some());
     assert!(store_both.session("hermes-default-h3").unwrap().is_none());
+}
+
+#[test]
+fn pinned_and_archived_survive_and_only_pinned_visible_archives_the_rest() {
+    let dir = tmp();
+    let src = fixture(dir.path());
+    let conn = rusqlite::Connection::open(&src).unwrap();
+    conn.execute_batch(
+        "INSERT INTO sessions(id, started_at, title, archived, pinned)
+            VALUES ('h2', 1700000100.0, 'Fixada', 0, 1),
+                   ('h3', 1700000200.0, 'Arquivada', 1, 0);",
+    )
+    .unwrap();
+    drop(conn);
+
+    let p = preview(&src).unwrap();
+    assert!(p.sessions.iter().any(|s| s.id == "h2" && s.pinned));
+
+    let store = Store::open(dir.path().join("a.db")).unwrap();
+    import_with(&src, "default", &store, &SessionOptions::default()).unwrap();
+    let archived = |st: &Store, id: &str| st.session(id).unwrap().unwrap().archived;
+    assert_eq!(store.pinned_sessions().unwrap(), ["hermes-default-h2"]);
+    assert!(archived(&store, "hermes-default-h3"));
+    assert!(!archived(&store, "hermes-default-h1"));
+    // A pessoa desafixa no Zerith; a segunda rodada não refixa.
+    store
+        .set_session_pinned("hermes-default-h2", false)
+        .unwrap();
+    import_with(&src, "default", &store, &SessionOptions::default()).unwrap();
+    assert!(store.pinned_sessions().unwrap().is_empty());
+
+    let store = Store::open(dir.path().join("b.db")).unwrap();
+    let opts = SessionOptions {
+        only_pinned_visible: true,
+        ..Default::default()
+    };
+    import_with(&src, "default", &store, &opts).unwrap();
+    assert!(!archived(&store, "hermes-default-h2"));
+    assert!(archived(&store, "hermes-default-h1"));
+    assert!(archived(&store, "hermes-default-h3"));
 }

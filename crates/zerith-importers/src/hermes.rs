@@ -50,6 +50,8 @@ pub struct SessionPreview {
     pub updated_at: i64,
     pub message_count: usize,
     pub archived: bool,
+    /// Fixada no Hermes (coluna `pinned`); vira fixada no Zerith.
+    pub pinned: bool,
 }
 
 /// Read-only preview of a Hermes database before importing.
@@ -199,6 +201,7 @@ struct SourceSessionRow {
     created_at: i64,
     updated_at: i64,
     archived: bool,
+    pinned: bool,
 }
 
 fn session_select_sql(scols: &[String]) -> String {
@@ -207,13 +210,15 @@ fn session_select_sql(scols: &[String]) -> String {
     let created_col = pick(scols, &["started_at", "created_at"]);
     let updated_col = pick(scols, &["ended_at", "updated_at", "started_at"]);
     let archived_col = pick(scols, &["archived"]);
+    let pinned_col = pick(scols, &["pinned"]);
 
     format!(
-        "SELECT id, {title_col}, {model}, {created}, {updated}, {archived} FROM sessions ORDER BY id",
+        "SELECT id, {title_col}, {model}, {created}, {updated}, {archived}, {pinned} FROM sessions ORDER BY id",
         model = model_col.unwrap_or("NULL"),
         created = created_col.unwrap_or("0"),
         updated = updated_col.unwrap_or("0"),
         archived = archived_col.unwrap_or("0"),
+        pinned = pinned_col.unwrap_or("0"),
     )
 }
 
@@ -230,6 +235,7 @@ fn decode_session_row(row: &rusqlite::Row<'_>) -> Result<Option<SourceSessionRow
     let updated = to_ms(row.get::<_, Option<f64>>(4)?.unwrap_or(0.0));
     let updated_at = if updated == 0 { created_at } else { updated };
     let archived = row.get::<_, Option<i64>>(5)?.unwrap_or(0) != 0;
+    let pinned = row.get::<_, Option<i64>>(6)?.unwrap_or(0) != 0;
     Ok(Some(SourceSessionRow {
         id,
         title,
@@ -237,6 +243,7 @@ fn decode_session_row(row: &rusqlite::Row<'_>) -> Result<Option<SourceSessionRow
         created_at,
         updated_at,
         archived,
+        pinned,
     }))
 }
 
@@ -321,6 +328,7 @@ pub fn preview(path: &Path) -> Result<SourcePreview> {
             updated_at: s.updated_at,
             message_count,
             archived: s.archived,
+            pinned: s.pinned,
         });
     }
 
@@ -354,12 +362,51 @@ pub fn import_selected(
     include_archived: bool,
     only_ids: Option<&[String]>,
 ) -> Result<ImportReport> {
+    let opts = SessionOptions {
+        include_archived,
+        only_ids: only_ids.map(<[String]>::to_vec),
+        only_pinned_visible: false,
+    };
+    import_with(path, profile, store, &opts)
+}
+
+/// Como as conversas entram.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionOptions {
+    pub include_archived: bool,
+    pub only_ids: Option<Vec<String>>,
+    /// Só as fixadas ficam visíveis; o resto entra arquivado (continua
+    /// buscável). Para quem tinha centenas de conversas no Hermes.
+    pub only_pinned_visible: bool,
+}
+
+impl Default for SessionOptions {
+    fn default() -> Self {
+        Self {
+            include_archived: true,
+            only_ids: None,
+            only_pinned_visible: false,
+        }
+    }
+}
+
+/// [`import_selected`] com todas as opções. Fixada e arquivada no Hermes
+/// continuam assim no Zerith; isso só é aplicado quando a conversa é criada,
+/// para uma nova rodada não desfazer o que a pessoa mudou no Zerith depois.
+pub fn import_with(
+    path: &Path,
+    profile: &str,
+    store: &Store,
+    opts: &SessionOptions,
+) -> Result<ImportReport> {
     let (src, _) = open_validated(path)?;
     let scols = columns(&src, "sessions")?;
     let mcols = columns(&src, "messages")?;
     let mut report = ImportReport::default();
-    let wanted: Option<HashSet<&str>> =
-        only_ids.map(|ids| ids.iter().map(String::as_str).collect());
+    let wanted: Option<HashSet<&str>> = opts
+        .only_ids
+        .as_ref()
+        .map(|ids| ids.iter().map(String::as_str).collect());
 
     let sql = session_select_sql(&scols);
     let mut st = src.prepare(&sql)?;
@@ -372,7 +419,7 @@ pub fn import_selected(
             continue;
         };
 
-        if !include_archived && s.archived {
+        if !opts.include_archived && s.archived {
             continue;
         }
         if let Some(ref set) = wanted {
@@ -381,6 +428,7 @@ pub fn import_selected(
             }
         }
 
+        let archived = s.archived || (opts.only_pinned_visible && !s.pinned);
         let session = Session {
             id: format!("hermes-{profile}-{}", s.id),
             title: s.title,
@@ -391,10 +439,13 @@ pub fn import_selected(
             provider: None,
             created_at: s.created_at,
             updated_at: s.updated_at,
-            archived: s.archived,
+            archived,
         };
 
         let (local_id, created_now) = store.upsert_imported(&session)?;
+        if created_now && s.pinned {
+            store.set_session_pinned(&local_id, true)?;
+        }
         let n = import_messages(&src, &mcols, &s.id, &local_id, store)?;
         report.messages_imported += n;
         tally(&mut report, created_now, n);

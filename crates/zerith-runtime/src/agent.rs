@@ -1473,6 +1473,14 @@ fn shrink(
     cwd: &Path,
 ) {
     let before = hist.tokens();
+    let (deduped, demoted) = hist.cheap_passes(budget);
+    if deduped + demoted > 0 {
+        log.emit(
+            "compaction/cheap",
+            json!({"deduped": deduped, "demoted": demoted, "tokens_before": before,
+                   "tokens_after": hist.tokens()}),
+        );
+    }
     hist.prune_tools(budget);
     if hist.tokens() > budget && !*summary_failed {
         let blocked = if let Some(st) = settings {

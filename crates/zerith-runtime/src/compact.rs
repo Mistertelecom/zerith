@@ -5,7 +5,10 @@
 //! supersedes}}`, and replay then hides the rows in `start_id..=end_id` and
 //! shows the summary in their place.
 //!
-//! Shrinking goes in three phases, cheapest first:
+//! Shrinking goes in phases, cheapest first:
+//! 0. cheap passes (in memory only): identical tool results keep only the
+//!    newest copy, and big old results outside the protected tail become
+//!    one line ([`History::cheap_passes`]);
 //! 1. prune: old tool results lose their body (in memory only, repeatable);
 //! 2. summarize: the oldest span becomes one summary row (one model call);
 //! 3. drop: if the summary failed or was not enough, the oldest turns go
@@ -23,6 +26,9 @@ use crate::{Result, RunError};
 
 /// Replaces a tool result dropped to fit the context window.
 pub const DROPPED: &str = "[saída removida para caber no contexto]";
+/// Replaces an older copy of a tool result repeated later (same tool, same
+/// arguments, same output).
+pub const DUPLICATE: &str = "[saída idêntica repetida mais adiante]";
 /// Stands in for a result that was never recorded (crash or cancel mid-step):
 /// the API rejects a tool call without an answer.
 pub(crate) const INTERRUPTED: &str = "[sem resultado: o turno foi interrompido]";
@@ -48,6 +54,14 @@ pub const DEFAULT_CONTEXT: usize = 128_000;
 pub const AUTO_COMPACT_PCT: usize = 75;
 /// Characters of the span sent to the summarizer, at most.
 const TRANSCRIPT_CHARS: usize = 60_000;
+/// Tokens at the end of the history whose tool results the cheap passes never
+/// demote (opencode `PRUNE_PROTECT`).
+pub const PROTECT_TOKENS: usize = 40_000;
+/// A tool result shorter than this is not worth deduplicating: the marker
+/// would save next to nothing (Hermes `_PRUNE_MIN_CHARS`).
+const DEDUPE_MIN_CHARS: usize = 200;
+/// An old tool result longer than this becomes one line.
+const DEMOTE_MIN_CHARS: usize = 2_000;
 
 /// Writes the summary of a span. A trait so tests (and hosts that prefer a
 /// cheaper model) can replace the model call.
@@ -164,6 +178,108 @@ impl History {
         self.items.push(Item::row(msg, id));
     }
 
+    /// The call each tool result answers, as `(tool, arguments)`, by index.
+    /// `pair` puts every result right after its assistant message, so the
+    /// lookup only searches the latest assistant's calls (call ids may repeat
+    /// across a resumed session).
+    fn call_of(&self) -> Vec<Option<(&str, &str)>> {
+        let mut calls: &[ToolCall] = &[];
+        self.items
+            .iter()
+            .map(|it| match it.msg.role {
+                PRole::Assistant => {
+                    calls = &it.msg.tool_calls;
+                    None
+                }
+                PRole::Tool => {
+                    let id = it.msg.tool_call_id.as_deref()?;
+                    calls
+                        .iter()
+                        .find(|c| c.id == id)
+                        .map(|c| (c.name.as_str(), c.arguments.as_str()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Phase 0, before any summary: deduplicate, then demote big old tool
+    /// results outside the newest [`PROTECT_TOKENS`] (at most half of
+    /// `budget`, so a small window still has something to demote). Only tool
+    /// result bodies change: user and assistant messages and the call/result
+    /// pairing stay as they are. Returns `(deduplicated, demoted)`.
+    /// Concept after Hermes `agent/context_compressor.py` (dedupe and demote
+    /// passes before the summary, MIT) and opencode v1
+    /// `session/compaction.ts` prune (protects the last 40k tokens, MIT).
+    // ponytail: no opencode-style "only if it frees 20k" floor; these passes
+    // run only past the threshold, where any saving helps.
+    pub fn cheap_passes(&mut self, budget: usize) -> (usize, usize) {
+        let deduped = self.dedupe_tools();
+        let demoted = self.demote_old_tools(PROTECT_TOKENS.min(budget / 2));
+        (deduped, demoted)
+    }
+
+    /// Identical tool results (same tool, arguments and output: a repeated
+    /// `show running-config`, the same `read_file`) keep only the newest copy.
+    pub fn dedupe_tools(&mut self) -> usize {
+        let dups: Vec<usize> = {
+            let calls = self.call_of();
+            let mut seen = HashSet::new();
+            (0..self.items.len())
+                .rev()
+                .filter(|&i| {
+                    let m = &self.items[i].msg;
+                    m.role == PRole::Tool
+                        && m.content.len() >= DEDUPE_MIN_CHARS
+                        && calls[i].is_some_and(|(n, a)| !seen.insert((n, a, m.content.as_str())))
+                })
+                .collect()
+        };
+        for &i in &dups {
+            self.items[i].msg.content = DUPLICATE.into();
+        }
+        dups.len()
+    }
+
+    /// Tool results before the protected tail (the newest `protect` tokens
+    /// and everything from the latest real user message on) longer than
+    /// [`DEMOTE_MIN_CHARS`] become one line naming the call, its first line,
+    /// and the spill file when there is one.
+    pub fn demote_old_tools(&mut self, protect: usize) -> usize {
+        let last_user = self
+            .items
+            .iter()
+            .rposition(|i| i.msg.role == PRole::User && !i.msg.synthetic)
+            .unwrap_or(self.items.len());
+        let mut tail = 0;
+        let mut start = self.items.len();
+        for (i, it) in self.items.iter().enumerate().rev() {
+            tail += cost(&it.msg);
+            if tail > protect {
+                break;
+            }
+            start = i;
+        }
+        let edits: Vec<(usize, String)> = {
+            let calls = self.call_of();
+            (0..start.min(last_user))
+                .filter_map(|i| {
+                    let m = &self.items[i].msg;
+                    if m.role != PRole::Tool || m.content.len() <= DEMOTE_MIN_CHARS {
+                        return None;
+                    }
+                    let (name, args) = calls[i].unwrap_or(("ferramenta", ""));
+                    Some((i, demoted_line(name, args, &m.content)))
+                })
+                .collect()
+        };
+        let n = edits.len();
+        for (i, line) in edits {
+            self.items[i].msg.content = line;
+        }
+        n
+    }
+
     /// Phase 1: oldest tool results lose their body until `budget` fits.
     pub fn prune_tools(&mut self, budget: usize) {
         let mut total = self.tokens();
@@ -246,13 +362,46 @@ impl History {
     }
 }
 
-/// Shrinks `msgs` to `budget` tokens without a model call: old tool results
-/// lose their body, then whole oldest turns go. The leading system prompt and
-/// everything from the latest user message on are kept.
+/// One line for a demoted tool result: `[saída antiga de <tool> (<args>)
+/// removida: <first line>…]`, plus the spill file when the output names one.
+/// An external-content result keeps its `[conteúdo externo de ...]` header
+/// as first line, so none of its body leaves the wrapper.
+fn demoted_line(name: &str, args: &str, content: &str) -> String {
+    let clip = |s: &str, n: usize| -> String {
+        let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
+        if flat.chars().count() > n {
+            format!("{}…", flat.chars().take(n).collect::<String>())
+        } else {
+            flat
+        }
+    };
+    let first = content.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    // spill.rs writes `saída completa: <path> (N linhas)`, RTK `...: <path>; use`.
+    let spill = content.split_once("saída completa: ").map(|(_, rest)| {
+        let end = [rest.find(" ("), rest.find(';'), rest.find('\n')]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(rest.len());
+        format!(" completa em {}", &rest[..end])
+    });
+    format!(
+        "[saída antiga de {name} ({}) removida: {}…{}]",
+        clip(args, 80),
+        clip(first, 120),
+        spill.unwrap_or_default()
+    )
+}
+
+/// Shrinks `msgs` to `budget` tokens without a model call: the cheap passes,
+/// then old tool results lose their body, then whole oldest turns go. The
+/// leading system prompt and everything from the latest user message on are
+/// kept.
 pub fn fit_context(msgs: &mut Vec<ChatMessage>, budget: usize) {
     let lead = msgs.iter().take_while(|m| m.role == PRole::System).count();
     let items = msgs.split_off(lead).into_iter().map(Item::plain).collect();
     let mut h = History::new(std::mem::take(msgs), items);
+    h.cheap_passes(budget);
     h.prune_tools(budget);
     let _ = h.drop_oldest(budget);
     *msgs = h.chat();
@@ -611,10 +760,13 @@ fn compact_with(
 /// Whether a history of `tokens` should be summarized before the next turn:
 /// past `pct`% of the window (`context_limit`, else [`DEFAULT_CONTEXT`]).
 pub fn needs_compaction_at(tokens: usize, context_limit: Option<u32>, pct: usize) -> bool {
-    let window = context_limit
+    tokens * 100 > window_of(context_limit) * pct
+}
+
+fn window_of(context_limit: Option<u32>) -> usize {
+    context_limit
         .filter(|&l| l > 0)
-        .map_or(DEFAULT_CONTEXT, |l| l as usize);
-    tokens * 100 > window * pct
+        .map_or(DEFAULT_CONTEXT, |l| l as usize)
 }
 
 /// Whether a history of `tokens` should be summarized before the next turn:
@@ -779,8 +931,15 @@ pub fn auto_compact_at(
     // ponytail: counts the replayed rows only; the system prompt and tool
     // specs (a few k tokens) ride on the margin.
     let rows = store.history_rows(session_id, history.max(1))?;
-    let tokens: usize = replay_items(&rows).iter().map(|i| cost(&i.msg)).sum();
-    if !needs_compaction_at(tokens, context_limit, threshold_pct) {
+    let mut hist = History::new(Vec::new(), replay_items(&rows));
+    if !needs_compaction_at(hist.tokens(), context_limit, threshold_pct) {
+        return Ok(None);
+    }
+    // The turn runs the same passes on its own replay (`agent::shrink`, in
+    // memory, nothing stored): when they bring the history under the line,
+    // no summary is paid for.
+    hist.cheap_passes(window_of(context_limit) * threshold_pct / 100);
+    if !needs_compaction_at(hist.tokens(), context_limit, threshold_pct) {
         return Ok(None);
     }
     compact_with(store, session_id, summarizer, cancel, "auto")
@@ -954,6 +1113,153 @@ mod tests {
             );
             Ok("o usuário pediu 30 coisas".into())
         }
+    }
+
+    fn call(id: &str, name: &str, args: &str) -> ChatMessage {
+        ChatMessage::assistant(
+            "",
+            vec![ToolCall {
+                id: id.into(),
+                name: name.into(),
+                arguments: args.into(),
+            }],
+        )
+    }
+
+    fn items(msgs: Vec<ChatMessage>) -> History {
+        History::new(Vec::new(), msgs.into_iter().map(Item::plain).collect())
+    }
+
+    /// The same `show running-config` twice: the older copy becomes the
+    /// marker, the newer stays; a different command or a short output is
+    /// left alone, and nothing but tool bodies changes.
+    #[test]
+    fn identical_tool_results_keep_only_the_newest_copy() {
+        let run = format!("hostname r1\n{}", "interface x\n".repeat(50));
+        let args = r#"{"command":"show running-config"}"#;
+        let mut h = items(vec![
+            ChatMessage::user("veja o r1"),
+            call("a", "ssh", args),
+            ChatMessage::tool("a", run.clone()),
+            call("b", "ssh", r#"{"command":"show version"}"#),
+            ChatMessage::tool("b", run.clone()),
+            call("c", "ssh", args),
+            ChatMessage::tool("c", "ok"),
+            call("d", "ssh", args),
+            ChatMessage::tool("d", run.clone()),
+            ChatMessage::assistant("pronto", vec![]),
+        ]);
+        let before: Vec<ChatMessage> = h.items.iter().map(|i| i.msg.clone()).collect();
+        assert_eq!(h.dedupe_tools(), 1);
+        assert_eq!(h.items[2].msg.content, DUPLICATE);
+        assert_eq!(h.items[4].msg.content, run, "other arguments: not a copy");
+        assert_eq!(h.items[8].msg.content, run, "the newest copy stays");
+        for (a, b) in before.iter().zip(&h.items) {
+            assert_eq!(a.role, b.msg.role);
+            assert_eq!(a.tool_call_id, b.msg.tool_call_id);
+            assert_eq!(a.tool_calls, b.msg.tool_calls);
+            if a.role != PRole::Tool {
+                assert_eq!(a.content, b.msg.content);
+            }
+        }
+    }
+
+    /// Old big results become one line naming the call and the spill file;
+    /// the protected tail, the current turn and small results stay whole.
+    #[test]
+    fn old_big_results_are_demoted_outside_the_protected_tail() {
+        let big = |tag: &str| format!("{tag} primeira linha\n{}", "y".repeat(8_000));
+        let spilled = format!(
+            "{}\n\n[saída completa: C:/spill/s1/a-1.txt (900 linhas), meio omitido; use read_file]",
+            big("cabeça")
+        );
+        let mut h = items(vec![
+            ChatMessage::user("primeiro"),
+            call("a", "shell", r#"{"command":"cat log"}"#),
+            ChatMessage::tool("a", spilled),
+            call("b", "read_file", r#"{"path":"x.rs"}"#),
+            ChatMessage::tool("b", "curto"),
+            ChatMessage::assistant("li", vec![]),
+            ChatMessage::user("segundo"),
+            call("c", "read_file", r#"{"path":"y.rs"}"#),
+            ChatMessage::tool("c", big("meio")),
+            ChatMessage::assistant("li", vec![]),
+            ChatMessage::user("agora"),
+            call("d", "read_file", r#"{"path":"z.rs"}"#),
+            ChatMessage::tool("d", big("atual")),
+        ]);
+        // A tail of ~5k tokens protects the second turn's result too.
+        assert_eq!(h.demote_old_tools(5_000), 1);
+        let line = &h.items[2].msg.content;
+        assert!(
+            line.starts_with(
+                r#"[saída antiga de shell ({"command":"cat log"}) removida: cabeça primeira linha…"#
+            ),
+            "{line}"
+        );
+        assert!(
+            line.ends_with(" completa em C:/spill/s1/a-1.txt]"),
+            "{line}"
+        );
+        assert_eq!(h.items[4].msg.content, "curto");
+        assert!(h.items[8].msg.content.starts_with("meio"));
+        // No protected tokens: only the current turn (from the last real
+        // user message on) is kept.
+        assert_eq!(h.demote_old_tools(0), 1);
+        assert!(h.items[8]
+            .msg
+            .content
+            .starts_with("[saída antiga de read_file"));
+        assert!(h.items[12].msg.content.starts_with("atual"));
+        assert_eq!(pair(h.items.clone()).len(), h.items.len(), "pairing intact");
+    }
+
+    /// Repeated big reads push the history past the line, but the cheap
+    /// passes bring it back under: the summarizer is never called.
+    #[test]
+    fn the_summary_is_skipped_when_the_cheap_passes_are_enough() {
+        struct Never;
+        impl Summarizer for Never {
+            fn summarize(&self, _: &str, _: &Cancel) -> std::result::Result<String, String> {
+                panic!("cheap passes were enough: no summary");
+            }
+        }
+        let store = Store::open_in_memory().unwrap();
+        let sid = store
+            .create_session("barata", SessionSource::Native)
+            .unwrap()
+            .id;
+        let out = "linha de config\n".repeat(1_500); // ~6k tokens
+        for i in 0..12 {
+            store
+                .append(&sid, &NewMessage::new(Role::User, format!("pedido {i}")))
+                .unwrap();
+            let id = format!("c{i}");
+            store
+                .append(
+                    &sid,
+                    &NewMessage {
+                        tool_calls: Some(json!([{"id": id, "name": "read_file",
+                                                  "arguments": format!(r#"{{"path":"f{i}"}}"#)}])),
+                        ..NewMessage::new(Role::Assistant, "")
+                    },
+                )
+                .unwrap();
+            store
+                .append(
+                    &sid,
+                    &NewMessage {
+                        tool_name: Some("read_file".into()),
+                        tool_calls: Some(json!({"tool_call_id": id})),
+                        ..NewMessage::new(Role::Tool, out.clone())
+                    },
+                )
+                .unwrap();
+        }
+        // ~72k tokens against a 64k window: past 75%.
+        let r = auto_compact(&store, &sid, 100, Some(64_000), &Never, &Cancel::default());
+        assert!(r.unwrap().is_none());
+        assert!(!store.has_open_compaction(&sid).unwrap());
     }
 
     #[test]

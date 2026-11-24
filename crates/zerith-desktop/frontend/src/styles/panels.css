@@ -409,6 +409,102 @@ button.pn-tile.on:hover {
   padding: 4px;
 }
 
+/* ---- Mídia: model picker -------------------------------------------- */
+
+/* The chosen model, pinned above the grid: always says what the chat uses. */
+.md-current {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  padding: 12px 14px;
+  border-radius: var(--r-md);
+  border: 1px dashed var(--line-strong);
+  background: var(--bg-base);
+  /* Pinned under the dialog's top padding: a band of the card colour above
+     it hides what scrolls by. */
+  box-shadow: 0 -20px 0 4px var(--layer-1);
+}
+.md-current.on {
+  border: 1px solid var(--accent);
+  box-shadow:
+    inset 0 0 0 1px var(--accent),
+    0 -20px 0 4px var(--layer-1);
+}
+.md-current-label {
+  font-size: var(--fs-caption);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--label-tertiary);
+}
+.md-current-name {
+  font-size: var(--fs-title);
+  font-weight: 600;
+  color: var(--label-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.md-current-price {
+  font-family: var(--mono);
+  font-size: var(--fs-small);
+  color: var(--label-secondary);
+}
+.md-current-empty {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 36px;
+  height: 36px;
+  border-radius: var(--r-sm);
+  background: var(--layer-2);
+  color: var(--label-tertiary);
+}
+
+.md-vendor {
+  width: auto;
+  flex: 0 1 220px;
+}
+.md-scroll {
+  max-height: 460px;
+}
+
+.md-card {
+  gap: 10px;
+  position: relative;
+}
+/* Selected: a two-pixel accent ring and a filled check, unmistakable in both
+   themes without relying on colour alone. */
+.md-card.on,
+button.md-card.on:hover {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+  background: var(--accent-softer);
+}
+.md-check {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 22px;
+  height: 22px;
+  border-radius: var(--r-full);
+  background: var(--accent);
+  color: var(--on-accent);
+}
+.md-price {
+  font-family: var(--mono);
+  font-size: var(--fs-small);
+  line-height: 1.45;
+  color: var(--label-secondary);
+}
+.md-adv-hint {
+  margin: 8px 0 12px;
+}
+
 /* ---- small pieces --------------------------------------------------- */
 
 .pn-usage {

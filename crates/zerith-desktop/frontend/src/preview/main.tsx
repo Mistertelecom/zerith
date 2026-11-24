@@ -1,6 +1,7 @@
 // Dev-only entry for `/preview.html`: renders the real App over the fake core
 // and drives it to one scene, so a headless browser can photograph it.
 //   ?scene=empty|chat|approval|question|settings  &tab=Contas  &open=anthropic  &theme=light
+//   Mídia: ?scene=settings&tab=Mídia (imagem) or &tab=Mídia&click=Vídeo (vídeo)
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { emit } from "@tauri-apps/api/event";
@@ -11,6 +12,12 @@ import "../styles/index.css";
 const q = new URLSearchParams(location.search);
 const scene = q.get("scene") ?? "empty";
 const theme = q.get("theme") ?? "dark";
+// The scene drivers click Portuguese labels (Ajustes, Mídia): pt-BR unless &lang= says otherwise.
+try {
+  localStorage.setItem("zerith.lang", q.get("lang") ?? "pt-BR");
+} catch {
+  /* no storage: the app falls back to English */
+}
 installMock(theme);
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));

@@ -2,6 +2,7 @@
 // a plain browser (`/preview.html?scene=...`). Never imported by index.html.
 import { mockIPC } from "@tauri-apps/api/mocks";
 import { emit } from "@tauri-apps/api/event";
+import type { ParamView } from "../lib/api";
 
 const now = Math.floor(Date.now() / 1000);
 const PREVIEW_IMG =
@@ -493,30 +494,61 @@ const history = sessions.map((s, i) => ({
   archived: i === 4,
 }));
 
-const mediaModels = {
-  total: 3,
-  models: [
-    ["black-forest-labs/flux-1.1-pro", "FLUX 1.1 Pro", "$0.04 / imagem"],
-    ["google/nanobanana", "Nano Banana", "$0.03 / imagem"],
-    ["recraft/recraft-v3", "Recraft V3", "$0.04 / imagem"],
-  ].map(([id, name, priceHint]) => ({
-    id,
-    name,
-    description: "Geração de imagem de alta fidelidade.",
-    priceHint,
-    params: [
-      {
-        name: "aspect_ratio",
-        kind: "enum",
-        options: ["1:1", "16:9", "9:16"],
-        min: null,
-        max: null,
-      },
-      { name: "steps", kind: "int", options: [], min: 1, max: 50 },
-    ],
-    maxReferences: 1,
-    frameImages: [],
-  })),
+// Media catalogue: entries and price lines as the core produced them from the
+// live OpenRouter lists on 2026-11-24, newest first.
+const enumP = (name: string, options: (string | number)[]): ParamView => ({
+  name,
+  kind: "enum",
+  options: options.map(String),
+  min: null,
+  max: null,
+});
+const rangeP = (name: string, min: number, max: number): ParamView => ({ name, kind: "range", options: [], min, max });
+const flagP = (name: string): ParamView => ({ name, kind: "flag", options: [], min: null, max: null });
+const AR = ["1:1", "4:3", "3:4", "16:9", "9:16", "3:2", "2:3"];
+const NOW = 1795489510;
+const day = 86_400;
+type MockModel = [string, string, string, number, ParamView[], number, string[]];
+const mediaModel = ([id, name, priceHint, created, params, maxReferences, frameImages]: MockModel) => ({
+  id,
+  name,
+  description: `${name}: modelo de geração no OpenRouter.`,
+  priceHint,
+  created,
+  isNew: NOW - created < 30 * day,
+  params,
+  maxReferences,
+  frameImages,
+});
+const imageModels: MockModel[] = [
+  ["microsoft/mai-image-2.7-flash", "Microsoft AI: MAI-Image-2.7 Flash", "US$ 10,00 por 1M tokens de imagem gerada", NOW - 6 * day, [enumP("aspect_ratio", [...AR, "auto"]), enumP("background", ["opaque", "transparent"]), rangeP("n", 1, 1)], 5, []],
+  ["recraft/recraft-v4.1-flash-v2", "Recraft: Recraft V4.1 Flash v2", "US$ 0,007/imagem", NOW - 10 * day, [enumP("aspect_ratio", AR), rangeP("n", 1, 6)], 0, []],
+  ["bytedance-seed/seedream-5-5", "ByteDance Seed: Seedream 5.5", "US$ 0,02/imagem · US$ 0,035/imagem (high resolution)", NOW - 11 * day, [enumP("aspect_ratio", AR), enumP("resolution", ["1K", "2K", "4K"]), rangeP("n", 1, 4)], 10, []],
+  ["openai/gpt-image-2.6-flare", "OpenAI: GPT Image 2.6 Flare", "US$ 30,00 por 1M tokens de imagem gerada", NOW - 19 * day, [enumP("aspect_ratio", AR), enumP("quality", ["low", "medium", "high"]), enumP("background", ["opaque", "transparent"])], 16, []],
+  ["qwen/qwen-image-2.1-pro", "Qwen: Qwen Image 2.1 Pro", "US$ 0,046/imagem (1K / 2K)", NOW - 38 * day, [enumP("aspect_ratio", AR), enumP("resolution", ["1K", "2K"])], 3, []],
+  ["black-forest-labs/flux-3-image", "Black Forest Labs: FLUX.3 Image", "US$ 0,041/imagem (768) · US$ 0,048/imagem (1K) · US$ 0,07/imagem (1.5K) · +2", NOW - 53 * day, [enumP("aspect_ratio", AR), enumP("resolution", ["768", "1K", "1.5K", "2K", "4K"])], 8, []],
+  ["google/gemini-nano-banana-2.1", "Google: Nano Banana 2.1", "US$ 30,00 por 1M tokens de imagem gerada", NOW - 48 * day, [enumP("aspect_ratio", AR), enumP("resolution", ["1K", "2K", "4K"])], 14, []],
+  ["black-forest-labs/flux.2-pro", "Black Forest Labs: FLUX.2 Pro", "US$ 0,03/megapixel (~US$ 0,0315 a 1024×1024)", NOW - 365 * day, [enumP("aspect_ratio", AR), flagP("seed")], 8, []],
+];
+const videoModels: MockModel[] = [
+  ["heygen/heygen-avatar-6-turbo", "HeyGen: Avatar 6 Turbo", "US$ 0,05/s (1080p) · US$ 0,0875/s (2K)", NOW - 6 * day, [enumP("resolution", ["1080p", "2K"])], 0, []],
+  ["bytedance/seedance-2.5-flash", "ByteDance: Seedance 2.5 Flash", "US$ 7,00 por 1M tokens de vídeo", NOW - 7 * day, [enumP("duration", [4, 5, 6, 8, 10, 12, 15, 20, 30]), enumP("resolution", ["480p", "720p", "1080p"]), enumP("aspect_ratio", ["16:9", "9:16", "1:1"]), flagP("generate_audio")], 0, ["first_frame", "last_frame"]],
+  ["google/gemini-omni-1.2-flash", "Google: Gemini Omni 1.2 Flash", "US$ 0,0232/s (com áudio, 360p) · US$ 0,0695/s (com áudio, 720p) · US$ 0,1043/s (com áudio) · +1", NOW - 18 * day, [enumP("duration", [3, 5, 8, 10, 15]), enumP("resolution", ["360p", "720p", "1080p", "4K"]), flagP("generate_audio")], 0, ["first_frame"]],
+  ["x-ai/grok-imagine-video-1.5-lite", "xAI: Grok Imagine Video 1.5 Lite", "US$ 0,02/s (480p) · US$ 0,03/s (720p) · US$ 0,14/s (1080p)", NOW - 48 * day, [enumP("duration", [1, 5, 10, 15]), enumP("resolution", ["480p", "720p", "1080p"]), enumP("aspect_ratio", ["16:9", "9:16"])], 0, ["first_frame"]],
+  ["runway/aleph-2", "Runway: Aleph 2", "US$ 0,28/s · mínimo US$ 0,56 por vídeo", NOW - 116 * day, [enumP("aspect_ratio", ["16:9", "9:16"])], 0, []],
+  ["kwaivgi/kling-v3.0-pro", "Kling: Kling v3.0 Pro", "US$ 0,112/s · US$ 0,168/s (com áudio)", NOW - 208 * day, [enumP("duration", [3, 5, 10, 15]), enumP("aspect_ratio", ["16:9", "9:16", "1:1"]), flagP("generate_audio")], 0, ["first_frame", "last_frame"]],
+  ["google/veo-3.1", "Google: Veo 3.1", "US$ 0,20/s (sem áudio) · US$ 0,40/s (com áudio / sem áudio, 4K) · US$ 0,60/s (com áudio, 4K)", NOW - 245 * day, [enumP("duration", [4, 6, 8]), enumP("resolution", ["720p", "1080p", "4K"]), enumP("aspect_ratio", ["16:9", "9:16"]), flagP("generate_audio")], 0, ["first_frame", "last_frame"]],
+];
+const mediaModels = (kind: unknown) => {
+  const models = (kind === "video" ? videoModels : imageModels).map(mediaModel);
+  return { total: models.length, models };
+};
+const mediaSlot = {
+  image: "bytedance-seed/seedream-5-5",
+  imageParams: {} as Record<string, unknown>,
+  video: "google/veo-3.1",
+  videoParams: {} as Record<string, unknown>,
+  outputDir: "C:/Users/Joao/Pictures/Zerith",
 };
 
 const messages: Record<
@@ -874,7 +906,13 @@ export function installMock(theme: string) {
             { name: "performance", maxSubagents: 6, historyWindow: 60 },
           ];
         case "media_models":
-          return mediaModels;
+          return mediaModels(a.kind);
+        case "media_save_slot": {
+          const e = a.edit as { kind: string; model: string; params: Record<string, unknown> };
+          if (e.kind === "video") Object.assign(mediaSlot, { video: e.model, videoParams: e.params });
+          else Object.assign(mediaSlot, { image: e.model, imageParams: e.params });
+          return null;
+        }
         case "media_key":
           return {
             source: "keyring",
@@ -883,13 +921,7 @@ export function installMock(theme: string) {
             limitUsd: 20,
           };
         case "media_settings":
-          return {
-            image: "black-forest-labs/flux-1.1-pro",
-            imageParams: { aspect_ratio: "16:9" },
-            video: "",
-            videoParams: {},
-            outputDir: "C:/Users/Joao/Pictures/Zerith",
-          };
+          return { ...mediaSlot };
         case "agents_list":
           return agents;
         case "sessions_history":

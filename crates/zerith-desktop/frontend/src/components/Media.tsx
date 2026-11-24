@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import {
+  Check,
+  ChevronRight,
   CircleAlert,
   CircleCheck,
   ExternalLink,
@@ -8,7 +10,6 @@ import {
   Image as ImageIcon,
   ImageOff,
   KeyRound,
-  Pin,
   RefreshCw,
   Save,
   Search,
@@ -37,8 +38,42 @@ const SOURCE: Record<string, string> = {
 const money = (v: number | null) =>
   v === null ? "—" : v.toLocaleString("pt-BR", { style: "currency", currency: "USD" });
 
-/// One control per parameter the model declares. Values start at the saved
-/// slot, so reopening the panel shows what will actually be sent.
+/** "Google: Veo 3.1" -> ["Google", "Veo 3.1"]; no prefix: the id's vendor. */
+function split(m: MediaModel): { vendor: string; short: string } {
+  const i = m.name.indexOf(": ");
+  if (i > 0) return { vendor: m.name.slice(0, i), short: m.name.slice(i + 2) };
+  return { vendor: m.id.split("/")[0], short: m.name };
+}
+
+const vendorKey = (m: MediaModel) => m.id.split("/")[0];
+
+/** Short facts for the card: durations, resolutions, audio, references. */
+function capabilities(m: MediaModel): string[] {
+  const out: string[] = [];
+  const opt = (name: string) => m.params.find((p) => p.name === name);
+  const dur = opt("duration");
+  if (dur?.kind === "enum" && dur.options.length) {
+    const n = dur.options.map(Number).filter((x) => Number.isFinite(x));
+    out.push(
+      n.length > 3
+        ? `${Math.min(...n)}–${Math.max(...n)} s`
+        : `${dur.options.join(", ")} s`,
+    );
+  }
+  const res = opt("resolution");
+  if (res?.kind === "enum" && res.options.length) out.push(res.options.join(" · "));
+  if (opt("generate_audio")) out.push("Áudio");
+  if (m.maxReferences > 0)
+    out.push(m.maxReferences === 1 ? "1 referência" : `até ${m.maxReferences} referências`);
+  if (m.frameImages.length)
+    out.push(m.frameImages.length > 1 ? "1º e último quadro" : "Quadro inicial");
+  const ar = opt("aspect_ratio");
+  if (ar?.kind === "enum" && ar.options.length > 1) out.push(`${ar.options.length} proporções`);
+  return out;
+}
+
+/// One optional default per parameter. Empty = the chat model (or the model)
+/// decides.
 function ParamField(props: {
   spec: ParamView;
   value: unknown;
@@ -49,7 +84,7 @@ function ParamField(props: {
     return (
       <div className="field">
         <span className="field-label mono">{spec.name}</span>
-        <Switch label={spec.name} checked={value === true} onChange={(v) => onChange(v)} />
+        <Switch label={spec.name} checked={value === true} onChange={(v) => onChange(v || undefined)} />
       </div>
     );
   }
@@ -60,9 +95,9 @@ function ParamField(props: {
         <select
           className="select"
           value={String(value ?? "")}
-          onChange={(e) => onChange(e.target.value)}
+          onChange={(e) => onChange(e.target.value || undefined)}
         >
-          <option value="">—</option>
+          <option value="">A IA decide</option>
           {spec.options.map((o) => (
             <option key={o} value={o}>
               {o}
@@ -72,37 +107,68 @@ function ParamField(props: {
       </label>
     );
   }
-  if (spec.kind === "range") {
-    return (
-      <label className="field">
-        <span className="field-label mono">{spec.name}</span>
-        <input
-          className="input"
-          type="number"
-          min={spec.min ?? undefined}
-          max={spec.max ?? undefined}
-          value={value === undefined || value === null ? "" : String(value)}
-          onChange={(e) =>
-            onChange(e.target.value === "" ? undefined : Number(e.target.value))
-          }
-        />
-        {spec.min !== null && spec.max !== null ? (
-          <span className="field-hint">
-            De {spec.min} a {spec.max}.
-          </span>
-        ) : null}
-      </label>
-    );
-  }
   return (
     <label className="field">
       <span className="field-label mono">{spec.name}</span>
       <input
         className="input"
+        type={spec.kind === "range" ? "number" : "text"}
+        min={spec.min ?? undefined}
+        max={spec.max ?? undefined}
         value={value === undefined || value === null ? "" : String(value)}
-        onChange={(e) => onChange(e.target.value)}
+        placeholder="A IA decide"
+        onChange={(e) =>
+          onChange(
+            e.target.value === ""
+              ? undefined
+              : spec.kind === "range"
+                ? Number(e.target.value)
+                : e.target.value,
+          )
+        }
       />
     </label>
+  );
+}
+
+function ModelCard(props: { m: MediaModel; on: boolean; onPick: () => void }) {
+  const { m, on, onPick } = props;
+  const { vendor, short } = split(m);
+  const caps = capabilities(m);
+  return (
+    <button
+      type="button"
+      className={"pn-tile md-card" + (on ? " on" : "")}
+      aria-pressed={on}
+      aria-label={`${m.name}${m.priceHint ? `, ${m.priceHint}` : ""}${on ? ", selecionado" : ""}`}
+      title={m.description || m.id}
+      onClick={onPick}
+    >
+      <span className="pn-tile-head">
+        <Logo id={m.id} size={32} />
+        <span className="pn-body">
+          <span className="pn-title">{short}</span>
+          <span className="pn-sub">{vendor}</span>
+        </span>
+        {on ? (
+          <span className="md-check" aria-hidden>
+            <Check size={14} strokeWidth={2.5} />
+          </span>
+        ) : m.isNew ? (
+          <span className="badge ok">Novo</span>
+        ) : null}
+      </span>
+      <span className="md-price">{m.priceHint || "Preço não informado pelo OpenRouter"}</span>
+      {caps.length ? (
+        <span className="pn-tile-foot">
+          {caps.map((c) => (
+            <span key={c} className="badge">
+              {c}
+            </span>
+          ))}
+        </span>
+      ) : null}
+    </button>
   );
 }
 
@@ -110,9 +176,9 @@ export function MediaTab() {
   const [kind, setKind] = useState<string>("image");
   const [models, setModels] = useState<MediaModel[] | null>(null);
   const [query, setQuery] = useState("");
-  const [model, setModel] = useState("");
+  const [vendor, setVendor] = useState("");
   const [prompt, setPrompt] = useState("");
-  const [values, setValues] = useState<Record<string, unknown>>({});
+  const [defaults, setDefaults] = useState<Record<string, unknown>>({});
   const [references, setReferences] = useState("");
   const [key, setKey] = useState<MediaKey | null>(null);
   const [keyInput, setKeyInput] = useState("");
@@ -133,11 +199,13 @@ export function MediaTab() {
       .catch((e) => setError(String(e)));
   }, []);
 
+  // The whole list (a few dozen, newest first); search and vendor filter
+  // run here, so typing never waits on the network.
   useEffect(() => {
     let live = true;
     setModels(null);
     api
-      .mediaModels(kind, query)
+      .mediaModels(kind)
       .then((p) => {
         if (!live) return;
         setModels(p.models);
@@ -151,25 +219,47 @@ export function MediaTab() {
     return () => {
       live = false;
     };
-  }, [kind, query]);
+  }, [kind]);
 
-  // Picking a model restores the parameters saved for it, if it is the one in
-  // the slot; otherwise the descriptor defaults apply.
+  const chosenId = slot ? (kind === "image" ? slot.image : slot.video) : "";
+  const savedDefaults = useMemo(
+    () => (slot ? (kind === "image" ? slot.imageParams : slot.videoParams) : {}),
+    [slot, kind],
+  );
+  useEffect(() => setDefaults({ ...savedDefaults }), [savedDefaults]);
+
+  const current = models?.find((m) => m.id === chosenId) ?? null;
+  const vendors = useMemo(() => {
+    const seen = new Map<string, string>();
+    for (const m of models ?? []) if (!seen.has(vendorKey(m))) seen.set(vendorKey(m), split(m).vendor);
+    return [...seen.entries()].sort((a, b) => a[1].localeCompare(b[1]));
+  }, [models]);
+  const shown = useMemo(() => {
+    const words = query.toLowerCase().split(/\s+/).filter(Boolean);
+    return (models ?? []).filter(
+      (m) =>
+        (!vendor || vendorKey(m) === vendor) &&
+        words.every((w) => `${m.id} ${m.name}`.toLowerCase().includes(w)),
+    );
+  }, [models, query, vendor]);
+
+  const save = (model: string, params: Record<string, unknown>, text: string) =>
+    api
+      .mediaSaveSlot({ kind, model, params })
+      .then(() => api.mediaSettings().then(setSlot))
+      .then(() => setNotice(text))
+      .catch((e) => setError(String(e)));
+
+  // Choosing is saving: the chat uses this model from the next message. The
+  // defaults belong to one model, so a new model starts without them.
   const pick = (m: MediaModel) => {
-    setModel(m.id);
-    const saved =
-      slot && ((kind === "image" ? slot.image : slot.video) === m.id)
-        ? kind === "image"
-          ? slot.imageParams
-          : slot.videoParams
-        : {};
-    setValues({ ...saved });
+    if (m.id === chosenId) return;
+    setError(null);
+    void save(m.id, {}, `${split(m).short} é o modelo de ${kind === "image" ? "imagem" : "vídeo"} da IA.`);
   };
 
-  const current = useMemo(
-    () => models?.find((m) => m.id === model) ?? null,
-    [models, model],
-  );
+  const clean = (v: Record<string, unknown>) =>
+    Object.fromEntries(Object.entries(v).filter(([, x]) => x !== undefined && x !== ""));
 
   const generate = async () => {
     if (!current) {
@@ -188,9 +278,7 @@ export function MediaTab() {
         kind,
         model: current.id,
         prompt,
-        params: Object.fromEntries(
-          Object.entries(values).filter(([, v]) => v !== undefined && v !== ""),
-        ),
+        params: clean(defaults),
         references: references
           .split("\n")
           .map((r) => r.trim())
@@ -205,11 +293,12 @@ export function MediaTab() {
     }
   };
 
-  const pinned = slot ? (kind === "image" ? slot.image : slot.video) : "";
   const KindIcon = kind === "image" ? ImageIcon : Film;
+  const kindWord = kind === "image" ? "imagem" : "vídeo";
   const used = key?.usageUsd ?? null;
   const limit = key?.limitUsd ?? null;
   const share = used !== null && limit ? Math.min(100, (used / limit) * 100) : null;
+  const pinnedUnknown = !!chosenId && models !== null && !current;
 
   return (
     <div className="page pn">
@@ -309,11 +398,7 @@ export function MediaTab() {
       <Card
         title="Modelo"
         icon={KindIcon}
-        description={
-          models
-            ? `${models.length} ${models.length === 1 ? "modelo" : "modelos"} de ${kind === "image" ? "imagem" : "vídeo"}`
-            : undefined
-        }
+        description={`Você escolhe o modelo; duração, proporção e resolução a IA define pelo que você pedir no chat.`}
         actions={
           <Segmented
             label="Tipo de mídia"
@@ -321,78 +406,143 @@ export function MediaTab() {
             options={KINDS}
             onPick={(v) => {
               setKind(v);
-              setModel("");
-              setValues({});
+              setQuery("");
+              setVendor("");
             }}
           />
         }
       >
-        <label className="pn-affix">
-          <span className="pn-affix-icon">
-            <Search size={16} strokeWidth={1.75} />
-          </span>
-          <input
-            className="input"
-            value={query}
-            placeholder="Filtrar modelos"
-            aria-label="Filtrar modelos"
-            onChange={(e) => setQuery(e.target.value)}
-          />
-        </label>
+        <div className={"md-current" + (current ? " on" : "")} role="status" aria-live="polite">
+          {current ? (
+            <>
+              <Logo id={current.id} size={36} />
+              <span className="pn-body">
+                <span className="md-current-label">Modelo atual de {kindWord}</span>
+                <span className="md-current-name">
+                  {split(current).short}
+                  <span className="pn-hint"> · {split(current).vendor}</span>
+                </span>
+                <span className="md-current-price">
+                  {current.priceHint || "Preço não informado pelo OpenRouter"}
+                </span>
+              </span>
+              <span className="badge accent">
+                <Check size={12} strokeWidth={2.5} /> Em uso pela IA
+              </span>
+            </>
+          ) : (
+            <>
+              <span className="md-current-empty">
+                <KindIcon size={18} strokeWidth={1.75} />
+              </span>
+              <span className="pn-body">
+                <span className="md-current-label">Modelo atual de {kindWord}</span>
+                <span className="md-current-name">
+                  {pinnedUnknown ? chosenId : "Nenhum escolhido"}
+                </span>
+                <span className="md-current-price">
+                  {pinnedUnknown
+                    ? "Este modelo não está mais na lista do OpenRouter; escolha outro."
+                    : `Sem modelo, a IA não oferece geração de ${kindWord}.`}
+                </span>
+              </span>
+            </>
+          )}
+        </div>
+
+        <div className="pn-toolbar">
+          <label className="pn-affix">
+            <span className="pn-affix-icon">
+              <Search size={16} strokeWidth={1.75} />
+            </span>
+            <input
+              className="input"
+              value={query}
+              placeholder="Buscar modelo"
+              aria-label="Buscar modelo"
+              onChange={(e) => setQuery(e.target.value)}
+            />
+          </label>
+          <select
+            className="select md-vendor"
+            value={vendor}
+            aria-label="Fornecedor"
+            onChange={(e) => setVendor(e.target.value)}
+          >
+            <option value="">Todos os fornecedores</option>
+            {vendors.map(([k, label]) => (
+              <option key={k} value={k}>
+                {label}
+              </option>
+            ))}
+          </select>
+          {models ? (
+            <span className="pn-hint">
+              {shown.length} de {models.length}
+            </span>
+          ) : null}
+        </div>
+
         {models === null ? (
           <div className="pn-loading">
-            <span className="spinner" /> Lendo os modelos…
+            <span className="spinner" /> Lendo os modelos e preços do OpenRouter…
           </div>
         ) : null}
-        {models?.length === 0 ? (
-          <EmptyState icon={ImageOff} title="Nenhum modelo" text="Nada corresponde ao filtro." />
+        {models !== null && shown.length === 0 ? (
+          <EmptyState icon={ImageOff} title="Nenhum modelo" text="Nada corresponde à busca." />
         ) : null}
-        {models?.length ? (
-          <div className="pn-scroll">
-            <div className="pn-grid wide">
-              {models.map((m) => (
-                <button
-                  key={m.id}
-                  className={"pn-tile" + (model === m.id ? " on" : "")}
-                  aria-pressed={model === m.id}
-                  onClick={() => pick(m)}
-                >
-                  <span className="pn-tile-head">
-                    <Logo id={m.id} size={28} />
-                    <span className="pn-body">
-                      <span className="pn-title">{m.name}</span>
-                      <span className="pn-sub mono">{m.id}</span>
-                    </span>
-                  </span>
-                  <span className="pn-tile-foot">
-                    {m.isNew ? <span className="badge ok">Novo</span> : null}
-                    <span className="badge mono">{m.priceHint}</span>
-                    {pinned === m.id ? (
-                      <span className="badge accent">
-                        <Pin size={12} strokeWidth={2} /> Fixado
-                      </span>
-                    ) : null}
-                  </span>
-                </button>
+        {shown.length ? (
+          <div className="pn-scroll md-scroll">
+            <div className="pn-grid wide" role="group" aria-label={`Modelos de ${kindWord}, mais recentes primeiro`}>
+              {shown.map((m) => (
+                <ModelCard key={m.id} m={m} on={m.id === chosenId} onPick={() => pick(m)} />
               ))}
             </div>
           </div>
+        ) : null}
+
+        {current && current.params.length ? (
+          <details className="sheet-adv">
+            <summary>
+              <ChevronRight size={14} strokeWidth={2} /> Avançado: padrões opcionais
+            </summary>
+            <p className="pn-hint md-adv-hint">
+              Só valem quando o pedido não diz. Deixe em “A IA decide” para ela escolher.
+            </p>
+            <div className="pn-row2">
+              {current.params.map((p) => (
+                <ParamField
+                  key={p.name}
+                  spec={p}
+                  value={defaults[p.name]}
+                  onChange={(v) => setDefaults((prev) => ({ ...prev, [p.name]: v }))}
+                />
+              ))}
+            </div>
+            <div className="pn-detail-foot">
+              <button
+                className="btn"
+                onClick={() => void save(current.id, clean(defaults), "Padrões salvos.")}
+              >
+                <Save size={16} strokeWidth={1.75} /> Salvar padrões
+              </button>
+            </div>
+          </details>
         ) : null}
       </Card>
 
       {current ? (
         <Card
-          title={`Gerar com ${current.name}`}
+          title={`Testar ${split(current).short}`}
           icon={WandSparkles}
-          description={current.description || undefined}
-          actions={<span className="badge mono">{current.priceHint}</span>}
+          description="Uma geração direta, fora do chat. Gera custo."
         >
           <div className="pn-form">
             <label className="field">
               <span className="field-label">Prompt</span>
               <textarea
                 className="input"
-                rows={4}
+                rows={3}
                 value={prompt}
                 placeholder="Descreva o que quer ver."
                 onChange={(e) => setPrompt(e.target.value)}
@@ -411,32 +561,7 @@ export function MediaTab() {
                 <span className="field-hint">Uma por linha, até {current.maxReferences}.</span>
               </label>
             ) : null}
-            {current.params.length ? (
-              <div className="pn-row2">
-                {current.params.map((p) => (
-                  <ParamField
-                    key={p.name}
-                    spec={p}
-                    value={values[p.name]}
-                    onChange={(v) => setValues((prev) => ({ ...prev, [p.name]: v }))}
-                  />
-                ))}
-              </div>
-            ) : null}
             <div className="pn-detail-foot">
-              <button
-                className="btn"
-                disabled={busy}
-                onClick={() =>
-                  void api
-                    .mediaSaveSlot({ kind, model: current.id, params: values })
-                    .then(() => api.mediaSettings().then(setSlot))
-                    .then(() => setNotice("Modelo e parâmetros fixados."))
-                    .catch((e) => setError(String(e)))
-                }
-              >
-                <Pin size={16} strokeWidth={1.75} /> Fixar para a IA
-              </button>
               <button className="btn btn-primary" disabled={busy} onClick={() => void generate()}>
                 {busy ? <span className="spinner" /> : <WandSparkles size={16} strokeWidth={1.75} />}
                 {busy ? "Gerando…" : "Gerar"}

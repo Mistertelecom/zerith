@@ -21,6 +21,7 @@ use zerith_core::settings::HookSpec;
 use zerith_core::{Paths, Settings};
 use zerith_mcp::config::{add_server, set_enabled, set_extra};
 use zerith_mcp::{Extra, ServerConfig};
+use zerith_memory::{Confidence, FactKind, MemoryBackend, Scope, SqliteMemory};
 use zerith_sessions::{NewMessage, Role, Session, SessionSource, Store};
 
 // ------------------------------------------------------------ plano comum
@@ -119,6 +120,11 @@ pub(crate) enum Payload {
     Hook {
         event: String,
         spec: HookSpec,
+    },
+    Memory {
+        scope: Scope,
+        kind: FactKind,
+        text: String,
     },
     /// Arquivo novo a gravar em `dest`.
     File {
@@ -278,6 +284,7 @@ pub fn apply(items: &[Item], paths: &Paths) -> Report {
     apply_files(items, Kind::Agent, &mut r);
     apply_permissions(items, paths, &mut r);
     apply_hooks(items, paths, &mut r);
+    apply_memory(items, paths, &mut r);
     r
 }
 
@@ -360,6 +367,7 @@ pub fn plan(src: &ClaudeSource, paths: &Paths, opt: &Options) -> Vec<Item> {
         items.extend(plan_agents(&agents, paths));
         items.extend(plan_permissions(&src.home, paths));
         items.extend(plan_hooks(&src.home, paths));
+        items.extend(plan_memory(claude_memory_files(&src.home), paths));
     }
     items
 }
@@ -1539,6 +1547,203 @@ pub fn apply_hooks(items: &[Item], paths: &Paths, r: &mut Report) {
     }
 }
 
+// --------------------------------------------------------------- memória
+
+/// Pasta de trabalho de um projeto do Claude Code, lida das sessões dele
+/// (`~/.claude/projects/<pasta>/*.jsonl`, campo `cwd`).
+fn project_cwd(project_dir: &Path) -> Option<String> {
+    for f in md_or_jsonl(project_dir, "jsonl") {
+        let text = std::fs::read_to_string(&f).ok()?;
+        for line in text.lines().take(50) {
+            if let Some(cwd) = serde_json::from_str::<Value>(line)
+                .ok()
+                .and_then(|v| v.get("cwd")?.as_str().map(str::to_string))
+            {
+                return Some(cwd);
+            }
+        }
+    }
+    None
+}
+
+fn md_or_jsonl(dir: &Path, ext: &str) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == ext))
+        .collect();
+    v.sort();
+    v
+}
+
+/// `.md` sob `dir`, recursivo, sem links simbólicos.
+fn md_tree(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let Ok(ty) = e.file_type() else { continue };
+        if ty.is_dir() && depth < 4 {
+            md_tree(&e.path(), depth + 1, out);
+        } else if ty.is_file() && e.path().extension().is_some_and(|x| x == "md") {
+            out.push(e.path());
+        }
+    }
+}
+
+/// O texto do fato e o tipo, do frontmatter `type:` do Claude Code
+/// (`user`, `feedback`, `project`, `reference`).
+fn memory_fact(text: &str) -> (String, FactKind) {
+    let text = text.trim_start_matches('\u{feff}');
+    let (header, body) = match text.strip_prefix("---").and_then(|r| {
+        let end = r.find("\n---")?;
+        Some((&r[..end], r[end + 4..].trim_start_matches(['\r', '\n'])))
+    }) {
+        Some(x) => x,
+        None => ("", text),
+    };
+    let ty = header
+        .lines()
+        .find_map(|l| l.strip_prefix("type:"))
+        .map(|t| t.trim().trim_matches(['"', '\'']))
+        .unwrap_or("");
+    let kind = match ty {
+        "user" => FactKind::Preference,
+        "feedback" => FactKind::Instruction,
+        "project" => FactKind::Project,
+        _ => FactKind::Fact,
+    };
+    (body.trim().to_string(), kind)
+}
+
+/// Um item por arquivo de memória. `MEMORY.md` (o índice) fica de fora.
+/// Texto que `mentions_secret` recusaria é pulado com o motivo, nunca com o
+/// conteúdo.
+pub(crate) fn plan_memory(files: Vec<(PathBuf, Scope)>, paths: &Paths) -> Vec<Item> {
+    let conn = open_ro(paths);
+    let mut items = Vec::new();
+    for (file, scope) in files {
+        let name = file
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        if name.eq_ignore_ascii_case("MEMORY.md") {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(&file) else {
+            items.push(Item::new(
+                Kind::Memory,
+                &file,
+                format!("{name}: ilegível"),
+                Action::Error,
+            ));
+            continue;
+        };
+        let (text, kind) = memory_fact(&raw);
+        let target = scope.write_for(kind).to_string();
+        let item = |d: String, a: Action| Item::new(Kind::Memory, &file, d, a);
+        if text.is_empty() {
+            items.push(item(format!("{name}: vazio"), Action::Skip));
+            continue;
+        }
+        if zerith_security::mentions_secret(&text) {
+            items.push(item(
+                format!("{name}: não importado, parece conter senha ou chave (guarde no cofre do sistema)"),
+                Action::Skip,
+            ));
+            continue;
+        }
+        let exists = conn.as_ref().is_some_and(|c| {
+            c.query_row(
+                "SELECT 1 FROM memory_facts WHERE scope = ?1 AND text = ?2 AND deleted = 0",
+                rusqlite::params![target, text],
+                |_| Ok(()),
+            )
+            .is_ok()
+        });
+        let (action, why) = if exists {
+            (Action::Skip, ": já importado")
+        } else {
+            (Action::Import, "")
+        };
+        items.push(
+            item(
+                format!("{name} → {target} ({}){why}", kind.as_str()),
+                action,
+            )
+            .with(Payload::Memory { scope, kind, text }),
+        );
+    }
+    items
+}
+
+/// `~/.claude/projects/*/memory/**/*.md`. Com a pasta do projeto inferida
+/// das sessões, o escopo é o da conversa naquela pasta (`write_for` manda
+/// fato de projeto para o projeto e preferência/instrução para o usuário,
+/// como no resto do Zerith); sem ela, o do usuário.
+pub fn claude_memory_files(home: &Path) -> Vec<(PathBuf, Scope)> {
+    let mut out = Vec::new();
+    for d in std::fs::read_dir(home.join("projects"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let mem = d.path().join("memory");
+        if !mem.is_dir() {
+            continue;
+        }
+        let scope = project_cwd(&d.path())
+            .map(|c| Scope::workspace(Path::new(&c)))
+            .unwrap_or_else(zerith_memory::default_scope);
+        let mut files = Vec::new();
+        md_tree(&mem, 0, &mut files);
+        files.sort();
+        out.extend(files.into_iter().map(|f| (f, scope.clone())));
+    }
+    out
+}
+
+/// Grava os fatos em `memory_facts` (a deduplicação do backend evita repetir).
+pub fn apply_memory(items: &[Item], paths: &Paths, r: &mut Report) {
+    let mine: Vec<&Item> = items.iter().filter(|i| i.kind == Kind::Memory).collect();
+    if mine.iter().all(|i| i.action != Action::Import) {
+        for i in mine {
+            r.tally(i.kind, i.action);
+        }
+        return;
+    }
+    let mem = match paths
+        .ensure()
+        .map_err(|e| e.to_string())
+        .and_then(|_| SqliteMemory::open(paths.db()).map_err(|e| e.to_string()))
+    {
+        Ok(m) => m,
+        Err(e) => {
+            for i in mine {
+                r.fail(i, &e);
+            }
+            return;
+        }
+    };
+    for item in mine {
+        let Payload::Memory { scope, kind, text } = &item.payload else {
+            r.tally(item.kind, item.action);
+            continue;
+        };
+        if item.action != Action::Import {
+            r.tally(item.kind, item.action);
+            continue;
+        }
+        let source = format!("import:{}", item.source_path.display());
+        match mem.remember(scope, *kind, text, Confidence::Confirmed, Some(&source)) {
+            Ok(_) => r.tally(item.kind, Action::Import),
+            // O motivo, nunca o texto.
+            Err(e) => r.fail(item, e),
+        }
+    }
+}
+
 // --------------------------------------------------------------- sessões
 
 /// Uma sessão já convertida para mensagens do Zerith.
@@ -2601,6 +2806,69 @@ pub(crate) mod tests {
             "{}",
             render_plan(&again)
         );
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    #[test]
+    fn memory_goes_to_project_scope_and_secrets_are_reported_not_imported() {
+        let t = scratch("cc-mem");
+        let home = t.join("claude");
+        let proj = home.join("projects/-w-proj");
+        write(&proj.join("s1.jsonl"), CC_SESSION);
+        write(&proj.join("memory/MEMORY.md"), "- [x](x.md)\n");
+        write(
+            &proj.join("memory/estilo.md"),
+            "---\nname: estilo\ntype: feedback\n---\nCommits em português.\n",
+        );
+        write(
+            &proj.join("memory/arq.md"),
+            "---\ntype: project\n---\nO banco é SQLite.\n",
+        );
+        write(
+            &proj.join("memory/roteador.md"),
+            "A senha do roteador é hunter2.\n",
+        );
+        write(
+            &home.join("projects/sem-sessao/memory/n.md"),
+            "Prefere respostas curtas.\n",
+        );
+        let paths = Paths::with_root(t.join("zerith"));
+        let items = plan_memory(claude_memory_files(&home), &paths);
+        assert_eq!(
+            items.len(),
+            4,
+            "MEMORY.md fica de fora: {}",
+            render_plan(&items)
+        );
+        let secret = items
+            .iter()
+            .find(|i| i.source_path.ends_with("roteador.md"))
+            .unwrap();
+        assert_eq!(secret.action, Action::Skip);
+        assert!(secret.description.contains("senha ou chave"));
+        assert!(!render_plan(&items).contains("hunter2"));
+        let r = apply(&items, &paths);
+        assert_eq!(r.counts[&Kind::Memory].imported, 3, "{:?}", r.errors);
+        let conn = Connection::open(paths.db()).unwrap();
+        let mut st = conn
+            .prepare("SELECT scope, text FROM memory_facts")
+            .unwrap();
+        let facts: Vec<(String, String)> = st
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let scope_of = |text: &str| facts.iter().find(|(_, t)| t == text).unwrap().0.clone();
+        assert!(scope_of("O banco é SQLite.").starts_with("project:"));
+        assert!(scope_of("O banco é SQLite.").ends_with("/w/proj"));
+        assert!(
+            scope_of("Commits em português.").starts_with("user:"),
+            "instrução segue o usuário"
+        );
+        assert!(scope_of("Prefere respostas curtas.").starts_with("user:"));
+        assert!(!facts.iter().any(|(_, t)| t.contains("hunter2")));
+        let again = plan_memory(claude_memory_files(&home), &paths);
+        assert!(again.iter().all(|i| i.action == Action::Skip));
         let _ = std::fs::remove_dir_all(&t);
     }
 

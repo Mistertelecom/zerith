@@ -14,9 +14,9 @@ use zerith_core::Paths;
 use zerith_sessions::{NewMessage, Role};
 
 use crate::claude_code::{
-    codex_mcp, parse_ts, plan_instructions, plan_mcp, plan_sessions, plan_skills, push_assistant,
-    title_from_user_text, tool_message, Action, Item, Kind, Options, Origin, ParsedSession,
-    CODEX_MARKER,
+    codex_mcp, parse_ts, plan_instructions, plan_mcp, plan_memory, plan_sessions, plan_skills,
+    push_assistant, title_from_user_text, tool_message, Action, Item, Kind, Options, Origin,
+    ParsedSession, CODEX_MARKER,
 };
 
 /// Onde estão os arquivos do Codex.
@@ -59,6 +59,19 @@ pub fn plan(src: &CodexSource, paths: &Paths, opt: &Options) -> Vec<Item> {
         let mut skills = vec![src.home.join("skills")];
         skills.extend(src.project.iter().map(|p| p.join(".agents/skills")));
         items.extend(plan_skills(&skills, "codex", paths));
+        let mut memories = Vec::new();
+        if let Ok(dir) = std::fs::read_dir(src.home.join("memories")) {
+            for e in dir.flatten() {
+                let p = e.path();
+                if e.file_type().is_ok_and(|t| t.is_file())
+                    && p.extension().is_some_and(|x| x == "md")
+                {
+                    memories.push((p, zerith_memory::default_scope()));
+                }
+            }
+        }
+        memories.sort_by(|a, b| a.0.cmp(&b.0));
+        items.extend(plan_memory(memories, paths));
     }
     items
 }

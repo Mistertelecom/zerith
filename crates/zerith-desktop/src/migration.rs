@@ -82,7 +82,7 @@ pub async fn migration_plan(
             &home()?,
             &paths,
             &options(opts, true),
-            &zerith_core::secrets::OsKeyring,
+            &zerith_core::secrets::Configured,
         )
     })
     .await
@@ -101,7 +101,7 @@ pub async fn migration_apply(
             &home()?,
             &paths,
             &options(opts, false),
-            &zerith_core::secrets::OsKeyring,
+            &zerith_core::secrets::Configured,
         )
     })
     .await

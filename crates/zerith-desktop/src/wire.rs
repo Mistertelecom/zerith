@@ -425,7 +425,7 @@ fn connect_account(
     account: &str,
     cred: &zerith_providers::OAuthCredential,
 ) -> Result<String, String> {
-    zerith_core::secrets::save_oauth(&zerith_core::secrets::OsKeyring, account, cred)
+    zerith_core::secrets::save_oauth(&zerith_core::secrets::Configured, account, cred)
         .map_err(|e| e.to_string())?;
     let acc = settings::AccountEntry {
         id: account.to_string(),
@@ -496,7 +496,7 @@ pub fn account_models(account: &str) -> Result<Vec<zerith_providers::oauth::Mode
 /// Where an account's credential stands, for the pill: which tool and how many
 /// minutes are left. `None` = no credential in the cofre.
 pub fn oauth_status(account: &str) -> Option<(OAuthTool, i64)> {
-    let cred = zerith_core::secrets::load_oauth(&zerith_core::secrets::OsKeyring, account)
+    let cred = zerith_core::secrets::load_oauth(&zerith_core::secrets::Configured, account)
         .ok()
         .flatten()?;
     let minutes = (cred.expires_at - zerith_providers::oauth::now_secs()).max(0) / 60;

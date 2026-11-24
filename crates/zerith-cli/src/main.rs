@@ -1691,7 +1691,7 @@ fn import_hermes_all(
         // do Hermes em %LOCALAPPDATA%.
         extra_creds: vec![home_dir().join(".hermes").join("creds")],
     };
-    let vault = zerith_core::secrets::OsKeyring;
+    let vault = zerith_core::secrets::Configured;
     let plan = run(&home, paths, &opts, &vault)?;
     print!("{}", plan.markdown());
     let pending = plan

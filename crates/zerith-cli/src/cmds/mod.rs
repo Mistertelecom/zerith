@@ -302,7 +302,7 @@ pub fn mcp_cmd(paths: &Paths, args: &[String]) -> Res {
         "remove" => {
             let name = args.get(2).ok_or("mcp remove precisa de um nome")?;
             if remove_server(paths, name)? {
-                zerith_mcp::oauth::forget(paths.root(), &zerith_core::secrets::OsKeyring, name)?;
+                zerith_mcp::oauth::forget(paths.root(), &zerith_core::secrets::Configured, name)?;
                 println!("removido {name}");
             } else {
                 return Err(format!(
@@ -366,7 +366,7 @@ pub fn mcp_cmd(paths: &Paths, args: &[String]) -> Res {
                 .chain(&loaded.unapproved)
                 .find(|s| &s.name == name && s.is_oauth())
                 .ok_or_else(|| format!("{name} não é um servidor MCP com auth = \"oauth\""))?;
-            let vault = zerith_core::secrets::OsKeyring;
+            let vault = zerith_core::secrets::Configured;
             match sub {
                 "login" => {
                     let url = s.url.clone().unwrap_or_default();
@@ -1469,7 +1469,7 @@ fn oauth_provider(tool: zerith_providers::OAuthTool) -> &'static str {
 }
 
 pub fn login_cmd(paths: &Paths, args: &[String], home: &Path) -> Res {
-    login_cmd_with(paths, args, home, &zerith_core::secrets::OsKeyring)
+    login_cmd_with(paths, args, home, &zerith_core::secrets::Configured)
 }
 
 /// Same as `login_cmd` with the cofre injected (tests use a map).

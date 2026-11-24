@@ -754,7 +754,7 @@ fn candidate_from_account(
         acc,
         spec_model,
         fallback_cfg,
-        &zerith_core::secrets::OsKeyring,
+        &zerith_core::secrets::Configured,
     )
 }
 
@@ -819,7 +819,7 @@ pub fn hydrate_oauth_with(
 pub fn fresh_oauth(
     account: &str,
 ) -> std::result::Result<zerith_providers::OAuthCredential, String> {
-    fresh_oauth_with(account, &zerith_core::secrets::OsKeyring, &|c| {
+    fresh_oauth_with(account, &zerith_core::secrets::Configured, &|c| {
         zerith_providers::oauth::renew(c).map_err(|e| e.to_string())
     })
 }

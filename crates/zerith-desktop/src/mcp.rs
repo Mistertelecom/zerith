@@ -106,7 +106,7 @@ fn list(paths: &Paths) -> Vec<McpView> {
             header_keys: keys(x.map(|x| &x.headers)),
             oauth: s.is_oauth(),
             connected: s.is_oauth()
-                && oauth::status(&zerith_core::secrets::OsKeyring, &s.name).connected,
+                && oauth::status(&zerith_core::secrets::Configured, &s.name).connected,
         }
     };
     let mut out: Vec<McpView> = l.servers.iter().map(|s| row(s, true, true)).collect();
@@ -193,7 +193,7 @@ pub async fn mcp_remove(state: State<'_, AppState>, name: String) -> Result<Vec<
                 "{name} não está em mcp.toml; se vem de settings.toml ou do projeto, edite o arquivo"
             ));
         }
-        oauth::forget(paths.root(), &zerith_core::secrets::OsKeyring, &name)?;
+        oauth::forget(paths.root(), &zerith_core::secrets::Configured, &name)?;
         cache.invalidate();
         Ok(list(&paths))
     })
@@ -296,7 +296,7 @@ pub async fn mcp_oauth_login(
             .ok_or_else(|| format!("{name} não é um servidor MCP com OAuth"))?;
         oauth::login(
             paths.root(),
-            &zerith_core::secrets::OsKeyring,
+            &zerith_core::secrets::Configured,
             &name,
             &url,
             &|u| {
@@ -314,7 +314,7 @@ pub async fn mcp_oauth_login(
 
 #[tauri::command]
 pub async fn mcp_oauth_status(name: String) -> Result<oauth::Status, String> {
-    blocking(move || Ok(oauth::status(&zerith_core::secrets::OsKeyring, &name))).await
+    blocking(move || Ok(oauth::status(&zerith_core::secrets::Configured, &name))).await
 }
 
 #[tauri::command]
@@ -325,7 +325,7 @@ pub async fn mcp_oauth_logout(
     let paths = Paths::with_root(state.root());
     let cache = state.mcp_cache();
     blocking(move || {
-        oauth::logout(&zerith_core::secrets::OsKeyring, &name)?;
+        oauth::logout(&zerith_core::secrets::Configured, &name)?;
         cache.invalidate();
         Ok(list(&paths))
     })

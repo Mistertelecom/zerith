@@ -133,7 +133,7 @@ pub fn provider_config(settings: &Settings) -> Result<ProviderConfig, Boxed> {
         settings,
         ProviderConfig::from_env(),
         |k| std::env::var(k).ok(),
-        &secrets::OsKeyring,
+        &secrets::Configured,
     )
 }
 

@@ -23,7 +23,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use zerith_core::secrets::{OsKeyring, SecretError, SecretStore};
+use zerith_core::secrets::{Configured, SecretError, SecretStore};
 use zerith_providers::oauth::{now_secs, random_state, wait_for_code, Pkce};
 
 pub const EXPIRED: &str = "Sessão expirada — clique em Entrar";
@@ -607,9 +607,10 @@ impl Auth {
         }
     }
 
-    /// The OS vault, which is where `login` saved the tokens.
+    /// The configured vault (OS, or the file backend on a server), which is
+    /// where `login` saved the tokens.
     pub fn os(name: &str) -> Self {
-        Self::new(name, Box::new(OsKeyring))
+        Self::new(name, Box::new(Configured))
     }
 
     /// The access token, refreshed first when it expires within a minute or

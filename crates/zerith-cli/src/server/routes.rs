@@ -5,7 +5,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use zerith_core::secrets::{SecretError, SecretStore};
 use zerith_workflows::remote::{Health, PutWorkflow, RunStarted};
 use zerith_workflows::{
@@ -108,38 +108,13 @@ fn health(ctx: &Ctx) -> Result<Resp, Resp> {
     health_value(ctx).map(|h| ok(&h))
 }
 
-/// Última linha da tabela `daemon_status` em `<raiz>/workflows.db`, com as
-/// colunas que existirem, como objeto JSON; `None` se a tabela não existe.
-///
-/// Contrato com o agendador no `zerith daemon` (feito em paralelo): ele grava
-/// uma linha por batida nessa tabela (ex.: `pid`, `started_at_ms`,
-/// `heartbeat_at_ms`, `last_error`). TODO(ligação): quando existir
-/// `zerith_workflows::Store::daemon_status()`, trocar esta leitura por ela.
+/// Sinal de vida que o `zerith daemon` grava a cada ciclo
+/// (`zerith_workflows::Store::daemon_status`), como JSON; `None` se o daemon
+/// nunca rodou nesta raiz.
 pub fn daemon_status(root: &Path) -> Option<Value> {
-    use rusqlite::types::Value as Sql;
-    let conn = rusqlite::Connection::open_with_flags(
-        root.join("workflows.db"),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .ok()?;
-    let mut stmt = conn
-        .prepare("SELECT * FROM daemon_status ORDER BY rowid DESC LIMIT 1")
-        .ok()?;
-    let names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
-    stmt.query_row([], |r| {
-        let mut m = Map::new();
-        for (i, n) in names.iter().enumerate() {
-            let v = match r.get::<_, Sql>(i)? {
-                Sql::Integer(x) => json!(x),
-                Sql::Real(x) => json!(x),
-                Sql::Text(x) => json!(x),
-                Sql::Null | Sql::Blob(_) => Value::Null,
-            };
-            m.insert(n.clone(), v);
-        }
-        Ok(Value::Object(m))
-    })
-    .ok()
+    let store = zerith_workflows::Store::open(&root.join("workflows.db")).ok()?;
+    let status = store.daemon_status().ok()??;
+    serde_json::to_value(status).ok()
 }
 
 // ------------------------------------------------------------ workflows

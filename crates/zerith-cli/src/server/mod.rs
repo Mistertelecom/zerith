@@ -620,28 +620,32 @@ pub(crate) mod tests {
             ),
             (Some(1), Some(1))
         );
-        assert!(h["daemon"].is_null(), "sem tabela daemon_status");
+        assert!(h["daemon"].is_null(), "daemon nunca rodou");
 
         assert_eq!(call(addr, "DELETE", "/v1/workflows/w1", t, None).0, 200);
         assert_eq!(call(addr, "GET", "/v1/workflows/w1", t, None).0, 404);
     }
 
     #[test]
-    fn health_le_a_tabela_daemon_status() {
+    fn health_mostra_o_sinal_de_vida_do_daemon() {
         let dir = tempfile::tempdir().unwrap();
         let addr = start(dir.path());
         let tok = auth::add_token(dir.path(), "pc").unwrap();
-        let c = rusqlite::Connection::open(dir.path().join("workflows.db")).unwrap();
-        c.execute_batch(
-            "CREATE TABLE daemon_status (pid INTEGER, heartbeat_at_ms INTEGER, last_error TEXT);
-             INSERT INTO daemon_status VALUES (1, 10, NULL), (42, 99, 'x');",
-        )
-        .unwrap();
+        let store = zerith_workflows::Store::open(&dir.path().join("workflows.db")).unwrap();
+        store
+            .set_daemon_status(&zerith_workflows::DaemonStatus {
+                version: "9.9.9".into(),
+                started_at_ms: 1,
+                last_cycle_ms: 99,
+                hostname: "gw".into(),
+                active_workflows: 2,
+                next_run: None,
+                consecutive_failures: Default::default(),
+            })
+            .unwrap();
         let h = call(addr, "GET", "/v1/health", Some(&tok), None).1;
-        assert_eq!(
-            h["daemon"],
-            json!({"pid": 42, "heartbeat_at_ms": 99, "last_error": "x"})
-        );
+        assert_eq!(h["daemon"]["last_cycle_ms"], json!(99));
+        assert_eq!(h["daemon"]["hostname"], json!("gw"));
     }
 
     #[test]

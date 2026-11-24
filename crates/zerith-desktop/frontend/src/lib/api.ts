@@ -238,6 +238,25 @@ export interface SessionUsageTotals {
   requests: number;
 }
 
+/** Custo em US$ pelos preços públicos do OpenRouter. `subscription` é o
+ * equivalente na API do uso por assinatura (não cobrado). `priced` falso =
+ * nenhum preço conhecido. */
+export interface CostLine {
+  key: string;
+  billed: number;
+  subscription: number;
+  priced: boolean;
+}
+
+export interface CostView {
+  billed: number;
+  subscription: number;
+  priced: boolean;
+  unpriced: string[];
+  by_model: CostLine[];
+  by_day: CostLine[];
+}
+
 export interface UsageSummary {
   accounts: AccountStats[];
   models: {
@@ -643,6 +662,9 @@ export const api = {
   routingSave: (routing: Routing) =>
     invoke<Routing>("routing_save", { routing }),
   usage: (hours = 5) => invoke<UsageSummary>("usage", { hours }),
+  /** Sem `sessionId`: o período de `hours` horas (0 = tudo). */
+  usageCost: (sessionId: string | null, hours = 0) =>
+    invoke<CostView>("usage_cost", { sessionId, hours }),
   clearCooldown: (accountId: string) =>
     invoke<void>("clear_cooldown", { accountId }),
   memoryFacts: () => invoke<Fact[]>("memory_facts"),

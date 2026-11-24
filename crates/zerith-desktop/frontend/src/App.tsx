@@ -65,6 +65,7 @@ import { titleOf } from "./lib/title";
 import { TitleBar, type AppView } from "./components/TitleBar";
 import { BotEmblem, emblemForAgent } from "./components/BotEmblem";
 import { BotModal } from "./components/BotModal";
+import { SessionCost } from "./components/SessionCost";
 import { AppVersion } from "./components/Update";
 import { FolderPill } from "./components/FolderPill";
 import { BackgroundJobs } from "./components/BackgroundJobs";
@@ -2300,6 +2301,13 @@ export default function App() {
                           <dt>{tr(lang, "Saída", "Output")}</dt>
                           <dd>{num(totalOut)}</dd>
                         </div>
+                        {selected ? (
+                          <SessionCost
+                            sessionId={selected}
+                            requests={sessionUsage?.requests ?? 0}
+                            lang={lang}
+                          />
+                        ) : null}
                         <div className={totalCache > 0 ? "saved" : undefined}>
                           <dt>Cache hit</dt>
                           <dd>{cachePct}</dd>

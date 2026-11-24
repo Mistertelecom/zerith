@@ -730,6 +730,38 @@ export function installMock(theme: string) {
           };
         case "usage":
           return usage;
+        case "usage_cost":
+          // Conversa: só a assinatura (equivalente na API); período: as três
+          // contas, com um modelo local sem preço.
+          return a.sessionId
+            ? {
+                billed: 0,
+                subscription: 0.4182,
+                priced: true,
+                unpriced: [],
+                by_model: [
+                  { key: "claude-sonnet-5-5", billed: 0, subscription: 0.4182, priced: true },
+                ],
+                by_day: [{ key: "2026-11-24", billed: 0, subscription: 0.4182, priced: true }],
+              }
+            : {
+                billed: 0.0391,
+                subscription: 3.912,
+                priced: true,
+                unpriced: ["qwen3-coder:30b"],
+                by_model: [
+                  { key: "claude-sonnet-5-5", billed: 0, subscription: 2.474, priced: true },
+                  { key: "gpt-5-codex", billed: 0, subscription: 1.231, priced: true },
+                  { key: "claude-haiku-5-5", billed: 0, subscription: 0.207, priced: true },
+                  { key: "deepseek-chat", billed: 0.0391, subscription: 0, priced: true },
+                  { key: "qwen3-coder:30b", billed: 0, subscription: 0, priced: false },
+                ],
+                by_day: [
+                  { key: "2026-11-22", billed: 0.0102, subscription: 0.884, priced: true },
+                  { key: "2026-11-23", billed: 0.0177, subscription: 1.612, priced: true },
+                  { key: "2026-11-24", billed: 0.0112, subscription: 1.416, priced: true },
+                ],
+              };
         case "account_quota": {
           const w = (u: number, h: number) => ({
             utilization: u,

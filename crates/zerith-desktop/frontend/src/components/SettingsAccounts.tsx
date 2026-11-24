@@ -45,6 +45,7 @@ import {
 } from "../lib/catalog";
 import { Card, EmptyState, Logo, Stat, Switch, Field, ProbeResult } from "./ui";
 import { fmt, compact, nameOf, host, isOauth } from "./settingsFmt";
+import { CostCard } from "./SessionCost";
 
 /** The window a new account gets; rows only mention it when it differs. */
 const WINDOW_H = 5;
@@ -1347,6 +1348,7 @@ export function UsageTab(p: { usage: UsageSummary | null; presets: Preset[] }) {
           </span>
         ))}
       </p>
+      <CostCard />
       <Card
         title="Por conta"
         icon={KeyRound}

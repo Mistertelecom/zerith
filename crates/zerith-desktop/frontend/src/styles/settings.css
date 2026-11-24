@@ -967,6 +967,15 @@ button.item-row {
   color: var(--label-caption);
 }
 
+/* custo: modelo/dia, participação, valor (o valor pode ter duas partes) */
+.cost-table .usage-head,
+.cost-table .usage-row {
+  grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr) minmax(0, 1.2fr);
+}
+.cost-total {
+  padding: 12px 16px;
+}
+
 .usage-who {
   display: flex;
   align-items: center;

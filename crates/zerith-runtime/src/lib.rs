@@ -19,6 +19,7 @@ mod budget;
 mod code_exec;
 pub mod compact;
 pub mod events;
+pub mod goal;
 pub mod guards;
 pub mod learn;
 pub mod pipeline;

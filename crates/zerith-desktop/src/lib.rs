@@ -368,6 +368,8 @@ pub fn run() {
             workflows::channel_save,
             workflows::channel_delete,
             workflows::channel_test,
+            workflows::channel_check,
+            workflows::channel_groups,
             update::update_check,
             update::update_install,
         ])

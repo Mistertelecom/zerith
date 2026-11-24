@@ -1113,6 +1113,12 @@ export interface ChannelConfig {
   updated_at_ms: number;
 }
 
+export interface ChannelGroup {
+  id: string;
+  name: string;
+  size?: number | null;
+}
+
 export interface NodeRunLog {
   node_id: string;
   label: string;
@@ -1184,6 +1190,12 @@ export const channelsApi = {
       target: target ?? null,
       message: message ?? null,
     }),
+  /** Confere a conexão (instância/sessão/token); `sendTest` manda a mensagem de teste. */
+  check: (id: string, sendTest = false) =>
+    invoke<string>("channel_check", { id, sendTest }),
+  /** Grupos de WhatsApp da instância (só Evolution API). */
+  groups: (channelId: string) =>
+    invoke<ChannelGroup[]>("channel_groups", { channelId }),
 };
 
 export function onWorkflowEvent(

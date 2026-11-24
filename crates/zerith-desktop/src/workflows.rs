@@ -1268,6 +1268,45 @@ pub async fn channel_test(
     .map_err(|e| e.to_string())?
 }
 
+fn load_channel(root: &std::path::Path, id: &str) -> Result<ChannelConfig, String> {
+    open_store(root)?
+        .get_channel(id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("canal '{id}' não encontrado"))
+}
+
+/// Confere a conexão do canal (instância/sessão/token) e, com `send_test`,
+/// manda a mensagem de teste ao destino padrão.
+#[tauri::command]
+pub async fn channel_check(
+    state: State<'_, AppState>,
+    id: String,
+    send_test: Option<bool>,
+) -> Result<String, String> {
+    let root = state.root().to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || {
+        let ch = load_channel(&root, &id)?;
+        channels::test_channel(&ch, send_test.unwrap_or(false)).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Grupos de WhatsApp da instância (Evolution API) para escolher o destino.
+#[tauri::command]
+pub async fn channel_groups(
+    state: State<'_, AppState>,
+    channel_id: String,
+) -> Result<Vec<channels::ChannelGroup>, String> {
+    let root = state.root().to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || {
+        let ch = load_channel(&root, &channel_id)?;
+        channels::list_groups(&ch).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 pub async fn workflow_webhook_base_url() -> Result<String, String> {
     let port = WEBHOOK_PORT.load(Ordering::Relaxed);

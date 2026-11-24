@@ -350,6 +350,10 @@ impl Ledger {
             },
         );
     }
+
+    pub fn entry(&self, source: &Path) -> Option<&LedgerEntry> {
+        self.entries.get(&key(source))
+    }
 }
 
 fn key(p: &Path) -> String {

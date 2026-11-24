@@ -96,6 +96,20 @@ fn fixture() -> Fx {
         &home.join("AGENTS.md"),
         "# Everything Claude Code (ECC) — Agent Instructions\n| a | b |\n",
     );
+    write(
+        &home.join("creds/acme-borda.txt"),
+        &format!(
+            "# NE20 da borda, cuidado\nhost: 10.0.0.1\nport: 2222\nlogin: admin\npassword: {CRED_PW}\nprotocolo: ssh (ssh-rsa)\nplataforma: Huawei NE20\nobservacao: produção, acesso alternativo (suporte/{ALT_PW})\n"
+        ),
+    );
+    write(
+        &home.join("creds/acme-olt-parks.txt"),
+        &format!("host: 10.0.0.9\nlogin: a\npassword: {CRED_PW}2\ncli_login: root\ncli_password: {CRED_PW}3\nprotocolo: telnet\n"),
+    );
+    write(
+        &home.join("creds/acme-segredos.txt"),
+        &format!("# lista\nwifi: {CRED_PW}4\n{CRED_PW}5\n"),
+    );
     let paths = Paths::with_root(t.path().join("zerith"));
     Fx { _t: t, home, paths }
 }
@@ -112,6 +126,72 @@ fn count(plan: &ImportPlan, kind: &str, status: Status) -> usize {
         .iter()
         .filter(|i| i.kind == kind && i.status == status)
         .count()
+}
+
+const CRED_PW: &str = "Pw!secr3t";
+const ALT_PW: &str = "Alt#9pass";
+
+#[test]
+fn credentials_become_inventory_without_passwords() {
+    let fx = fixture();
+    let vault = Vault::default();
+    let plan = run(&fx.home, &fx.paths, &opts(false), &vault).unwrap();
+    let inv = std::fs::read_to_string(fx.paths.root().join("inventory.toml")).unwrap();
+    assert!(!inv.contains(CRED_PW) && !inv.contains(ALT_PW), "{inv}");
+    assert!(!rendered(&plan).contains(CRED_PW));
+    // Sem --migrate-secrets nenhuma senha de creds/ vai ao cofre (o valor
+    // tirado da memória vai sempre: é o único jeito de ela entrar).
+    assert!(
+        vault
+            .0
+            .borrow()
+            .keys()
+            .all(|k| k.starts_with("hermes-memoria-")),
+        "sem --migrate-secrets nada de creds/ vai ao cofre"
+    );
+    assert!(plan
+        .stripped_secrets
+        .contains(&"credencial:acme-borda".to_string()));
+    let devs = zerith_tools::network::parse_inventory(&inv).unwrap();
+    assert_eq!(devs.len(), 2);
+    let b = devs.iter().find(|d| d.name == "borda").unwrap();
+    assert_eq!(b.client.as_deref(), Some("acme"));
+    assert_eq!(
+        (b.host.as_str(), b.port, b.user.as_str()),
+        ("10.0.0.1", 2222, "admin")
+    );
+    assert_eq!(b.vendor, zerith_tools::network::Vendor::HuaweiVrp);
+    assert_eq!(b.role, zerith_tools::network::DeviceRole::Border);
+    assert!(b.legacy_ssh);
+    assert!(b.tags.contains(&"producao".to_string()));
+    assert_eq!(b.secret_ref.as_deref(), Some("acme-borda"));
+    let d = b.description.as_deref().unwrap();
+    assert!(
+        d.contains("NE20 da borda") && d.contains("senha no cofre: acme-borda-alt1"),
+        "{d}"
+    );
+    let o = devs.iter().find(|d| d.name == "olt-parks").unwrap();
+    assert_eq!(o.transport, zerith_tools::network::DeviceTransport::Telnet);
+    assert_eq!(o.port, 23);
+    assert!(o.tags.contains(&"parks".to_string()) && o.tags.contains(&"olt".to_string()));
+    assert_eq!(
+        count(&plan, "credencial", Status::Skipped),
+        1,
+        "lista sem host e sem flag"
+    );
+
+    // Agora com a flag: as senhas vão ao cofre, o inventário não muda.
+    let o2 = Options {
+        dry_run: false,
+        migrate_secrets: true,
+        ..Default::default()
+    };
+    run(&fx.home, &fx.paths, &o2, &vault).unwrap();
+    let v = vault.0.borrow();
+    assert_eq!(v["acme-borda"], CRED_PW);
+    assert_eq!(v["acme-borda-alt1"], ALT_PW);
+    assert_eq!(v["acme-olt-parks-cli"], format!("{CRED_PW}3"));
+    assert_eq!(v["acme-segredos"], format!("wifi: {CRED_PW}4 | {CRED_PW}5"));
 }
 
 /// Tudo que um plano/relatório mostra, para procurar vazamento de valores.

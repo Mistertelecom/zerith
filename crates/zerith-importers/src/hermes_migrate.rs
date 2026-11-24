@@ -165,6 +165,9 @@ pub fn run(
     if opts.wants("persona") {
         persona(&mut ctx);
     }
+    if opts.wants("credencial") {
+        credentials(&mut ctx);
+    }
     if ctx.apply() {
         ctx.ledger.save(paths).map_err(|e| format!("ledger: {e}"))?;
         if let Some(dir) = &ctx.dir {
@@ -353,6 +356,13 @@ fn looks_like_password(v: &str) -> bool {
 /// sinônimos neutros. O texto devolvido pode ainda ser recusado (uma chave
 /// `sk-…` solta, por exemplo); quem chama decide.
 pub fn extract_secrets(text: &str, prefix: &str) -> (String, Vec<Extracted>) {
+    let (out, found) = extract_values(text, prefix);
+    (neutral_words(&out), found)
+}
+
+/// [`extract_secrets`] sem a troca de palavras (para o inventário, que não
+/// passa pelo filtro da memória).
+pub fn extract_values(text: &str, prefix: &str) -> (String, Vec<Extracted>) {
     use regex::Regex;
     use std::sync::OnceLock;
     static RES: OnceLock<[Regex; 4]> = OnceLock::new();
@@ -376,7 +386,9 @@ pub fn extract_secrets(text: &str, prefix: &str) -> (String, Vec<Extracted>) {
         for c in re.captures_iter(&out) {
             let whole = c.get(0).unwrap();
             let value = c.get(3).unwrap().as_str();
-            let already = value.starts_with("valor") || value.contains("cofre");
+            let already = value.starts_with("valor")
+                || value.contains("cofre")
+                || c.get(2).is_some_and(|g| g.as_str().contains("cofre"));
             // Depois de `snmpv2c` ou de `senha:` qualquer valor conta; sem
             // separador só o que parece senha (não "senha forte", "TCP/UDP").
             let marked = i == 1 || (i == 0 && c.get(4).is_some());
@@ -411,7 +423,7 @@ pub fn extract_secrets(text: &str, prefix: &str) -> (String, Vec<Extracted>) {
         next.push_str(&out[last..]);
         out = next;
     }
-    (neutral_words(&out), found)
+    (out, found)
 }
 
 /// As palavras que `mentions_secret` recusa, trocadas por sinônimos.
@@ -701,6 +713,336 @@ fn persona(ctx: &mut Ctx) {
         }
         ctx.plan.push("persona", file, dest, status, reason);
     }
+}
+
+// -------------------------------------------------------------- credenciais
+
+/// Um `creds/*.txt` do Hermes: linhas `chave: valor` e `# comentário`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CredFile {
+    pub fields: Vec<(String, String)>,
+    pub comments: Vec<String>,
+    /// Linhas sem `chave:` (listas de segredos).
+    pub loose: Vec<String>,
+}
+
+impl CredFile {
+    pub fn parse(text: &str) -> Self {
+        let mut f = CredFile::default();
+        for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            if let Some(c) = line.strip_prefix('#') {
+                f.comments.push(c.trim().to_string());
+                continue;
+            }
+            match line.split_once(':') {
+                Some((k, v))
+                    if !k.trim().is_empty()
+                        && k.trim().chars().all(|c| c.is_alphanumeric() || c == '_') =>
+                {
+                    f.fields
+                        .push((k.trim().to_lowercase(), v.trim().to_string()));
+                }
+                _ => f.loose.push(line.to_string()),
+            }
+        }
+        f
+    }
+
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.fields
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+            .filter(|v| !v.is_empty())
+    }
+}
+
+/// O que um arquivo de credencial vira: um dispositivo (com os segredos que
+/// iriam para o cofre) ou um segredo só (arquivo sem host).
+#[derive(Debug, Clone, PartialEq)]
+pub enum CredTarget {
+    Device {
+        dev: Box<zerith_tools::network::DeviceEntry>,
+        /// `(nome no cofre, valor)`; o valor só vai para o cofre.
+        secrets: Vec<(String, String)>,
+    },
+    Secret {
+        name: String,
+        value: String,
+    },
+}
+
+/// `cliente-nome.txt` → (`Some("cliente")`, `"nome"`); sem `-`, sem cliente.
+fn client_and_name(stem: &str) -> (Option<String>, String) {
+    match stem.split_once('-') {
+        Some((c, n)) if !c.is_empty() && !n.is_empty() => (Some(c.to_string()), n.to_string()),
+        _ => (None, stem.to_string()),
+    }
+}
+
+/// Converte um `creds/*.txt` (o `stem` é o nome do arquivo sem `.txt`).
+pub fn cred_target(stem: &str, f: &CredFile) -> CredTarget {
+    use zerith_tools::network::{DeviceEntry, DeviceRole, DeviceTransport, Vendor};
+    let (client, name) = client_and_name(stem);
+    let base_ref = match &client {
+        Some(c) => format!("{c}-{name}"),
+        None => name.clone(),
+    };
+    let hosts: Vec<String> = f
+        .get("host")
+        .or(f.get("hosts"))
+        .unwrap_or("")
+        .split([',', ' ', ';'])
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .map(str::to_string)
+        .collect();
+    let Some(host) = hosts.first().cloned() else {
+        let mut lines: Vec<String> = f.fields.iter().map(|(k, v)| format!("{k}: {v}")).collect();
+        lines.extend(f.loose.iter().cloned());
+        return CredTarget::Secret {
+            name: base_ref,
+            value: lines.join(" | "),
+        };
+    };
+    let get = |k: &str| f.get(k).unwrap_or("");
+    let hay = format!(
+        "{stem} {} {} {} {}",
+        get("plataforma"),
+        get("observacao"),
+        get("protocolo"),
+        f.comments.join(" ")
+    )
+    .to_lowercase();
+    let has = |w: &[&str]| w.iter().any(|x| hay.contains(x));
+    let vendor = if has(&["mikrotik", "routeros"]) || name.starts_with("mk-") {
+        Vendor::MikrotikRouterOs
+    } else if has(&["ne20", "huawei", "vrp"]) {
+        Vendor::HuaweiVrp
+    } else if has(&["nexus", "nx-os", "nxos"]) {
+        Vendor::CiscoNxos
+    } else if has(&["airos", "ubiquiti"]) {
+        Vendor::Linux
+    } else {
+        Vendor::Generic
+    };
+    let role = if has(&["borda", "ne20", "concentrador"]) {
+        DeviceRole::Border
+    } else if has(&["swcore", "sw-core"]) {
+        DeviceRole::Core
+    } else {
+        DeviceRole::Access
+    };
+    let proto = get("protocolo").to_lowercase();
+    let transport = if proto.contains("telnet") || proto.contains("tl1") {
+        DeviceTransport::Telnet
+    } else {
+        DeviceTransport::Ssh
+    };
+    let port = get("port").parse().unwrap_or(match transport {
+        DeviceTransport::Telnet => 23,
+        _ => 22,
+    });
+    let mut tags: Vec<String> = client.iter().cloned().collect();
+    if get("observacao").to_lowercase().contains("produ") {
+        tags.push("producao".into());
+    }
+    for t in ["datacom", "parks", "fiberhome", "olt"] {
+        if hay.contains(t) {
+            tags.push(t.into());
+        }
+    }
+
+    let mut secrets: Vec<(String, String)> = Vec::new();
+    if let Some(p) = f.get("password") {
+        secrets.push((base_ref.clone(), p.to_string()));
+    }
+    let mut desc_parts: Vec<String> = f.comments.clone();
+    if hosts.len() > 1 {
+        desc_parts.push(format!("outros hosts: {}", hosts[1..].join(", ")));
+    }
+    for k in ["observacao", "plataforma", "protocolo"] {
+        desc_parts.extend(f.get(k).map(str::to_string));
+    }
+    if let Some(v) = f.get("acesso_alternativo") {
+        desc_parts.push(format!("acesso alternativo: {v}"));
+    }
+    if let Some(cl) = f.get("cli_login") {
+        let pw = f.get("cli_password").map(|v| {
+            secrets.push((format!("{base_ref}-cli"), v.to_string()));
+            format!(", senha no cofre: {base_ref}-cli")
+        });
+        desc_parts.push(format!("CLI: usuário {cl}{}", pw.unwrap_or_default()));
+    }
+    // Pares `(usuario/senha)` e `senha: x` no texto livre: `<ref>-altN`.
+    let (mut desc, found) = extract_values(&desc_parts.join(" | "), "tmp");
+    for (n, e) in found.into_iter().enumerate() {
+        let alt = format!("{base_ref}-alt{}", n + 1);
+        desc = desc.replace(
+            &format!("valor no cofre ({})", e.name),
+            &format!("senha no cofre: {alt}"),
+        );
+        secrets.push((alt, e.value));
+    }
+    let dev = DeviceEntry {
+        name,
+        client,
+        host,
+        port,
+        user: get("login").to_string(),
+        vendor,
+        role,
+        transport,
+        secret_ref: f.get("password").map(|_| base_ref.clone()),
+        legacy_ssh: hay.contains("ssh-rsa"),
+        tags,
+        description: (!desc.is_empty()).then_some(desc),
+        ..Default::default()
+    };
+    CredTarget::Device {
+        dev: Box::new(dev),
+        secrets,
+    }
+}
+
+fn credentials(ctx: &mut Ctx) {
+    let inv_path = ctx.paths.root().join("inventory.toml");
+    let mut dirs = vec![ctx.home.join("creds")];
+    dirs.extend(ctx.opts.extra_creds.iter().cloned());
+    let mut seen_dirs = HashSet::new();
+    dirs.retain(|d| seen_dirs.insert(d.canonicalize().unwrap_or_else(|_| d.clone())));
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut files: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("txt")))
+            .collect();
+        files.sort();
+        for path in files {
+            credential(ctx, &path, &inv_path);
+        }
+    }
+}
+
+fn credential(ctx: &mut Ctx, path: &Path, inv_path: &Path) {
+    let src = path.display().to_string();
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        ctx.plan
+            .push("credencial", src, "", Status::Error, "não foi possível ler");
+        return;
+    };
+    let sha = plan::sha256_hex(raw.as_bytes());
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let target = cred_target(&stem, &CredFile::parse(&raw));
+    // Pula se o arquivo é o mesmo de antes, a menos que agora os segredos
+    // vão para o cofre e da outra vez não foram.
+    let ledger_id = if ctx.opts.migrate_secrets {
+        "com-cofre"
+    } else {
+        "sem-cofre"
+    };
+    let done_before = ctx.ledger.entry(path).is_some_and(|e| {
+        e.sha256 == sha && (!ctx.opts.migrate_secrets || e.target_id.ends_with("com-cofre"))
+    });
+    if done_before {
+        ctx.plan.push(
+            "credencial",
+            src,
+            "",
+            Status::Skipped,
+            "arquivo igual ao da última migração",
+        );
+        return;
+    }
+    let (dest, secrets, dev) = match target {
+        CredTarget::Secret { name, value } => {
+            (format!("cofre ({name})"), vec![(name, value)], None)
+        }
+        CredTarget::Device { dev, secrets } => (
+            format!("inventory.toml ({})", dev.display_qualified_name()),
+            secrets,
+            Some(*dev),
+        ),
+    };
+    let names: Vec<String> = secrets.iter().map(|(n, _)| n.clone()).collect();
+    let mut reason = Vec::new();
+    let mut status = Status::Imported;
+    // O dispositivo e o cofre são decididos à parte: um dispositivo já no
+    // inventário ainda pode ter as senhas levadas ao cofre numa rodada com
+    // --migrate-secrets.
+    let mut write_dev = dev.is_some();
+    let write_vault = ctx.opts.migrate_secrets && !secrets.is_empty();
+    if let Some(dev) = &dev {
+        let existing = std::fs::read_to_string(inv_path)
+            .ok()
+            .and_then(|t| zerith_tools::network::parse_inventory(&t).ok())
+            .and_then(|l| {
+                l.into_iter()
+                    .find(|d| d.composite_key() == dev.composite_key())
+            });
+        match existing {
+            Some(e) if &e == dev => {
+                write_dev = false;
+                reason.push("já no inventário".to_string());
+            }
+            Some(_) if !ctx.opts.overwrite => {
+                write_dev = false;
+                status = Status::Conflict;
+                reason.push("já existe no inventário com outros dados; use --overwrite".into());
+            }
+            Some(_) => reason.push("substitui o dispositivo do inventário".into()),
+            None => {}
+        }
+    }
+    if !names.is_empty() {
+        if ctx.opts.migrate_secrets {
+            reason.push(format!("senha(s) no cofre: {}", names.join(", ")));
+        } else {
+            reason.push(format!(
+                "senha(s) fora: re-adicione com zerith secret set {}",
+                names.join(" / ")
+            ));
+            for n in &names {
+                ctx.plan.strip(format!("credencial:{n}"));
+            }
+        }
+    }
+    if status == Status::Imported && !write_dev && !write_vault {
+        // Já no inventário, ou arquivo só de segredos sem a flag.
+        status = Status::Skipped;
+    }
+    if ctx.apply() && status == Status::Imported {
+        let vault_err = match ctx.secrets {
+            Some(vault) if write_vault => secrets
+                .iter()
+                .try_for_each(|(n, v)| vault.set(n, v))
+                .err()
+                .map(|e| e.to_string()),
+            _ => None,
+        };
+        let inv_err = match (&vault_err, dev) {
+            (None, Some(d)) if write_dev => {
+                zerith_tools::network::upsert_inventory_device(inv_path, d).err()
+            }
+            _ => None,
+        };
+        if let Some(e) = vault_err.or(inv_err) {
+            ctx.plan.push("credencial", src, dest, Status::Error, e);
+            return;
+        }
+    }
+    if ctx.apply() && status != Status::Conflict {
+        ctx.ledger
+            .record(path, &sha, &format!("{dest} {ledger_id}"));
+    }
+    ctx.plan
+        .push("credencial", src, dest, status, reason.join("; "));
 }
 
 #[cfg(test)]

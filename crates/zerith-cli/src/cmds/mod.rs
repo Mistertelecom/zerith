@@ -700,11 +700,14 @@ pub struct Check {
 pub fn keyring_check() -> Check {
     // A name no one uses: NotFound means the store answered, Unavailable means
     // it cannot be used at all.
+    let choice = secrets::active();
+    let backend = format!("backend {}: {}", choice.backend.label(), choice.reason);
     let (ok, detail) = match secrets::get_secret("zerith-doctor-probe") {
-        Ok(_) | Err(secrets::SecretError::NotFound(_)) => (true, "disponível".to_string()),
-        Err(secrets::SecretError::Unavailable(why)) => {
-            (false, format!("indisponível ({why}); use ZERITH_API_KEY"))
-        }
+        Ok(_) | Err(secrets::SecretError::NotFound(_)) => (true, format!("disponível; {backend}")),
+        Err(secrets::SecretError::Unavailable(why)) => (
+            false,
+            format!("indisponível ({why}); {backend}; use ZERITH_API_KEY"),
+        ),
     };
     Check {
         name: "cofre de credenciais",

@@ -113,7 +113,7 @@ usage:
   zerith remote list|add <alias> <ssh://...|docker://...>|exec <alvo> [--] <cmd...>
   zerith media show|models|set|key|generate   (imagem e vídeo; veja `zerith media`)
   zerith config show
-  zerith secret set <name> [value] | get <name> | delete <name>
+  zerith secret set <name> [value] [--multiline] | get <name> | delete <name> | list | backend
   zerith login <claude-code|codex|antigravity> [--account <id>] [--import] [--no-browser]
   zerith import hermes [--profile <name>] [--jsonl <file>]
   zerith import hermes --all [--dry-run] [--yes] [--overwrite] [--migrate-secrets]
@@ -718,35 +718,87 @@ fn config_cmd(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
-/// `zerith secret set|get|delete <name>`. `set` reads the value from stdin
-/// when not given, so it stays out of shell history.
+/// `zerith secret set|get|delete <name> | list | backend`. `set` reads the
+/// value from stdin when not given, so it stays out of shell history.
 fn secret_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let sub = args.get(1).map(String::as_str);
-    let name = args.get(2).ok_or("secret needs a name")?;
-    match sub {
+    let choice = secrets::active();
+    let out = secret_cmd_with(args, choice, &mut std::io::stdin().lock())?;
+    print!("{out}");
+    Ok(())
+}
+
+/// [`secret_cmd`] with the backend and stdin injected; returns what to print.
+fn secret_cmd_with(
+    args: &[String],
+    choice: &secrets::Choice,
+    stdin: &mut dyn std::io::BufRead,
+) -> Result<String, Box<dyn std::error::Error>> {
+    use secrets::{Backend, SecretStore};
+    let store = &choice.backend;
+    let multiline = args.iter().any(|a| a == "--multiline");
+    let pos: Vec<&String> = args.iter().filter(|a| *a != "--multiline").collect();
+    let sub = pos.get(1).map(|s| s.as_str());
+    let where_ = match store {
+        Backend::File(_) => "no backend de arquivo",
+        _ => "no cofre do sistema",
+    };
+    if sub == Some("list") {
+        if *store == Backend::Os {
+            return Err("o cofre do sistema não enumera os segredos do Zerith; \
+                 `zerith secret list` funciona no backend de arquivo (zerith secret backend)"
+                .into());
+        }
+        // Só nomes: o valor nunca sai daqui.
+        let names = store
+            .list()
+            .map_err(|e| format!("{e} (zerith secret backend mostra o backend ativo)"))?;
+        return Ok(names.iter().map(|n| format!("{n}\n")).collect());
+    }
+    if sub == Some("backend") {
+        let mut out = format!("{}  ({})\n", store.label(), choice.reason);
+        if let Backend::File(f) = store {
+            out += &format!("pasta: {}\n", f.dir.display());
+            if let Some(c) = &f.creds {
+                out += &format!("credenciais do systemd: {}\n", c.display());
+            }
+        }
+        return Ok(out);
+    }
+    let name = pos.get(2).ok_or("secret needs a name")?;
+    Ok(match sub {
         Some("set") => {
-            let value = match args.get(3) {
-                Some(v) => v.clone(),
+            let value = match pos.get(3) {
+                Some(v) => v.to_string(),
+                // Tudo, até o fim da entrada: chaves PEM, JSON de conta.
+                None if multiline => {
+                    let mut all = String::new();
+                    stdin.read_to_string(&mut all)?;
+                    all.trim_end_matches(['\r', '\n']).to_string()
+                }
                 None => {
                     let mut line = String::new();
-                    std::io::stdin().read_line(&mut line)?;
+                    stdin.read_line(&mut line)?;
                     line.trim_end_matches(['\r', '\n']).to_string()
                 }
             };
             if value.is_empty() {
                 return Err("valor vazio; nada gravado".into());
             }
-            secrets::set_secret(name, &value)?;
-            println!("{name} gravado no cofre do sistema");
+            store.set(name, &value)?;
+            format!("{name} gravado {where_}\n")
         }
-        Some("get") => println!("{name} {}", secrets::mask(&secrets::get_secret(name)?)),
+        Some("get") => format!("{name} {}\n", secrets::mask(&store.get(name)?)),
         Some("delete") => {
-            secrets::delete_secret(name)?;
-            println!("{name} removido");
+            store.delete(name)?;
+            format!("{name} removido\n")
         }
-        _ => return Err("usage: zerith secret set|get|delete <name>".into()),
-    }
-    Ok(())
+        _ => {
+            return Err(
+                "usage: zerith secret set <name> [value] [--multiline] | get|delete <name> | list | backend"
+                    .into(),
+            )
+        }
+    })
 }
 
 /// `[s]im / [n]ão / [t]odos nesta conversa` (and `[p]rojeto` when the runtime
@@ -2001,6 +2053,40 @@ mod tests {
 
     fn v(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn secret_cmd_no_backend_de_arquivo_lista_sem_valores_e_le_multilinha() {
+        let root = std::env::temp_dir().join(format!("zerith-secret-cmd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let choice = secrets::choose_with(
+            |k| (k == secrets::BACKEND_ENV).then(|| "file".to_string()),
+            None,
+            &root,
+            false,
+        );
+        let run =
+            |args: &[&str], input: &str| secret_cmd_with(&v(args), &choice, &mut input.as_bytes());
+        // Sem a flag: só a primeira linha, como antes.
+        run(&["secret", "set", "a"], "sk-um\nresto\n").unwrap();
+        // Com --multiline: tudo, só a quebra final sai.
+        let out = run(&["secret", "set", "--multiline", "pem"], "L1\nL2\n").unwrap();
+        assert!(out.contains("backend de arquivo"));
+        use secrets::SecretStore;
+        assert_eq!(choice.backend.get("a").unwrap(), "sk-um");
+        assert_eq!(choice.backend.get("pem").unwrap(), "L1\nL2");
+        let list = run(&["secret", "list"], "").unwrap();
+        assert_eq!(list, "a\npem\n");
+        assert!(!list.contains("sk-") && !list.contains("L1"));
+        let b = run(&["secret", "backend"], "").unwrap();
+        assert!(
+            b.starts_with("file  (ZERITH_SECRETS_BACKEND = file)"),
+            "{b}"
+        );
+        assert!(run(&["secret", "set", "vazio"], "\n").is_err());
+        run(&["secret", "delete", "a"], "").unwrap();
+        assert_eq!(run(&["secret", "list"], "").unwrap(), "pem\n");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

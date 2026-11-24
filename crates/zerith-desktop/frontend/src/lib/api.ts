@@ -589,6 +589,15 @@ export interface ReportView {
   failed: string[];
 }
 
+/** Resposta de `/btw` (comando `btw_ask`). */
+export interface BtwAnswer {
+  text: string;
+  model: string;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cache_read_tokens: number;
+}
+
 export const api = {
   boot: () => invoke<Boot>("boot"),
   listSessions: (limit = 200) => invoke<Session[]>("list_sessions", { limit }),
@@ -812,6 +821,9 @@ export const api = {
         history: args.history ?? 0,
       },
     }),
+  /** `/btw`: pergunta paralela sem ferramentas; nada entra na conversa. */
+  btwAsk: (sessionId: string, model: string, question: string, agent?: string | null) =>
+    invoke<BtwAnswer>("btw_ask", { sessionId, model, question, agent: agent ?? null }),
   steerTurn: (sessionId: string, prompt: string) =>
     invoke<boolean>("steer_turn", { sessionId, prompt }),
   cancelTurn: (sessionId: string) => invoke<void>("cancel_turn", { sessionId }),

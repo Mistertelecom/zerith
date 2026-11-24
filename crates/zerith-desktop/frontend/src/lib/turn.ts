@@ -19,7 +19,14 @@ export type Block =
       toolsAtText?: number;
     }
   /** `learned`: what the background review saved after the turn (with undo). */
-  | { kind: "note"; text: string; learned?: LearnedItem[]; sub?: string }
+  | {
+      kind: "note";
+      text: string;
+      learned?: LearnedItem[];
+      sub?: string;
+      /** `/btw`: pergunta paralela, mostrada à parte e nunca enviada ao modelo. */
+      btw?: { id: number; question: string; answer?: string; error?: string; model?: string };
+    }
   /** Antigravity-style live/expandable card for a delegated subagent. */
   | {
       kind: "subagent";

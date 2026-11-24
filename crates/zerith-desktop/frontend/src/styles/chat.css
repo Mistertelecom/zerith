@@ -1514,6 +1514,18 @@
   opacity: 0.5;
   cursor: default;
 }
+.btw-body {
+  font-size: var(--fs-small);
+  color: var(--label-secondary);
+}
+.btw-pending,
+.btw-meta {
+  color: var(--label-tertiary);
+  font-size: var(--fs-caption);
+}
+.btw-error {
+  color: var(--danger, var(--label-secondary));
+}
 .learned-body {
   display: grid;
   gap: 6px;

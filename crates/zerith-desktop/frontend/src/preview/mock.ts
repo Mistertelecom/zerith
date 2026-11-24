@@ -1000,6 +1000,14 @@ export function installMock(theme: string) {
           return state.theme;
         case "background_jobs":
           return state.jobs;
+        case "btw_ask":
+          return {
+            text: `No NX-OS: `route-map NOME permit 10` e depois `match ip address prefix-list LISTA`.`,
+            model: a.model as string,
+            prompt_tokens: 1200,
+            completion_tokens: 40,
+            cache_read_tokens: 1100,
+          };
         case "subagent_stop":
           return true;
         case "background_job_stop":

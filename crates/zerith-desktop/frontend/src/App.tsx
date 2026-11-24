@@ -217,7 +217,7 @@ export default function App() {
       const cur = prev[id];
       if (!cur || cur.busy || cur.blocks.length === 0) return prev;
       const kept = cur.blocks.filter(
-        (b) => b.kind === "note" && Boolean(b.learned?.length),
+        (b) => b.kind === "note" && (Boolean(b.learned?.length) || !!b.btw),
       );
       if (kept.length === cur.blocks.length) return prev;
       return { ...prev, [id]: { ...cur, blocks: kept } };
@@ -821,6 +821,43 @@ export default function App() {
       setStatus("Uso: /goal <objetivo>");
       return;
     }
+    // /btw <pergunta>: à parte, mesmo com o turno rodando. O cartão vive só
+    // na tela: não é mensagem da conversa nem volta ao modelo.
+    const btwMatch = /^\/btw(?:\s+([\s\S]*))?$/.exec(typed);
+    if (btwMatch) {
+      const question = (btwMatch[1] ?? "").trim();
+      const sid = selectedRef.current;
+      if (!question) return setStatus("Uso: /btw <pergunta>");
+      if (!sid) return setStatus("/btw precisa de uma conversa aberta");
+      if (!model) return setError("Escolha um modelo antes de perguntar");
+      if (!overridePrompt) setDraft("");
+      const btwId = Date.now();
+      // O cartão fica nos blocos do turno (desenhados depois da conversa e
+      // levados para ela no próximo envio), rodando ou não.
+      // Nasce nos blocos do turno; um novo envio pode tê-lo levado para a
+      // conversa, então a resposta troca o cartão onde ele estiver.
+      const mine = (x: Block) => x.kind === "note" && x.btw?.id === btwId;
+      const swap = (list: Block[], b: Block) =>
+        list.some(mine) ? list.map((x) => (mine(x) ? b : x)) : list;
+      const put = (b: Block, first = false) => {
+        updateTurn(sid, (prev) => ({
+          ...prev,
+          blocks: first ? [...prev.blocks, b] : swap(prev.blocks, b),
+        }));
+        if (!first && selectedRef.current === sid) setMessages((prev) => swap(prev, b));
+      };
+      const card = (extra: Partial<NonNullable<Extract<Block, { kind: "note" }>["btw"]>>): Block => ({
+        kind: "note",
+        text: question,
+        btw: { id: btwId, question, ...extra },
+      });
+      put(card({}), true);
+      api
+        .btwAsk(sid, model, question, activeAgent)
+        .then((a) => put(card({ answer: a.text || "(sem resposta)", model: a.model })))
+        .catch((e) => put(card({ error: String(e) })));
+      return;
+    }
     if (!prompt) return;
     const curSelected = selectedRef.current;
     const sendKey = curSelected ?? "__new__";
@@ -999,6 +1036,7 @@ export default function App() {
     effort,
     activeAgent,
     workflowsList,
+    setError,
     folder,
     updateTurn,
     bumpSessionEpoch,

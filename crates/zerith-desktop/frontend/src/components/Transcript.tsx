@@ -16,6 +16,7 @@ import {
   ImageOff,
   Info,
   ListTodo,
+  MessageCircleQuestionMark,
   Pencil,
   Search,
   Sparkles,
@@ -44,6 +45,47 @@ function formatLearnedItemText(item: LearnedItem): string {
     return item.text ? `${item.name}: ${item.text}` : item.name;
   }
   return item.text;
+}
+
+/** `/btw`: a pergunta paralela e a resposta, num cartão recolhível que não é
+ * mensagem da conversa (nunca volta ao modelo). Aberto quando a resposta chega. */
+function BtwNote(props: { btw: NonNullable<Extract<Block, { kind: "note" }>["btw"]> }) {
+  const { question, answer, error, model } = props.btw;
+  const [open, setOpen] = useState(true);
+  const pending = answer == null && error == null;
+  return (
+    <div className={"learned-card btw-card" + (open ? " open" : "")}>
+      <div className="learned-head">
+        <button
+          type="button"
+          className="learned-toggle"
+          aria-expanded={open}
+          onClick={() => setOpen((v) => !v)}
+        >
+          <MessageCircleQuestionMark size={13} strokeWidth={2} className="learned-icon" aria-hidden />
+          <span className="learned-title">Pergunta paralela</span>
+          <span className="learned-preview" title={question}>
+            {question}
+          </span>
+        </button>
+        <span className="learned-chev" aria-hidden="true" onClick={() => setOpen((v) => !v)}>
+          <ChevronRight size={14} strokeWidth={2} className="chev" />
+        </span>
+      </div>
+      {open ? (
+        <div className="learned-body btw-body">
+          {pending ? (
+            <span className="btw-pending">pensando…</span>
+          ) : error != null ? (
+            <span className="btw-error">Não consegui responder: {error}</span>
+          ) : (
+            <Markdown text={answer ?? ""} streaming={false} />
+          )}
+          {model ? <span className="btw-meta">{model} · fora da conversa</span> : null}
+        </div>
+      ) : null}
+    </div>
+  );
 }
 
 /** Antigravity-style collapsible card for what the background review saved after a turn. */
@@ -1280,6 +1322,9 @@ export function Transcript(props: {
             }
             if (b.kind === "subagent") {
               return <SubagentCard key={`sub-${b.id}`} block={b} />;
+            }
+            if (b.kind === "note" && b.btw) {
+              return <BtwNote key={`btw-${b.btw.id}`} btw={b.btw} />;
             }
             if (b.kind === "note" && b.learned?.length) {
               return <LearnedNote key={`n-${nOrd++}`} text={b.text} items={b.learned} />;

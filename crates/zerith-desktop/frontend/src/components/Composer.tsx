@@ -24,6 +24,7 @@ import {
   Gauge,
   History,
   ListChecks,
+  MessageCircleQuestionMark,
   Minimize2,
   Paperclip,
   RotateCcw,
@@ -58,6 +59,7 @@ const isVideoPath = (p: string) => /\.(mp4|m4v|webm|mov)$/i.test(p);
 /// over; `run` is handled by App, which owns the state each one touches.
 export const COMMANDS = [
   ["goal", "Trabalhar até um juiz dar o objetivo como cumprido"],
+  ["btw", "Pergunta paralela, sem entrar na conversa (funciona com o turno rodando)"],
   ["compact", "Resumir o histórico para caber no contexto"],
   ["context", "Quanto do contexto já foi usado"],
   ["rewind", "Voltar ao último ponto de restauração"],
@@ -75,6 +77,7 @@ export type CommandName = (typeof COMMANDS)[number][0];
 
 const COMMAND_ICONS: Record<CommandName, LucideIcon> = {
   goal: Target,
+  btw: MessageCircleQuestionMark,
   compact: Minimize2,
   context: Gauge,
   rewind: RotateCcw,
@@ -342,6 +345,8 @@ export function Composer(props: {
   const send = () => {
     if (props.busy) {
       const t = props.draft.trim();
+      // `/btw` não direciona o turno: vai à parte, com o turno rodando.
+      if (/^\/btw(\s|$)/.test(t)) return props.onSend();
       if (t && props.onSteer) props.onSteer(t);
       return;
     }
@@ -444,9 +449,10 @@ export function Composer(props: {
     if (!trigger || !rows[i]) return;
     const [name, , kind] = rows[i].split("\u0000");
     // Naming the skill in the prompt is what loads it for the model; `/goal`
-    // needs the objective, so it stays in the box for the person to write.
-    if (trigger.kind === "slash" && (kind === "skill" || name === "goal")) {
-      const next = name === "goal" && kind !== "skill" ? "/goal " : `use a skill ${name} `;
+    // and `/btw` need their text, so they stay in the box for the person to write.
+    const typed = name === "goal" || name === "btw";
+    if (trigger.kind === "slash" && (kind === "skill" || typed)) {
+      const next = typed && kind !== "skill" ? `/${name} ` : `use a skill ${name} `;
       props.onDraft(next);
       setCaret(next.length);
       box.current?.focus();

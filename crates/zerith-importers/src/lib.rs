@@ -15,6 +15,7 @@
 mod hermes;
 mod hermes_jsonl;
 pub mod hermes_setup;
+pub mod plan;
 
 pub use hermes::{
     detect, import, import_selected, preview, ImportReport, SessionPreview, SourceLayout,

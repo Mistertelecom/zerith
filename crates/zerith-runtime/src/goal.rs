@@ -301,6 +301,18 @@ pub enum End {
     Failed,
 }
 
+impl End {
+    /// O veredito final em uma palavra (`done`, `blocked`...), para JSON e eventos.
+    pub fn label(self) -> &'static str {
+        match self {
+            End::Done => "done",
+            End::Blocked => "blocked",
+            End::Cancelled => "cancelled",
+            End::Failed => "failed",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Outcome {
     pub end: End,

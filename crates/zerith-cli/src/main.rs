@@ -95,7 +95,7 @@ usage:
   zerith tokensaver [show|ponytail <off|lite|full|ultra>|caveman <off|lite|full|ultra|wenyan>|rtk <on|off>]
   zerith repl [--session <id>|--resume [id|name]|--continue] [--model <id>] [--mode <mode>] [--effort <off|low|medium|high|xhigh|max>] [--remote <uri|alias>]
   zerith chat [--session <id>|--resume [id|name]|--continue] [--fork] [--model <id>] [--remote <uri|alias>] [<prompt>]
-  zerith -p <prompt> [--output-format text|json|stream-json] [--model M]
+  zerith -p <prompt> | -p --goal <objetivo> [--output-format text|json|stream-json] [--model M]
         [--session ID | --resume [id|name] | --continue] [--fork]
         [--max-turns N] [--effort <off|low|medium|high|xhigh|max>]
         [--orchestrator] [--agent <nome>]
@@ -746,6 +746,7 @@ fn execute_cli_turn(
     model: &str,
     prompt: &str,
     reasoning_effort: Option<&str>,
+    sink: &mut dyn FnMut(&RunEvent),
 ) -> Result<TurnReport, Box<dyn std::error::Error>> {
     let guards = Guards::new(ctx.settings.clone(), ctx.policy, session_id.to_string());
     ctx.tools.register(guards.enter_plan_mode_tool());
@@ -796,6 +797,7 @@ fn execute_cli_turn(
         ctx.cancel,
         |e| {
             digest.observe(&e);
+            sink(&e);
             match e {
                 RunEvent::Delta(text) => {
                     streamed = true;
@@ -981,7 +983,7 @@ fn chat(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>
         spill_dir: paths.root().join("spill"),
         cancel: &cancel,
     };
-    let res = execute_cli_turn(&mut ctx, &session_id, &model, &prompt, None);
+    let res = execute_cli_turn(&mut ctx, &session_id, &model, &prompt, None, &mut |_| {});
 
     let end = zerith_core::hooks::run_hooks(
         zerith_core::hooks::HookEvent::SessionEnd,
@@ -1011,6 +1013,7 @@ enum ReplSlash<'a> {
     Mode(Option<&'a str>),
     Effort(Option<&'a str>),
     Rewind(Option<i64>),
+    Goal(Option<&'a str>),
     Unknown(&'a str),
 }
 
@@ -1032,6 +1035,7 @@ fn parse_repl_slash(line: &str) -> Option<ReplSlash<'_>> {
         "/mode" => ReplSlash::Mode(rest),
         "/effort" => ReplSlash::Effort(rest),
         "/rewind" => ReplSlash::Rewind(rest.and_then(|s| s.parse().ok())),
+        "/goal" => ReplSlash::Goal(rest),
         other => ReplSlash::Unknown(other),
     })
 }
@@ -1150,12 +1154,13 @@ fn repl(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>
         if trimmed.is_empty() {
             continue;
         }
+        let mut goal: Option<String> = None;
         if let Some(cmd) = parse_repl_slash(trimmed) {
             match cmd {
                 ReplSlash::Help => eprintln!(
                     "/help  /model <id>  /mode <default|acceptEdits|plan|bypass>  \
                      /effort <off|low|medium|high|xhigh|max>  /compact  /rewind [N]  \
-                     /sessions [id]  /clear  /exit"
+                     /sessions [id]  /goal <objetivo>  /clear  /exit"
                 ),
                 ReplSlash::Exit => break,
                 ReplSlash::Clear => {
@@ -1271,26 +1276,32 @@ fn repl(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>
                     }
                     Err(e) => eprintln!("zerith: {e}"),
                 },
+                ReplSlash::Goal(None) => eprintln!("zerith: uso: /goal <objetivo>"),
+                ReplSlash::Goal(Some(objective)) => goal = Some(objective.to_string()),
                 ReplSlash::Unknown(other) => {
                     eprintln!("zerith: comando desconhecido {other} (tente /help)");
                 }
             }
-            continue;
+            if goal.is_none() {
+                continue;
+            }
         }
 
         let sid = match &session_id {
             Some(s) => s.clone(),
             None => {
-                let s = select_session(&store, &SessionArgs::default(), trimmed)?;
+                let title = goal.as_deref().unwrap_or(trimmed);
+                let s = select_session(&store, &SessionArgs::default(), title)?;
                 let _ = store.set_workspace(&s, &workspace.to_string_lossy());
                 session_id = Some(s.clone());
                 s
             }
         };
+        let typed = goal.as_deref().unwrap_or(trimmed);
         let expanded = if mcp.is_empty() {
-            trimmed.to_string()
+            typed.to_string()
         } else {
-            let (text, errors) = mcp.expand_mentions(trimmed);
+            let (text, errors) = mcp.expand_mentions(typed);
             for e in &errors {
                 eprintln!("zerith: {e}");
             }
@@ -1323,7 +1334,40 @@ fn repl(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>
             spill_dir: paths.root().join("spill"),
             cancel: &cancel,
         };
-        if let Err(e) = execute_cli_turn(&mut ctx, &sid, &model, &prompt, effort.as_deref()) {
+        if goal.is_some() {
+            // ponytail: o REPL não instala tratador de sinal (o contador de
+            // `signals` não zera entre turnos), então Ctrl+C encerra o REPL e
+            // o objetivo junto. Cancelar só o objetivo pede um `Cancel` por
+            // turno ligado a um tratador que zere.
+            let judge = zerith_runtime::goal::ClientJudge::new(Some(&settings), &client, &model);
+            eprintln!("zerith: objetivo ativo (juiz: {})", judge.model);
+            let out = zerith_runtime::goal::run(
+                &prompt,
+                &judge,
+                &cancel,
+                zerith_runtime::goal::MAX_ROUNDS,
+                |_, p| {
+                    let mut ev = zerith_runtime::goal::Evidence::new(&workspace);
+                    execute_cli_turn(&mut ctx, &sid, &model, p, effort.as_deref(), &mut |e| {
+                        ev.observe(e)
+                    })
+                    .map(|r| zerith_runtime::goal::Round {
+                        answer: r.text,
+                        evidence: ev,
+                    })
+                    .map_err(|e| redact(&e.to_string()))
+                },
+                |l| eprintln!("{l}"),
+            );
+            eprintln!("{}", out.line());
+        } else if let Err(e) = execute_cli_turn(
+            &mut ctx,
+            &sid,
+            &model,
+            &prompt,
+            effort.as_deref(),
+            &mut |_| {},
+        ) {
             eprintln!("zerith: {}", redact(&e.to_string()));
         }
     }
@@ -1795,6 +1839,11 @@ mod tests {
             Some(ReplSlash::Sessions(Some("abc")))
         );
         assert_eq!(parse_repl_slash("/compact"), Some(ReplSlash::Compact));
+        assert_eq!(
+            parse_repl_slash("/goal  A01-A09 passarem "),
+            Some(ReplSlash::Goal(Some("A01-A09 passarem")))
+        );
+        assert_eq!(parse_repl_slash("/goal"), Some(ReplSlash::Goal(None)));
         assert_eq!(parse_repl_slash("/clear"), Some(ReplSlash::Clear));
         assert_eq!(parse_repl_slash("oi tudo bem"), None);
     }

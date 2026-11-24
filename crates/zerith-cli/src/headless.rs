@@ -383,7 +383,7 @@ pub fn run(paths: &Paths, args: &[String]) -> Result<(), Boxed> {
             zerith_runtime::guards::Guards::new(settings.clone(), &mut policy, session_id.clone());
         tools.register(g.enter_plan_mode_tool());
         tools.register(g.exit_plan_mode_tool());
-        guards = Some(g);
+        guards = Some(std::sync::Arc::new(g));
         // Create skills/agents, as in the window.
         let have: Vec<String> = tools.specs().iter().map(|s| s.name.clone()).collect();
         for t in zerith_tools::authoring_tools(zerith_tools::Authoring {
@@ -426,36 +426,6 @@ pub fn run(paths: &Paths, args: &[String]) -> Result<(), Boxed> {
     let cancel = Cancel::default();
     signals::install(cancel.clone());
 
-    let mut opts = AgentOptions::for_profile(zerith_runtime::active_profile());
-    opts.spill_dir = Some(paths.root().join("spill"));
-    // Same pre-turn summary as the window: a long `--resume` chain would
-    // otherwise only be trimmed under pressure, mid-turn.
-    match zerith_runtime::compact::auto_compact_routed(
-        &store,
-        &settings,
-        &client,
-        &session_id,
-        &model,
-        opts.history,
-        &cancel,
-    ) {
-        Ok(Some(r)) => eprintln!(
-            "zerith: histórico resumido ({} → {} tokens)",
-            r.tokens_before, r.tokens_after
-        ),
-        Ok(None) => {}
-        Err(e) => eprintln!("zerith: resumo automático falhou: {e}"),
-    }
-    if let Some(g) = guards {
-        opts.tools = Some(&tools);
-        opts.policy = Some(&policy);
-        opts.middleware.push(Box::new(g));
-    }
-    if let Some(n) = h.max_turns {
-        opts.max_steps = n;
-    }
-    opts.reasoning_effort = h.effort.clone();
-    opts.orchestrator = h.orchestrator;
     let extra_agents = contrib.as_ref().map(|c| c.agents.as_slice()).unwrap_or(&[]);
     let agent_def = match h.agent.as_deref() {
         Some(name) => Some(
@@ -468,45 +438,107 @@ pub fn run(paths: &Paths, args: &[String]) -> Result<(), Boxed> {
     let format = h.format;
     let spent = Cell::new(0f64);
     let over_budget = Cell::new(false);
-    let mut digest = zerith_runtime::learn::TurnDigest::new(&prompt);
-    let result = run_agent_turn(
-        &store,
-        &client,
-        TurnContext {
-            memory,
-            scope: Some(&scope),
-            skills: skills.as_ref(),
-            settings: Some(&settings),
-            agent: agent_def.as_ref(),
-            ..TurnContext::default()
-        },
-        opts,
-        &session_id,
-        &model,
-        &prompt,
-        &cancel,
-        |e| {
-            digest.observe(&e);
-            if let (RunEvent::Usage { input, output, .. }, Some((pi, po)), Some(max)) =
-                (&e, prices, h.max_budget_usd)
-            {
-                spent.set(spent.get() + cost_usd(*input, *output, pi, po));
-                // Checked after each model request: the request that crosses
-                // the line has already been paid for.
-                if spent.get() >= max {
-                    over_budget.set(true);
-                    cancel.cancel();
+    // Um turno; com `--goal`, um por rodada (as opções são refeitas a cada um).
+    let run_once = |prompt: &str, sink: &mut dyn FnMut(&RunEvent)| {
+        let mut opts = AgentOptions::for_profile(zerith_runtime::active_profile());
+        opts.spill_dir = Some(paths.root().join("spill"));
+        // Same pre-turn summary as the window: a long `--resume` chain would
+        // otherwise only be trimmed under pressure, mid-turn.
+        match zerith_runtime::compact::auto_compact_routed(
+            &store,
+            &settings,
+            &client,
+            &session_id,
+            &model,
+            opts.history,
+            &cancel,
+        ) {
+            Ok(Some(r)) => eprintln!(
+                "zerith: histórico resumido ({} → {} tokens)",
+                r.tokens_before, r.tokens_after
+            ),
+            Ok(None) => {}
+            Err(e) => eprintln!("zerith: resumo automático falhou: {e}"),
+        }
+        if let Some(g) = &guards {
+            opts.tools = Some(&tools);
+            opts.policy = Some(&policy);
+            // O mesmo Guards em todas as rodadas: o gate de plano guarda o
+            // modo anterior.
+            opts.middleware.push(Box::new(SharedGuards(g.clone())));
+        }
+        if let Some(n) = h.max_turns {
+            opts.max_steps = n;
+        }
+        opts.reasoning_effort = h.effort.clone();
+        opts.orchestrator = h.orchestrator;
+        run_agent_turn(
+            &store,
+            &client,
+            TurnContext {
+                memory,
+                scope: Some(&scope),
+                skills: skills.as_ref(),
+                settings: Some(&settings),
+                agent: agent_def.as_ref(),
+                ..TurnContext::default()
+            },
+            opts,
+            &session_id,
+            &model,
+            prompt,
+            &cancel,
+            |e| {
+                sink(&e);
+                if let (RunEvent::Usage { input, output, .. }, Some((pi, po)), Some(max)) =
+                    (&e, prices, h.max_budget_usd)
+                {
+                    spent.set(spent.get() + cost_usd(*input, *output, pi, po));
+                    // Checked after each model request: the request that crosses
+                    // the line has already been paid for.
+                    if spent.get() >= max {
+                        over_budget.set(true);
+                        cancel.cancel();
+                    }
                 }
-            }
-            if format != OutputFormat::StreamJson {
-                return;
-            }
-            let Some(line) = stream_event_json(e) else {
-                return;
-            };
-            println!("{line}");
-        },
-    );
+                if format != OutputFormat::StreamJson {
+                    return;
+                }
+                let Some(line) = stream_event_json(e) else {
+                    return;
+                };
+                println!("{line}");
+            },
+        )
+    };
+
+    if h.goal {
+        let goal = GoalRun {
+            objective: &prompt,
+            format,
+            settings: &settings,
+            client: &client,
+            model: &model,
+            workspace: &workspace,
+            cancel: &cancel,
+        };
+        let outcome = match run_goal(&goal, run_once) {
+            Err(_) if over_budget.get() => Err(Box::new(ExitWith(
+                1,
+                format!(
+                    "orçamento excedido: US$ {:.4} de US$ {:.4}",
+                    spent.get(),
+                    h.max_budget_usd.unwrap_or(0.0)
+                ),
+            )) as Boxed),
+            o => o,
+        };
+        end_session(&settings, &session_id, &workspace);
+        return outcome;
+    }
+
+    let mut digest = zerith_runtime::learn::TurnDigest::new(&prompt);
+    let result = run_once(&prompt, &mut |e| digest.observe(e));
 
     let outcome = (|| -> Result<(), Boxed> {
         let report = match result {
@@ -600,19 +632,123 @@ pub fn run(paths: &Paths, args: &[String]) -> Result<(), Boxed> {
         Ok(())
     })();
 
+    end_session(&settings, &session_id, &workspace);
+    outcome
+}
+
+fn end_session(settings: &Settings, session_id: &str, workspace: &std::path::Path) {
     let end = zerith_core::hooks::run_hooks(
         zerith_core::hooks::HookEvent::SessionEnd,
         &zerith_core::hooks::HookPayload {
-            session_id: session_id.clone(),
-            cwd: workspace.clone(),
+            session_id: session_id.to_string(),
+            cwd: workspace.to_path_buf(),
             ..Default::default()
         },
-        &settings,
+        settings,
     );
     for e in &end.errors {
         eprintln!("zerith: {e}");
     }
-    outcome
+}
+
+/// Um `Guards` compartilhado entre os turnos de um `--goal`.
+struct SharedGuards(std::sync::Arc<zerith_runtime::guards::Guards>);
+
+impl zerith_runtime::Middleware for SharedGuards {
+    fn before(&self, call: &mut zerith_runtime::ToolInvocation) -> zerith_runtime::Flow {
+        self.0.before(call)
+    }
+    fn after(&self, call: &zerith_runtime::ToolInvocation, out: &mut zerith_runtime::ToolOutcome) {
+        self.0.after(call, out)
+    }
+}
+
+struct GoalRun<'a> {
+    objective: &'a str,
+    format: OutputFormat,
+    settings: &'a Settings,
+    client: &'a Client,
+    model: &'a str,
+    workspace: &'a std::path::Path,
+    cancel: &'a Cancel,
+}
+
+/// `zerith -p --goal "<objetivo>"`: turnos até o juiz dar o objetivo como
+/// cumprido ou bloqueado ([`zerith_runtime::goal`]). Uma linha por rodada no
+/// stderr; o veredito final no stdout (texto) ou no campo `goal` (JSON).
+/// Sai com 0 só em `done`.
+fn run_goal(
+    g: &GoalRun<'_>,
+    run_once: impl Fn(&str, &mut dyn FnMut(&RunEvent)) -> Result<TurnReport, RunError>,
+) -> Result<(), Boxed> {
+    use zerith_runtime::goal;
+    let judge = goal::ClientJudge::new(Some(g.settings), g.client, g.model);
+    eprintln!("zerith: objetivo ativo (juiz: {})", judge.model);
+    let mut last: Option<TurnReport> = None;
+    let mut failure: Option<RunError> = None;
+    let out = goal::run(
+        g.objective,
+        &judge,
+        g.cancel,
+        goal::MAX_ROUNDS,
+        |_, prompt| {
+            let mut ev = goal::Evidence::new(g.workspace);
+            match run_once(prompt, &mut |e| ev.observe(e)) {
+                Ok(r) => {
+                    let answer = r.text.clone();
+                    last = Some(r);
+                    Ok(goal::Round {
+                        answer,
+                        evidence: ev,
+                    })
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    failure = Some(e);
+                    Err(msg)
+                }
+            }
+        },
+        |line| {
+            eprintln!("{line}");
+            if g.format == OutputFormat::StreamJson {
+                println!("{}", serde_json::json!({"type": "goal", "text": line}));
+            }
+        },
+    );
+    if let (goal::End::Failed, Some(e)) = (out.end, failure) {
+        return Err(e.into());
+    }
+    let text = last.as_ref().map_or("", |r| r.text.as_str());
+    match g.format {
+        OutputFormat::Text => {
+            println!("{text}");
+            println!("{}", out.line());
+        }
+        OutputFormat::Json | OutputFormat::StreamJson => {
+            let mut obj = serde_json::json!({
+                "session_id": last.as_ref().map(|r| r.session_id.clone()),
+                "result": text,
+                "goal": {
+                    "verdict": out.end.label(),
+                    "reason": out.reason,
+                    "rounds": out.rounds,
+                },
+            });
+            if g.format == OutputFormat::StreamJson {
+                obj["type"] = "result".into();
+            }
+            println!("{obj}");
+        }
+    }
+    match out.end {
+        goal::End::Done => Ok(()),
+        goal::End::Cancelled => Err(Box::new(ExitWith(
+            signals::received().unwrap_or(143),
+            "cancelado".into(),
+        ))),
+        _ => Err(Box::new(ExitWith(1, out.line()))),
+    }
 }
 
 fn opts_steps(h: &Headless) -> usize {

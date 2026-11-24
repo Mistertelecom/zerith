@@ -225,6 +225,9 @@ pub struct Headless {
     pub orchestrator: bool,
     /// A named agent or bot (`noc-engineer`): its instructions join the prompt.
     pub agent: Option<String>,
+    /// `--goal <objetivo>`: turnos seguidos até o juiz dar o objetivo como
+    /// cumprido (ou bloqueado). O objetivo é o prompt.
+    pub goal: bool,
 }
 
 pub fn is_headless(args: &[String]) -> bool {
@@ -278,8 +281,10 @@ pub fn parse_headless(args: &[String]) -> Result<Headless, String> {
         effort: None,
         orchestrator: false,
         agent: None,
+        goal: false,
     };
     let mut prompt = None;
+    let mut goal = None;
     let mut i = 0;
     while i < args.len() {
         if session_flag(args, &mut i, &mut out.session)? {
@@ -301,8 +306,14 @@ pub fn parse_headless(args: &[String]) -> Result<Headless, String> {
                 .cloned()
                 .ok_or_else(|| format!("{a} precisa de um valor"))
         };
+        // `zerith -p --goal "<objetivo>"`: o `-p` só liga o modo sem REPL.
+        if matches!(a, "-p" | "--print") && args.get(i + 1).is_none_or(|n| n == "--goal") {
+            i += 1;
+            continue;
+        }
         match a {
             "-p" | "--print" => prompt = Some(value()?),
+            "--goal" => goal = Some(value()?),
             "--model" => out.model = Some(value()?),
             "--output-format" => {
                 out.format = match value()?.as_str() {
@@ -362,7 +373,12 @@ pub fn parse_headless(args: &[String]) -> Result<Headless, String> {
         i += 2;
     }
     out.session.check()?;
+    if goal.is_some() && prompt.is_some() {
+        return Err("use -p --goal <objetivo> (o objetivo é o prompt)".into());
+    }
+    out.goal = goal.is_some();
     out.prompt = prompt
+        .or(goal)
         .filter(|p| !p.trim().is_empty())
         .ok_or("-p precisa de um prompt")?;
     Ok(out)
@@ -692,6 +708,7 @@ mod tests {
         assert!(is_headless(&args));
         let h = parse_headless(&args).unwrap();
         assert_eq!(h.prompt, "olá");
+        assert!(!h.goal);
         assert_eq!(h.format, OutputFormat::StreamJson);
         assert_eq!(h.model.as_deref(), Some("m"));
         assert_eq!(h.session.target, Target::Key("s1".into()));
@@ -734,6 +751,20 @@ mod tests {
                 .session
                 .fork
         );
+    }
+
+    #[test]
+    fn goal_is_the_prompt_of_a_headless_run() {
+        for args in [
+            &["-p", "--goal", "A01-A09 passarem"][..],
+            &["--goal", "A01-A09 passarem", "-p"][..],
+        ] {
+            let h = parse_headless(&v(args)).unwrap();
+            assert!(h.goal);
+            assert_eq!(h.prompt, "A01-A09 passarem");
+        }
+        assert!(parse_headless(&v(&["-p", "x", "--goal", "y"])).is_err());
+        assert!(parse_headless(&v(&["-p", "--goal", " "])).is_err());
     }
 
     #[test]

@@ -409,8 +409,7 @@ fn judge_round(judge: &dyn Judge, input: &str, cancel: &Cancel) -> Option<Verdic
 
 /// Roda o objetivo. `turn(rodada, instrução)` roda um turno do host e devolve
 /// a resposta e as evidências (`Err` = o turno falhou; se `cancel` estiver
-/// ligado, é cancelamento). `note` recebe uma linha por rodada que continua
-/// e os avisos.
+/// ligado, é cancelamento). `note` recebe uma linha por rodada que continua.
 pub fn run(
     objective: &str,
     judge: &dyn Judge,
@@ -468,12 +467,10 @@ pub fn run(
                         round,
                     );
                 }
-                note(&format!(
-                    "Objetivo: rodada {round} — aviso: o juiz não deu veredito válido; seguindo como continuar"
-                ));
+                // O aviso vai na própria linha da rodada.
                 Verdict {
                     kind: Kind::Continue,
-                    reason: "o juiz não conseguiu avaliar a rodada; siga rumo ao objetivo e mostre a evidência".into(),
+                    reason: "(aviso: o juiz não deu veredito válido) siga rumo ao objetivo e mostre a evidência".into(),
                     next_step: None,
                 }
             }
@@ -727,9 +724,9 @@ mod tests {
         assert_eq!((out.end, out.rounds), (End::Blocked, 3));
         assert!(out.reason.contains("juiz"));
         assert_eq!(*judge.1.borrow(), 6);
-        // Rodada 1: continuar; rodada 2: aviso + continuar.
-        assert_eq!(notes.len(), 3);
-        assert!(notes[1].contains("rodada 2 — aviso"));
+        // Uma linha por rodada; a da rodada 2 leva o aviso.
+        assert_eq!(notes.len(), 2);
+        assert!(notes[1].starts_with("Objetivo: rodada 2 — continuar: (aviso"));
     }
 
     #[test]

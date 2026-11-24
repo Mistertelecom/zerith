@@ -139,7 +139,9 @@ export type TurnEvent =
       modelUsed: string | null;
     }
   | { type: "failed"; message: string }
-  | { type: "modeChanged"; mode: string };
+  | { type: "modeChanged"; mode: string }
+  /** `/goal`: `state` = start, continue, done, blocked, cancelled ou failed. */
+  | { type: "goal"; state: string; text: string };
 
 /** A provider preset: only the defaults that save typing. */
 export interface Preset {
@@ -770,6 +772,8 @@ export const api = {
     orchestrator?: boolean;
     executorModel?: string | null;
     history?: number;
+    /** `/goal`: `prompt` é o objetivo; o backend roda rodadas até o juiz decidir. */
+    goal?: boolean;
   }) =>
     invoke<void>("send_turn", {
       args: {
@@ -781,6 +785,7 @@ export const api = {
         reasoning_effort: args.reasoningEffort ?? null,
         orchestrator: !!args.orchestrator,
         executor_model: args.executorModel ?? null,
+        goal: !!args.goal,
         // 0 = the profile's history window (the core decides).
         history: args.history ?? 0,
       },

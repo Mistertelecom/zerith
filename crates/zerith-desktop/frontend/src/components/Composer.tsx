@@ -31,6 +31,7 @@ import {
   Sparkles,
   Square,
   SquarePen,
+  Target,
   X,
   type LucideIcon,
 } from "lucide-react";
@@ -56,6 +57,7 @@ const isVideoPath = (p: string) => /\.(mp4|m4v|webm|mov)$/i.test(p);
 /// What `/` offers. The names are the old window's, so muscle memory carries
 /// over; `run` is handled by App, which owns the state each one touches.
 export const COMMANDS = [
+  ["goal", "Trabalhar até um juiz dar o objetivo como cumprido"],
   ["compact", "Resumir o histórico para caber no contexto"],
   ["context", "Quanto do contexto já foi usado"],
   ["rewind", "Voltar ao último ponto de restauração"],
@@ -72,6 +74,7 @@ export const COMMANDS = [
 export type CommandName = (typeof COMMANDS)[number][0];
 
 const COMMAND_ICONS: Record<CommandName, LucideIcon> = {
+  goal: Target,
   compact: Minimize2,
   context: Gauge,
   rewind: RotateCcw,
@@ -440,9 +443,10 @@ export function Composer(props: {
   const accept = (i: number) => {
     if (!trigger || !rows[i]) return;
     const [name, , kind] = rows[i].split("\u0000");
-    if (trigger.kind === "slash" && kind === "skill") {
-      // Naming the skill in the prompt is what loads it for the model.
-      const next = `use a skill ${name} `;
+    // Naming the skill in the prompt is what loads it for the model; `/goal`
+    // needs the objective, so it stays in the box for the person to write.
+    if (trigger.kind === "slash" && (kind === "skill" || name === "goal")) {
+      const next = name === "goal" && kind !== "skill" ? "/goal " : `use a skill ${name} `;
       props.onDraft(next);
       setCaret(next.length);
       box.current?.focus();

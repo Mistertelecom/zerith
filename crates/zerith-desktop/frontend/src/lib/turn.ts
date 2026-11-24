@@ -186,6 +186,13 @@ export function applyEvent(prev: TurnState, ev: TurnEvent): TurnState {
     case "notice":
       state.blocks = [...state.blocks, { kind: "note", text: ev.text }];
       return state;
+    case "goal": {
+      // Uma rodada acabou: a resposta dela fecha, e a próxima abre outra.
+      const last = state.blocks[state.blocks.length - 1];
+      if (last?.kind === "assistant" && last.streaming) assistant(state).streaming = false;
+      state.blocks = [...state.blocks, { kind: "note", text: ev.text }];
+      return state;
+    }
     case "steered":
       state.blocks = [...state.blocks, { kind: "note", text: `Direcionado: ${ev.text}` }];
       return state;

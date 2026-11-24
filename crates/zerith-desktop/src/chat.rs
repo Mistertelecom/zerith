@@ -134,6 +134,10 @@ pub struct SendArgs {
     pub orchestrator: bool,
     #[serde(default)]
     pub executor_model: Option<String>,
+    /// `/goal`: `prompt` é o objetivo, e o turno vira o laço de
+    /// [`turn::run_goal`] (o mesmo slot, o mesmo botão de parar).
+    #[serde(default)]
+    pub goal: bool,
     // No `history`: the replay window is the execution profile's
     // (`history_window`), read by the turn. An old window still sending one
     // is fine, serde ignores the field.
@@ -179,6 +183,7 @@ pub fn spawn_monitor_waker(app: AppHandle) {
                 if notices.is_empty() {
                     continue;
                 }
+                args.goal = false; // o aviso é um turno comum, não um novo objetivo
                 args.prompt = format!(
                     "{}\n[aviso automático do Zerith, não escrito pelo usuário: o monitor seguiu rodando depois da sua última resposta]",
                     notices.join("\n\n")
@@ -279,7 +284,8 @@ fn start_turn(
                     move || start_precompact_in(&precompacts, &sid)
                 })),
             };
-            turn::run(
+            let run = if args.goal { turn::run_goal } else { turn::run };
+            run(
                 &setup,
                 &session,
                 &args.model,

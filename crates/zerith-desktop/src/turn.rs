@@ -153,6 +153,12 @@ pub enum TurnEvent {
     Failed {
         message: String,
     },
+    /// `/goal`: uma linha por rodada (`state` = `continue`) e o veredito
+    /// final (`done`, `blocked`, `cancelled`, `failed`).
+    Goal {
+        state: String,
+        text: String,
+    },
 }
 
 /// Translates the runtime's event into the window's shape. `None` means the
@@ -628,6 +634,118 @@ pub fn session_workspace(db: &Path, session: &str) -> PathBuf {
         .map(PathBuf::from)
         .filter(|p| p.is_dir())
         .unwrap_or_else(|| last_workspace(db))
+}
+
+/// `/goal <objetivo>`: [`run`] uma vez por rodada até o juiz de
+/// [`zerith_runtime::goal`] dar o objetivo como cumprido ou bloqueado. O
+/// corpo do turno não muda: cada rodada é um turno comum, com a instrução do
+/// objetivo como prompt. Uma nota `Goal` por rodada e uma no fim; cancelar o
+/// turno (botão de parar) cancela o objetivo.
+#[allow(clippy::too_many_arguments)]
+pub fn run_goal(
+    setup: &Setup,
+    session_id: &str,
+    model: &str,
+    objective: &str,
+    cancel: &Cancel,
+    approvals: &ApprovalGate,
+    questions: &QuestionGate,
+    inbox: Option<&InboxReceiver>,
+    on: &mut dyn FnMut(TurnEvent),
+) -> Result<TurnOutcome, String> {
+    use zerith_runtime::goal;
+    let paths = zerith_core::Paths::with_root(&setup.root);
+    let settings = zerith_core::Settings::load(&paths, Some(&setup.workspace)).settings;
+    let provider = crate::wire::configured_providers_from(&settings, &setup.root)
+        .into_iter()
+        .next()
+        .ok_or_else(|| "Nenhum provedor configurado".to_string())?;
+    let client = Client::new(provider).map_err(|e| zerith_providers::explain::headline(&e))?;
+    let judge = goal::ClientJudge::new(Some(&settings), &client, model);
+    on(TurnEvent::Goal {
+        state: "start".into(),
+        text: format!("Objetivo ativo (juiz: {}): {objective}", judge.model),
+    });
+    let mut last = TurnOutcome::Done;
+    // `turn` e `note` emitem pelo mesmo `on`.
+    let on = std::cell::RefCell::new(on);
+    let out = goal::run(
+        objective,
+        &judge,
+        cancel,
+        goal::MAX_ROUNDS,
+        |_, prompt| {
+            let mut ev = goal::Evidence::new(&setup.workspace);
+            let mut on = on.borrow_mut();
+            // Só os eventos que o juiz lê; a janela recebe todos.
+            let mut tap = |e: TurnEvent| {
+                match &e {
+                    TurnEvent::ToolCall { id, name, args } => ev.observe(&RunEvent::ToolCall {
+                        id: id.clone(),
+                        name: name.clone(),
+                        args: args.clone(),
+                    }),
+                    TurnEvent::ToolResult {
+                        id,
+                        name,
+                        ok,
+                        preview,
+                    } => ev.observe(&RunEvent::ToolResult {
+                        id: id.clone(),
+                        name: name.clone(),
+                        ok: *ok,
+                        output_preview: preview.clone(),
+                    }),
+                    _ => {}
+                }
+                (*on)(e);
+            };
+            let mut answer = String::new();
+            let mut tap_done = |e: TurnEvent| {
+                if let TurnEvent::Done { text, .. } = &e {
+                    answer = text.clone();
+                }
+                tap(e);
+            };
+            last = run(
+                setup,
+                session_id,
+                model,
+                prompt,
+                cancel,
+                approvals,
+                questions,
+                inbox,
+                &mut tap_done,
+            )?;
+            match &last {
+                TurnOutcome::Done => Ok(goal::Round {
+                    answer,
+                    evidence: ev,
+                }),
+                TurnOutcome::Cancelled => Err("cancelado".into()),
+                TurnOutcome::Failed(e) => Err(e.clone()),
+            }
+        },
+        |line| {
+            (*on.borrow_mut())(TurnEvent::Goal {
+                state: "continue".into(),
+                text: line.to_string(),
+            })
+        },
+    );
+    (*on.borrow_mut())(TurnEvent::Goal {
+        state: out.end.label().into(),
+        text: out.line(),
+    });
+    Ok(match out.end {
+        goal::End::Cancelled => TurnOutcome::Cancelled,
+        // `run` já emitiu o `Failed` do turno.
+        goal::End::Failed if matches!(last, TurnOutcome::Failed(_)) => last,
+        // Erro antes do turno (provedor, store): quem chamou emite o `Failed`.
+        goal::End::Failed => return Err(out.reason),
+        goal::End::Done | goal::End::Blocked => TurnOutcome::Done,
+    })
 }
 
 #[cfg(test)]

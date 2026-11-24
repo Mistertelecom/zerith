@@ -812,7 +812,14 @@ export default function App() {
   }, [updateTurn, flushDeltas, bumpSessionEpoch]);
 
   const send = useCallback(async (overridePrompt?: string) => {
-    const prompt = (overridePrompt ?? draft).trim();
+    const typed = (overridePrompt ?? draft).trim();
+    // `/goal <objetivo>`: o objetivo vira o prompt e o backend roda o laço.
+    const goalMatch = /^\/goal(?:\s+([\s\S]*))?$/.exec(typed);
+    const prompt = goalMatch ? (goalMatch[1] ?? "").trim() : typed;
+    if (goalMatch && !prompt) {
+      setStatus("Uso: /goal <objetivo>");
+      return;
+    }
     if (!prompt) return;
     const curSelected = selectedRef.current;
     const sendKey = curSelected ?? "__new__";
@@ -947,7 +954,7 @@ export default function App() {
       setMessages((prev) => [
         ...prev,
         ...done,
-        { kind: "user", text: prompt },
+        { kind: "user", text: typed },
       ]);
       bumpSessionEpoch(id);
       cancelRequestedRef.current.delete(id);
@@ -966,6 +973,7 @@ export default function App() {
         orchestrator,
         executorModel: orchestrator ? executorModel || model : null,
         history: 0,
+        goal: !!goalMatch,
       });
     } catch (e) {
       setError(String(e));

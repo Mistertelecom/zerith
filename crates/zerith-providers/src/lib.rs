@@ -20,6 +20,7 @@ pub mod media;
 pub mod models;
 pub mod oauth;
 mod openai;
+pub mod pricing;
 mod retry;
 pub mod stream;
 

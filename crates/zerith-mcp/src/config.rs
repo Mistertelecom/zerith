@@ -413,9 +413,44 @@ pub fn parse_add(args: &[String]) -> Result<ServerConfig, String> {
     Ok(server)
 }
 
+/// `${VAR}` / `${VAR:-padrão}` trocados pelo valor da variável de ambiente
+/// (vazio se não existir e sem padrão). É assim que um servidor importado do
+/// Claude Code ou do Codex referencia um segredo sem que o valor seja copiado
+/// para o `mcp.toml`. `$` sem chave fica como está.
+pub fn expand_env(value: &str, env: impl Fn(&str) -> Option<String>) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(start) = rest.find("${") {
+        let Some(len) = rest[start..].find('}') else {
+            break;
+        };
+        out.push_str(&rest[..start]);
+        let inner = &rest[start + 2..start + len];
+        let (name, default) = match inner.split_once(":-") {
+            Some((n, d)) => (n, Some(d)),
+            None => (inner, None),
+        };
+        match env(name).filter(|v| !v.is_empty()) {
+            Some(v) => out.push_str(&v),
+            None => out.push_str(default.unwrap_or("")),
+        }
+        rest = &rest[start + len + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn env_placeholders_expand_from_the_environment() {
+        let env = |k: &str| (k == "TOKEN").then(|| "abc".to_string());
+        assert_eq!(expand_env("Bearer ${TOKEN}", env), "Bearer abc");
+        assert_eq!(expand_env("${NOPE:-x}/${NOPE}", env), "x/");
+        assert_eq!(expand_env("$HOME e ${aberto", env), "$HOME e ${aberto");
+    }
 
     fn v(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| s.to_string()).collect()

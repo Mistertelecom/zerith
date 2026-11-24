@@ -78,7 +78,10 @@ impl Server {
         let timeout = self.timeout();
         let pairs = |m: &std::collections::BTreeMap<String, String>| {
             m.iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
+                .map(|(k, v)| {
+                    let v = crate::config::expand_env(v, |n| std::env::var(n).ok());
+                    (k.clone(), v)
+                })
                 .collect::<Vec<_>>()
         };
         match (&self.cfg.command, &self.cfg.url) {

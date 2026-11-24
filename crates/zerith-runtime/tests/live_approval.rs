@@ -68,7 +68,9 @@ fn a_real_model_asks_to_write_and_the_approval_lets_it() {
          exatamente: zerith. Não pergunte nada, só chame a ferramenta.",
         &Cancel::default(),
         |e| match e {
-            RunEvent::ApprovalNeeded { id, tool, summary } => {
+            RunEvent::ApprovalNeeded {
+                id, tool, summary, ..
+            } => {
                 eprintln!("aprovação pedida: {tool} — {summary}");
                 asked = Some(tool);
                 tx.answer(id, Approval::AllowOnce);

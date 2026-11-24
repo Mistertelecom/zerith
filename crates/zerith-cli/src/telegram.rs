@@ -841,7 +841,7 @@ fn handle_callback(
     let ack = match sender {
         Some(s) if s.answer(req_id, decision) => match decision {
             Approval::AllowOnce => "Permitido 1x",
-            Approval::AllowSession => "Permitido na sessão",
+            Approval::AllowSession | Approval::AllowProject => "Permitido na sessão",
             Approval::Deny => "Negado",
         },
         _ => "Solicitação expirada",
@@ -959,7 +959,10 @@ fn run_telegram_turn(t: TelegramTurnArgs<'_>) -> std::result::Result<(), String>
                     generated.extend(generated_files(output_preview));
                 }
             }
-            if let RunEvent::ApprovalNeeded { id, tool, summary } = e {
+            if let RunEvent::ApprovalNeeded {
+                id, tool, summary, ..
+            } = e
+            {
                 if let Ok(mut map) = t.approvals.lock() {
                     map.insert((t.chat_id, id), approver.clone());
                 }

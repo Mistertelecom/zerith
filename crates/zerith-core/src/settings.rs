@@ -862,6 +862,25 @@ impl Settings {
                 Err(e) => out.errors.push(e),
             }
         }
+        // "Sempre neste projeto": the person's own allow rules for this
+        // folder, kept beside the user layer (not in the repo, which only
+        // tightens).
+        if let Some(dir) = project_dir {
+            match project_allow(paths, dir) {
+                Ok(rules) if !rules.is_empty() => {
+                    let mut perms = Table::new();
+                    perms.insert(
+                        "allow".into(),
+                        Value::Array(rules.into_iter().map(Value::String).collect()),
+                    );
+                    let mut t = Table::new();
+                    t.insert("permissions".into(), Value::Table(perms));
+                    merge(&mut merged, t, "project-allow", "", &mut out.sources);
+                }
+                Ok(_) => {}
+                Err(e) => out.errors.push(e),
+            }
+        }
 
         let env_layer = env_table(&env);
         match Value::Table(env_layer.clone()).try_into::<Settings>() {
@@ -918,6 +937,94 @@ impl Settings {
         std::fs::rename(&tmp, &path)?;
         Ok(())
     }
+}
+
+/// How a project folder is named in `project-permissions.json`: canonical,
+/// `/` separators, and case-folded on Windows, so `C:\X` and `c:/x/` match.
+pub fn project_key(dir: &Path) -> String {
+    let p = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let s = p.to_string_lossy();
+    let s = s.strip_prefix(r"\\?\").unwrap_or(&s).replace('\\', "/");
+    let s = s.trim_end_matches('/').to_string();
+    if cfg!(windows) {
+        s.to_lowercase()
+    } else {
+        s
+    }
+}
+
+/// The file as JSON; absent is an empty object. Corrupt is an error, so a
+/// write never replaces what the person wrote with a fresh file.
+fn read_project_permissions(path: &Path) -> Result<serde_json::Value, String> {
+    match std::fs::read_to_string(path) {
+        Ok(t) if t.trim().is_empty() => Ok(serde_json::json!({})),
+        Ok(t) => match serde_json::from_str::<serde_json::Value>(&t) {
+            Ok(v) if v.is_object() => Ok(v),
+            Ok(_) => Err(format!("{}: esperado um objeto JSON", path.display())),
+            Err(e) => Err(format!("{}: JSON inválido: {e}", path.display())),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(serde_json::json!({})),
+        Err(e) => Err(format!("{}: não foi possível ler: {e}", path.display())),
+    }
+}
+
+/// Allow rules saved for this project with "sempre neste projeto".
+pub fn project_allow(paths: &Paths, project: &Path) -> Result<Vec<String>, String> {
+    let v = read_project_permissions(&paths.project_permissions())?;
+    Ok(v["projects"][project_key(project)]["allow"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|r| r.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// Adds `rule` to this project's allow list in `project-permissions.json`,
+/// keeping every other key of the file. Written to a temp file then renamed,
+/// so a crash leaves the old file. `Ok(false)`: the rule was already there.
+pub fn add_project_allow(paths: &Paths, project: &Path, rule: &str) -> crate::Result<bool> {
+    let path = paths.project_permissions();
+    let mut v = read_project_permissions(&path).map_err(crate::Error::Other)?;
+    let key = project_key(project);
+    let obj = v.as_object_mut().expect("checked object");
+    let projects = obj
+        .entry("projects")
+        .or_insert_with(|| serde_json::json!({}));
+    if !projects.is_object() {
+        *projects = serde_json::json!({});
+    }
+    let entry = projects
+        .as_object_mut()
+        .expect("object")
+        .entry(key)
+        .or_insert_with(|| serde_json::json!({}));
+    if !entry.is_object() {
+        *entry = serde_json::json!({});
+    }
+    let allow = entry
+        .as_object_mut()
+        .expect("object")
+        .entry("allow")
+        .or_insert_with(|| serde_json::json!([]));
+    if !allow.is_array() {
+        *allow = serde_json::json!([]);
+    }
+    let list = allow.as_array_mut().expect("array");
+    if list.iter().any(|r| r.as_str() == Some(rule)) {
+        return Ok(false);
+    }
+    list.push(serde_json::Value::String(rule.to_string()));
+    let text = serde_json::to_string_pretty(&v)
+        .map_err(|e| crate::Error::Other(format!("falha ao serializar: {e}")))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(true)
 }
 
 fn read_layer(path: &Path) -> Result<Option<Table>, String> {
@@ -1124,6 +1231,44 @@ mod tests {
         let l = Settings::load_with_env(&paths, None, |_| None);
         assert!(l.errors[0].contains(":1:"), "{}", l.errors[0]);
         assert_eq!(l.settings, Settings::default());
+    }
+
+    #[test]
+    fn project_allow_is_idempotent_keeps_other_keys_and_loads_for_that_project_only() {
+        let dir = scratch();
+        let paths = Paths::with_root(dir.path().join("z"));
+        let (proj, other) = (dir.path().join("p"), dir.path().join("q"));
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        // Created when absent.
+        assert!(add_project_allow(&paths, &proj, "shell(cargo test *)").unwrap());
+        assert!(!add_project_allow(&paths, &proj, "shell(cargo test *)").unwrap());
+        // Other keys of the file survive a write.
+        let file = paths.project_permissions();
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        v["nota"] = serde_json::json!("minha");
+        std::fs::write(&file, v.to_string()).unwrap();
+        assert!(add_project_allow(&paths, &proj, "shell(snmpwalk *)").unwrap());
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(v["nota"], "minha");
+        assert_eq!(
+            project_allow(&paths, &proj).unwrap(),
+            vec!["shell(cargo test *)", "shell(snmpwalk *)"]
+        );
+        // Loaded as allow for that project, not for another one.
+        let s = Settings::load_with_env(&paths, Some(&proj), |_| None).settings;
+        assert!(s
+            .permissions
+            .allow
+            .contains(&"shell(snmpwalk *)".to_string()));
+        let s = Settings::load_with_env(&paths, Some(&other), |_| None).settings;
+        assert!(s.permissions.allow.is_empty());
+        // A corrupt file is never overwritten.
+        std::fs::write(&file, "{ x").unwrap();
+        assert!(add_project_allow(&paths, &proj, "shell(ping *)").is_err());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "{ x");
     }
 
     #[test]

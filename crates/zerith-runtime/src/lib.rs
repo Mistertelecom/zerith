@@ -96,6 +96,14 @@ pub enum RunEvent {
         id: u64,
         tool: String,
         summary: String,
+        /// The allow rule `Approval::AllowProject` would save for the
+        /// project. `None`: "sempre neste projeto" is not offered.
+        always: Option<String>,
+    },
+    /// A line for the person (not the model): an allow rule was saved, and
+    /// where, so it can be undone.
+    Notice {
+        text: String,
     },
     /// Token counts of one model request, as the provider reported them.
     Usage {

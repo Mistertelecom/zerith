@@ -69,6 +69,25 @@ expansão de variáveis e scripts que o comando executa escapam da análise. A
 fronteira real é o sandbox (`docs/sandbox.md`, parcial) e a aprovação do
 usuário.
 
+### "Sempre neste projeto"
+
+No pedido de aprovação, além de "uma vez" e "nesta conversa", a terceira
+escolha grava uma regra `allow` para a pasta do projeto em
+`<dados do Zerith>/project-permissions.json` (`{"projects": {"<pasta>":
+{"allow": [...]}}}`), que entra como camada `project-allow` no próximo turno.
+Fica com o usuário, não no repositório: o `.zerith/settings.toml` do projeto
+só aperta. Para desfazer, apague a linha do arquivo.
+
+A regra é o prefixo do comando, como o opencode (`git status *`) e as prefix
+rules do Codex: `cargo test -p x` → `shell(cargo test *)`, `snmpwalk -v2c ...`
+→ `shell(snmpwalk *)`; `timeout`/`env` são ignorados, `sudo` fica na regra.
+`web_fetch` grava o site (`web_fetch(https://docs.rs/*)`); `web_search` e
+`mcp__*`, a ferramenta inteira. Não é oferecida para: comando composto,
+redirecionado ou com `$()`; ssh/telnet e terminais de rede; prefixos que
+liberariam qualquer código (`bash`, `python`, `git` sozinho, `rm`, `npm
+run`...); escrita/leitura fora do workspace ou em arquivo de controle;
+`web_fetch` com rede privada; pedido de hook ou de regra `ask`.
+
 ### Leitura sempre liberada
 
 Comandos somente-leitura (`ls`, `cat`, `head`, `tail`, `pwd`, `echo`, `wc`,

@@ -46,6 +46,13 @@ impl Paths {
         self.root.join("settings.toml")
     }
 
+    /// Allow rules saved with "sempre neste projeto", by project folder (see
+    /// `settings::add_project_allow`). Kept with the user, never in the repo:
+    /// a project's own `.zerith/` may only tighten.
+    pub fn project_permissions(&self) -> PathBuf {
+        self.root.join("project-permissions.json")
+    }
+
     /// User-level project instructions, applied to every project.
     pub fn instructions(&self) -> PathBuf {
         self.root.join("AGENTS.md")

@@ -316,7 +316,7 @@ impl Pipeline<'_> {
                 need = Some((format!("⚠️ COMANDO DESTRUTIVO DE REDE: {summary}"), true));
                 if let Some((why, forced)) = need {
                     if let Err(refusal) =
-                        self.approve(&inv.name, &grant_override, why, forced, on_event)
+                        self.approve(&inv.name, &grant_override, why, forced, None, on_event)
                     {
                         return settle(inv, false, refusal);
                     }
@@ -325,9 +325,20 @@ impl Pipeline<'_> {
             }
         }
         if let Some((why, forced)) = need {
+            // "Sempre neste projeto" only where an allow rule is what stops
+            // the asking: never past a hook or an `ask` rule (allow does not
+            // beat them), remote access, a sensitive boundary or a network
+            // device (all `forced`). A `mcp__*` call asked only because it has
+            // no rule is the one forced ask an allow rule settles.
+            let mcp_unruled =
+                inv.name.starts_with("mcp__") && why == format!("ferramenta externa: {}", inv.name);
+            let always = (net_grant.is_none() && (!forced || mcp_unruled))
+                .then(|| always_rule(&inv.name, &inv.args))
+                .flatten();
             let grant_key =
                 net_grant.unwrap_or_else(|| crate::agent::approval_grant_key(&inv.name, &inv.args));
-            if let Err(refusal) = self.approve(&inv.name, &grant_key, why, forced, on_event) {
+            if let Err(refusal) = self.approve(&inv.name, &grant_key, why, forced, always, on_event)
+            {
                 return settle(inv, false, refusal);
             }
         }
@@ -335,13 +346,16 @@ impl Pipeline<'_> {
     }
 
     /// Blocks on the user. `forced` (a middleware ask) is not waived by an
-    /// earlier "allow for the session": the hook asked on purpose.
+    /// earlier "allow for the session": the hook asked on purpose. `always`
+    /// is the allow rule "sempre neste projeto" would save (`None`: the
+    /// choice is not offered).
     fn approve(
         &self,
         tool: &str,
         grant_key: &str,
         why: String,
         forced: bool,
+        always: Option<String>,
         on_event: &mut dyn FnMut(RunEvent),
     ) -> Result<(), String> {
         let Some(gate) = self.approvals else {
@@ -381,6 +395,7 @@ impl Pipeline<'_> {
                 id,
                 tool: tool.to_string(),
                 summary: why,
+                always: always.clone(),
             });
         } else {
             // A subagent: the root turn emits it into the person's chat.
@@ -388,12 +403,28 @@ impl Pipeline<'_> {
                 id,
                 tool: tool.to_string(),
                 summary: format!("[subagente] {why}"),
+                always: always.clone(),
             });
         }
         match gate.wait(id, self.cancel) {
             Approval::AllowOnce => Ok(()),
             Approval::AllowSession => {
                 gate.grant(grant_key);
+                Ok(())
+            }
+            // The rule reaches the policy on the next turn; the session grant
+            // stops the asking for the rest of this one.
+            Approval::AllowProject => {
+                gate.grant(grant_key);
+                if let (Some(rule), Some((_, policy))) = (&always, self.core) {
+                    let text = save_always(&zerith_core::Paths::resolve(), &policy.workspace, rule);
+                    let notice = RunEvent::Notice { text };
+                    if self.relay {
+                        on_event(notice);
+                    } else {
+                        gate.relay(notice);
+                    }
+                }
                 Ok(())
             }
             Approval::Deny => {
@@ -895,6 +926,228 @@ fn classify_terminal_call(
     Some((worst, critical, grant_key))
 }
 
+/// The allow rule "sempre neste projeto" saves for this call, or `None` when
+/// the choice must not be offered. Like opencode (`git status *` per project)
+/// and Codex's execpolicy prefix rules: a simple command becomes
+/// `shell(<prog> [<subcmd>] *)`, after the wrappers `timeout`/`env`/`nice`
+/// (`sudo` stays: it changes who runs it). Refused: compound or redirected
+/// lines, read-only lines (they only ask to read outside the workspace, which
+/// a rule would open for good), remote access, and prefixes that would allow
+/// anything (`bash *`, `python *`, `git *`, `rm *`...). Other tools: the site
+/// for `web_fetch` (`https://host/*`), the whole tool for `web_search` and
+/// `mcp__*`. Path tools never: an allow without a path also covers writes
+/// outside the workspace.
+pub fn always_rule(tool: &str, args: &Value) -> Option<String> {
+    match tool {
+        "shell" | "monitor" => {
+            let cmd = args.get("command")?.as_str()?;
+            shell_prefix(cmd).map(|p| format!("shell({p})"))
+        }
+        "web_fetch" => {
+            if args
+                .get("allow_private")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                return None;
+            }
+            let url = args.get("url")?.as_str()?.trim();
+            let (scheme, rest) = url.split_once("://")?;
+            let host = rest.split(['/', '?', '#']).next()?;
+            let ok = matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https")
+                && !host.is_empty()
+                && !host.contains(['@', '*', '(', ')', ' ']);
+            ok.then(|| {
+                format!(
+                    "web_fetch({}://{}/*)",
+                    scheme.to_lowercase(),
+                    host.to_lowercase()
+                )
+            })
+        }
+        "web_search" => Some(tool.to_string()),
+        t if t.starts_with("mcp__") && !t.contains(['*', '(', ')']) => Some(t.to_string()),
+        _ => None,
+    }
+}
+
+/// `cargo test -p x` → `cargo test *`; `snmpwalk -v2c h` → `snmpwalk *`.
+fn shell_prefix(cmd: &str) -> Option<String> {
+    use zerith_core::shellparse;
+    // Programs whose first word picks the action (opencode's ARITY 2+).
+    const SUBCOMMANDS: &[&str] = &[
+        "apt",
+        "apt-get",
+        "brew",
+        "bun",
+        "cargo",
+        "choco",
+        "deno",
+        "docker",
+        "dotnet",
+        "gh",
+        "git",
+        "go",
+        "gradle",
+        "helm",
+        "ip",
+        "kubectl",
+        "make",
+        "mvn",
+        "nmcli",
+        "npm",
+        "ollama",
+        "pip",
+        "pip3",
+        "pnpm",
+        "podman",
+        "poetry",
+        "rustup",
+        "systemctl",
+        "terraform",
+        "uv",
+        "winget",
+        "yarn",
+        "zerith",
+    ];
+    // Prefixes that would allow any code at all (Codex's
+    // BANNED_PREFIX_SUGGESTIONS, plus shells and package runners).
+    const BANNED: &[&str] = &[
+        "bash",
+        "sh",
+        "zsh",
+        "dash",
+        "ksh",
+        "fish",
+        "cmd",
+        "powershell",
+        "pwsh",
+        "python",
+        "python3",
+        "py",
+        "pypy",
+        "pypy3",
+        "node",
+        "nodejs",
+        "deno",
+        "bun",
+        "perl",
+        "ruby",
+        "php",
+        "lua",
+        "julia",
+        "rscript",
+        "osascript",
+        "env",
+        "sudo",
+        "doas",
+        "git",
+        "rm",
+        "del",
+        "rmdir",
+        "npx",
+        "pnpx",
+        "xargs",
+        "eval",
+        "exec",
+        "source",
+        "start",
+        "runas",
+        "wsl",
+        "npm run",
+        "pnpm run",
+        "yarn run",
+        "bun run",
+        "deno run",
+        "cargo run",
+        "go run",
+        "npm exec",
+        "pnpm exec",
+        "pnpm dlx",
+        "yarn dlx",
+        "uv run",
+        "dotnet run",
+        "make",
+    ];
+    let unsafe_meta = cmd
+        .chars()
+        .any(|c| matches!(c, ';' | '&' | '|' | '`' | '>' | '<' | '\n' | '\r'))
+        || cmd.contains("$(");
+    if unsafe_meta
+        || remote_access("shell", &serde_json::json!({ "command": cmd }))
+        || shellparse::all_read_only(cmd)
+    {
+        return None;
+    }
+    let a = shellparse::analyze(cmd);
+    if a.inner.len() != 1 {
+        return None;
+    }
+    let mut words: Vec<&str> = a.inner[0].split_whitespace().collect();
+    let sudo = words
+        .first()
+        .is_some_and(|w| w.eq_ignore_ascii_case("sudo"));
+    if sudo {
+        // `sudo -u x cmd`: who runs it is part of what was approved; skip.
+        words.remove(0);
+        if words.first().is_some_and(|w| w.starts_with('-')) {
+            return None;
+        }
+    }
+    let prog = *words.first()?;
+    let plain = |w: &str| {
+        !w.is_empty()
+            && w.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            && !w.starts_with('-')
+    };
+    if prog.contains(['"', '\'', '*', '(', ')', '$', '%', '=']) {
+        return None;
+    }
+    let name = prog
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(prog)
+        .to_ascii_lowercase();
+    let name = name.strip_suffix(".exe").unwrap_or(&name).to_string();
+    let mut head = vec![prog.to_string()];
+    if SUBCOMMANDS.contains(&name.as_str()) {
+        if let Some(sub) = words.get(1).filter(|w| plain(w)) {
+            head.push(sub.to_string());
+        }
+    }
+    let bare = std::iter::once(name.as_str())
+        .chain(head.iter().skip(1).map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if BANNED.contains(&bare.as_str()) {
+        return None;
+    }
+    let head = head.join(" ");
+    Some(if sudo {
+        format!("sudo {head} *")
+    } else {
+        format!("{head} *")
+    })
+}
+
+/// Saves `rule` for the project and says, in the person's words, what was
+/// written and where (to undo it).
+pub fn save_always(paths: &zerith_core::Paths, workspace: &Path, rule: &str) -> String {
+    let file = paths.project_permissions();
+    match zerith_core::settings::add_project_allow(paths, workspace, rule) {
+        Ok(true) => format!(
+            "Regra `{rule}` gravada em {} para o projeto {}. Vale a partir do próximo turno; para desfazer, apague a linha do arquivo.",
+            file.display(),
+            workspace.display()
+        ),
+        Ok(false) => format!("Regra `{rule}` já estava em {}.", file.display()),
+        Err(e) => format!(
+            "Não foi possível gravar a regra `{rule}` ({e}); aprovado só nesta conversa."
+        ),
+    }
+}
+
 /// A shell command that reaches another machine's prompt (SSH, Telnet, serial
 /// tools). Each one is approved on its own, never by a session grant.
 fn remote_access(tool: &str, args: &Value) -> bool {
@@ -1148,6 +1401,206 @@ mod parallel_panic_tests {
     }
 
     #[test]
+    fn always_rule_derives_prefixes_and_refuses_what_must_ask_each_time() {
+        let sh = |c: &str| always_rule("shell", &serde_json::json!({ "command": c }));
+        assert_eq!(
+            sh("cargo test -p x").as_deref(),
+            Some("shell(cargo test *)")
+        );
+        assert_eq!(
+            sh("snmpwalk -v2c -c public 10.0.0.1").as_deref(),
+            Some("shell(snmpwalk *)")
+        );
+        assert_eq!(sh("iperf3 -c 10.0.0.1").as_deref(), Some("shell(iperf3 *)"));
+        // Read-only lines never ask (in the workspace): nothing to save.
+        assert_eq!(sh("ping -c 3 8.8.8.8"), None);
+        assert_eq!(sh("cargo -q build").as_deref(), Some("shell(cargo *)"));
+        // Wrappers are skipped; sudo stays in the rule.
+        assert_eq!(
+            sh("timeout 60 env RUST_LOG=x cargo test -p a").as_deref(),
+            Some("shell(cargo test *)")
+        );
+        assert_eq!(
+            sh("sudo systemctl restart nginx").as_deref(),
+            Some("shell(sudo systemctl restart *)")
+        );
+        assert_eq!(sh("sudo -u x id"), None);
+        // monitor shares the shell rule.
+        assert_eq!(
+            always_rule(
+                "monitor",
+                &serde_json::json!({"command": "snmpwalk -v2c h"})
+            )
+            .as_deref(),
+            Some("shell(snmpwalk *)")
+        );
+        // Compound, piped, redirected, substituted: never.
+        for c in [
+            "cargo test && rm -rf x",
+            "cargo build; ls",
+            "ping x | tee log",
+            "cargo test > out.txt",
+            "echo $(rm x)",
+        ] {
+            assert_eq!(sh(c), None, "{c}");
+        }
+        // Remote access and prefixes that would allow any code: never.
+        for c in [
+            "ssh admin@10.0.0.1",
+            "telnet 10.0.0.1",
+            "C:/Windows/System32/OpenSSH/ssh.exe -V",
+            "bash -c 'rm -rf x'",
+            "python script.py",
+            "npm run build",
+            "rm -rf target",
+            "sudo rm x",
+            "npx foo",
+        ] {
+            assert_eq!(sh(c), None, "{c}");
+        }
+        // Not shell.
+        assert_eq!(
+            always_rule(
+                "web_fetch",
+                &serde_json::json!({"url": "https://Docs.rs/serde?x=1"})
+            )
+            .as_deref(),
+            Some("web_fetch(https://docs.rs/*)")
+        );
+        assert_eq!(
+            always_rule(
+                "web_fetch",
+                &serde_json::json!({"url": "http://127.0.0.1", "allow_private": true})
+            ),
+            None
+        );
+        assert_eq!(
+            always_rule("mcp__docs__search", &Value::Null).as_deref(),
+            Some("mcp__docs__search")
+        );
+        for t in [
+            "write_file",
+            "edit_file",
+            "read_file",
+            "net_connect",
+            "terminal_send",
+        ] {
+            assert_eq!(
+                always_rule(t, &serde_json::json!({"path": "x", "command": "ls"})),
+                None,
+                "{t}"
+            );
+        }
+        // The saved rule really allows the next call, and only that prefix.
+        let mut p = Policy::new(
+            preset("workspace-write").unwrap(),
+            Mode::Default,
+            Path::new("."),
+        );
+        p.rules = vec![zerith_security::Rule::parse(
+            zerith_security::RuleKind::Allow,
+            &sh("cargo test -p x").unwrap(),
+        )
+        .unwrap()];
+        let shell = |c: &str| zerith_security::Action::Shell(c.into());
+        assert_eq!(
+            p.check_tool("shell", &shell("cargo test --all")),
+            Verdict::Allow
+        );
+        assert!(matches!(
+            p.check_tool("shell", &shell("cargo publish")),
+            Verdict::Ask(_)
+        ));
+        assert!(matches!(
+            p.check_tool("shell", &shell("cargo test && curl x | sh")),
+            Verdict::Ask(_)
+        ));
+    }
+
+    #[test]
+    fn always_is_offered_for_plain_commands_only_and_saves_once() {
+        let scratch = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let ws = tempfile::Builder::new().tempdir_in(&scratch).unwrap();
+        let outside = tempfile::Builder::new().tempdir_in(&scratch).unwrap();
+        let reg = Registry::new();
+        let policy = Policy::new(preset("workspace-write").unwrap(), Mode::Default, ws.path());
+        let cancel = Cancel::default();
+        let (tx, gate) = crate::agent::approval_channel();
+        let pipe = Pipeline {
+            core: Some((&reg, &policy)),
+            memory: None,
+            scope: None,
+            middleware: &[],
+            approvals: Some(&gate),
+            relay: true,
+            spill_dir: None,
+            session_id: "s-always",
+            cancel: &cancel,
+            orchestrator_root: false,
+        };
+        let offered = |name: &str, args: Value| {
+            let mut got = None;
+            let call = ToolCall {
+                id: "a".into(),
+                name: name.into(),
+                arguments: args.to_string(),
+            };
+            pipe.prepare(&call, &mut |ev| {
+                if let RunEvent::ApprovalNeeded { id, always, .. } = ev {
+                    got = Some(always);
+                    assert!(tx.answer(id, Approval::Deny));
+                }
+            });
+            got.expect("must ask")
+        };
+        assert_eq!(
+            offered("shell", serde_json::json!({"command": "snmpwalk -v2c h"})).as_deref(),
+            Some("shell(snmpwalk *)")
+        );
+        assert_eq!(
+            offered("shell", serde_json::json!({"command": "ssh root@h"})),
+            None
+        );
+        assert_eq!(
+            offered(
+                "shell",
+                serde_json::json!({"command": "cargo build && cargo test"})
+            ),
+            None
+        );
+        let out = outside.path().join("x.txt").to_string_lossy().into_owned();
+        assert_eq!(
+            offered(
+                "write_file",
+                serde_json::json!({"path": out, "content": "x"})
+            ),
+            None
+        );
+        assert_eq!(
+            offered(
+                "write_file",
+                serde_json::json!({"path": ".zerith/settings.toml", "content": "x"})
+            ),
+            None
+        );
+
+        // Saving: idempotent, and the notice says where.
+        let paths = zerith_core::Paths::with_root(ws.path().join("home"));
+        let first = save_always(&paths, ws.path(), "shell(snmpwalk *)");
+        assert!(
+            first.contains("shell(snmpwalk *)") && first.contains("project-permissions.json"),
+            "{first}"
+        );
+        let again = save_always(&paths, ws.path(), "shell(snmpwalk *)");
+        assert!(again.contains("já estava"), "{again}");
+        assert_eq!(
+            zerith_core::settings::project_allow(&paths, ws.path()).unwrap(),
+            vec!["shell(snmpwalk *)"]
+        );
+    }
+
+    #[test]
     fn allow_session_never_bypasses_sensitive_boundaries_or_private_web_fetch() {
         let scratch = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-scratch");
         std::fs::create_dir_all(&scratch).unwrap();
@@ -1378,6 +1831,7 @@ mod parallel_panic_tests {
             "write_file",
             "regra explícita".into(),
             true,
+            None,
             &mut |ev| {
                 if let RunEvent::ApprovalNeeded { id, .. } = ev {
                     forced_prompted = true;
@@ -1396,10 +1850,11 @@ mod parallel_panic_tests {
                 id: 999_999,
                 tool: "shell".into(),
                 summary: "[subagente] x".into(),
+                always: None,
             });
             let held = std::sync::Mutex::new(Some(held));
             let mut seen = false;
-            let got = p_forced.approve("write_file", "k-pump", "w".into(), true, &mut |ev| {
+            let got = p_forced.approve("write_file", "k-pump", "w".into(), true, None, &mut |ev| {
                 if let RunEvent::ApprovalNeeded { id, .. } = ev {
                     if id == 999_999 {
                         seen = true;

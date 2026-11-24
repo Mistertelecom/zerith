@@ -695,14 +695,16 @@ fn secret_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// `[s]im / [n]ão / [t]odos nesta conversa` on stderr; anything else is no.
+/// `[s]im / [n]ão / [t]odos nesta conversa` (and `[p]rojeto` when the runtime
+/// offers a rule to save) on stderr; anything else is no.
 /// The turn waits here, on its own thread, which is what the gate expects.
-fn ask_terminal(tool: &str, summary: &str) -> zerith_runtime::Approval {
+fn ask_terminal(tool: &str, summary: &str, always: Option<&str>) -> zerith_runtime::Approval {
     use std::io::Write;
     let mut err = std::io::stderr();
     let _ = write!(
         err,
-        "\n\x1b[1m[aprovação]\x1b[0m {tool}: {summary}\n  Permitir? [s]im / [n]ão / [t]odos nesta conversa: "
+        "\n\x1b[1m[aprovação]\x1b[0m {tool}: {summary}\n  Permitir? [s]im / [n]ão / [t]odos nesta conversa{}: ",
+        always.map(|r| format!(" / [p]rojeto sempre ({r})")).unwrap_or_default()
     );
     let _ = err.flush();
     let mut line = String::new();
@@ -716,6 +718,7 @@ fn parse_answer(line: &str) -> zerith_runtime::Approval {
     match line.trim().to_lowercase().as_str() {
         "s" | "sim" | "y" | "yes" => zerith_runtime::Approval::AllowOnce,
         "t" | "todos" | "a" | "all" => zerith_runtime::Approval::AllowSession,
+        "p" | "projeto" => zerith_runtime::Approval::AllowProject,
         _ => zerith_runtime::Approval::Deny,
     }
 }
@@ -800,9 +803,16 @@ fn execute_cli_turn(
                     let _ = std::io::Write::flush(&mut std::io::stdout());
                 }
                 RunEvent::Reasoning(r) => eprintln!("[reasoning] {r}"),
-                RunEvent::ApprovalNeeded { id, tool, summary } => {
-                    ctx.approver.answer(id, ask_terminal(&tool, &summary));
+                RunEvent::ApprovalNeeded {
+                    id,
+                    tool,
+                    summary,
+                    always,
+                } => {
+                    ctx.approver
+                        .answer(id, ask_terminal(&tool, &summary, always.as_deref()));
                 }
+                RunEvent::Notice { text } => eprintln!("[permissão] {text}"),
                 RunEvent::ToolCall { name, args, .. } => eprintln!("\n[tool] {name} {args}"),
                 RunEvent::ToolResult {
                     name,

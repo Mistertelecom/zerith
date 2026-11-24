@@ -42,6 +42,9 @@ pub enum Approval {
     AllowOnce,
     /// Allow this tool for as long as the host keeps the same `ApprovalGate`.
     AllowSession,
+    /// `AllowSession`, and save the event's `always` rule for the project.
+    /// Without an `always` rule it is just `AllowSession`.
+    AllowProject,
     Deny,
 }
 

@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde_json::{json, Value};
+use zerith_core::settings::HookSpec;
 use zerith_core::{Paths, Settings};
 use zerith_mcp::config::{add_server, set_enabled, set_extra};
 use zerith_mcp::{Extra, ServerConfig};
@@ -114,6 +115,10 @@ pub(crate) enum Payload {
     Rules {
         list: &'static str,
         rules: Vec<String>,
+    },
+    Hook {
+        event: String,
+        spec: HookSpec,
     },
     /// Arquivo novo a gravar em `dest`.
     File {
@@ -272,6 +277,7 @@ pub fn apply(items: &[Item], paths: &Paths) -> Report {
     apply_skills(items, paths, &mut r);
     apply_files(items, Kind::Agent, &mut r);
     apply_permissions(items, paths, &mut r);
+    apply_hooks(items, paths, &mut r);
     r
 }
 
@@ -353,6 +359,7 @@ pub fn plan(src: &ClaudeSource, paths: &Paths, opt: &Options) -> Vec<Item> {
         agents.extend(proj(".claude/agents"));
         items.extend(plan_agents(&agents, paths));
         items.extend(plan_permissions(&src.home, paths));
+        items.extend(plan_hooks(&src.home, paths));
     }
     items
 }
@@ -1172,7 +1179,7 @@ pub fn apply_files(items: &[Item], kind: Kind, r: &mut Report) {
     }
 }
 
-// ------------------------------------------------------------ permissões
+// ------------------------------------------------------ permissões e hooks
 
 /// `settings.json` + `settings.local.json` do usuário, nessa ordem.
 fn claude_settings(home: &Path) -> Vec<(PathBuf, Value)> {
@@ -1327,6 +1334,201 @@ pub fn apply_permissions(items: &[Item], paths: &Paths, r: &mut Report) {
                     target.push(rule.clone());
                 }
             }
+        }
+    });
+    for item in todo {
+        match &done {
+            Ok(()) => r.tally(item.kind, Action::Import),
+            Err(e) => r.fail(item, e),
+        }
+    }
+}
+
+/// O comando com `~/.claude/hooks/` (em qualquer grafia) apontando para a
+/// pasta de hooks do Zerith.
+fn rewrite_hook_paths(cmd: &str, from: &Path, to: &Path) -> String {
+    let to = to.to_string_lossy().replace('\\', "/");
+    let abs = from.to_string_lossy().to_string();
+    let mut out = cmd.to_string();
+    for f in [
+        abs.clone(),
+        abs.replace('\\', "/"),
+        "~/.claude/hooks".to_string(),
+        "$HOME/.claude/hooks".to_string(),
+        "${HOME}/.claude/hooks".to_string(),
+        "%USERPROFILE%\\.claude\\hooks".to_string(),
+    ] {
+        out = out.replace(&f, &to);
+    }
+    out
+}
+
+/// Hooks `type: command` do `settings.json`, e os scripts de
+/// `~/.claude/hooks/` copiados para `<raiz>/hooks/` (sem sobrescrever).
+pub(crate) fn plan_hooks(home: &Path, paths: &Paths) -> Vec<Item> {
+    let user = Settings::load_with_env(paths, None, |_| None)
+        .settings
+        .hooks;
+    let current = toml::Value::try_from(&user).ok();
+    let src_dir = home.join("hooks");
+    let dest_dir = paths.root().join("hooks");
+    let mut items = Vec::new();
+    for file in std::fs::read_dir(&src_dir).into_iter().flatten().flatten() {
+        if !file.file_type().is_ok_and(|t| t.is_file()) {
+            continue;
+        }
+        let dest = dest_dir.join(file.file_name());
+        let name = file.file_name().to_string_lossy().into_owned();
+        let Ok(content) = std::fs::read_to_string(file.path()) else {
+            items.push(Item::new(
+                Kind::Hook,
+                &file.path(),
+                format!("script {name}: ilegível"),
+                Action::Error,
+            ));
+            continue;
+        };
+        let (action, why) = match std::fs::read_to_string(&dest) {
+            Ok(c) if c == content => (Action::Skip, ": já copiado"),
+            Ok(_) => (Action::Conflict, ": já existe outro com esse nome"),
+            Err(_) => (Action::Import, ""),
+        };
+        items.push(
+            Item::new(
+                Kind::Hook,
+                &file.path(),
+                format!("script {name} → <raiz>/hooks{why}"),
+                action,
+            )
+            .with(Payload::File { dest, content }),
+        );
+    }
+    let mut seen = HashSet::new();
+    for (file, v) in claude_settings(home) {
+        let Some(events) = v.get("hooks").and_then(Value::as_object) else {
+            continue;
+        };
+        for (event, list) in events {
+            for group in list.as_array().into_iter().flatten() {
+                let matcher = group
+                    .get("matcher")
+                    .and_then(Value::as_str)
+                    .and_then(zerith_plugins::translate_hook_matcher);
+                for h in group
+                    .get("hooks")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    let ty = h.get("type").and_then(Value::as_str).unwrap_or("command");
+                    let cmd = h
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .trim();
+                    let label = format!("{event} {}", matcher.as_deref().unwrap_or("*"));
+                    let item = |d: String, a: Action| Item::new(Kind::Hook, &file, d, a);
+                    if ty != "command" || cmd.is_empty() {
+                        items.push(item(
+                            format!("{label}: tipo {ty} não suportado"),
+                            Action::Skip,
+                        ));
+                        continue;
+                    }
+                    let ev_ok = current
+                        .as_ref()
+                        .and_then(|c| c.get(event.as_str()))
+                        .is_some();
+                    if !ev_ok {
+                        items.push(item(format!("{label}: evento desconhecido"), Action::Skip));
+                        continue;
+                    }
+                    let command = rewrite_hook_paths(cmd, &src_dir, &dest_dir);
+                    let timeout_ms = h
+                        .get("timeout")
+                        .and_then(Value::as_u64)
+                        .map_or(60_000, |s| s * 1000);
+                    let spec = HookSpec {
+                        matcher: matcher.clone(),
+                        command: command.clone(),
+                        timeout_ms,
+                    };
+                    let exists = current
+                        .as_ref()
+                        .and_then(|c| c.get(event.as_str()))
+                        .and_then(|l| l.as_array())
+                        .is_some_and(|l| {
+                            l.iter().any(|x| {
+                                x.get("command").and_then(|c| c.as_str()) == Some(&command)
+                                    && x.get("matcher").and_then(|m| m.as_str())
+                                        == matcher.as_deref()
+                            })
+                        });
+                    let mut desc = format!("{label}: {command}");
+                    if command.contains("CLAUDE_PROJECT_DIR") {
+                        desc.push_str(
+                            " (aviso: $CLAUDE_PROJECT_DIR não existe no Zerith; o hook roda na pasta do projeto, troque por caminho relativo)",
+                        );
+                    }
+                    let action = if exists {
+                        desc.push_str(" (já existe)");
+                        Action::Skip
+                    } else if !seen.insert((event.clone(), command.clone(), matcher.clone())) {
+                        Action::Skip
+                    } else {
+                        Action::Import
+                    };
+                    items.push(item(desc, action).with(Payload::Hook {
+                        event: event.clone(),
+                        spec,
+                    }));
+                }
+            }
+        }
+    }
+    items
+}
+
+/// Scripts primeiro (o comando aponta para eles), depois os hooks no
+/// `settings.toml` do usuário.
+pub fn apply_hooks(items: &[Item], paths: &Paths, r: &mut Report) {
+    let scripts: Vec<Item> = items
+        .iter()
+        .filter(|i| i.kind == Kind::Hook && matches!(i.payload, Payload::File { .. }))
+        .cloned()
+        .collect();
+    apply_files(&scripts, Kind::Hook, r);
+    let hooks: Vec<&Item> = items
+        .iter()
+        .filter(|i| i.kind == Kind::Hook && !matches!(i.payload, Payload::File { .. }))
+        .collect();
+    let todo: Vec<&&Item> = hooks
+        .iter()
+        .filter(|i| i.action == Action::Import)
+        .collect();
+    for i in hooks.iter().filter(|i| i.action != Action::Import) {
+        r.tally(i.kind, i.action);
+    }
+    if todo.is_empty() {
+        return;
+    }
+    // Pelo TOML, para não repetir aqui a lista de campos de `Hooks`.
+    let done = Settings::save_user(paths, |s| {
+        let Ok(toml::Value::Table(mut t)) = toml::Value::try_from(&s.hooks) else {
+            return;
+        };
+        for item in &todo {
+            let Payload::Hook { event, spec } = &item.payload else {
+                continue;
+            };
+            if let (Some(toml::Value::Array(list)), Ok(v)) =
+                (t.get_mut(event.as_str()), toml::Value::try_from(spec))
+            {
+                list.push(v);
+            }
+        }
+        if let Ok(h) = toml::Value::Table(t).try_into() {
+            s.hooks = h;
         }
     });
     for item in todo {
@@ -2350,6 +2552,55 @@ pub(crate) mod tests {
         );
         let again = plan_permissions(&home, &paths);
         assert!(again.iter().all(|i| i.action == Action::Skip));
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    #[test]
+    fn hooks_convert_with_scripts_copied_and_paths_rewritten() {
+        let t = scratch("cc-hooks");
+        let home = t.join("claude");
+        write(&home.join("hooks/guard.sh"), "#!/bin/sh\nexit 0\n");
+        write(
+            &home.join("settings.json"),
+            r#"{"hooks":{
+                "PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"sh ~/.claude/hooks/guard.sh","timeout":5}]}],
+                "Stop":[{"hooks":[{"type":"command","command":"\"$CLAUDE_PROJECT_DIR\"/check.sh"},{"type":"prompt","prompt":"x"}]}],
+                "Inventado":[{"hooks":[{"type":"command","command":"x"}]}]
+            }}"#,
+        );
+        let paths = Paths::with_root(t.join("zerith"));
+        let items = plan_hooks(&home, &paths);
+        assert_eq!(
+            items.iter().filter(|i| i.action == Action::Import).count(),
+            3,
+            "{}",
+            render_plan(&items)
+        );
+        assert!(items
+            .iter()
+            .any(|i| i.description.contains("aviso: $CLAUDE_PROJECT_DIR")));
+        let r = apply(&items, &paths);
+        assert_eq!(r.counts[&Kind::Hook].imported, 3, "{:?}", r.errors);
+        assert!(paths.root().join("hooks/guard.sh").is_file());
+        let h = Settings::load_with_env(&paths, None, |_| None)
+            .settings
+            .hooks;
+        let pre = &h.pre_tool_use[0];
+        assert_eq!(pre.matcher.as_deref(), Some("shell"));
+        assert_eq!(pre.timeout_ms, 5000);
+        let dest = paths
+            .root()
+            .join("hooks")
+            .to_string_lossy()
+            .replace('\\', "/");
+        assert_eq!(pre.command, format!("sh {dest}/guard.sh"));
+        assert_eq!(h.stop.len(), 1);
+        let again = plan_hooks(&home, &paths);
+        assert!(
+            again.iter().all(|i| i.action == Action::Skip),
+            "{}",
+            render_plan(&again)
+        );
         let _ = std::fs::remove_dir_all(&t);
     }
 

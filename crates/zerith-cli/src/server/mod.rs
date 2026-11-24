@@ -179,15 +179,152 @@ pub fn spawn(paths: &Paths) -> Result<JoinHandle<()>, Boxed> {
 
 /// `zerith server ...`
 pub fn cmd(paths: &Paths, args: &[String]) -> Result<(), Boxed> {
-    match args.get(1).map(String::as_str) {
-        Some("serve") => {
+    let root = paths.root();
+    let flag = |name: &str| {
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
+    match (
+        args.get(1).map(String::as_str),
+        args.get(2).map(String::as_str),
+    ) {
+        (Some("init"), _) => {
+            if auth::config_path(root).exists() {
+                return Err(format!(
+                    "{} já existe; para outro dispositivo use `zerith server token add <nome>`",
+                    auth::config_path(root).display()
+                )
+                .into());
+            }
+            let allow_public = args.iter().any(|a| a == "--allow-public");
+            let bind = flag("--bind").unwrap_or_else(|| DEFAULT_BIND.into());
+            let addr = auth::check_bind(&bind, allow_public)?;
+            let url =
+                match flag("--url") {
+                    Some(u) => u,
+                    None if addr.ip().is_unspecified() => return Err(
+                        "com bind em todas as interfaces, informe --url <http://ip-ou-nome:porta> \
+                                (o endereço que o desktop vai usar)"
+                            .into(),
+                    ),
+                    None => format!("http://{addr}"),
+                };
+            let cfg = auth::ServerConfig {
+                name: flag("--name").unwrap_or_else(hostname),
+                bind: addr.to_string(),
+                url,
+                allow_public,
+            };
+            auth::save_config(root, &cfg)?;
+            let device = flag("--device").unwrap_or_else(|| "desktop".into());
+            let token = auth::add_token(root, &device)?;
+            println!(
+                "servidor '{}' configurado em {}",
+                cfg.name,
+                auth::config_path(root).display()
+            );
+            if auth::classify(addr.ip()) == auth::BindKind::Public {
+                println!("\n{}", auth::PUBLIC_WARNING);
+            }
+            print_pairing(&cfg, &device, token);
+            Ok(())
+        }
+        (Some("token"), Some("add")) => {
+            let device = args
+                .get(3)
+                .ok_or("uso: zerith server token add <dispositivo>")?;
+            let cfg = auth::load_config(root)?;
+            let token = auth::add_token(root, device)?;
+            print_pairing(&cfg, device, token);
+            Ok(())
+        }
+        (Some("token"), Some("list")) => {
+            let usage = auth::load_usage(root);
+            let list = auth::load_tokens(root);
+            if list.is_empty() {
+                println!("(nenhum dispositivo pareado)");
+            }
+            for t in list {
+                let last = usage
+                    .get(&t.device)
+                    .map_or("nunca".into(), |&ms| fmt_ms(ms));
+                println!(
+                    "{:<24} criado {}  último uso {}",
+                    t.device,
+                    fmt_ms(t.created_at_ms),
+                    last
+                );
+            }
+            Ok(())
+        }
+        (Some("token"), Some("revoke")) => {
+            let device = args
+                .get(3)
+                .ok_or("uso: zerith server token revoke <dispositivo>")?;
+            auth::revoke_token(root, device)?;
+            println!("token de '{device}' revogado (vale na hora, sem reiniciar o servidor)");
+            Ok(())
+        }
+        (Some("serve"), _) => {
             let h = spawn(paths)?;
             h.join()
                 .map_err(|_| "thread do servidor terminou com pânico")?;
             Ok(())
         }
-        _ => Err("uso: zerith server serve".into()),
+        _ => Err(
+            "uso: zerith server init [--name <nome>] [--bind <ip:porta>] [--url <url>] \
+                  [--device <nome>] [--allow-public]\n\
+                  \x20     zerith server token add <dispositivo> | list | revoke <dispositivo>\n\
+                  \x20     zerith server serve"
+                .into(),
+        ),
     }
+}
+
+/// Imprime o código (sozinho na linha, fácil de copiar) e, separado, como usar.
+/// O token só existe aqui e no código; o servidor guarda apenas o hash.
+fn print_pairing(cfg: &auth::ServerConfig, device: &str, token: String) {
+    let code = zerith_workflows::remote::PairingCode {
+        v: 1,
+        name: cfg.name.clone(),
+        url: cfg.url.clone(),
+        token,
+    }
+    .encode();
+    println!("\ncódigo de pareamento para '{device}' (trate como senha; não aparece de novo):\n");
+    println!("{code}\n");
+    println!(
+        "como usar:\n\
+         \x20 1. no Zerith desktop, abra Workflows > Servidores > Adicionar servidor;\n\
+         \x20 2. cole o código acima e confirme;\n\
+         \x20 3. o desktop vai chamar {}/v1/ping e depois /v1/health com o token.\n\
+         o desktop precisa alcançar {} (Tailscale/WireGuard ou proxy HTTPS; veja docs/servidor.md).\n\
+         revogar: zerith server token revoke {device}",
+        cfg.url, cfg.url
+    );
+}
+
+/// Nome da máquina: `/etc/hostname`, `HOSTNAME`, `COMPUTERNAME`, senão "zerith".
+pub(crate) fn hostname() -> String {
+    std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .or_else(|| std::env::var("COMPUTERNAME").ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "zerith".into())
+}
+
+/// `AAAA-MM-DD HH:MM` no fuso local.
+fn fmt_ms(ms: i64) -> String {
+    let secs = ms / 1000;
+    let dt = zerith_workflows::LocalDateTime::from_unix_secs(
+        secs,
+        zerith_workflows::local_offset_minutes(secs),
+    );
+    format!("{} {}", dt.date_string(), &dt.time_string()[..5])
 }
 
 #[cfg(test)]
@@ -269,5 +406,29 @@ pub(crate) mod tests {
         // Bloqueado por IP: nem o token certo passa até a janela esvaziar.
         assert_eq!(call(addr, "GET", "/v1/workflows", Some(&tok), None).0, 429);
         assert_eq!(call(addr, "GET", "/v1/ping", None, None).0, 200);
+    }
+
+    #[test]
+    fn init_cria_config_e_token_e_recusa_bind_publico() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(dir.path());
+        let a = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
+        assert!(cmd(&paths, &a("server init --bind 0.0.0.0:7878")).is_err());
+        assert!(!auth::config_path(dir.path()).exists());
+        cmd(&paths, &a("server init --name casa --bind 100.64.0.9:7878")).unwrap();
+        let cfg = auth::load_config(dir.path()).unwrap();
+        assert_eq!(
+            (cfg.name.as_str(), cfg.url.as_str()),
+            ("casa", "http://100.64.0.9:7878")
+        );
+        assert_eq!(auth::load_tokens(dir.path())[0].device, "desktop");
+        assert!(cmd(&paths, &a("server init")).is_err(), "não sobrescreve");
+        cmd(&paths, &a("server token add celular")).unwrap();
+        cmd(&paths, &a("server token revoke desktop")).unwrap();
+        let left: Vec<_> = auth::load_tokens(dir.path())
+            .into_iter()
+            .map(|t| t.device)
+            .collect();
+        assert_eq!(left, ["celular"]);
     }
 }

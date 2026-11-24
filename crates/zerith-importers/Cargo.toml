@@ -13,6 +13,8 @@ zerith-mcp = { path = "../zerith-mcp" }
 zerith-memory = { path = "../zerith-memory" }
 zerith-security = { path = "../zerith-security" }
 zerith-tools = { path = "../zerith-tools" }
+# Fuso local (cron do Hermes é no fuso dele; o daemon do Zerith avalia em UTC).
+zerith-workflows = { path = "../zerith-workflows" }
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true

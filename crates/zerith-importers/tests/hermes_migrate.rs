@@ -141,6 +141,25 @@ fn fixture() -> Fx {
         &home.join("skills/.hub/lock.json"),
         &format!(r#"{{"version":1,"installed":{{"hubby":{{"content_hash":"{hub}"}}}}}}"#),
     );
+    write(
+        &home.join("config.yaml"),
+        &format!(
+            "mcp_servers:\n  web:\n    url: https://example.test/mcp\n    headers:\n      Authorization: \"Bearer {TG_TOKEN}\"\n      X-Region: br\n  gh:\n    command: definitely-not-installed-xyz\ntelegram:\n  allowed_chats: \"111, 222\"\n"
+        ),
+    );
+    write(
+        &home.join(".env"),
+        &format!("# TELEGRAM_BOT_TOKEN=\nTELEGRAM_BOT_TOKEN={TG_TOKEN}\nTELEGRAM_ALLOWED_USERS=222,333\nTELEGRAM_HOME_CHANNEL=-100\n"),
+    );
+    write(
+        &home.join("cron/jobs.json"),
+        r#"{"jobs":[
+            {"id":"j1","name":"resumo","prompt":"Resuma o dia","schedule":{"kind":"cron","expr":"0 9 * * *"},"deliver":"telegram"},
+            {"id":"j2","name":"ping","prompt":"x","schedule":{"kind":"interval","minutes":30}},
+            {"id":"j3","name":"script","script":"run.py","no_agent":true,"schedule":{"kind":"cron","expr":"*/5 * * * *"}},
+            {"id":"j4","name":"uma vez","prompt":"y","schedule":{"kind":"once","run_at":"2026-12-01T10:00:00"}}
+        ]}"#,
+    );
     let paths = Paths::with_root(t.path().join("zerith"));
     Fx { _t: t, home, paths }
 }
@@ -186,6 +205,69 @@ fn only_user_skills_come_by_default() {
     let plan = run(&fx.home, &fx.paths, &o, &vault).unwrap();
     assert_eq!(count(&plan, "skill", Status::Imported), 1);
     assert!(fx.paths.skills().join("mexida/SKILL.md").is_file());
+}
+
+const TG_TOKEN: &str = "123456:AAbbCCddEEff";
+
+#[test]
+fn mcp_cron_and_telegram() {
+    let fx = fixture();
+    let vault = Vault::default();
+    let plan = run(&fx.home, &fx.paths, &opts(false), &vault).unwrap();
+    assert!(!rendered(&plan).contains(TG_TOKEN));
+    // MCP: cabeçalho secreto fora, o resto entra; comando ausente é erro.
+    let toml = std::fs::read_to_string(fx.paths.root().join("mcp.toml")).unwrap();
+    assert!(
+        toml.contains("X-Region") && !toml.contains(TG_TOKEN),
+        "{toml}"
+    );
+    assert!(plan
+        .stripped_secrets
+        .contains(&"mcp:web.headers.Authorization".to_string()));
+    assert_eq!(count(&plan, "mcp", Status::Error), 1);
+    // Cron: dois agendamentos (desligados), dois arquivados.
+    let store = zerith_sessions::Store::open(fx.paths.db()).unwrap();
+    let s = store.schedule_list().unwrap();
+    let names: Vec<&str> = s.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, ["hermes-default-resumo", "hermes-default-ping"]);
+    assert!(s.iter().all(|s| !s.enabled));
+    assert_eq!(s[1].cron_expr, "*/30 * * * *");
+    assert_eq!(count(&plan, "cron", Status::Archived), 2);
+    let dir = PathBuf::from(plan.report_dir.as_ref().unwrap());
+    assert!(dir.join("archive/cron/default-script.json").is_file());
+    // Telegram: sem a flag, token fora; allowlist entra; resto arquivado.
+    assert!(vault.get("telegram_bot_token").is_err());
+    let set = zerith_core::Settings::load(&fx.paths, None).settings;
+    assert_eq!(set.gateway.telegram.allowed_chats, [111, 222, 333]);
+    assert!(
+        std::fs::read_to_string(dir.join("archive/telegram/LEIA.md"))
+            .unwrap()
+            .contains("TELEGRAM_HOME_CHANNEL")
+    );
+    let o = Options {
+        dry_run: false,
+        migrate_secrets: true,
+        kinds: Some(["telegram".to_string()].into()),
+        ..Default::default()
+    };
+    run(&fx.home, &fx.paths, &o, &vault).unwrap();
+    assert_eq!(vault.get("telegram_bot_token").unwrap(), TG_TOKEN);
+}
+
+#[test]
+fn hermes_cron_hours_move_to_utc() {
+    use serde_json::json;
+    use zerith_importers::hermes_migrate::cron_to_utc;
+    let c = |e: &str| json!({"kind": "cron", "expr": e});
+    assert_eq!(cron_to_utc(&c("0 9 * * *"), -180).unwrap(), "0 12 * * *");
+    assert_eq!(cron_to_utc(&c("0 22 * * *"), -180).unwrap(), "0 1 * * *");
+    assert!(cron_to_utc(&c("0 22 * * 1"), -180).is_err());
+    assert_eq!(cron_to_utc(&c("*/5 * * * *"), -180).unwrap(), "*/5 * * * *");
+    assert_eq!(
+        cron_to_utc(&json!({"kind": "interval", "minutes": 120}), 0).unwrap(),
+        "0 */2 * * *"
+    );
+    assert!(cron_to_utc(&json!({"kind": "interval", "minutes": 45}), 0).is_err());
 }
 
 const CRED_PW: &str = "Pw!secr3t";
@@ -355,14 +437,15 @@ fn persona_is_appended_rebranded_and_the_generic_guide_archived() {
 fn a_second_run_skips_everything() {
     let fx = fixture();
     let vault = Vault::default();
+    // O MCP com comando ausente continua erro em toda rodada; o resto pula.
+    let still_wrong = |i: &&zerith_importers::plan::ImportItem| {
+        i.status != Status::Skipped && !(i.kind == "mcp" && i.status == Status::Error)
+    };
     run(&fx.home, &fx.paths, &opts(false), &vault).unwrap();
     let again = run(&fx.home, &fx.paths, &opts(false), &vault).unwrap();
-    let not_skipped: Vec<_> = again
-        .items
-        .iter()
-        .filter(|i| i.status != Status::Skipped)
-        .collect();
+    let not_skipped: Vec<_> = again.items.iter().filter(still_wrong).collect();
     assert!(not_skipped.is_empty(), "{not_skipped:#?}");
     let plan = run(&fx.home, &fx.paths, &opts(true), &vault).unwrap();
-    assert!(plan.items.iter().all(|i| i.status == Status::Skipped));
+    let not_skipped: Vec<_> = plan.items.iter().filter(still_wrong).collect();
+    assert!(not_skipped.is_empty(), "{not_skipped:#?}");
 }

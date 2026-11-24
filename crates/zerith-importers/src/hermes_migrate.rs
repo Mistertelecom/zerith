@@ -79,6 +79,7 @@ pub(crate) struct Ctx<'a> {
     pub paths: &'a Paths,
     pub home: &'a Path,
     pub opts: &'a Options,
+    /// O cofre: lido no plano, escrito só na aplicação.
     pub secrets: Option<&'a dyn SecretStore>,
     pub plan: ImportPlan,
     pub ledger: Ledger,
@@ -142,7 +143,7 @@ pub fn run(
         paths,
         home,
         opts,
-        secrets: (!opts.dry_run).then_some(secrets),
+        secrets: Some(secrets),
         plan: ImportPlan::new("hermes", home, opts.dry_run),
         ledger: Ledger::load(paths),
         dir: None,
@@ -170,6 +171,15 @@ pub fn run(
     }
     if opts.wants("skill") {
         skills(&mut ctx);
+    }
+    if opts.wants("mcp") {
+        mcp(&mut ctx);
+    }
+    if opts.wants("cron") {
+        cron(&mut ctx);
+    }
+    if opts.wants("telegram") {
+        telegram(&mut ctx);
     }
     if ctx.apply() {
         ctx.ledger.save(paths).map_err(|e| format!("ledger: {e}"))?;
@@ -552,7 +562,7 @@ fn memories(ctx: &mut Ctx) {
                 } else {
                     format!("valor(es) no cofre: {}", names.join(", "))
                 };
-                if let (Some(mem), Some(vault)) = (&mem, ctx.secrets) {
+                if let (Some(mem), Some(vault), true) = (&mem, ctx.secrets, ctx.apply()) {
                     let source = format!("hermes:{profile}/{file}");
                     let done = values
                         .iter()
@@ -1287,6 +1297,460 @@ fn skills(ctx: &mut Ctx) {
             done.insert(s.name.clone());
         }
         ctx.plan.push("skill", src, dest, status, reason);
+    }
+}
+
+// ---------------------------------------------------------------------- mcp
+
+fn mcp(ctx: &mut Ctx) {
+    use crate::hermes_setup::{hermes_mcp, import_hermes_mcp_with, McpStatus};
+    if !ctx.home.join("config.yaml").is_file() {
+        return;
+    }
+    let found = match hermes_mcp(ctx.home, ctx.paths) {
+        Ok(f) => f,
+        Err(e) => {
+            ctx.plan
+                .push("mcp", "config.yaml", "mcp.toml", Status::Error, e);
+            return;
+        }
+    };
+    let keep = ctx.opts.migrate_secrets;
+    let mut importable = Vec::new();
+    for (m, st) in &found {
+        let gone: Vec<String> = plan::strip_secrets(&m.env)
+            .1
+            .into_iter()
+            .map(|k| format!("env.{k}"))
+            .chain(
+                plan::strip_secrets(&m.headers)
+                    .1
+                    .into_iter()
+                    .map(|k| format!("headers.{k}")),
+            )
+            .collect();
+        let (status, mut reason) = match st {
+            McpStatus::Exists => (Status::Skipped, "já existe no Zerith".to_string()),
+            McpStatus::NotFound => (
+                Status::Error,
+                "comando não encontrado neste computador".to_string(),
+            ),
+            McpStatus::Invalid => (
+                Status::Error,
+                "precisa de `command` ou `url` (http/https)".to_string(),
+            ),
+            McpStatus::OAuth => (
+                Status::Imported,
+                "OAuth: entre depois com zerith mcp login".to_string(),
+            ),
+            McpStatus::Importable => (Status::Imported, String::new()),
+        };
+        if status == Status::Imported {
+            importable.push(m.name.clone());
+            if !gone.is_empty() {
+                let what = if keep {
+                    "copiado(s) para mcp.toml (--migrate-secrets)"
+                } else {
+                    "deixado(s) de fora"
+                };
+                let sep = if reason.is_empty() { "" } else { "; " };
+                reason = format!("{reason}{sep}{} {what}", gone.join(", "));
+                if !keep {
+                    for g in &gone {
+                        ctx.plan.strip(format!("mcp:{}.{g}", m.name));
+                    }
+                }
+            }
+        }
+        ctx.plan.push(
+            "mcp",
+            format!("config.yaml: {}", m.name),
+            format!("mcp.toml ({})", m.name),
+            status,
+            reason,
+        );
+    }
+    if !ctx.apply() || importable.is_empty() {
+        return;
+    }
+    let failed = match import_hermes_mcp_with(ctx.home, ctx.paths, &importable, keep) {
+        Ok((r, _)) => r.failed,
+        Err(e) => importable.iter().map(|n| format!("{n}: {e}")).collect(),
+    };
+    for f in failed {
+        let name = f.split(':').next().unwrap_or("").to_string();
+        if let Some(i) = ctx
+            .plan
+            .items
+            .iter_mut()
+            .find(|i| i.kind == "mcp" && i.dest == format!("mcp.toml ({name})"))
+        {
+            i.status = Status::Error;
+            i.reason = f;
+        }
+    }
+}
+
+// --------------------------------------------------------------------- cron
+
+/// `jobs.json` do Hermes: `{"jobs": [...]}`, uma lista solta ou um mapa por id.
+fn cron_jobs(text: &str) -> Vec<serde_json::Value> {
+    let v: serde_json::Value = serde_json::from_str(text).unwrap_or_default();
+    let jobs = if v.is_object() && v.get("jobs").is_some() {
+        v["jobs"].clone()
+    } else {
+        v
+    };
+    match jobs {
+        serde_json::Value::Array(a) => a,
+        serde_json::Value::Object(m) => m
+            .into_iter()
+            .map(|(k, mut j)| {
+                if j.get("id").is_none() {
+                    j["id"] = k.into();
+                }
+                j
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Expressão cron (UTC, como o daemon do Zerith avalia) equivalente ao
+/// agendamento do Hermes, ou o motivo de não haver.
+///
+/// O Hermes avalia cron no fuso dele; aqui as horas são deslocadas por
+/// `offset_min` (minutos a leste de UTC). Só quando é claro: horas numéricas,
+/// deslocamento em horas cheias e, se a hora muda de dia, dia livre.
+pub fn cron_to_utc(schedule: &serde_json::Value, offset_min: i32) -> Result<String, String> {
+    let kind = schedule["kind"].as_str().unwrap_or("");
+    match kind {
+        "interval" => {
+            let m = schedule["minutes"].as_i64().unwrap_or(0);
+            match m {
+                1..=59 if 60 % m == 0 => Ok(format!("*/{m} * * * *")),
+                60 => Ok("0 * * * *".into()),
+                _ if m > 0 && m % 60 == 0 && 24 % (m / 60) == 0 => {
+                    Ok(format!("0 */{} * * *", m / 60))
+                }
+                _ => Err(format!("intervalo de {m} min não cabe em cron")),
+            }
+        }
+        "cron" => {
+            let expr = schedule["expr"].as_str().unwrap_or("");
+            let f: Vec<&str> = expr.split_whitespace().collect();
+            if f.len() != 5 {
+                return Err(format!("cron com {} campos", f.len()));
+            }
+            if f[1] == "*" || f[1].starts_with("*/") || offset_min == 0 {
+                return Ok(f.join(" "));
+            }
+            if offset_min % 60 != 0 {
+                return Err("fuso com fração de hora".into());
+            }
+            let shift = offset_min / 60;
+            let mut crosses = false;
+            let mut hours = Vec::new();
+            for h in f[1].split(',') {
+                let h: i32 = h.parse().map_err(|_| format!("hora `{}`", f[1]))?;
+                let u = h - shift;
+                crosses |= !(0..24).contains(&u);
+                hours.push(u.rem_euclid(24).to_string());
+            }
+            if crosses && (f[2] != "*" || f[4] != "*") {
+                return Err("a hora em UTC muda de dia e o dia está restrito".into());
+            }
+            Ok(format!(
+                "{} {} {} {} {}",
+                f[0],
+                hours.join(","),
+                f[2],
+                f[3],
+                f[4]
+            ))
+        }
+        "once" => Err("execução única (once)".into()),
+        other => Err(format!("tipo de agendamento `{other}`")),
+    }
+}
+
+/// Fuso local em minutos a leste de UTC agora.
+fn local_offset_min() -> i32 {
+    zerith_workflows::local_offset_minutes(zerith_workflows::unix_secs())
+}
+
+fn cron(ctx: &mut Ctx) {
+    let offset = local_offset_min();
+    let existing: HashSet<String> = ctx
+        .read_db()
+        .and_then(|c| {
+            let mut st = c.prepare("SELECT name FROM schedules").ok()?;
+            let rows = st.query_map([], |r| r.get::<_, String>(0)).ok()?;
+            Some(rows.flatten().collect())
+        })
+        .unwrap_or_default();
+    for (profile, dir) in profile_dirs(ctx.home, ctx.opts.profile.as_deref()) {
+        let path = dir.join("cron").join("jobs.json");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for job in cron_jobs(&text) {
+            let id = job["id"].as_str().unwrap_or("").to_string();
+            let label = job["name"]
+                .as_str()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or(&id)
+                .to_string();
+            let name = format!("hermes-{profile}-{label}");
+            let src = format!("{profile}/cron/jobs.json: {label}");
+            if existing.contains(&name) {
+                ctx.plan.push(
+                    "cron",
+                    src,
+                    format!("agendamento {name}"),
+                    Status::Skipped,
+                    "já existe",
+                );
+                continue;
+            }
+            let prompt = job["prompt"].as_str().unwrap_or("").trim().to_string();
+            let scripted = job["script"].as_str().is_some_and(|s| !s.is_empty())
+                || job["no_agent"].as_bool() == Some(true)
+                || job["monitor_script"]
+                    .as_str()
+                    .is_some_and(|s| !s.is_empty());
+            let expr = cron_to_utc(&job["schedule"], offset);
+            let why_not = match (&expr, prompt.is_empty(), scripted) {
+                (Err(e), _, _) => Some(e.clone()),
+                (_, true, _) => Some("sem prompt".into()),
+                (_, _, true) => Some("usa script do Hermes".into()),
+                _ => None,
+            };
+            if let Some(why) = why_not {
+                let rel = format!("cron/{profile}-{}.json", safe_name(&label));
+                let key = path.join(&id);
+                let sha = plan::sha256_hex(job.to_string().as_bytes());
+                if ctx.ledger.unchanged(&key, &sha) {
+                    ctx.plan.push(
+                        "cron",
+                        src,
+                        ctx.archive_path(&rel),
+                        Status::Skipped,
+                        "já arquivado",
+                    );
+                    continue;
+                }
+                if ctx.apply() {
+                    ctx.ledger.record(&key, &sha, &rel);
+                    let body = serde_json::json!({
+                        "instrucao": format!("Sem equivalente direto ({why}). Recrie com `zerith schedule add` ou um workflow."),
+                        "job": job,
+                    });
+                    let _ = ctx.archive(
+                        &rel,
+                        serde_json::to_string_pretty(&body)
+                            .unwrap_or_default()
+                            .as_bytes(),
+                    );
+                }
+                ctx.plan.push(
+                    "cron",
+                    src,
+                    ctx.archive_path(&rel),
+                    Status::Archived,
+                    format!("sem equivalente direto: {why}; recrie com zerith schedule add"),
+                );
+                continue;
+            }
+            let expr = expr.unwrap_or_default();
+            let mut notes = vec![format!(
+                "cron `{expr}` (UTC); entra desligado: ative com zerith schedule enable {name} depois de desligar no Hermes"
+            )];
+            if let Some(d) = job["deliver"]
+                .as_str()
+                .filter(|d| !matches!(*d, "" | "local" | "origin"))
+            {
+                notes.push(format!("entrega `{d}` não migrada"));
+            }
+            if ctx.apply() {
+                let n = zerith_sessions::NewSchedule {
+                    name: name.clone(),
+                    cron_expr: expr,
+                    workspace: job["workdir"].as_str().unwrap_or("").to_string(),
+                    prompt: Some(prompt),
+                    command: None,
+                    no_agent: false,
+                    model: job["model"].as_str().map(str::to_string),
+                    enabled: false,
+                };
+                let r = Store::open(ctx.paths.db())
+                    .map_err(|e| e.to_string())
+                    .and_then(|s| s.schedule_add(&n).map_err(|e| e.to_string()));
+                if let Err(e) = r {
+                    ctx.plan
+                        .push("cron", src, format!("agendamento {name}"), Status::Error, e);
+                    continue;
+                }
+            }
+            ctx.plan.push(
+                "cron",
+                src,
+                format!("agendamento {name}"),
+                Status::Imported,
+                notes.join("; "),
+            );
+        }
+    }
+}
+
+fn safe_name(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+// ----------------------------------------------------------------- telegram
+
+/// O nome no cofre que o gateway do Zerith lê (`zerith-cli/src/telegram.rs`,
+/// `TELEGRAM_SECRET_KEY`).
+pub const TELEGRAM_SECRET: &str = "telegram_bot_token";
+
+/// `CHAVE=valor` de um `.env`, sem comentários nem aspas.
+fn dotenv(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with('#'))
+        .filter_map(|l| {
+            let l = l.strip_prefix("export ").unwrap_or(l);
+            let (k, v) = l.split_once('=')?;
+            let v = v.trim().trim_matches(|c| c == '"' || c == '\'');
+            Some((k.trim().to_string(), v.to_string()))
+        })
+        .filter(|(k, v)| !k.is_empty() && !v.is_empty())
+        .collect()
+}
+
+fn telegram(ctx: &mut Ctx) {
+    let env = dotenv(&std::fs::read_to_string(ctx.home.join(".env")).unwrap_or_default());
+    let var = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+    let yaml = std::fs::read_to_string(ctx.home.join("config.yaml")).unwrap_or_default();
+
+    // Token: só com --migrate-secrets.
+    if let Some(token) = var("TELEGRAM_BOT_TOKEN") {
+        let src = ".env: TELEGRAM_BOT_TOKEN";
+        let dest = format!("cofre ({TELEGRAM_SECRET})");
+        if !ctx.opts.migrate_secrets {
+            ctx.plan.strip(format!("telegram:{TELEGRAM_SECRET}"));
+            ctx.plan.push(
+                "telegram",
+                src,
+                dest,
+                Status::Skipped,
+                "token fora: rode com --migrate-secrets ou use zerith gateway telegram setup",
+            );
+        } else {
+            let (status, reason) = match ctx.secrets.map(|v| v.get(TELEGRAM_SECRET)) {
+                Some(Ok(cur)) if cur == token => (Status::Skipped, "já no cofre".to_string()),
+                Some(Ok(_)) if !ctx.opts.overwrite => (
+                    Status::Conflict,
+                    "o cofre já tem outro token; use --overwrite".to_string(),
+                ),
+                _ if !ctx.apply() => (Status::Imported, String::new()),
+                _ => match ctx.secrets.map(|v| v.set(TELEGRAM_SECRET, &token)) {
+                    Some(Err(e)) => (Status::Error, e.to_string()),
+                    _ => (Status::Imported, String::new()),
+                },
+            };
+            ctx.plan.push("telegram", src, dest, status, reason);
+        }
+    }
+
+    // Allowlist: TELEGRAM_ALLOWED_USERS e telegram.allowed_chats.
+    let mut chats: Vec<i64> = var("TELEGRAM_ALLOWED_USERS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::to_string)
+        .chain(crate::hermes_setup::telegram_allowed_chats(&yaml))
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+    chats.sort_unstable();
+    chats.dedup();
+    if !chats.is_empty() {
+        let have = zerith_core::Settings::load(ctx.paths, None)
+            .settings
+            .gateway
+            .telegram
+            .allowed_chats;
+        let new: Vec<i64> = chats
+            .iter()
+            .copied()
+            .filter(|c| !have.contains(c))
+            .collect();
+        let dest = "settings.toml (gateway.telegram.allowed_chats)";
+        let src = "allowlist do Telegram";
+        if new.is_empty() {
+            ctx.plan
+                .push("telegram", src, dest, Status::Skipped, "chats já liberados");
+        } else {
+            let mut status = Status::Imported;
+            let mut reason = format!("{} chat(s) liberado(s)", new.len());
+            if ctx.apply() {
+                if let Err(e) = zerith_core::Settings::save_user(ctx.paths, |s| {
+                    s.gateway.telegram.allowed_chats.extend(&new);
+                }) {
+                    status = Status::Error;
+                    reason = e.to_string();
+                }
+            }
+            ctx.plan.push("telegram", src, dest, status, reason);
+        }
+    }
+
+    // O resto (canal padrão, webhook, tópico do cron): só os nomes.
+    let rest: Vec<&str> = env
+        .iter()
+        .map(|(k, _)| k.as_str())
+        .filter(|k| {
+            k.starts_with("TELEGRAM_")
+                && !matches!(*k, "TELEGRAM_BOT_TOKEN" | "TELEGRAM_ALLOWED_USERS")
+        })
+        .collect();
+    if !rest.is_empty() {
+        let names = rest.join(", ");
+        let rel = "telegram/LEIA.md";
+        let sha = plan::sha256_hex(names.as_bytes());
+        let key = ctx.home.join(".env#telegram");
+        if ctx.ledger.unchanged(&key, &sha) {
+            ctx.plan.push(
+                "telegram",
+                ".env",
+                ctx.archive_path(rel),
+                Status::Skipped,
+                "já arquivado",
+            );
+            return;
+        }
+        if ctx.apply() {
+            let text = format!(
+                "# Telegram do Hermes\n\nVariáveis sem equivalente no gateway do Zerith (valores não copiados): {names}.\n\nConfigure com `zerith gateway telegram setup`.\n"
+            );
+            if ctx.archive(rel, text.as_bytes()).is_ok() {
+                ctx.ledger.record(&key, &sha, rel);
+            }
+        }
+        ctx.plan.push(
+            "telegram",
+            ".env",
+            ctx.archive_path(rel),
+            Status::Archived,
+            format!("sem equivalente: {names}"),
+        );
     }
 }
 

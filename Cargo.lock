@@ -5263,6 +5263,7 @@ dependencies = [
  "zerith-sessions",
  "zerith-skills",
  "zerith-tools",
+ "zerith-workflows",
 ]
 
 [[package]]

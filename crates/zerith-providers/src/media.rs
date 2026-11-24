@@ -47,7 +47,7 @@ pub const NEW_WINDOW_SECS: i64 = 30 * 86_400;
 const REFERER: &str = "https://github.com/Mistertelecom/zerith";
 const TITLE: &str = "Zerith";
 /// Params whose value must be sent as a JSON integer.
-const INT_PARAMS: [&str; 4] = ["duration", "n", "seed", "output_compression"];
+pub const INT_PARAMS: [&str; 4] = ["duration", "n", "seed", "output_compression"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Kind {
@@ -292,6 +292,8 @@ pub struct OpenRouter {
     max_wait: Duration,
     cache: Mutex<HashMap<Kind, CachedList>>,
     prices: Mutex<Option<CachedPrices>>,
+    /// Where the last model lists are copied (see [`cached_model`]).
+    disk: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for OpenRouter {
@@ -328,7 +330,15 @@ impl OpenRouter {
             max_wait: VIDEO_MAX_WAIT,
             cache: Mutex::new(HashMap::new()),
             prices: Mutex::new(None),
+            disk: None,
         }
+    }
+
+    /// Keeps a copy of every model list fetched in `dir`, for
+    /// [`cached_model`].
+    pub fn with_disk_cache(mut self, dir: PathBuf) -> Self {
+        self.disk = Some(dir);
+        self
     }
 
     /// Gap between video polls (tests use milliseconds).
@@ -486,6 +496,12 @@ impl OpenRouter {
         let list = Arc::new(parse_list(kind, &typed)?);
         if let Ok(mut c) = self.cache.lock() {
             c.insert(kind, (Instant::now(), list.clone()));
+        }
+        // Best-effort copy on disk: the tool schemas are built from it at
+        // start-up, without a network call.
+        if let Some(dir) = &self.disk {
+            let _ = std::fs::create_dir_all(dir);
+            let _ = std::fs::write(catalog_file(dir, kind), typed.to_string());
         }
         Ok(list)
     }
@@ -1096,6 +1112,24 @@ fn parse_descriptor(name: &str, d: &Value) -> ParamKind {
         Some("boolean") => ParamKind::Flag,
         _ => ParamKind::Other,
     }
+}
+
+fn catalog_file(dir: &Path, kind: Kind) -> PathBuf {
+    dir.join(format!("openrouter-{}-models.json", kind.as_str()))
+}
+
+/// The model `id` from the last list saved by
+/// [`OpenRouter::with_disk_cache`], without the network. `None` when there
+/// is no copy or the model is not in it. `vendor/model:free` falls back to
+/// `vendor/model`.
+pub fn cached_model(dir: &Path, kind: Kind, id: &str) -> Option<MediaModel> {
+    let text = std::fs::read_to_string(catalog_file(dir, kind)).ok()?;
+    let all = parse_list(kind, &serde_json::from_str(&text).ok()?).ok()?;
+    let base = id.split(':').next().unwrap_or(id);
+    all.iter()
+        .find(|m| m.id == id)
+        .or_else(|| all.iter().find(|m| m.id == base))
+        .cloned()
 }
 
 /// Every entry of a typed list (`{"data": [...]}`) that has an id, once per

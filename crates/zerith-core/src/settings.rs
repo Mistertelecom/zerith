@@ -706,15 +706,17 @@ pub struct MediaSettings {
     pub video: MediaSlot,
 }
 
-/// One generator: the chosen model and the parameters fixed for it. The chat
-/// model can write the prompt but can never change these.
+/// One generator: the model the user chose. The chat model cannot change the
+/// model; it picks duration, aspect ratio, resolution and the rest per call,
+/// from what the user asked and within what the model accepts.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MediaSlot {
     /// Empty means "not configured": the tool is not offered to the model.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub model: String,
-    /// Ints, bools and strings (`aspect_ratio = "16:9"`, `n = 1`).
+    /// Optional defaults (`aspect_ratio = "16:9"`, `n = 1`), used only when
+    /// the chat model leaves that parameter out of a call.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub params: BTreeMap<String, serde_json::Value>,
 }
@@ -732,6 +734,12 @@ impl MediaSlot {
 impl MediaSettings {
     pub fn is_empty(&self) -> bool {
         self == &Self::default()
+    }
+
+    /// Where the last OpenRouter model lists are copied, so the tools can
+    /// describe the chosen model's parameters without a network call.
+    pub fn catalog_dir(paths: &Paths) -> PathBuf {
+        paths.root().join("cache")
     }
 
     /// Where files go: `output_dir`, or `<data root>/media`.

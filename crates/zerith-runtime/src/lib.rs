@@ -400,7 +400,7 @@ fn media_section(m: &zerith_core::settings::MediaSettings) -> String {
         return String::new();
     }
     format!(
-        "\n\n# Mídia\nVocê pode gerar {} usando o modelo que o usuário escolheu. Quando pedirem uma imagem ou um vídeo, use a ferramenta; não diga que não consegue gerar.",
+        "\n\n# Mídia\nVocê pode gerar {} usando o modelo que o usuário escolheu. Quando pedirem uma imagem ou um vídeo, use a ferramenta; não diga que não consegue gerar. O modelo é fixo, mas duração, proporção, resolução, áudio e os demais parâmetros são você quem escolhe a cada chamada, conforme o pedido do usuário (\"vídeo de 8 segundos em 16:9\" → duration=8, aspect_ratio=16:9) e dentro dos valores que a ferramenta lista; não diga que não consegue definir a duração.",
         kinds.join(" e ")
     )
 }
@@ -1674,7 +1674,13 @@ mod skills_tests {
         );
         assert!(!s.contains("generate_video"));
         st.media.video.model = "veo-3".into();
-        assert!(ctx(&st).contains("`generate_video` (veo-3)"));
+        let s = ctx(&st);
+        assert!(s.contains("`generate_video` (veo-3)"));
+        // The chat model, not the settings, picks duration and the rest.
+        assert!(
+            s.contains("duration=8") && s.contains("você quem escolhe"),
+            "{s}"
+        );
     }
 
     fn scratch() -> std::path::PathBuf {

@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::io::IsTerminal;
 
 use serde_json::Value;
-use zerith_core::{secrets, Paths, Settings};
+use zerith_core::{secrets, MediaSettings, Paths, Settings};
 use zerith_providers::media::{
     ImageRequest, Kind, MediaError, MediaModel, OpenRouter, ParamKind, VideoRequest,
 };
@@ -16,7 +16,7 @@ type Res = Result<(), Box<dyn std::error::Error>>;
 pub const USAGE: &str = "\
   zerith media show
   zerith media models image|video [--query Q] [--limit N] [--offset N]
-  zerith media set image|video --model ID [--param k=v ...] [--clear-params]
+  zerith media set image|video --model ID [--param k=v ...] [--clear-params]   (params: padrões opcionais; a IA escolhe por pedido)
   zerith media key set [valor] | check | delete
   zerith media generate image|video \"<prompt>\" [--ref <imagem>] [--first-frame <imagem>] [--last-frame <imagem>]";
 
@@ -99,7 +99,7 @@ fn show(paths: &Paths) -> Res {
         }
         println!("{name:<15} {}", slot.model);
         for (k, v) in &slot.params {
-            println!("                  {k} = {v}");
+            println!("                  {k} = {v}  (padrão se a IA não escolher)");
         }
     }
     let key = match secrets::resolve_openrouter_key() {
@@ -122,6 +122,7 @@ fn models(paths: &Paths, args: &[String]) -> Res {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     let page = client(&settings(paths), false)?
+        .with_disk_cache(MediaSettings::catalog_dir(paths))
         .models(kind, &query, offset, limit)
         .map_err(|e| e.to_string())?;
     for m in &page.models {
@@ -198,7 +199,7 @@ fn set(paths: &Paths, args: &[String]) -> Res {
     if final_model.is_empty() {
         return Err("escolha um modelo com --model".into());
     }
-    let or = client(&current, false)?;
+    let or = client(&current, false)?.with_disk_cache(MediaSettings::catalog_dir(paths));
     let planned = match kind {
         Kind::Image => or.plan_image(&ImageRequest {
             model: final_model.clone(),

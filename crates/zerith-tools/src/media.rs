@@ -1,5 +1,10 @@
-//! `generate_image` and `generate_video`: the chat model writes the prompt, the
-//! user's settings decide everything else (model, aspect ratio, duration...).
+//! `generate_image` and `generate_video`: the user picks the model in the
+//! settings; the chat model writes the prompt and picks the parameters the
+//! request calls for (duration, aspect ratio, resolution...), within what
+//! that model accepts. The schema lists exactly those parameters, with their
+//! values, from the last OpenRouter list saved on disk; without one, a free
+//! set is offered and the API validates. Values are checked against the live
+//! descriptor before any paid request.
 //!
 //! The tools exist only when `media.image.model` / `media.video.model` is set,
 //! so a model never sees a tool it cannot use. Both carry the policy action
@@ -16,8 +21,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 use zerith_core::{secrets, MediaSettings, Paths, Settings};
 use zerith_providers::media::{
-    sanitize_filename, GeneratedFile, ImageRequest, Kind, MediaError, OpenRouter, VideoRequest,
-    VIDEO_MAX_WAIT,
+    cached_model, sanitize_filename, GeneratedFile, ImageRequest, Kind, MediaError, MediaModel,
+    OpenRouter, ParamKind, ParamSpec, VideoRequest, INT_PARAMS, VIDEO_MAX_WAIT,
 };
 use zerith_security::{Action, Verdict};
 
@@ -53,19 +58,135 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
 fn tools_inner(settings: &Settings, paths: &Paths, key: Option<String>) -> Vec<Box<dyn Tool>> {
     let m = &settings.media;
     let root = m.resolve_output_dir(paths);
+    let cache = MediaSettings::catalog_dir(paths);
     [Kind::Image, Kind::Video]
         .into_iter()
         .filter(|k| slot(m, *k).configured())
         .map(|kind| {
+            let model = cached_model(&cache, kind, slot(m, kind).model.trim());
+            let params = match &model {
+                Some(d) => d.params.clone(),
+                None => free_params(kind),
+            };
             Box::new(MediaTool {
-                spec: spec(kind, m),
+                spec: spec(kind, m, model.as_ref(), &params),
                 kind,
+                params,
                 media: m.clone(),
                 root: root.clone(),
+                cache: cache.clone(),
                 key: key.clone(),
             }) as Box<dyn Tool>
         })
         .collect()
+}
+
+/// Offered when no saved model list describes the chosen model: the common
+/// names, loosely typed. The API validates the values.
+fn free_params(kind: Kind) -> Vec<ParamSpec> {
+    let names: &[&str] = match kind {
+        Kind::Image => &[
+            "aspect_ratio",
+            "resolution",
+            "size",
+            "n",
+            "quality",
+            "background",
+            "output_format",
+            "seed",
+        ],
+        Kind::Video => &[
+            "duration",
+            "resolution",
+            "aspect_ratio",
+            "size",
+            "generate_audio",
+            "seed",
+        ],
+    };
+    names
+        .iter()
+        .map(|n| ParamSpec {
+            name: (*n).into(),
+            kind: match *n {
+                "generate_audio" => ParamKind::Flag,
+                _ => ParamKind::Other,
+            },
+        })
+        .collect()
+}
+
+/// What a parameter is for, in words the chat model maps a request onto.
+fn param_doc(name: &str) -> &'static str {
+    match name {
+        "duration" => "duração do vídeo em segundos (\"vídeo de 8 segundos\" → 8)",
+        "aspect_ratio" => {
+            "proporção (\"16:9\" paisagem/YouTube, \"9:16\" vertical/Reels/TikTok, \"1:1\" quadrado)"
+        }
+        "resolution" => "resolução (ex.: 720p, 1080p, 2K, 4K); maior custa mais",
+        "size" => "tamanho em pixels LARGURAxALTURA",
+        "generate_audio" => "gerar áudio junto (sons, música, falas); pode custar mais",
+        "seed" => "semente para repetir um resultado; só passe se o usuário pedir",
+        "n" => "quantas imagens gerar; cada uma é cobrada",
+        "quality" => "qualidade; maior custa mais",
+        "background" => "fundo (transparent para recorte/logo, opaque)",
+        "output_format" => "formato do arquivo (png, jpeg, webp)",
+        "output_compression" => "compressão do arquivo (0-100)",
+        _ => "parâmetro do modelo",
+    }
+}
+
+/// JSON schema of one parameter, from its descriptor.
+fn param_schema(p: &ParamSpec, default: Option<&Value>) -> Value {
+    let int = INT_PARAMS.contains(&p.name.as_str());
+    let mut s = match &p.kind {
+        ParamKind::Enum(values) => {
+            let ints: Option<Vec<i64>> = if int {
+                values.iter().map(|v| v.parse().ok()).collect()
+            } else {
+                None
+            };
+            match ints {
+                Some(i) => json!({"type": "integer", "enum": i}),
+                None => json!({"type": "string", "enum": values}),
+            }
+        }
+        ParamKind::Range { min, max } => json!({
+            "type": if int { "integer" } else { "number" },
+            "minimum": min,
+            "maximum": max,
+        }),
+        ParamKind::Flag => json!({"type": "boolean"}),
+        ParamKind::Text if p.name == "size" => {
+            json!({"type": "string", "pattern": "^[0-9]+x[0-9]+$"})
+        }
+        _ if int => json!({"type": "integer"}),
+        _ => json!({"type": "string"}),
+    };
+    let fallback = match default {
+        Some(v) => format!("se omitido: {}", show(v)),
+        None => "se omitido: padrão do modelo".into(),
+    };
+    s["description"] = json!(format!("opcional: {}; {fallback}", param_doc(&p.name)));
+    s
+}
+
+fn show(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// `duration (4, 6, 8)`, `n (1..4)`: repeated in the description because
+/// some providers drop `enum` from tool schemas.
+fn param_line(p: &ParamSpec) -> String {
+    match &p.kind {
+        ParamKind::Enum(v) => format!("{} ({})", p.name, v.join(", ")),
+        ParamKind::Range { min, max } => format!("{} ({min}..{max})", p.name),
+        ParamKind::Flag => format!("{} (true/false)", p.name),
+        _ => p.name.clone(),
+    }
 }
 
 fn slot(m: &MediaSettings, kind: Kind) -> &zerith_core::MediaSlot {
@@ -75,31 +196,47 @@ fn slot(m: &MediaSettings, kind: Kind) -> &zerith_core::MediaSlot {
     }
 }
 
-fn fixed_params(m: &MediaSettings, kind: Kind) -> String {
-    let p = &slot(m, kind).params;
-    if p.is_empty() {
-        return "nenhum".into();
-    }
-    p.iter()
-        .map(|(k, v)| match v {
-            Value::String(s) => format!("{k}={s}"),
-            other => format!("{k}={other}"),
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn spec(kind: Kind, m: &MediaSettings) -> ToolSpec {
-    let model = &slot(m, kind).model;
-    let fixed = fixed_params(m, kind);
-    let (name, description, parameters, timeout_s, returns) = match kind {
+fn spec(
+    kind: Kind,
+    m: &MediaSettings,
+    known: Option<&MediaModel>,
+    params: &[ParamSpec],
+) -> ToolSpec {
+    let s = slot(m, kind);
+    let model = match known {
+        Some(d) if d.name != d.id => format!("{}, {}", d.name, d.id),
+        _ => s.model.trim().to_string(),
+    };
+    let accepted = if params.is_empty() {
+        "este modelo não aceita parâmetros além do prompt".to_string()
+    } else if known.is_some() {
+        format!(
+            "parâmetros aceitos por este modelo: {}",
+            params.iter().map(param_line).collect::<Vec<_>>().join("; ")
+        )
+    } else {
+        format!(
+            "parâmetros comuns (a lista exata do modelo ainda não foi carregada; o OpenRouter valida): {}",
+            params
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    let choose = format!(
+        "O modelo é a escolha do usuário e não muda. VOCÊ escolhe os parâmetros conforme o pedido \
+(ex.: \"vídeo de 8 segundos em 16:9\" → duration=8, aspect_ratio=\"16:9\"; \"para Reels\" → 9:16) e omite o que o usuário não pediu \
+(vale o padrão). Use só valores da lista; {accepted}."
+    );
+    let (name, description, mut parameters, timeout_s, returns) = match kind {
         Kind::Image => (
             "generate_image",
             format!(
                 "Gera uma imagem (generate image, text-to-image) com o modelo escolhido pelo usuário ({model}) e salva em arquivo. \
 Use sempre que o usuário pedir uma imagem, ilustração, foto, logo, arte ou capa. COSTA DINHEIRO: chame uma vez por pedido. \
-Modelo e parâmetros já estão fixados nas configurações e NÃO podem ser alterados por você (fixos: {fixed}). \
-Você só escreve o `prompt`, e ele precisa ser ELABORADO, em inglês de preferência, com no mínimo {MIN_WORDS_IMAGE} palavras, cobrindo: \
+{choose} \
+O `prompt` precisa ser ELABORADO, em inglês de preferência, com no mínimo {MIN_WORDS_IMAGE} palavras, cobrindo: \
 subject (sujeito e detalhes), setting (cenário), composition/framing (enquadramento, ângulo), style/medium (estilo, técnica, mídia), \
 lighting (iluminação), color palette (paleta de cores), mood (clima), lens/camera (lente, profundidade de campo), \
 quality terms (alta resolução, detalhes nítidos) e o que evitar (negative: texto distorcido, mãos deformadas, marcas d'água). \
@@ -115,22 +252,18 @@ Depois de gerar, mostre a imagem ao usuário colando a linha Markdown devolvida.
             "o caminho de cada imagem gerada, o modelo, os parâmetros enviados, o custo (quando informado) e uma linha Markdown ![descrição](caminho) para exibir a imagem",
         ),
         Kind::Video => {
-            let audio = slot(m, kind)
-                .params
-                .get("generate_audio")
-                .and_then(Value::as_bool)
-                == Some(true);
+            let audio = params.iter().any(|p| p.name == "generate_audio");
             (
                 "generate_video",
                 format!(
                     "Gera um vídeo curto (generate video, text-to-video / image-to-video) com o modelo escolhido pelo usuário ({model}) e salva em arquivo. \
 Use quando o usuário pedir um vídeo, animação ou clipe. É LENTO (até 10 minutos) e COSTA DINHEIRO: chame uma vez por pedido. \
-Modelo e parâmetros já estão fixados nas configurações e NÃO podem ser alterados por você (fixos: {fixed}). \
-Você só escreve o `prompt`, ELABORADO, com no mínimo {MIN_WORDS_VIDEO} palavras, cobrindo: subject e ação, setting (cenário), \
+{choose} \
+O `prompt` precisa ser ELABORADO, com no mínimo {MIN_WORDS_VIDEO} palavras, cobrindo: subject e ação, setting (cenário), \
 motion (o que se move e como), camera movement (pan, tilt, dolly, drone, câmera fixa), pacing (ritmo, câmera lenta), \
 composition/framing, style/medium, lighting, color palette, mood, lens/camera, quality terms e o que evitar{}. \
 Para image-to-video passe `first_frame` (e `last_frame` se o modelo aceitar): URL ou caminho de imagem.",
-                    if audio { "; o áudio está LIGADO: descreva também sons, música e falas" } else { "" }
+                    if audio { "; com generate_audio=true, descreva também sons, música e falas" } else { "" }
                 ),
                 json!({"type": "object", "additionalProperties": false, "properties": {
                     "prompt": {"type": "string", "description": "prompt detalhado de vídeo: sujeito, ação, movimento, câmera, ritmo, estilo, iluminação, paleta, clima, qualidade, o que evitar"},
@@ -143,6 +276,9 @@ Para image-to-video passe `first_frame` (e `last_frame` se o modelo aceitar): UR
             )
         }
     };
+    for p in params {
+        parameters["properties"][p.name.as_str()] = param_schema(p, s.params.get(&p.name));
+    }
     ToolSpec {
         name: name.into(),
         description,
@@ -159,13 +295,17 @@ Para image-to-video passe `first_frame` (e `last_frame` se o modelo aceitar): UR
 struct MediaTool {
     spec: ToolSpec,
     kind: Kind,
+    /// The generation parameters the schema offers.
+    params: Vec<ParamSpec>,
     media: MediaSettings,
     root: PathBuf,
+    /// Where the model lists are saved (see `cached_model`).
+    cache: PathBuf,
     key: Option<String>,
 }
 
 impl MediaTool {
-    fn allowed_args(&self) -> &'static [&'static str] {
+    fn base_args(&self) -> &'static [&'static str] {
         match self.kind {
             Kind::Image => &["prompt", "reference_images", "filename_hint"],
             Kind::Video => &["prompt", "first_frame", "last_frame", "filename_hint"],
@@ -173,21 +313,36 @@ impl MediaTool {
     }
 
     /// Rejects anything the schema does not list: the model must not be able
-    /// to smuggle in `model`, `n`, `duration`...
+    /// to swap the `model` or send a parameter this model does not take.
     fn check_args<'a>(&self, args: &'a Value) -> Result<&'a serde_json::Map<String, Value>> {
         let obj = args.as_object().ok_or_else(|| {
             ToolError::BadArguments("os argumentos precisam ser um objeto".into())
         })?;
-        if let Some(k) = obj
-            .keys()
-            .find(|k| !self.allowed_args().contains(&k.as_str()))
-        {
+        let known =
+            |k: &str| self.base_args().contains(&k) || self.params.iter().any(|p| p.name == k);
+        if let Some(k) = obj.keys().find(|k| !known(k)) {
+            let mut all: Vec<&str> = self.base_args().to_vec();
+            all.extend(self.params.iter().map(|p| p.name.as_str()));
             return Err(ToolError::BadArguments(format!(
-                "argumento '{k}' não existe nesta ferramenta: modelo e parâmetros vêm das configurações do usuário; aceitos: {}",
-                self.allowed_args().join(", ")
+                "argumento '{k}' não existe nesta ferramenta (o modelo é escolha do usuário e não muda); aceitos: {}",
+                all.join(", ")
             )));
         }
         Ok(obj)
+    }
+
+    /// The user's optional defaults, overridden by what the chat model chose.
+    fn params(
+        &self,
+        args: &serde_json::Map<String, Value>,
+    ) -> std::collections::BTreeMap<String, Value> {
+        let mut out = slot(&self.media, self.kind).params.clone();
+        for p in &self.params {
+            if let Some(v) = args.get(&p.name).filter(|v| !v.is_null()) {
+                out.insert(p.name.clone(), v.clone());
+            }
+        }
+        out
     }
 
     fn client(&self) -> Result<OpenRouter> {
@@ -198,7 +353,7 @@ impl MediaTool {
             }
         };
         let base = Some(self.media.base_url.clone()).filter(|b| !b.trim().is_empty());
-        Ok(OpenRouter::new(key, base))
+        Ok(OpenRouter::new(key, base).with_disk_cache(self.cache.clone()))
     }
 
     fn out_dir(&self, exec: &Exec<'_>) -> PathBuf {
@@ -311,7 +466,7 @@ impl Tool for MediaTool {
                 let req = ImageRequest {
                     model: s.model.clone(),
                     prompt: prompt.to_string(),
-                    params: s.params.clone(),
+                    params: self.params(obj),
                     reference_images: refs,
                     filename_hint: Self::hint(obj),
                 };
@@ -334,7 +489,7 @@ impl Tool for MediaTool {
                 let req = VideoRequest {
                     model: s.model.clone(),
                     prompt: prompt.to_string(),
-                    params: s.params.clone(),
+                    params: self.params(obj),
                     first_frame: frame("first_frame")?,
                     last_frame: frame("last_frame")?,
                     filename_hint: Self::hint(obj),
@@ -369,8 +524,13 @@ impl Tool for MediaTool {
 fn map_err(e: MediaError) -> ToolError {
     match e {
         MediaError::Cancelled => ToolError::Cancelled,
+        // A value outside the model's list: the message names the accepted
+        // ones, so the chat model can fix its own argument.
+        MediaError::Invalid(m) if m.starts_with("parâmetro '") => ToolError::BadArguments(format!(
+            "{m}. Chame de novo com um dos valores aceitos (o mais próximo do que o usuário pediu) e diga a ele o que mudou."
+        )),
         MediaError::Invalid(m) => ToolError::Failed(format!(
-            "{m} (vem das configurações de mídia do usuário; não tente de novo com outros parâmetros, avise o usuário)"
+            "{m} (o modelo é escolha do usuário; não tente outro modelo, avise o usuário)"
         )),
         MediaError::Timeout => ToolError::Failed(
             "o vídeo não ficou pronto a tempo (limite de 10 minutos); o provedor pode ter cobrado mesmo assim, avise o usuário".into(),

@@ -132,11 +132,14 @@ pub async fn media_models(
     limit: usize,
 ) -> Result<MediaPage, String> {
     let base = crate::wire::media_load(state.root()).base_url;
+    // The tools build their parameter schema from this copy at start-up.
+    let cache = zerith_core::MediaSettings::catalog_dir(&Paths::with_root(state.root()));
     tauri::async_runtime::spawn_blocking(move || {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs() as i64);
         let page = OpenRouter::new(None, Some(base))
+            .with_disk_cache(cache)
             .models(kind_of(&kind)?, &query, offset, limit)
             .map_err(|e| e.to_string())?;
         Ok::<_, String>(MediaPage {

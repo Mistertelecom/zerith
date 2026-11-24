@@ -146,39 +146,90 @@ fn tools_exist_only_for_configured_models() {
     assert!(reg.get("generate_video").is_some() && reg.get("generate_image").is_none());
 }
 
+/// The video list as `/videos/models` returns it, saved where the tools
+/// read it at start-up.
+fn save_video_list(paths: &Paths) {
+    let dir = MediaSettings::catalog_dir(paths);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("openrouter-video-models.json"),
+        json!({"data": [{"id": "acme/clip-1", "name": "Acme: Clip", "created": 9,
+            "supported_resolutions": ["720p", "1080p"], "supported_aspect_ratios": ["16:9", "9:16"],
+            "supported_sizes": null, "supported_durations": [-1, 4, 6, 8],
+            "supported_frame_images": ["first_frame"], "generate_audio": true, "seed": false,
+            "pricing_skus": {"duration_seconds_720p": "0.1"}}]})
+        .to_string(),
+    )
+    .unwrap();
+}
+
 #[test]
-fn specs_tell_the_model_what_is_fixed_and_how_to_write_the_prompt() {
+fn specs_list_the_parameters_the_chosen_model_accepts() {
     let root = scratch("spec");
     let (mut s, paths) = settings("http://x/api/v1", &root);
     s.media.video.model = "acme/clip-1".into();
     s.media
         .video
         .params
-        .insert("generate_audio".into(), json!(true));
+        .insert("resolution".into(), json!("720p"));
+    save_video_list(&paths);
     let t = tools_with_key(&s, &paths, "k".into());
     let img = t[0].spec();
     assert_eq!(img.permission, Permission::Network);
     assert!(!img.local);
+    // No saved image list: a free set, the API validates.
     for w in [
         "acme/pic-1",
-        "aspect_ratio=16:9",
         "lighting",
         "iluminação",
-        "NÃO podem",
+        "VOCÊ escolhe",
+        "não foi carregada",
         "12 palavras",
     ] {
         assert!(img.description.contains(w), "{w}");
     }
     assert_eq!(img.parameters["additionalProperties"], json!(false));
     assert!(img.parameters["properties"].get("model").is_none());
+    assert_eq!(
+        img.parameters["properties"]["aspect_ratio"]["type"],
+        "string"
+    );
+    assert!(img.parameters["properties"]["aspect_ratio"]["description"]
+        .as_str()
+        .unwrap()
+        .contains("se omitido: 16:9"));
+    assert_eq!(img.parameters["required"], json!(["prompt"]));
+
+    // Saved video list: exactly its parameters, typed, with their values.
     let vid = t[1].spec();
+    let props = &vid.parameters["properties"];
+    assert_eq!(
+        props["duration"],
+        json!({"type": "integer", "enum": [4, 6, 8],
+        "description": props["duration"]["description"]})
+    );
+    assert_eq!(props["aspect_ratio"]["enum"], json!(["16:9", "9:16"]));
+    assert_eq!(props["generate_audio"]["type"], "boolean");
+    assert!(props["resolution"]["description"]
+        .as_str()
+        .unwrap()
+        .contains("se omitido: 720p"));
+    assert!(props["duration"]["description"]
+        .as_str()
+        .unwrap()
+        .contains("padrão do modelo"));
+    assert!(props.get("seed").is_none() && props.get("size").is_none());
     for w in [
+        "Acme: Clip, acme/clip-1",
+        "duration (4, 6, 8)",
+        "aspect_ratio (16:9, 9:16)",
+        "duration=8",
         "camera movement",
         "pacing",
-        "áudio está LIGADO",
+        "generate_audio=true",
         "18 palavras",
     ] {
-        assert!(vid.description.contains(w), "{w}");
+        assert!(vid.description.contains(w), "{w}: {}", vid.description);
     }
     assert!(
         vid.timeout >= Duration::from_secs(660),
@@ -192,10 +243,10 @@ fn unknown_arguments_and_short_prompts_are_refused_without_a_request() {
     let root = scratch("gate");
     let (s, paths) = settings("http://127.0.0.1:1/api/v1", &root);
     let tool = &tools_with_key(&s, &paths, "k".into())[0];
-    // The model cannot override the fixed model or params.
+    // The model cannot swap the model or send a parameter not offered.
     for bad in [
         json!({"prompt": LONG, "model": "x/y"}),
-        json!({"prompt": LONG, "n": 5}),
+        json!({"prompt": LONG, "duration": 5}),
     ] {
         let e = run_tool(tool.as_ref(), &bad, &root).unwrap_err();
         assert!(matches!(e, ToolError::BadArguments(_)), "{e:?}");
@@ -334,6 +385,70 @@ fn image_is_generated_with_fixed_params_and_reported_with_markdown() {
     assert_eq!(body["model"], "acme/pic-1");
     assert_eq!(body["aspect_ratio"], "16:9");
     assert!(body.get("quality").is_none());
+}
+
+#[test]
+fn the_chat_model_picks_the_parameters_and_a_bad_value_names_the_options() {
+    let root = scratch("choose");
+    let (base, seen) = fake_server();
+    let (s, paths) = settings(&base, &root);
+    let tool = &tools_with_key(&s, &paths, "k".into())[0];
+    // The chosen value wins over the saved default; the rest of the
+    // defaults still apply.
+    let out = run_tool(
+        tool.as_ref(),
+        &json!({"prompt": LONG, "aspect_ratio": "1:1", "n": 2}),
+        &root,
+    )
+    .unwrap();
+    assert!(
+        out.contains("aspect_ratio=1:1") && out.contains("n=2"),
+        "{out}"
+    );
+    let post = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|r| r.starts_with("POST /api/v1/images"))
+        .cloned()
+        .unwrap();
+    assert!(
+        post.contains(r#""aspect_ratio":"1:1""#) && post.contains(r#""n":2"#),
+        "{post}"
+    );
+
+    // Outside the descriptor: refused before any paid request, with the
+    // accepted values, as an argument error the model can fix.
+    seen.lock().unwrap().clear();
+    let e = run_tool(
+        tool.as_ref(),
+        &json!({"prompt": LONG, "aspect_ratio": "21:9"}),
+        &root,
+    )
+    .unwrap_err();
+    let msg = e.to_string();
+    assert!(matches!(e, ToolError::BadArguments(_)), "{e:?}");
+    assert!(
+        msg.contains("1:1, 16:9") && msg.contains("Chame de novo"),
+        "{msg}"
+    );
+    let e = run_tool(tool.as_ref(), &json!({"prompt": LONG, "n": 9}), &root).unwrap_err();
+    assert!(e.to_string().contains("1..4"), "{e}");
+    assert!(seen.lock().unwrap().iter().all(|r| !r.starts_with("POST")));
+
+    // The run saved the list: the next start describes the exact model.
+    let t = tools_with_key(&s, &paths, "k".into());
+    let props = &t[0].spec().parameters["properties"];
+    assert_eq!(props["aspect_ratio"]["enum"], json!(["1:1", "16:9"]));
+    assert_eq!(props["n"]["type"], "integer");
+    assert_eq!(
+        (
+            props["n"]["minimum"].as_f64(),
+            props["n"]["maximum"].as_f64()
+        ),
+        (Some(1.0), Some(4.0))
+    );
+    assert!(props.get("quality").is_none());
 }
 
 #[test]

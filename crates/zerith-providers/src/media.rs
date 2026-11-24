@@ -40,6 +40,8 @@ const IMAGE_TIMEOUT: Duration = Duration::from_secs(300);
 const SUBMIT_TIMEOUT: Duration = Duration::from_secs(60);
 const CATALOG_TIMEOUT: Duration = Duration::from_secs(15);
 const CATALOG_TTL: Duration = Duration::from_secs(600);
+/// A model this recent (by `created`) gets the "novo" badge.
+pub const NEW_WINDOW_SECS: i64 = 30 * 86_400;
 const REFERER: &str = "https://github.com/Mistertelecom/zerith";
 const TITLE: &str = "Zerith";
 /// Params whose value must be sent as a JSON integer.
@@ -111,6 +113,13 @@ pub struct MediaModel {
     pub max_references: u32,
     /// Video: accepted frame images (`first_frame`, `last_frame`).
     pub frame_images: Vec<String>,
+}
+
+impl MediaModel {
+    /// Published less than [`NEW_WINDOW_SECS`] before `now` (unix seconds).
+    pub fn is_new(&self, now: i64) -> bool {
+        self.created > 0 && now - self.created < NEW_WINDOW_SECS
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -451,12 +460,7 @@ impl OpenRouter {
             16 << 20,
             &none,
         )?;
-        let mut models: Vec<MediaModel> = typed["data"]
-            .as_array()
-            .ok_or_else(|| MediaError::Malformed("lista de modelos sem `data`".into()))?
-            .iter()
-            .filter_map(|m| parse_model(kind, m))
-            .collect();
+        let mut models = parse_list(kind, &typed)?;
         if kind == Kind::Image {
             // Prices live only in the generic listing. Best-effort.
             if let Ok(prices) = self.image_prices() {
@@ -1018,12 +1022,36 @@ fn parse_descriptor(name: &str, d: &Value) -> ParamKind {
     }
 }
 
+/// Every entry of a typed list (`{"data": [...]}`) that has an id, once per
+/// id, newest first (`created` descending; ties keep the API's order).
+pub fn parse_list(kind: Kind, v: &Value) -> Result<Vec<MediaModel>> {
+    let data = v["data"]
+        .as_array()
+        .ok_or_else(|| MediaError::Malformed("lista de modelos sem `data`".into()))?;
+    let mut seen = std::collections::HashSet::new();
+    let mut models: Vec<MediaModel> = data
+        .iter()
+        .filter_map(|m| parse_model(kind, m))
+        .filter(|m| seen.insert(m.id.clone()))
+        .collect();
+    models.sort_by_key(|m| std::cmp::Reverse(m.created));
+    Ok(models)
+}
+
 fn parse_model(kind: Kind, m: &Value) -> Option<MediaModel> {
-    let id = m["id"].as_str()?.to_string();
+    let id = m["id"]
+        .as_str()
+        .map(str::trim)
+        .filter(|i| !i.is_empty())?
+        .to_string();
     let mut model = MediaModel {
-        name: m["name"].as_str().unwrap_or(&id).to_string(),
+        name: m["name"]
+            .as_str()
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or(&id)
+            .to_string(),
         description: m["description"].as_str().unwrap_or("").to_string(),
-        created: m["created"].as_i64().unwrap_or(0),
+        created: num(&m["created"]).map_or(0, |x| x as i64),
         id,
         kind,
         price_hint: String::new(),
@@ -1045,11 +1073,18 @@ fn parse_model(kind: Kind, m: &Value) -> Option<MediaModel> {
             }
         }
         Kind::Video => {
+            // `-1` in `supported_durations` means "the model decides", the
+            // same as sending no duration, so it is not offered as a value.
             let list = |key: &str| -> Option<Vec<String>> {
                 m[key]
                     .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter(|v| !v.is_null() && num(v) != Some(-1.0))
+                            .map(render)
+                            .collect::<Vec<_>>()
+                    })
                     .filter(|a| !a.is_empty())
-                    .map(|a| a.iter().map(render).collect())
             };
             for (name, key) in [
                 ("duration", "supported_durations"),

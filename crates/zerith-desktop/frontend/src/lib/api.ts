@@ -462,6 +462,10 @@ export interface MediaModel {
   name: string;
   description: string;
   priceHint: string;
+  /** Unix seconds; the list comes newest first. */
+  created: number;
+  /** Published in the last 30 days. */
+  isNew: boolean;
   params: ParamView[];
   maxReferences: number;
   frameImages: string[];

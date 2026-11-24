@@ -313,6 +313,84 @@ fn video_list_builds_params_from_the_flat_fields() {
     assert!(m.price_hint.contains("0.01"), "{}", m.price_hint);
 }
 
+/// Shapes seen on the live lists on 2026-11-24: nulls everywhere, `-1` among
+/// the durations, a `:free` twin, an entry without a name, the API's order
+/// not guaranteed.
+#[test]
+fn every_model_is_kept_newest_first_whatever_the_fields() {
+    let videos = json!({"data": [
+        {"id": "google/veo-3.1", "name": "Google: Veo 3.1", "created": 1774277148,
+         "supported_resolutions": ["720p", "1080p", "4K"], "supported_aspect_ratios": ["16:9", "9:16"],
+         "supported_sizes": null, "supported_durations": [4, 6, 8],
+         "supported_frame_images": ["first_frame", "last_frame"], "upscale_factor": null,
+         "creativity": null, "generate_audio": true, "seed": true,
+         "pricing_skus": {"duration_seconds_with_audio": "0.40"},
+         "allowed_passthrough_parameters": null},
+        {"id": "heygen/heygen-avatar-6-turbo", "canonical_slug": "x", "hugging_face_id": null,
+         "name": "HeyGen: Avatar 6 Turbo", "created": 1794940883, "description": null,
+         "supported_resolutions": ["1080p", "2K"], "supported_aspect_ratios": null,
+         "supported_sizes": null, "supported_durations": null, "supported_frame_images": null,
+         "generate_audio": false, "seed": false, "pricing_skus": null},
+        {"id": "bytedance/seedance-2.5-flash", "name": "ByteDance: Seedance 2.5 Flash",
+         "created": 1794874901, "supported_durations": [-1, 4, 5, 6],
+         "supported_resolutions": [], "generate_audio": null, "seed": null,
+         "pricing_skus": {"video_tokens": "0.000007"}},
+        {"id": "", "name": "sem id"},
+        {"name": "também sem id"},
+        {"id": "google/veo-3.1", "name": "duplicado", "created": 1}
+    ]});
+    let all = zerith_providers::media::parse_list(Kind::Video, &videos).unwrap();
+    let ids: Vec<&str> = all.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        [
+            "heygen/heygen-avatar-6-turbo",
+            "bytedance/seedance-2.5-flash",
+            "google/veo-3.1"
+        ]
+    );
+    assert_eq!(
+        all[2].name, "Google: Veo 3.1",
+        "the first entry of an id wins"
+    );
+    // -1 ("the model decides") is not a value to offer; an empty list is no param.
+    let seedance = &all[1];
+    assert_eq!(
+        seedance.params[0].kind,
+        ParamKind::Enum(vec!["4".into(), "5".into(), "6".into()])
+    );
+    assert_eq!(seedance.params.len(), 1);
+    let heygen = &all[0];
+    assert_eq!(heygen.description, "");
+    assert_eq!(heygen.params.len(), 1);
+    assert!(heygen.frame_images.is_empty());
+    let now = 1794940883 + 86_400;
+    assert!(heygen.is_new(now));
+    assert!(!all[2].is_new(now));
+
+    let images = json!({"data": [
+        {"id": "old/pic", "created": 10, "supported_parameters": null},
+        {"id": "recraft/recraft-v4.1-flash-v2:free", "name": "Recraft (free)", "created": 30,
+         "supported_parameters": {"aspect_ratio": {"type": "enum", "values": ["1:1", "auto"]}}},
+        {"id": "recraft/recraft-v4.1-flash-v2", "name": "Recraft", "created": 30,
+         "architecture": null, "supported_parameters": {"n": {"type": "range", "min": 1, "max": 6}}},
+        {"id": "x/no-date", "name": "Sem data", "created": null}
+    ]});
+    let all = zerith_providers::media::parse_list(Kind::Image, &images).unwrap();
+    let ids: Vec<&str> = all.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        [
+            "recraft/recraft-v4.1-flash-v2:free",
+            "recraft/recraft-v4.1-flash-v2",
+            "old/pic",
+            "x/no-date"
+        ]
+    );
+    assert_eq!(all[2].name, "old/pic", "no name falls back to the id");
+    assert!(zerith_providers::media::parse_list(Kind::Image, &json!({"x": 1})).is_err());
+}
+
 #[test]
 fn image_is_decoded_to_a_file_with_the_exact_bytes_and_fixed_params_typed() {
     let fake = Fake::start(vec![

@@ -114,9 +114,10 @@ fn show(paths: &Paths) -> Res {
 fn models(paths: &Paths, args: &[String]) -> Res {
     let kind = kind_arg(args)?;
     let query = flag(args, "--query").unwrap_or_default();
+    // All of them by default: the lists are a few dozen, newest first.
     let limit = flag(args, "--limit")
         .and_then(|v| v.parse().ok())
-        .unwrap_or(20);
+        .unwrap_or(usize::MAX);
     let offset = flag(args, "--offset")
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);

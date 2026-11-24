@@ -23,6 +23,10 @@ pub struct MediaModelView {
     pub name: String,
     pub description: String,
     pub price_hint: String,
+    /// Unix seconds the model was published; the list comes newest first.
+    pub created: i64,
+    /// Published in the last 30 days.
+    pub is_new: bool,
     pub params: Vec<ParamView>,
     pub max_references: u32,
     pub frame_images: Vec<String>,
@@ -129,6 +133,9 @@ pub async fn media_models(
 ) -> Result<MediaPage, String> {
     let base = crate::wire::media_load(state.root()).base_url;
     tauri::async_runtime::spawn_blocking(move || {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
         let page = OpenRouter::new(None, Some(base))
             .models(kind_of(&kind)?, &query, offset, limit)
             .map_err(|e| e.to_string())?;
@@ -138,6 +145,8 @@ pub async fn media_models(
                 .models
                 .into_iter()
                 .map(|m| MediaModelView {
+                    is_new: m.is_new(now),
+                    created: m.created,
                     id: m.id,
                     name: m.name,
                     description: m.description,

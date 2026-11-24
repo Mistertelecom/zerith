@@ -365,6 +365,7 @@ export function MediaTab() {
                     </span>
                   </span>
                   <span className="pn-tile-foot">
+                    {m.isNew ? <span className="badge ok">Novo</span> : null}
                     <span className="badge mono">{m.priceHint}</span>
                     {pinned === m.id ? (
                       <span className="badge accent">

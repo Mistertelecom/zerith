@@ -275,6 +275,7 @@ fn run(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
     }
     let mut plan: Vec<Step> = Vec::new();
     let mut summary = Vec::new();
+    let mut moved_from = std::collections::HashMap::new();
     for op in &ops {
         match op {
             Op::Add { path, lines } => {
@@ -312,6 +313,7 @@ fn run(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
                 match to {
                     Some(t) => {
                         summary.push(format!("R {path} -> {t}"));
+                        moved_from.insert(ctx.resolve(t), p.clone());
                         plan.push(Step::Write(ctx.resolve(t), new));
                         plan.push(Step::Remove(p));
                     }
@@ -337,19 +339,30 @@ fn run(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
             exec.host.before_write(p)?;
         }
     }
+    let mut checked = Vec::new();
     for s in plan {
         match s {
             Step::Write(p, body) => {
+                // Num `Move to`, o "antes" é o arquivo de origem.
+                let pc = crate::postcheck::before(ctx.workspace, moved_from.get(&p).unwrap_or(&p));
                 if let Some(d) = p.parent() {
                     std::fs::create_dir_all(d)?;
                 }
                 write_atomic(&p, body.as_bytes())?;
                 exec.host.note_read(&p);
+                checked.push((p, pc));
             }
             Step::Remove(p) => std::fs::remove_file(&p)?,
         }
     }
-    Ok(format!("patch aplicado:\n{}", summary.join("\n")))
+    let mut msg = format!("patch aplicado:\n{}", summary.join("\n"));
+    for (p, pc) in checked {
+        let block = crate::postcheck::after(&p, pc);
+        if !block.is_empty() {
+            msg.push_str(&format!("\n\n{}:\n{block}", p.display()));
+        }
+    }
+    Ok(msg)
 }
 
 /// The first path the patch touches: what the approval card and the policy

@@ -574,6 +574,7 @@ fn write_file(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String
     let content = str_arg(args, "content")?;
     exec.host.check_editable(&path)?;
     crate::lint::check(&path, content.as_bytes())?;
+    let pc = crate::postcheck::before(ctx.workspace, &path);
     exec.host.before_write(&path)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -581,11 +582,9 @@ fn write_file(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String
     write_atomic(&path, content.as_bytes())?;
     // The model knows what it just wrote; a follow-up edit needs no re-read.
     exec.host.note_read(&path);
-    Ok(format!(
-        "{} bytes escritos em {}",
-        content.len(),
-        path.display()
-    ))
+    let mut msg = format!("{} bytes escritos em {}", content.len(), path.display());
+    crate::postcheck::append(&mut msg, &path, pc);
+    Ok(msg)
 }
 
 /// The platform shell: `cmd /C` on Windows, `sh -c` elsewhere.

@@ -53,6 +53,7 @@ pub(super) fn edit_file(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Res
                 let mut buf = text;
                 buf.replace_range(start..end, &rep);
                 crate::lint::check(&path, buf.as_bytes())?;
+                let pc = crate::postcheck::before(ctx.workspace, &path);
                 exec.host.before_write(&path)?;
                 super::write_atomic(&path, buf.as_bytes())?;
                 exec.host.note_read(&path);
@@ -63,6 +64,7 @@ pub(super) fn edit_file(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Res
                 if let Some(diags) = crate::lsp::warm_diagnostics_for_edit(ctx.workspace, &path) {
                     msg.push_str(&format!("\n\n[diagnósticos LSP]\n{diags}"));
                 }
+                crate::postcheck::append(&mut msg, &path, pc);
                 Ok(msg)
             }
             WhitespaceFallback::Ambiguous(k) => Err(ToolError::Failed(format!(
@@ -81,6 +83,7 @@ pub(super) fn edit_file(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Res
         _ => {
             let out = text.replace(old, new);
             crate::lint::check(&path, out.as_bytes())?;
+            let pc = crate::postcheck::before(ctx.workspace, &path);
             exec.host.before_write(&path)?;
             super::write_atomic(&path, out.as_bytes())?;
             exec.host.note_read(&path);
@@ -88,6 +91,7 @@ pub(super) fn edit_file(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Res
             if let Some(diags) = crate::lsp::warm_diagnostics_for_edit(ctx.workspace, &path) {
                 msg.push_str(&format!("\n\n[diagnósticos LSP]\n{diags}"));
             }
+            crate::postcheck::append(&mut msg, &path, pc);
             Ok(msg)
         }
     }
@@ -259,6 +263,7 @@ pub(super) fn multi_edit(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Re
         buf.into_bytes()
     };
     crate::lint::check(&path, &out_bytes)?;
+    let pc = crate::postcheck::before(ctx.workspace, &path);
     exec.host.before_write(&path)?;
     super::write_atomic(&path, &out_bytes)?;
     exec.host.note_read(&path);
@@ -270,5 +275,6 @@ pub(super) fn multi_edit(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Re
     if let Some(diags) = crate::lsp::warm_diagnostics_for_edit(ctx.workspace, &path) {
         msg.push_str(&format!("\n\n[diagnósticos LSP]\n{diags}"));
     }
+    crate::postcheck::append(&mut msg, &path, pc);
     Ok(msg)
 }

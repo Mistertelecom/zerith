@@ -170,6 +170,11 @@ pub struct ContextSettings {
     /// verify_on_stop = false` turns it off.
     #[serde(default = "default_true")]
     pub verify_on_stop: bool,
+    /// Depois de gravar `.py`, `.sh`, `.js`, `.ps1`, roda um verificador
+    /// rápido de linha de comando e anexa ao resultado só os erros que a
+    /// edição criou. `[context] post_write_check = false` desliga.
+    #[serde(default = "default_true")]
+    pub post_write_check: bool,
     /// A short text sent again at the start of every turn, after any
     /// compaction ("nunca salvar config em roteador de produção"). Joined
     /// with the workspace's `.zerith/PINNED.md`.
@@ -182,6 +187,7 @@ impl Default for ContextSettings {
         Self {
             billion_context: true,
             verify_on_stop: true,
+            post_write_check: true,
             pinned_instructions: None,
         }
     }

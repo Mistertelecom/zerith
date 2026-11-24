@@ -24,6 +24,7 @@ pub mod lsp;
 mod media;
 pub mod network;
 mod patch;
+mod postcheck;
 pub mod remote;
 mod skill_tool;
 mod tasks;

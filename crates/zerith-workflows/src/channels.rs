@@ -9,7 +9,8 @@
 //! - WAHA (devlikeapro/waha): `/api/sendText`, `/api/sendFile`,
 //!   `/api/sessions/{session}`.
 //! - WhatsApp Cloud API (Meta, Graph API): `/{phone_number_id}/messages`,
-//!   mensagens `text` e `template`.
+//!   mensagens `text` e `template`. A Cloud API não envia para grupos (só
+//!   números); a versão do Graph é configurável (`graph_version`).
 //! - Telegram Bot API: `sendMessage`, `sendDocument`, `getMe`.
 
 use std::path::Path;
@@ -315,21 +316,32 @@ pub fn dispatch_with(
                 )));
             }
             // Fora da janela de 24 h desde a última mensagem do contato a Meta
-            // só aceita template aprovado.
+            // só aceita template aprovado. O texto do aviso vai na variável
+            // {{1}} do corpo; `template_no_params: true` para template fixo
+            // (ex.: `hello_world`), senão a Meta recusa pela contagem.
             let body = match opt_str(cfg, "template_name") {
-                Some(name) => json!({
-                    "messaging_product": "whatsapp",
-                    "to": to,
-                    "type": "template",
-                    "template": {
+                Some(name) => {
+                    let mut tpl = json!({
                         "name": name,
                         "language": { "code": opt_str(cfg, "template_language").unwrap_or("pt_BR") },
-                        "components": [{
+                    });
+                    if !cfg
+                        .get("template_no_params")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                    {
+                        tpl["components"] = json!([{
                             "type": "body",
                             "parameters": [{ "type": "text", "text": template_param(text) }]
-                        }]
+                        }]);
                     }
-                }),
+                    json!({
+                        "messaging_product": "whatsapp",
+                        "to": to,
+                        "type": "template",
+                        "template": tpl
+                    })
+                }
                 None => json!({
                     "messaging_product": "whatsapp",
                     "to": to,
@@ -1055,6 +1067,20 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("não envia para grupos"), "{err}");
+
+        let (base, rx) = serve(vec![(200, "{}")]);
+        let mut cfg = ch.config.clone();
+        cfg["api_base"] = base.into();
+        cfg["graph_version"] = "v25.0".into();
+        cfg["template_name"] = "hello_world".into();
+        cfg["template_language"] = "en_US".into();
+        cfg["template_no_params"] = true.into();
+        dispatch(&channel(ChannelKind::WhatsAppCloud, cfg), None, "x").unwrap();
+        let req = rx.recv().unwrap();
+        assert_eq!(req.line, "POST /v25.0/PHONE/messages HTTP/1.1");
+        let b = req.json();
+        assert_eq!(b["template"]["language"]["code"], "en_US");
+        assert!(b["template"].get("components").is_none());
     }
 
     #[test]

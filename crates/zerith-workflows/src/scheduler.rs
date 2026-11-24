@@ -103,6 +103,50 @@ pub fn due_workflows(
     due
 }
 
+/// Quanto à frente [`next_run`] procura (8 dias cobre crons semanais).
+const NEXT_RUN_HORIZON_MIN: i64 = 8 * 24 * 60;
+
+/// Próximo disparo de cron entre os workflows ativos, depois do minuto de
+/// `now_utc_secs`: `(id, unix_secs)`. Fusos como em [`due_workflows`]. `None`
+/// sem cron ativo nos próximos 8 dias.
+pub fn next_run(
+    workflows: &[Workflow],
+    now_utc_secs: i64,
+    tz_offset_min: Option<i32>,
+) -> Option<(String, i64)> {
+    let crons: Vec<(&str, CronSchedule, Option<i32>)> = workflows
+        .iter()
+        .filter(|w| w.enabled)
+        .flat_map(|w| {
+            w.nodes
+                .iter()
+                .filter(|n| n.kind == NodeKind::TriggerCron)
+                .filter_map(move |n| {
+                    let expr = n
+                        .config
+                        .get("cron")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("0 8 * * *");
+                    let sched = CronSchedule::parse(expr).ok()?;
+                    Some((w.id.as_str(), sched, node_tz(n).or(tz_offset_min)))
+                })
+        })
+        .collect();
+    if crons.is_empty() {
+        return None;
+    }
+    let first = now_utc_secs.div_euclid(60) + 1;
+    (first..first + NEXT_RUN_HORIZON_MIN).find_map(|m| {
+        let secs = m * 60;
+        crons
+            .iter()
+            .find(|(_, s, tz)| {
+                s.matches_unix(secs, tz.unwrap_or_else(|| local_offset_minutes(secs)))
+            })
+            .map(|(id, _, _)| (id.to_string(), secs))
+    })
+}
+
 /// Estado do agendador de um processo: minutos já disparados e workflows em
 /// execução agora.
 #[derive(Default)]
@@ -315,6 +359,23 @@ mod tests {
         assert_eq!(d.len(), 1);
         assert_eq!(d[0].tz_offset_minutes, -180);
         assert!(due_workflows(&no_tz, at11, Some(0), &mut FireLog::default()).is_empty());
+    }
+
+    #[test]
+    fn next_run_finds_earliest_cron_and_ignores_disabled() {
+        let top_of_hour = (T / 3600 + 1) * 3600;
+        let mut off = cron_wf("off", vec![cron_node("c", "* * * * *", Some(0))]);
+        off.enabled = false;
+        let wfs = vec![
+            off,
+            cron_wf("hourly", vec![cron_node("c", "0 * * * *", Some(0))]),
+            cron_wf("daily", vec![cron_node("c", "0 3 * * *", Some(0))]),
+        ];
+        assert_eq!(
+            next_run(&wfs, T, None),
+            Some(("hourly".to_string(), top_of_hour))
+        );
+        assert_eq!(next_run(&wfs[..1], T, None), None);
     }
 
     #[test]

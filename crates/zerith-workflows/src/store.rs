@@ -5,8 +5,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::json;
 
 use crate::model::{
-    ChannelConfig, ChannelKind, NodeKind, NodeRunLog, Workflow, WorkflowEdge, WorkflowNode,
-    WorkflowRun,
+    ChannelConfig, ChannelKind, DaemonStatus, NodeKind, NodeRunLog, Workflow, WorkflowEdge,
+    WorkflowNode, WorkflowRun,
 };
 use crate::{now_ms, Result, WorkflowError};
 
@@ -305,6 +305,31 @@ impl Store {
             out.push(row?);
         }
         Ok(out)
+    }
+
+    /// Último sinal de vida gravado pelo `zerith daemon` (`None` se o daemon
+    /// nunca rodou com este banco). API estável para a API HTTP do servidor.
+    pub fn daemon_status(&self) -> Result<Option<DaemonStatus>> {
+        let conn = self.conn.lock().map_err(|_| WorkflowError::Lock)?;
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT value FROM workflow_meta WHERE key = 'daemon_status'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(raw.and_then(|r| serde_json::from_str(&r).ok()))
+    }
+
+    /// Grava o sinal de vida do daemon (substitui o anterior).
+    pub fn set_daemon_status(&self, status: &DaemonStatus) -> Result<()> {
+        let conn = self.conn.lock().map_err(|_| WorkflowError::Lock)?;
+        conn.execute(
+            "INSERT INTO workflow_meta (key, value) VALUES ('daemon_status', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![serde_json::to_string(status)?],
+        )?;
+        Ok(())
     }
 
     /// Persistent deduplication (`Seen Store`), read half: items not yet seen

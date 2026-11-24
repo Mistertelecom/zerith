@@ -8,7 +8,7 @@ use std::thread::JoinHandle;
 use zerith_core::{Paths, Settings};
 use zerith_providers::{Cancel, ChatMessage, ChatRequest, Client};
 use zerith_workflows::scheduler::{self, NoHooks, SchedulerState, TickOptions};
-use zerith_workflows::{AiExecutor, Store, WorkflowError};
+use zerith_workflows::{AiExecutor, DaemonStatus, NextRun, Store, WorkflowError};
 
 use crate::headless::{provider_config, resolve_model};
 
@@ -67,6 +67,7 @@ pub struct WorkflowDaemon {
     store: Arc<Store>,
     ai: Arc<dyn AiExecutor>,
     state: SchedulerState,
+    started_at_ms: i64,
 }
 
 impl WorkflowDaemon {
@@ -78,25 +79,60 @@ impl WorkflowDaemon {
                 paths: paths.clone(),
             }),
             state: SchedulerState::default(),
+            started_at_ms: zerith_workflows::now_ms(),
             root,
         })
     }
 
-    /// Um ciclo: dispara os workflows vencidos e devolve as threads iniciadas.
+    /// Um ciclo: dispara os workflows vencidos, grava o sinal de vida e
+    /// devolve as threads iniciadas.
     pub fn cycle(&self, now_secs: i64) -> Vec<JoinHandle<()>> {
+        let tz = None;
         let opts = TickOptions {
             data_root: self.root.clone(),
             now_secs,
-            tz_offset_minutes: None,
+            tz_offset_minutes: tz,
             hooks: Arc::new(NoHooks),
         };
-        match scheduler::tick(&self.store, &self.ai, &opts, &self.state) {
-            Ok(h) => h,
-            Err(e) => {
+        let handles =
+            scheduler::tick(&self.store, &self.ai, &opts, &self.state).unwrap_or_else(|e| {
                 eprintln!("zerith: erro ao verificar workflows: {e}");
                 Vec::new()
+            });
+        if let Err(e) = self.write_status(now_secs, tz) {
+            eprintln!("zerith: falha ao gravar status do daemon: {e}");
+        }
+        handles
+    }
+
+    fn write_status(&self, now_secs: i64, tz: Option<i32>) -> zerith_workflows::Result<()> {
+        let active: Vec<_> = self
+            .store
+            .list_workflows()?
+            .into_iter()
+            .filter(|w| w.enabled)
+            .collect();
+        let mut fails = std::collections::BTreeMap::new();
+        for w in &active {
+            let n = scheduler::consecutive_failures(&self.store, &w.id)?;
+            if n > 0 {
+                fails.insert(w.id.clone(), n);
             }
         }
+        self.store.set_daemon_status(&DaemonStatus {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            started_at_ms: self.started_at_ms,
+            last_cycle_ms: zerith_workflows::now_ms(),
+            hostname: zerith_workflows::hostname(),
+            active_workflows: active.len(),
+            next_run: scheduler::next_run(&active, now_secs, tz).map(|(workflow_id, secs)| {
+                NextRun {
+                    workflow_id,
+                    at_ms: secs * 1000,
+                }
+            }),
+            consecutive_failures: fails,
+        })
     }
 }
 
@@ -174,6 +210,37 @@ mod tests {
         let runs = st.list_runs("wf-vps", 5).unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, "ok");
+
+        let status = st.daemon_status().unwrap().expect("status gravado");
+        assert_eq!(status.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(status.active_workflows, 1);
+        assert!(status.last_cycle_ms >= status.started_at_ms);
+        let next = status.next_run.unwrap();
+        assert_eq!(next.workflow_id, "wf-vps");
+        assert_eq!(next.at_ms, (t / 60 + 1) * 60_000);
+        assert!(status.consecutive_failures.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn daemon_status_counts_failures_of_broken_workflow() {
+        let dir = temp_root("fail");
+        let st = Store::open(&dir.join("workflows.db")).unwrap();
+        let wf = every_minute_wf(
+            "wf-ruim",
+            node("s", NodeKind::Shell, json!({"command": "exit 3"})),
+        );
+        st.save_workflow(&wf).unwrap();
+        let d = WorkflowDaemon::open(&Paths::with_root(&dir)).unwrap();
+        let t = 1_700_000_000;
+        for i in 0..2 {
+            d.cycle(t + i * 60)
+                .into_iter()
+                .for_each(|h| h.join().unwrap());
+        }
+        d.cycle(t + 150);
+        let status = st.daemon_status().unwrap().unwrap();
+        assert_eq!(status.consecutive_failures.get("wf-ruim"), Some(&2));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

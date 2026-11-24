@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -157,4 +159,31 @@ pub struct NodeEvent {
     pub node_id: String,
     pub status: String,
     pub output: String,
+}
+
+/// Próxima execução agendada conhecida pelo daemon.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NextRun {
+    pub workflow_id: String,
+    /// Horário UTC (ms desde 1970).
+    pub at_ms: i64,
+}
+
+/// Sinal de vida do `zerith daemon`, gravado a cada ciclo em `workflows.db`
+/// (lido por [`crate::Store::daemon_status`]). Formato estável: campos novos
+/// entram só com `serde(default)`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonStatus {
+    /// Versão do binário `zerith` que roda o daemon.
+    pub version: String,
+    pub started_at_ms: i64,
+    pub last_cycle_ms: i64,
+    pub hostname: String,
+    /// Workflows ativos (`enabled`).
+    pub active_workflows: usize,
+    #[serde(default)]
+    pub next_run: Option<NextRun>,
+    /// Falhas seguidas por id de workflow (só os que estão falhando).
+    #[serde(default)]
+    pub consecutive_failures: BTreeMap<String, u32>,
 }

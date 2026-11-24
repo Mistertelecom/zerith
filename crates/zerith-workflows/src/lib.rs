@@ -9,8 +9,8 @@ pub mod scheduler;
 pub mod store;
 
 pub use model::{
-    ChannelConfig, ChannelKind, NodeEvent, NodeKind, NodeRunLog, Workflow, WorkflowEdge,
-    WorkflowNode, WorkflowRun,
+    ChannelConfig, ChannelKind, DaemonStatus, NextRun, NodeEvent, NodeKind, NodeRunLog, Workflow,
+    WorkflowEdge, WorkflowNode, WorkflowRun,
 };
 pub use runner::{execute_workflow, test_single_node, AiExecutor, NoopAiExecutor, RunOptions};
 pub use schedule::{CronSchedule, LocalDateTime};
@@ -52,6 +52,17 @@ pub fn local_offset_minutes(unix_secs: i64) -> i32 {
         .single()
         .map(|dt| dt.offset().fix().local_minus_utc() / 60)
         .unwrap_or(0)
+}
+
+/// Nome da máquina (`HOSTNAME`/`COMPUTERNAME`, senão `/etc/hostname`); vazio
+/// se nada disso existir.
+pub fn hostname() -> String {
+    ["HOSTNAME", "COMPUTERNAME"]
+        .iter()
+        .find_map(|k| std::env::var(k).ok())
+        .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
 }
 
 pub fn now_ms() -> i64 {

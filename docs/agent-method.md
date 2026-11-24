@@ -16,7 +16,7 @@ não significa paridade de comportamento.
 | Regras `allow`/`ask`/`deny` por ferramenta e padrão | Implementado | `Policy::check_tool` |
 | Sandbox de SO | **Parcial**: política checada pelo Zerith; `zerith doctor` mostra o nível | `zerith-security` |
 | Instruções de projeto (`AGENTS.md`/`CLAUDE.md`) | Implementado (`system_prompt_with_instructions`) | `zerith-core/instructions.rs` |
-| Hooks de ciclo de vida | Implementado para os 9 eventos (`Guards` + runtime + hosts CLI/UI; confirmação explícita para hooks de projeto planejada) | `zerith-core/hooks.rs`, `zerith-runtime` (`docs/hooks.md`) |
+| Hooks de ciclo de vida | Implementado para os 14 eventos (`Guards` + runtime + hosts CLI/UI; confirmação explícita para hooks de projeto planejada) | `zerith-core/hooks.rs`, `zerith-runtime` (`docs/hooks.md`) |
 | Skills (formato Agent Skills) | Implementado | `zerith-skills` |
 | Subagentes e planos | Implementado em modo plano | `zerith-runtime/src/plan.rs` |
 | Agentes nomeados em Markdown | Implementado | `zerith-core/agents.rs` |

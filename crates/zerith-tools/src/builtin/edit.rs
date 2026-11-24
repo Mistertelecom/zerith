@@ -52,6 +52,7 @@ pub(super) fn edit_file(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Res
                 };
                 let mut buf = text;
                 buf.replace_range(start..end, &rep);
+                crate::lint::check(&path, buf.as_bytes())?;
                 exec.host.before_write(&path)?;
                 super::write_atomic(&path, buf.as_bytes())?;
                 exec.host.note_read(&path);
@@ -71,9 +72,6 @@ pub(super) fn edit_file(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Res
             WhitespaceFallback::None => Err(ToolError::Failed(not_found(&text, old, &path))),
         };
     }
-    if n > 0 {
-        exec.host.before_write(&path)?;
-    }
     match (n, all) {
         (0, _) => Err(ToolError::Failed(not_found(&text, old, &path))),
         (n, false) if n > 1 => Err(ToolError::Failed(format!(
@@ -81,7 +79,10 @@ pub(super) fn edit_file(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Res
             path.display()
         ))),
         _ => {
-            super::write_atomic(&path, text.replace(old, new).as_bytes())?;
+            let out = text.replace(old, new);
+            crate::lint::check(&path, out.as_bytes())?;
+            exec.host.before_write(&path)?;
+            super::write_atomic(&path, out.as_bytes())?;
             exec.host.note_read(&path);
             let mut msg = format!("{n} ocorrência(s) substituída(s) em {}", path.display());
             if let Some(diags) = crate::lsp::warm_diagnostics_for_edit(ctx.workspace, &path) {
@@ -257,6 +258,7 @@ pub(super) fn multi_edit(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Re
     } else {
         buf.into_bytes()
     };
+    crate::lint::check(&path, &out_bytes)?;
     exec.host.before_write(&path)?;
     super::write_atomic(&path, &out_bytes)?;
     exec.host.note_read(&path);

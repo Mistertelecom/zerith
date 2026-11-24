@@ -323,6 +323,12 @@ fn run(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
             }
         }
     }
+    // Conteúdo final inválido barra o patch inteiro antes de tocar o disco.
+    for s in &plan {
+        if let Step::Write(p, body) = s {
+            crate::lint::check(p, body.as_bytes())?;
+        }
+    }
     for s in &plan {
         let p = match s {
             Step::Write(p, _) | Step::Remove(p) => p,

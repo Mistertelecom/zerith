@@ -573,6 +573,7 @@ fn write_file(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String
     let path = ctx.resolve(str_arg(args, "path")?);
     let content = str_arg(args, "content")?;
     exec.host.check_editable(&path)?;
+    crate::lint::check(&path, content.as_bytes())?;
     exec.host.before_write(&path)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;

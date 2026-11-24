@@ -19,6 +19,7 @@ mod diagnostics;
 mod fntool;
 mod host;
 mod jobs;
+mod lint;
 pub mod lsp;
 mod media;
 pub mod network;

@@ -734,3 +734,30 @@ fn apply_patch_is_all_or_nothing_and_follows_the_edit_rules() {
         .is_err());
     assert!(!dir.path().join("ok.txt").exists() && !dir.path().join("segredo.txt").exists());
 }
+
+#[test]
+fn an_edit_that_breaks_json_is_refused_and_the_file_stays_whole() {
+    let dir = scratch();
+    let p = policy(dir.path(), Mode::AcceptEdits);
+    let (r, c) = (Registry::new(), ctx(&p));
+    r.call(
+        "write_file",
+        &json!({"path": "cfg.json", "content": "{\"a\": 1}"}),
+        &c,
+    )
+    .unwrap();
+    let err = r
+        .call(
+            "edit_file",
+            &json!({"path": "cfg.json", "old_string": "1}", "new_string": "1,}"}),
+            &c,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("JSON inválido na linha 1"), "{err}");
+    let disk = std::fs::read_to_string(dir.path().join("cfg.json")).unwrap();
+    assert_eq!(disk, "{\"a\": 1}");
+    let patch = "*** Begin Patch\n*** Add File: b.toml\n+x = \n*** End Patch\n";
+    assert!(r.call("apply_patch", &json!({"patch": patch}), &c).is_err());
+    assert!(!dir.path().join("b.toml").exists());
+}

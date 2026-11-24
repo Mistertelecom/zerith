@@ -415,6 +415,104 @@ pub fn steer_turn(
         .ok_or_else(|| "Nenhum turno rodando nesta conversa".to_string())
 }
 
+/// A resposta de `/btw`, para o cartão "pergunta paralela".
+#[derive(serde::Serialize)]
+pub struct BtwAnswer {
+    pub text: String,
+    pub model: String,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub cache_read_tokens: u64,
+}
+
+/// `/btw <pergunta>`: uma chamada sem ferramentas com o prefixo da conversa
+/// ([`zerith_runtime::btw`]). Não usa o slot do turno (roda junto de um
+/// turno em andamento), não grava nada na conversa e não entra na caixa de
+/// entrada do turno.
+#[tauri::command]
+pub async fn btw_ask(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+    model: String,
+    question: String,
+    agent: Option<String>,
+) -> Result<BtwAnswer, String> {
+    if question.trim().is_empty() {
+        return Err("Uso: /btw <pergunta>".into());
+    }
+    if model.trim().is_empty() {
+        return Err("Escolha um modelo antes de perguntar".into());
+    }
+    let root = state.root().to_path_buf();
+    let db = state.db();
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = zerith_sessions::Store::open(&db).map_err(|e| e.to_string())?;
+        let workspace = turn::session_workspace(&db, &session_id);
+        let paths = zerith_core::Paths::with_root(&root);
+        let settings = zerith_core::Settings::load(&paths, Some(&workspace)).settings;
+        let provider = crate::wire::configured_providers_from(&settings, &root)
+            .into_iter()
+            .next()
+            .ok_or("Nenhum provedor configurado")?;
+        let client = zerith_providers::Client::new(provider)
+            .map_err(|e| zerith_providers::explain::headline(&e))?;
+        let contrib = zerith_plugins::Library::open(&root.join("plugins"))
+            .and_then(|l| l.contributions())
+            .ok();
+        let skills =
+            zerith_skills::Library::open(root.join("skills"))
+                .ok()
+                .map(|l| match &contrib {
+                    Some(c) => l.with_extra(c.skill_dirs()),
+                    None => l,
+                });
+        let extra = contrib.as_ref().map(|c| c.agents.as_slice()).unwrap_or(&[]);
+        let agent = agent
+            .as_ref()
+            .and_then(|n| zerith_core::agents::find_with_extra(&paths, Some(&workspace), extra, n));
+        // Só para a orientação de ferramentas do prompt de sistema sair igual
+        // à do turno (built-ins + criação de skills/agentes); nada roda.
+        // ponytail: sem MCP aqui, a orientação não depende dele.
+        let mut tools = zerith_tools::Registry::new();
+        let have: Vec<String> = tools.specs().iter().map(|s| s.name.clone()).collect();
+        for t in zerith_tools::authoring_tools(zerith_tools::Authoring {
+            paths: paths.clone(),
+            project_dir: Some(workspace.clone()),
+            tools: have,
+            mode: String::new(),
+        }) {
+            tools.register(t);
+        }
+        let a = zerith_runtime::btw::ask(
+            &store,
+            &client,
+            zerith_runtime::TurnContext {
+                skills: skills.as_ref(),
+                agent: agent.as_ref(),
+                settings: Some(&settings),
+                project_dir: Some(&workspace),
+                ..Default::default()
+            },
+            Some(&tools),
+            settings.profile.limits().history_window,
+            &session_id,
+            &model,
+            &question,
+            &Cancel::default(),
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(BtwAnswer {
+            text: a.text,
+            model: a.model,
+            prompt_tokens: a.prompt_tokens,
+            completion_tokens: a.completion_tokens,
+            cache_read_tokens: a.cache_read_tokens,
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

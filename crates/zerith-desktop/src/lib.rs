@@ -228,6 +228,7 @@ pub fn run() {
             providers::account_models,
             chat::cancel_turn,
             chat::steer_turn,
+            chat::btw_ask,
             chat::answer_approval,
             chat::answer_question,
             commands::boot,

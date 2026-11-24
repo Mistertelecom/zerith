@@ -459,6 +459,7 @@ pub fn daemon_cmd(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::err
             Err(e) => eprintln!("zerith: erro ao listar agendamentos: {e}"),
         }
         handles.retain(|h| !h.is_finished());
+        maybe_curate_memory(paths, &store);
 
         if once || cancel.is_cancelled() {
             for h in handles {
@@ -475,6 +476,49 @@ pub fn daemon_cmd(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::err
     }
 
     Ok(())
+}
+
+/// Quando a curadoria da memória rodou pela última vez (ms), na tabela `settings`.
+const CURATE_KEY: &str = "memory.curate.last_run";
+
+/// Curadoria periódica (`[memory] curate_every_days`, 0 = desligada): a cada
+/// tantos dias monta o plano de `zerith memory curate` e só avisa (stderr e
+/// Telegram); nunca aplica. Intervalo como o do curador do Hermes (7 dias;
+/// MIT).
+fn maybe_curate_memory(paths: &Paths, store: &Store) {
+    let cwd = std::env::current_dir().ok();
+    let settings = Settings::load(paths, cwd.as_deref()).settings;
+    let now = now_ms();
+    let last = store
+        .setting(CURATE_KEY)
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<i64>().ok());
+    if !curate_due(settings.memory.curate_every_days, last, now) {
+        return;
+    }
+    let _ = store.set_setting(CURATE_KEY, &now.to_string());
+    let plan =
+        match SqliteMemory::open(paths.db()).and_then(|m| zerith_memory::curate::plan(&m, now)) {
+            Ok(p) => p,
+            Err(e) => return eprintln!("zerith: curadoria da memória falhou: {e}"),
+        };
+    if plan.is_empty() {
+        return;
+    }
+    let msg = format!(
+        "Curadoria da memória: {} fusão(ões) e {} arquivamento(s) propostos. Revise com `zerith memory curate` ou em Memória > Revisar memória; nada foi aplicado.",
+        plan.merges.len(),
+        plan.archives.len()
+    );
+    eprintln!("zerith: {msg}");
+    maybe_alert_telegram(&settings, &msg);
+}
+
+/// Se a curadoria deve rodar agora: ligada e, sem execução anterior ou com a
+/// última há `every_days` dias ou mais.
+fn curate_due(every_days: u32, last_ms: Option<i64>, now_ms: i64) -> bool {
+    every_days > 0 && last_ms.is_none_or(|l| now_ms - l >= i64::from(every_days) * 86_400_000)
 }
 
 /// Tarefa que passa disso avisa ao terminar mesmo dando certo: quem agendou
@@ -831,6 +875,16 @@ mod tests {
             &mk_schedule("*/5 * * * *", true, None),
             ts + 60
         ));
+    }
+
+    #[test]
+    fn memory_curation_is_off_by_default_and_runs_every_n_days() {
+        let day = 86_400_000;
+        assert_eq!(Settings::default().memory.curate_every_days, 0);
+        assert!(!curate_due(0, None, 10 * day));
+        assert!(curate_due(7, None, 10 * day));
+        assert!(!curate_due(7, Some(5 * day), 11 * day));
+        assert!(curate_due(7, Some(4 * day), 11 * day));
     }
 
     #[test]

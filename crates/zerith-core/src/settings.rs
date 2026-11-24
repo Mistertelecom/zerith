@@ -684,6 +684,9 @@ impl Profile {
 pub struct MemorySettings {
     pub paused: bool,
     pub budget_chars: usize,
+    /// `zerith daemon` monta o plano da curadoria (`zerith memory curate`) a
+    /// cada tantos dias e só avisa; nunca aplica. 0 = desligado (padrão).
+    pub curate_every_days: u32,
 }
 
 impl Default for MemorySettings {
@@ -691,6 +694,7 @@ impl Default for MemorySettings {
         Self {
             paused: false,
             budget_chars: 2000,
+            curate_every_days: 0,
         }
     }
 }

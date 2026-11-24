@@ -1349,6 +1349,51 @@ pub(crate) fn tool_guidance(tools: &zerith_tools::Registry) -> String {
     out
 }
 
+/// First line of the pinned-instructions note.
+pub const PINNED_HEADER: &str = "[instruções fixas do usuário]";
+/// Pinned instructions past this many bytes are cut, with a warning.
+const PINNED_MAX: usize = 8 * 1024;
+
+/// The note a turn appends after the prompt: `[context] pinned_instructions`
+/// plus the workspace's `.zerith/PINNED.md`, read again every turn so an edit
+/// counts at once and a compaction never loses it. A synthetic user note,
+/// never the system prompt (that would break the provider's prefix cache).
+/// Concept after Goose `platform_extensions/tom.rs` ("top of mind" text and
+/// file re-sent every turn, Apache-2.0) and Claude Code's re-injection after
+/// compaction.
+pub fn pinned_note(settings: Option<&Settings>, workspace: &std::path::Path) -> Option<String> {
+    use std::io::Read;
+    let file = std::fs::File::open(workspace.join(".zerith").join("PINNED.md"))
+        .ok()
+        .and_then(|f| {
+            let mut b = Vec::new();
+            f.take(PINNED_MAX as u64 + 4).read_to_end(&mut b).ok()?;
+            Some(String::from_utf8_lossy(&b).into_owned())
+        });
+    let parts: Vec<&str> = [
+        settings.and_then(|s| s.context.pinned_instructions.as_deref()),
+        file.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .filter(|s| !s.is_empty())
+    .collect();
+    if parts.is_empty() {
+        return None;
+    }
+    let mut body = parts.join("\n\n");
+    if body.len() > PINNED_MAX {
+        let mut cut = PINNED_MAX;
+        while !body.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        body.truncate(cut);
+        body.push_str("\n[cortado: as instruções fixas passam de 8 KB]");
+    }
+    Some(format!("{PINNED_HEADER}\n{body}"))
+}
+
 /// The skills index for a turn with the `skill` tool: name and description of
 /// each enabled skill when they all fit `budget`, otherwise the ones relevant
 /// to `prompt` plus a pointer to `skill_search`. Bodies are never inlined; that
@@ -1629,6 +1674,33 @@ mod skills_tests {
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-scratch");
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    /// Settings text and `.zerith/PINNED.md` join under the header; nothing
+    /// set, no note; past 8 KB the text is cut and says so.
+    #[test]
+    fn pinned_instructions_join_settings_and_file_and_stop_at_8kb() {
+        let dir = tempfile::Builder::new().tempdir_in(scratch()).unwrap();
+        let ws = dir.path();
+        let mut st = zerith_core::Settings::default();
+        assert_eq!(pinned_note(Some(&st), ws), None);
+        st.context.pinned_instructions = Some(" nunca salvar config em produção ".into());
+        assert_eq!(
+            pinned_note(Some(&st), ws).as_deref(),
+            Some("[instruções fixas do usuário]\nnunca salvar config em produção")
+        );
+        std::fs::create_dir_all(ws.join(".zerith")).unwrap();
+        std::fs::write(ws.join(".zerith/PINNED.md"), "use a VRF mgmt\n").unwrap();
+        assert_eq!(
+            pinned_note(Some(&st), ws).as_deref(),
+            Some(
+                "[instruções fixas do usuário]\nnunca salvar config em produção\n\nuse a VRF mgmt"
+            )
+        );
+        std::fs::write(ws.join(".zerith/PINNED.md"), "é".repeat(10_000)).unwrap();
+        let n = pinned_note(None, ws).unwrap();
+        assert!(n.ends_with("[cortado: as instruções fixas passam de 8 KB]"));
+        assert!(n.len() < PINNED_MAX + 200);
     }
 
     fn skill(dir: &std::path::Path, name: &str, body: &str) {

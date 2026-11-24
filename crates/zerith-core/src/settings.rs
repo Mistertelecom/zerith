@@ -170,6 +170,11 @@ pub struct ContextSettings {
     /// verify_on_stop = false` turns it off.
     #[serde(default = "default_true")]
     pub verify_on_stop: bool,
+    /// A short text sent again at the start of every turn, after any
+    /// compaction ("nunca salvar config em roteador de produção"). Joined
+    /// with the workspace's `.zerith/PINNED.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_instructions: Option<String>,
 }
 
 impl Default for ContextSettings {
@@ -177,6 +182,7 @@ impl Default for ContextSettings {
         Self {
             billion_context: true,
             verify_on_stop: true,
+            pinned_instructions: None,
         }
     }
 }
@@ -1374,6 +1380,13 @@ models = [\"gemini-flash\"]
         assert!(toml::to_string_pretty(&off)
             .unwrap()
             .contains("billion_context = false"));
+        let pinned: Settings =
+            toml::from_str("[context]\npinned_instructions = \"nunca salvar\"\n").unwrap();
+        assert_eq!(
+            pinned.context.pinned_instructions.as_deref(),
+            Some("nunca salvar")
+        );
+        assert!(pinned.context.billion_context, "the rest keeps its default");
     }
 
     #[test]

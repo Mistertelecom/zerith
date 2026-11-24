@@ -702,6 +702,20 @@ fn turn_body(
         )?;
         hist.push(ChatMessage::synthetic_user(text), cid);
     }
+    // Pinned instructions, after the prompt of every turn: a summary or a
+    // dropped turn can hide an older copy, never this one.
+    // ponytail: one copy per turn stays in history (short texts expected,
+    // 8 KB cap); skip a copy still visible if long pins start to weigh.
+    if let Some(note) = crate::pinned_note(ctx.settings, &cwd) {
+        let id = store.append(
+            session_id,
+            &NewMessage {
+                raw: Some(json!({"tool_context": true})),
+                ..NewMessage::new(Role::User, note.clone())
+            },
+        )?;
+        hist.push(ChatMessage::synthetic_user(note), id);
+    }
 
     let context_probe = {
         let mut s = prompt.to_lowercase();

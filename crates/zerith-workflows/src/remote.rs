@@ -61,6 +61,42 @@ impl PairingCode {
     }
 }
 
+// ------------------------------------------------------------ tipos das rotas
+
+/// `GET /v1/health`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Health {
+    pub name: String,
+    pub version: String,
+    pub hostname: String,
+    pub uptime_secs: u64,
+    /// Linha da tabela `daemon_status` (se o daemon gravar uma), como JSON.
+    #[serde(default)]
+    pub daemon: Option<serde_json::Value>,
+    pub workflows_total: usize,
+    pub workflows_enabled: usize,
+    /// Workflows cuja última execução terminou em erro.
+    pub failing_workflows: usize,
+    /// Execuções disparadas por esta API ainda rodando.
+    pub runs_active: usize,
+}
+
+/// Corpo de `PUT /v1/workflows/:id`. `base_updated_at_ms` é o
+/// `updated_at_ms` que o cliente viu por último; `None` = só criar. Se o
+/// servidor tiver versão diferente, responde 409 com a atual.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PutWorkflow {
+    pub workflow: crate::Workflow,
+    #[serde(default)]
+    pub base_updated_at_ms: Option<i64>,
+}
+
+/// Resposta de `POST /v1/workflows/:id/run`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunStarted {
+    pub run_id: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

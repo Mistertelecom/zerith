@@ -10,17 +10,20 @@
 //! pareamento por código do Hermes (MIT, `gateway/pairing.py`).
 
 mod auth;
+mod events;
 mod http;
+mod routes;
 
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use zerith_core::Paths;
+use zerith_workflows::{AiExecutor, Store};
 
 type Boxed = Box<dyn std::error::Error>;
 
@@ -32,20 +35,86 @@ const MAX_CONNS: usize = 64;
 pub(crate) struct Ctx {
     pub root: PathBuf,
     pub started: Instant,
+    pub store: Store,
+    pub ai: Arc<dyn AiExecutor>,
+    pub secrets: routes::Secrets,
+    pub bus: events::EventBus,
+    pub runs_active: AtomicUsize,
+    /// Serializa ler-comparar-gravar (PUT com versão, índice de segredos).
+    pub write_lock: Mutex<()>,
     conns: AtomicUsize,
     limiter: auth::FailLimiter,
-    usage_lock: std::sync::Mutex<()>,
+    usage_lock: Mutex<()>,
 }
 
 impl Ctx {
-    pub(crate) fn new(paths: &Paths) -> Self {
-        Self {
-            root: paths.root().to_path_buf(),
+    /// `<raiz>/workflows.db` (o mesmo banco do desktop e do daemon) e o cofre
+    /// do sistema. Não semeia os modelos de exemplo: o servidor é gerenciado
+    /// pelo desktop.
+    pub(crate) fn open(paths: &Paths) -> Result<Self, Boxed> {
+        Self::with(
+            paths,
+            Box::new(zerith_core::secrets::OsKeyring),
+            Arc::new(CliAi {
+                paths: paths.clone(),
+            }),
+        )
+    }
+
+    pub(crate) fn with(
+        paths: &Paths,
+        secrets: routes::Secrets,
+        ai: Arc<dyn AiExecutor>,
+    ) -> Result<Self, Boxed> {
+        let root = paths.root().to_path_buf();
+        Ok(Self {
+            store: Store::open(&root.join("workflows.db"))?,
+            root,
             started: Instant::now(),
+            ai,
+            secrets,
+            bus: events::EventBus::default(),
+            runs_active: AtomicUsize::new(0),
+            write_lock: Mutex::new(()),
             conns: AtomicUsize::new(0),
             limiter: auth::FailLimiter::default(),
-            usage_lock: std::sync::Mutex::new(()),
-        }
+            usage_lock: Mutex::new(()),
+        })
+    }
+}
+
+/// Nós `ai_agent` no servidor: uma chamada ao provedor configurado em
+/// `<raiz>` (mesma resolução de conta/modelo do `zerith -p`). Sem loop de
+/// ferramentas — `complete_agent_loop` cai no padrão do trait.
+// ponytail: só `complete`; ligar o loop do agente com ferramentas quando o
+// daemon tiver um executor próprio (aí reaproveitar o dele).
+struct CliAi {
+    paths: Paths,
+}
+
+impl AiExecutor for CliAi {
+    fn complete(
+        &self,
+        model: Option<&str>,
+        system: &str,
+        prompt: &str,
+    ) -> zerith_workflows::Result<String> {
+        use zerith_providers::{Cancel, ChatMessage, ChatRequest, Client};
+        let err = |e: String| zerith_workflows::WorkflowError::Ai(e);
+        let settings = crate::headless::load_settings(&self.paths);
+        let cfg = crate::headless::provider_config(&settings).map_err(|e| err(e.to_string()))?;
+        let model = crate::headless::resolve_model(model.map(str::to_string), &settings, &cfg)
+            .ok_or_else(|| err("nenhum modelo configurado no servidor".into()))?;
+        let client = Client::new(cfg).map_err(|e| err(e.to_string()))?;
+        let req = ChatRequest::new(
+            &model,
+            vec![ChatMessage::system(system), ChatMessage::user(prompt)],
+        )
+        .max_tokens(4096);
+        client
+            .complete(&req, &Cancel::default())
+            .map(|c| c.text)
+            .map_err(|e| err(zerith_providers::explain::headline(&e)))
     }
 }
 
@@ -72,7 +141,7 @@ pub(crate) fn run_on(listener: TcpListener, ctx: Arc<Ctx>) -> JoinHandle<()> {
     })
 }
 
-fn handle_conn(ctx: &Ctx, mut stream: TcpStream) {
+fn handle_conn(ctx: &Arc<Ctx>, mut stream: TcpStream) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
     let peer = stream.peer_addr().ok();
@@ -90,7 +159,18 @@ fn handle_conn(ctx: &Ctx, mut stream: TcpStream) {
         Err(None) => return,
     };
     let (status, body) = match authorize(ctx, &req, peer) {
-        Ok(()) => route(ctx, &req),
+        Ok(()) if req.method == "GET" && req.path == "/v1/events" => {
+            let since = req
+                .query_param("since")
+                .or(req.header("last-event-id"))
+                .and_then(|s| s.parse().ok());
+            let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
+            let status =
+                || serde_json::to_value(routes::health_value(ctx).ok()).unwrap_or_default();
+            events::serve_sse(&mut stream, &ctx.bus, since, &status);
+            return;
+        }
+        Ok(()) => routes::route(ctx, &req),
         Err(denied) => denied,
     };
     let _ = http::write_json(&mut stream, status, &body.to_string());
@@ -139,16 +219,6 @@ fn authorize(ctx: &Ctx, req: &http::Request, peer: Option<SocketAddr>) -> Result
     }
 }
 
-fn route(_ctx: &Ctx, req: &http::Request) -> (u16, Value) {
-    match (req.method.as_str(), req.path.as_str()) {
-        ("GET", "/v1/ping") => (
-            200,
-            json!({ "name": "zerith", "version": zerith_core::VERSION }),
-        ),
-        _ => (404, json!({ "error": "rota não encontrada" })),
-    }
-}
-
 /// Liga o servidor configurado em `<raiz>/server/` e devolve a thread que
 /// aceita conexões. Pensado para o `zerith daemon` chamar
 /// (`let _h = server::spawn(&paths)?;`) e seguir com o agendador; `zerith
@@ -174,7 +244,7 @@ pub fn spawn(paths: &Paths) -> Result<JoinHandle<()>, Boxed> {
         listener.local_addr()?,
         auth::load_tokens(paths.root()).len()
     );
-    Ok(run_on(listener, Arc::new(Ctx::new(paths))))
+    Ok(run_on(listener, Arc::new(Ctx::open(paths)?)))
 }
 
 /// `zerith server ...`
@@ -332,12 +402,46 @@ pub(crate) mod tests {
     use super::*;
     use std::io::{Read, Write};
 
-    /// Sobe o servidor numa porta efêmera de 127.0.0.1 sobre uma raiz temporária.
-    pub(crate) fn start(root: &std::path::Path) -> SocketAddr {
+    /// Cofre de teste em memória: nada vai para o Gerenciador de Credenciais.
+    #[derive(Default, Clone)]
+    pub(crate) struct MapSecrets(Arc<Mutex<std::collections::HashMap<String, String>>>);
+
+    impl zerith_core::secrets::SecretStore for MapSecrets {
+        fn get(&self, name: &str) -> Result<String, zerith_core::secrets::SecretError> {
+            self.0
+                .lock()
+                .unwrap()
+                .get(name)
+                .cloned()
+                .ok_or_else(|| zerith_core::secrets::SecretError::NotFound(name.into()))
+        }
+        fn set(&self, name: &str, value: &str) -> Result<(), zerith_core::secrets::SecretError> {
+            self.0.lock().unwrap().insert(name.into(), value.into());
+            Ok(())
+        }
+        fn delete(&self, name: &str) -> Result<(), zerith_core::secrets::SecretError> {
+            self.0.lock().unwrap().remove(name);
+            Ok(())
+        }
+    }
+
+    /// Sobe o servidor numa porta efêmera de 127.0.0.1 sobre uma raiz
+    /// temporária, com cofre em memória e IA de mentira.
+    pub(crate) fn start_with(root: &std::path::Path, secrets: MapSecrets) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        run_on(listener, Arc::new(Ctx::new(&Paths::with_root(root))));
+        let ctx = Ctx::with(
+            &Paths::with_root(root),
+            Box::new(secrets),
+            Arc::new(zerith_workflows::NoopAiExecutor),
+        )
+        .unwrap();
+        run_on(listener, Arc::new(ctx));
         addr
+    }
+
+    pub(crate) fn start(root: &std::path::Path) -> SocketAddr {
+        start_with(root, MapSecrets::default())
     }
 
     /// Requisição crua; devolve (status, corpo JSON).
@@ -430,5 +534,197 @@ pub(crate) mod tests {
             .map(|t| t.device)
             .collect();
         assert_eq!(left, ["celular"]);
+    }
+
+    fn sample_wf(id: &str) -> Value {
+        json!({
+            "id": id, "name": "teste", "created_at_ms": 0, "updated_at_ms": 0,
+            "nodes": [
+                {"id": "t", "kind": "trigger_manual", "label": "T", "x": 0, "y": 0},
+                {"id": "a", "kind": "transform", "label": "A", "x": 1, "y": 0,
+                 "config": {"mode": "template", "template": "oi {{prev}}"}}
+            ],
+            "edges": [{"id": "e", "from": "t", "to": "a"}]
+        })
+    }
+
+    #[test]
+    fn rotas_de_workflow_concorrencia_e_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let addr = start(dir.path());
+        let tok = auth::add_token(dir.path(), "pc").unwrap();
+        let t = Some(tok.as_str());
+
+        let (st, list) = call(addr, "GET", "/v1/workflows", t, None);
+        assert_eq!(
+            (st, list.as_array().map(Vec::len)),
+            (200, Some(0)),
+            "sem seed"
+        );
+        let put = json!({ "workflow": sample_wf("w1") });
+        let (st, saved) = call(addr, "PUT", "/v1/workflows/w1", t, Some(&put));
+        assert_eq!(st, 201);
+        let v1 = saved["updated_at_ms"].as_i64().unwrap();
+        // Recriar sem versão = conflito (já existe).
+        assert_eq!(call(addr, "PUT", "/v1/workflows/w1", t, Some(&put)).0, 409);
+        let upd = json!({ "workflow": sample_wf("w1"), "base_updated_at_ms": v1 });
+        let (st, saved) = call(addr, "PUT", "/v1/workflows/w1", t, Some(&upd));
+        assert_eq!(st, 200);
+        assert!(saved["updated_at_ms"].as_i64().unwrap() > v1);
+        // Mesma base de novo: o servidor já tem versão mais nova.
+        let (st, v) = call(addr, "PUT", "/v1/workflows/w1", t, Some(&upd));
+        assert_eq!(st, 409);
+        assert_eq!(v["current"]["id"], "w1");
+        let bad = json!({ "workflow": sample_wf("outro") });
+        assert_eq!(call(addr, "PUT", "/v1/workflows/w1", t, Some(&bad)).0, 400);
+
+        let (st, w) = call(addr, "GET", "/v1/workflows/w1", t, None);
+        assert_eq!((st, w["name"].as_str()), (200, Some("teste")));
+        assert_eq!(call(addr, "GET", "/v1/workflows/nada", t, None).0, 404);
+        let (st, w) = call(
+            addr,
+            "POST",
+            "/v1/workflows/w1/enabled",
+            t,
+            Some(&json!({"enabled": true})),
+        );
+        assert_eq!((st, w["enabled"].as_bool()), (200, Some(true)));
+
+        let (st, r) = call(addr, "POST", "/v1/workflows/w1/run", t, None);
+        assert_eq!(st, 202);
+        let run_id = r["run_id"].as_str().unwrap().to_string();
+        let mut run = Value::Null;
+        for _ in 0..100 {
+            run = call(addr, "GET", &format!("/v1/runs/{run_id}"), t, None).1;
+            if run["status"] != "running" {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(run["status"], "ok", "{run}");
+        assert!(run["node_logs"].as_array().is_some_and(|l| l.len() == 2));
+        let (st, runs) = call(addr, "GET", "/v1/workflows/w1/runs?limit=5", t, None);
+        assert_eq!((st, runs[0]["id"].as_str()), (200, Some(run_id.as_str())));
+        assert_eq!(call(addr, "GET", "/v1/runs/nada", t, None).0, 404);
+
+        let (st, h) = call(addr, "GET", "/v1/health", t, None);
+        assert_eq!(st, 200);
+        assert_eq!(
+            (
+                h["workflows_total"].as_u64(),
+                h["workflows_enabled"].as_u64()
+            ),
+            (Some(1), Some(1))
+        );
+        assert!(h["daemon"].is_null(), "sem tabela daemon_status");
+
+        assert_eq!(call(addr, "DELETE", "/v1/workflows/w1", t, None).0, 200);
+        assert_eq!(call(addr, "GET", "/v1/workflows/w1", t, None).0, 404);
+    }
+
+    #[test]
+    fn health_le_a_tabela_daemon_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let addr = start(dir.path());
+        let tok = auth::add_token(dir.path(), "pc").unwrap();
+        let c = rusqlite::Connection::open(dir.path().join("workflows.db")).unwrap();
+        c.execute_batch(
+            "CREATE TABLE daemon_status (pid INTEGER, heartbeat_at_ms INTEGER, last_error TEXT);
+             INSERT INTO daemon_status VALUES (1, 10, NULL), (42, 99, 'x');",
+        )
+        .unwrap();
+        let h = call(addr, "GET", "/v1/health", Some(&tok), None).1;
+        assert_eq!(
+            h["daemon"],
+            json!({"pid": 42, "heartbeat_at_ms": 99, "last_error": "x"})
+        );
+    }
+
+    #[test]
+    fn segredos_so_nomes_nunca_valores() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = MapSecrets::default();
+        let addr = start_with(dir.path(), vault.clone());
+        let tok = auth::add_token(dir.path(), "pc").unwrap();
+        let t = Some(tok.as_str());
+        let valor = "valor-super-secreto-123";
+        let (st, v) = call(
+            addr,
+            "PUT",
+            "/v1/secrets/API_X",
+            t,
+            Some(&json!({"value": valor})),
+        );
+        assert_eq!(st, 200);
+        assert!(!v.to_string().contains(valor));
+        assert_eq!(
+            vault.0.lock().unwrap().get("API_X").map(String::as_str),
+            Some(valor)
+        );
+        let (st, names) = call(addr, "GET", "/v1/secrets", t, None);
+        assert_eq!((st, names), (200, json!(["API_X"])));
+        assert_eq!(
+            call(addr, "GET", "/v1/secrets/API_X", t, None).0,
+            404,
+            "sem leitura"
+        );
+        assert_eq!(
+            call(
+                addr,
+                "PUT",
+                "/v1/secrets/a%2F..",
+                t,
+                Some(&json!({"value": "x"}))
+            )
+            .0,
+            400
+        );
+        for f in ["secrets.json", "tokens.json", "config.toml"] {
+            let txt =
+                std::fs::read_to_string(auth::server_dir(dir.path()).join(f)).unwrap_or_default();
+            assert!(!txt.contains(valor) && !txt.contains(&tok), "{f}");
+        }
+        assert_eq!(call(addr, "DELETE", "/v1/secrets/API_X", t, None).0, 200);
+        assert!(vault.0.lock().unwrap().is_empty());
+        assert_eq!(call(addr, "GET", "/v1/secrets", t, None).1, json!([]));
+    }
+
+    #[test]
+    fn eventos_sse_entregam_run_iniciado_e_terminado() {
+        use std::io::BufRead;
+        let dir = tempfile::tempdir().unwrap();
+        let addr = start(dir.path());
+        let tok = auth::add_token(dir.path(), "pc").unwrap();
+        let t = Some(tok.as_str());
+        call(
+            addr,
+            "PUT",
+            "/v1/workflows/w1",
+            t,
+            Some(&json!({ "workflow": sample_wf("w1") })),
+        );
+
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        write!(
+            s,
+            "GET /v1/events HTTP/1.1\r\nAuthorization: Bearer {tok}\r\n\r\n"
+        )
+        .unwrap();
+        let mut rd = std::io::BufReader::new(s);
+        let mut seen = String::new();
+        // Cabeçalho + primeiro daemon_status (sai na hora).
+        while !seen.contains("event: daemon_status") {
+            rd.read_line(&mut seen).unwrap();
+        }
+        assert!(seen.starts_with("HTTP/1.1 200") && seen.contains("text/event-stream"));
+        assert_eq!(call(addr, "POST", "/v1/workflows/w1/run", t, None).0, 202);
+        while !seen.contains("event: run_finished") {
+            assert!(rd.read_line(&mut seen).unwrap() > 0);
+        }
+        assert!(seen.contains("event: run_started"));
+        assert!(!seen.contains(&tok));
+        // Sem token não abre o fluxo.
+        assert_eq!(call(addr, "GET", "/v1/events", None, None).0, 401);
     }
 }

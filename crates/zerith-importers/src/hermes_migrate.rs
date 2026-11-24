@@ -101,6 +101,14 @@ impl Ctx<'_> {
         .ok()
     }
 
+    /// Caminho relativo ao home do Hermes, com `/` (absoluto se estiver fora).
+    pub fn rel(&self, p: &Path) -> String {
+        p.strip_prefix(self.home)
+            .unwrap_or(p)
+            .to_string_lossy()
+            .replace('\\', "/")
+    }
+
     /// Onde um arquivo arquivado iria: `archive/<rel>`.
     pub fn archive_path(&self, rel: &str) -> String {
         format!("archive/{rel}")
@@ -215,7 +223,7 @@ fn sessions(ctx: &mut Ctx) {
         if !db.is_file() {
             continue;
         }
-        let src = db.display().to_string();
+        let src = ctx.rel(&db);
         let preview = match crate::preview(&db) {
             Ok(p) => p,
             Err(e) => {
@@ -941,7 +949,7 @@ fn credentials(ctx: &mut Ctx) {
 }
 
 fn credential(ctx: &mut Ctx, path: &Path, inv_path: &Path) {
-    let src = path.display().to_string();
+    let src = ctx.rel(path);
     let Ok(raw) = std::fs::read_to_string(path) else {
         ctx.plan
             .push("credencial", src, "", Status::Error, "não foi possível ler");

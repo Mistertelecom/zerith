@@ -58,12 +58,18 @@ pub fn hermes_skills(home: &Path, lib: &Library) -> Vec<HermesSkill> {
         .manifest()
         .map(|m| m.skills.into_iter().map(|s| s.name).collect())
         .unwrap_or_default();
-    let root = home.join("skills");
-    let mut out = Vec::new();
-    walk(&root, &root, 0, &mut out);
+    let mut out = scan_skills(&home.join("skills"));
     for s in &mut out {
         s.installed = installed.contains(&s.name);
     }
+    out
+}
+
+/// Every `SKILL.md` under `root` (same rules as [`hermes_skills`]), without
+/// a library: `installed` stays `false`. Writes nothing.
+pub fn scan_skills(root: &Path) -> Vec<HermesSkill> {
+    let mut out = Vec::new();
+    walk(root, root, 0, &mut out);
     out.sort_by(|a, b| (&a.category, &a.name).cmp(&(&b.category, &b.name)));
     out
 }
@@ -235,7 +241,20 @@ pub fn import_hermes_mcp(
     paths: &Paths,
     names: &[String],
 ) -> Result<SetupReport, String> {
+    import_hermes_mcp_with(home, paths, names, true).map(|(r, _)| r)
+}
+
+/// [`import_hermes_mcp`]; with `keep_secrets = false` the env vars and
+/// headers whose name looks like a credential ([`crate::plan::is_secret_key`])
+/// are left out and returned as `"<server>.env.<NAME>"` / `".headers."`.
+pub fn import_hermes_mcp_with(
+    home: &Path,
+    paths: &Paths,
+    names: &[String],
+    keep_secrets: bool,
+) -> Result<(SetupReport, Vec<String>), String> {
     let mut r = SetupReport::default();
+    let mut stripped = Vec::new();
     for (m, status) in hermes_mcp(home, paths)?
         .into_iter()
         .filter(|(m, _)| names.contains(&m.name))
@@ -253,10 +272,16 @@ pub fn import_hermes_mcp(
             r.failed.push(format!("{}: {why}", m.name));
             continue;
         }
-        let extra = Extra {
-            env: m.env.clone(),
-            headers: m.headers.clone(),
+        let (env, headers) = if keep_secrets {
+            (m.env.clone(), m.headers.clone())
+        } else {
+            let (env, gone_env) = crate::plan::strip_secrets(&m.env);
+            let (headers, gone_h) = crate::plan::strip_secrets(&m.headers);
+            stripped.extend(gone_env.iter().map(|k| format!("{}.env.{k}", m.name)));
+            stripped.extend(gone_h.iter().map(|k| format!("{}.headers.{k}", m.name)));
+            (env, headers)
         };
+        let extra = Extra { env, headers };
         let done = add_server(paths, m.config())
             .and_then(|_| set_extra(paths, &m.name, &extra))
             .and_then(|_| set_enabled(paths, &m.name, m.enabled));
@@ -265,7 +290,7 @@ pub fn import_hermes_mcp(
             Err(e) => r.failed.push(format!("{}: {e}", m.name)),
         }
     }
-    Ok(r)
+    Ok((r, stripped))
 }
 
 /// A YAML node, as far as `mcp_servers:` needs.
@@ -315,37 +340,9 @@ impl Y {
 // nested flow collections or multi-documents; those come back as the raw
 // string. If Hermes ever writes them here, add a YAML crate then.
 pub fn parse_mcp_servers(yaml: &str) -> Result<Vec<HermesMcp>, String> {
-    let mut lines: Vec<(usize, usize, String)> = Vec::new();
-    let mut inside = false;
-    for (no, raw) in yaml.lines().enumerate() {
-        let text = strip_comment(raw.trim_end());
-        if text.trim().is_empty() {
-            continue;
-        }
-        let indent = text.len() - text.trim_start().len();
-        if indent == 0 {
-            if inside {
-                break;
-            }
-            inside = text.trim_end() == "mcp_servers:";
-            continue;
-        }
-        if inside {
-            lines.push((no + 1, indent, text.trim().to_string()));
-        }
-    }
-    if lines.is_empty() {
+    let Some(root) = section(yaml, "mcp_servers")? else {
         return Ok(Vec::new());
-    }
-    let mut i = 0;
-    let first = lines[0].1;
-    let root = block(&lines, &mut i, first)?;
-    if i < lines.len() {
-        return Err(format!(
-            "config.yaml linha {}: indentação inesperada",
-            lines[i].0
-        ));
-    }
+    };
     let Y::Map(entries) = root else {
         return Err("mcp_servers não é um mapa".into());
     };
@@ -367,6 +364,59 @@ pub fn parse_mcp_servers(yaml: &str) -> Result<Vec<HermesMcp>, String> {
             name,
         })
         .collect())
+}
+
+/// `telegram: allowed_chats:` of a Hermes `config.yaml`, as strings: a block
+/// list, a flow list or a comma-separated scalar.
+pub fn telegram_allowed_chats(yaml: &str) -> Vec<String> {
+    let Ok(Some(node)) = section(yaml, "telegram") else {
+        return Vec::new();
+    };
+    node.get("allowed_chats")
+        .map(Y::strings)
+        .unwrap_or_default()
+        .iter()
+        .flat_map(|s| s.split(','))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// The block under the top-level key `name:`, if there is one.
+fn section(yaml: &str, name: &str) -> Result<Option<Y>, String> {
+    let header = format!("{name}:");
+    let mut lines: Vec<(usize, usize, String)> = Vec::new();
+    let mut inside = false;
+    for (no, raw) in yaml.lines().enumerate() {
+        let text = strip_comment(raw.trim_end());
+        if text.trim().is_empty() {
+            continue;
+        }
+        let indent = text.len() - text.trim_start().len();
+        if indent == 0 {
+            if inside {
+                break;
+            }
+            inside = text.trim_end() == header;
+            continue;
+        }
+        if inside {
+            lines.push((no + 1, indent, text.trim().to_string()));
+        }
+    }
+    if lines.is_empty() {
+        return Ok(None);
+    }
+    let mut i = 0;
+    let first = lines[0].1;
+    let root = block(&lines, &mut i, first)?;
+    if i < lines.len() {
+        return Err(format!(
+            "config.yaml linha {}: indentação inesperada",
+            lines[i].0
+        ));
+    }
+    Ok(Some(root))
 }
 
 /// One node whose lines sit at exactly `indent`.

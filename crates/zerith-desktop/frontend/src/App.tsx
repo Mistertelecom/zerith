@@ -16,6 +16,7 @@ import {
   FolderTree,
   Gauge,
   GitPullRequest,
+  Import,
   ListChecks,
   Loader,
   PanelRight,
@@ -150,6 +151,15 @@ export default function App() {
   const [boot, setBoot] = useState<Boot | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [sessions, setSessions] = useState<Session[]>([]);
+  // Primeiro uso: sem conversas e com um Hermes instalado, o início oferece
+  // a migração (o plano abre em Ajustes › Histórico).
+  const [hermesOffer, setHermesOffer] = useState(false);
+  useEffect(() => {
+    api
+      .migrationOffer()
+      .then(setHermesOffer)
+      .catch(() => setHermesOffer(false));
+  }, [sessions.length === 0]);
   const [pinnedSessions, setPinnedSessions] = useState<string[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [messages, setMessages] = useState<Block[]>([]);
@@ -2052,6 +2062,15 @@ export default function App() {
                         Peça código, revisão ou um plano. As ferramentas rodam no
                         seu computador e pedem aprovação.
                       </p>
+                      {hermesOffer ? (
+                        <button
+                          type="button"
+                          className="btn btn-sm"
+                          onClick={() => setSettings("Histórico")}
+                        >
+                          <Import size={14} strokeWidth={2} /> Migrar do Hermes
+                        </button>
+                      ) : null}
                       <AppVersion />
                     </>
                   )}

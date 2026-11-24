@@ -589,6 +589,34 @@ export interface ReportView {
   failed: string[];
 }
 
+/** Uma linha do plano de migração (`zerith_importers::plan::ImportItem`). */
+export interface MigrationItem {
+  kind: string;
+  source: string;
+  dest: string;
+  status: "imported" | "skipped" | "conflict" | "archived" | "error";
+  reason: string;
+}
+
+/** Plano (dry-run) ou relatório da migração do Hermes. Nunca traz valores de segredo. */
+export interface MigrationPlan {
+  origin: string;
+  source_root: string;
+  dry_run: boolean;
+  items: MigrationItem[];
+  stripped_secrets: string[];
+  backup_dir: string | null;
+  report_dir: string | null;
+}
+
+export interface MigrationOpts {
+  kinds?: string[] | null;
+  migrateSecrets?: boolean;
+  overwrite?: boolean;
+  onlyPinnedVisible?: boolean;
+  customizedSkills?: boolean;
+}
+
 /** Plano da curadoria da memória: fundir quase duplicatas, arquivar sem uso. */
 export interface CuratePlan {
   merges: { keep: number; text: string; drop: [number, string][] }[];
@@ -803,6 +831,9 @@ export const api = {
     includeArchived = true,
     onlyIds: string[] | null = null,
   ) => invoke<ReportView>("hermes_import", { path, includeArchived, onlyIds }),
+  migrationOffer: () => invoke<boolean>("migration_offer"),
+  migrationPlan: (opts: MigrationOpts) => invoke<MigrationPlan>("migration_plan", { opts }),
+  migrationApply: (opts: MigrationOpts) => invoke<MigrationPlan>("migration_apply", { opts }),
   sendTurn: (args: {
     sessionId: string;
     model: string;

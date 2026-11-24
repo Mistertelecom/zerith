@@ -17,6 +17,7 @@ import {
   Trash2,
 } from "lucide-react";
 import { api, type ReportView, type SessionRow, type SourceView } from "../lib/api";
+import { HermesMigration } from "./HermesMigration";
 import { Card, EmptyState, Logo, Segmented, Stat } from "./ui";
 
 const when = (ts: number) => {
@@ -247,8 +248,10 @@ export function HistoryTab() {
         ) : null}
       </Card>
 
+      <HermesMigration onDone={load} />
+
       <Card
-        title="Importar do Hermes"
+        title="Só conversas do Hermes"
         icon={Import}
         description="O banco de origem é aberto só para leitura. Rodar de novo não duplica: cada conversa é casada pelo id de origem."
         actions={

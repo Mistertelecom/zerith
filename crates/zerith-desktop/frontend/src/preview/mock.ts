@@ -958,6 +958,35 @@ export function installMock(theme: string) {
           return agents;
         case "sessions_history":
           return history.filter((h) => a.includeArchived || !h.archived);
+        case "migration_offer":
+          return false;
+        case "migration_plan":
+        case "migration_apply": {
+          const applied = cmd === "migration_apply";
+          const st = (s: string) => (applied && s === "imported" ? "imported" : s);
+          return {
+            origin: "hermes",
+            source_root: "C:/Users/Joao/AppData/Local/hermes",
+            dry_run: !applied,
+            items: [
+              { kind: "sessao", source: "state.db", dest: "zerith.db (perfil default)", status: st("imported"), reason: "412 conversas novas (9 fixadas, 380 arquivadas), 0 já importadas" },
+              { kind: "memoria", source: "default/memories/MEMORY.md#1", dest: "memory_facts (entity)", status: "imported", reason: "" },
+              { kind: "memoria", source: "default/memories/MEMORY.md#2", dest: "memory_facts (entity)", status: "imported", reason: "valor(es) no cofre: hermes-memoria-1a2b3c4d" },
+              { kind: "memoria", source: "default/memories/USER.md#1", dest: "memory_facts (instruction)", status: "skipped", reason: "já na memória" },
+              { kind: "persona", source: "SOUL.md", dest: "AGENTS.md", status: "skipped", reason: "é o texto padrão que vem com o Hermes" },
+              { kind: "persona", source: "AGENTS.md", dest: "archive/persona/AGENTS.md", status: "archived", reason: "guia genérico do pacote Everything Claude Code (ECC)" },
+              { kind: "credencial", source: "creds/acme-borda.txt", dest: "inventory.toml (acme/borda)", status: "imported", reason: "senha(s) fora: re-adicione com zerith secret set acme-borda" },
+              { kind: "skill", source: "networking/olt-parks", dest: "skills/olt-parks", status: "imported", reason: "criada no Hermes" },
+              { kind: "skill", source: "creative/ascii-video", dest: "skills/ascii-video", status: "skipped", reason: "embutida no Hermes e sem alteração" },
+              { kind: "mcp", source: "config.yaml: github", dest: "mcp.toml (github)", status: "imported", reason: "env.GITHUB_TOKEN deixado(s) de fora" },
+              { kind: "cron", source: "default/cron/jobs.json: resumo", dest: "agendamento hermes-default-resumo", status: "imported", reason: "cron `0 12 * * *` (UTC); entra desligado" },
+              { kind: "telegram", source: ".env", dest: "archive/telegram/LEIA.md", status: "archived", reason: "sem equivalente: TELEGRAM_HOME_CHANNEL" },
+            ],
+            stripped_secrets: ["credencial:acme-borda", "mcp:github.env.GITHUB_TOKEN"],
+            backup_dir: applied ? "C:/Users/Joao/AppData/Roaming/Zerith/backups/pre-migracao-20261124-120000" : null,
+            report_dir: applied ? "C:/Users/Joao/AppData/Roaming/Zerith/migrations/20261124-120000" : null,
+          };
+        }
         case "hermes_detect":
           return [
             {

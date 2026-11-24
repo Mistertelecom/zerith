@@ -6,6 +6,7 @@
 //! Facts carry `confidence`, so an inference is never shown as a confirmed fact.
 
 pub mod backend;
+pub mod curate;
 pub mod extract;
 pub mod sqlite;
 

@@ -104,6 +104,17 @@ pub(crate) enum Payload {
         text: String,
     },
     Mcp(Box<McpCandidate>),
+    /// Uma pasta de skill (`source_path`) ou um `SKILL.md` gerado
+    /// (`(nome, texto)`, de um comando).
+    Skill {
+        source: String,
+        generated: Option<(String, String)>,
+    },
+    /// Arquivo novo a gravar em `dest`.
+    File {
+        dest: PathBuf,
+        content: String,
+    },
 }
 
 /// De qual ferramenta veio uma sessão.
@@ -253,6 +264,8 @@ pub fn apply(items: &[Item], paths: &Paths) -> Report {
     apply_sessions(items, paths, &mut r);
     apply_instructions(items, paths, &mut r);
     apply_mcp(items, paths, &mut r);
+    apply_skills(items, paths, &mut r);
+    apply_files(items, Kind::Agent, &mut r);
     r
 }
 
@@ -323,6 +336,16 @@ pub fn plan(src: &ClaudeSource, paths: &Paths, opt: &Options) -> Vec<Item> {
             paths,
         ));
         items.extend(plan_mcp(claude_mcp(src), paths));
+        let proj = |sub: &str| src.project.iter().map(|p| p.join(sub)).collect::<Vec<_>>();
+        let mut skills = vec![src.home.join("skills")];
+        skills.extend(proj(".claude/skills"));
+        items.extend(plan_skills(&skills, "claude-code", paths));
+        let mut commands = vec![src.home.join("commands")];
+        commands.extend(proj(".claude/commands"));
+        items.extend(plan_commands(&commands, paths));
+        let mut agents = vec![src.home.join("agents")];
+        agents.extend(proj(".claude/agents"));
+        items.extend(plan_agents(&agents, paths));
     }
     items
 }
@@ -769,6 +792,372 @@ pub fn apply_mcp(items: &[Item], paths: &Paths, r: &mut Report) {
         let done = add_server(paths, c.cfg.clone())
             .and_then(|_| set_extra(paths, name, &c.extra))
             .and_then(|_| set_enabled(paths, name, c.enabled));
+        match done {
+            Ok(()) => r.tally(item.kind, Action::Import),
+            Err(e) => r.fail(item, e),
+        }
+    }
+}
+
+// ------------------------------------------------- skills, comandos, agentes
+
+/// Pastas com `SKILL.md` direto abaixo de `root`. Links simbólicos e pastas
+/// ocultas (`.system`) ficam de fora.
+pub(crate) fn skill_dirs(root: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut v: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+        .map(|e| e.path())
+        .filter(|p| p.join("SKILL.md").is_file())
+        .collect();
+    v.sort();
+    v
+}
+
+fn md_files(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut v: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "md"))
+        .collect();
+    v.sort();
+    v
+}
+
+/// Nomes já na biblioteca de skills, lidos sem criar nada em disco.
+fn installed_skills(paths: &Paths) -> Vec<zerith_skills::Installed> {
+    std::fs::read(paths.skills().join("manifest.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<zerith_skills::install::Manifest>(&b).ok())
+        .map(|m| m.skills)
+        .unwrap_or_default()
+}
+
+/// Ação para uma skill `name` vinda de `source`: nova, já importada daqui
+/// (pular) ou mesmo nome de outra origem (conflito).
+fn skill_action(
+    name: &str,
+    source: &str,
+    have: &[zerith_skills::Installed],
+    paths: &Paths,
+    seen: &mut HashSet<String>,
+) -> (Action, &'static str) {
+    if let Some(i) = have.iter().find(|i| i.name == name) {
+        if i.source == source {
+            (Action::Skip, "já importada")
+        } else {
+            (Action::Conflict, "já existe skill com esse nome")
+        }
+    } else if paths.skills().join(name).exists() || !seen.insert(name.to_string()) {
+        (Action::Conflict, "nome já usado")
+    } else {
+        (Action::Import, "")
+    }
+}
+
+/// Um item por pasta de skill encontrada em `roots`.
+pub(crate) fn plan_skills(roots: &[PathBuf], tool: &str, paths: &Paths) -> Vec<Item> {
+    let have = installed_skills(paths);
+    let mut seen = HashSet::new();
+    let mut items = Vec::new();
+    for dir in roots.iter().flat_map(|r| skill_dirs(r)) {
+        let skill = match zerith_skills::scan(&dir) {
+            Ok(s) => s,
+            Err(e) => {
+                items.push(Item::new(Kind::Skill, &dir, e.to_string(), Action::Error));
+                continue;
+            }
+        };
+        let name = skill.frontmatter.name;
+        let source = format!("{tool}:{}", dir.display());
+        let (action, why) = skill_action(&name, &source, &have, paths, &mut seen);
+        let desc = if why.is_empty() {
+            name.clone()
+        } else {
+            format!("{name}: {why}")
+        };
+        items.push(
+            Item::new(Kind::Skill, &dir, desc, action).with(Payload::Skill {
+                source,
+                generated: None,
+            }),
+        );
+    }
+    items
+}
+
+/// `deploy prod.md` → `cmd-deploy-prod`: o que `validate_dir_name` aceita.
+fn command_skill_name(stem: &str) -> Option<String> {
+    let mut s = String::new();
+    for c in stem.to_ascii_lowercase().chars() {
+        if c.is_ascii_alphanumeric() {
+            s.push(c);
+        } else if !s.ends_with('-') {
+            s.push('-');
+        }
+    }
+    let s = s.trim_matches('-');
+    (!s.is_empty()).then(|| format!("cmd-{s}"))
+}
+
+/// Frontmatter `description:` (se houver) e o corpo de um comando.
+fn split_frontmatter(text: &str) -> (String, &str) {
+    let text = text.trim_start_matches('\u{feff}');
+    let Some(rest) = text.strip_prefix("---") else {
+        return (String::new(), text);
+    };
+    let Some(end) = rest.find("\n---") else {
+        return (String::new(), text);
+    };
+    let desc = rest[..end]
+        .lines()
+        .find_map(|l| l.strip_prefix("description:"))
+        .map(|d| d.trim().trim_matches(['"', '\'']).to_string())
+        .unwrap_or_default();
+    let body = rest[end + 4..].trim_start_matches(['\r', '\n']);
+    (desc, body)
+}
+
+/// O `SKILL.md` de um comando `/stem`.
+fn command_skill(name: &str, stem: &str, text: &str) -> String {
+    let (desc, body) = split_frontmatter(text);
+    let desc = if desc.is_empty() {
+        body.lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty() && !l.starts_with('#'))
+            .unwrap_or("")
+            .to_string()
+    } else {
+        desc
+    };
+    let desc: String = format!("Comando /{stem} importado. {desc}")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace('"', "'")
+        .chars()
+        .take(1000)
+        .collect();
+    format!(
+        "---\nname: {name}\ndescription: \"{desc}\"\n---\n\n{}\n\n(Comando /{stem}: os \
+         argumentos são o texto que o usuário escreveu depois de /{stem}; onde o texto acima \
+         diz $ARGUMENTS, use esse texto.)\n",
+        rewrite_terms(body.trim_end())
+    )
+}
+
+/// `commands/*.md` → skills `cmd-<nome>` (o Zerith não tem comandos `/x`
+/// próprios; o mesmo caminho que `zerith-plugins` usa para plugins).
+pub(crate) fn plan_commands(dirs: &[PathBuf], paths: &Paths) -> Vec<Item> {
+    let have = installed_skills(paths);
+    let mut seen = HashSet::new();
+    let mut items = Vec::new();
+    for file in dirs.iter().flat_map(|d| md_files(d)) {
+        let stem = file
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let (Some(name), Ok(text)) = (command_skill_name(&stem), std::fs::read_to_string(&file))
+        else {
+            items.push(Item::new(
+                Kind::Command,
+                &file,
+                format!("/{stem}: ilegível"),
+                Action::Error,
+            ));
+            continue;
+        };
+        let source = format!("claude-code:{}", file.display());
+        let (action, why) = skill_action(&name, &source, &have, paths, &mut seen);
+        let desc = format!(
+            "/{stem} → skill {name}{}{why}",
+            if why.is_empty() { "" } else { ": " }
+        );
+        items.push(
+            Item::new(Kind::Command, &file, desc, action).with(Payload::Skill {
+                source,
+                generated: Some((name.clone(), command_skill(&name, &stem, &text))),
+            }),
+        );
+    }
+    items
+}
+
+/// Instala skills e comandos pela `Library` (varredura, checagem de nome,
+/// manifesto atômico), como qualquer outra instalação: ativas.
+pub fn apply_skills(items: &[Item], paths: &Paths, r: &mut Report) {
+    let mine: Vec<&Item> = items
+        .iter()
+        .filter(|i| matches!(i.kind, Kind::Skill | Kind::Command))
+        .collect();
+    if mine.iter().all(|i| i.action != Action::Import) {
+        for i in mine {
+            r.tally(i.kind, i.action);
+        }
+        return;
+    }
+    let lib = match zerith_skills::Library::open(paths.skills()) {
+        Ok(l) => l,
+        Err(e) => {
+            for i in mine {
+                r.fail(i, &e);
+            }
+            return;
+        }
+    };
+    let staging = paths.root().join(".import-staging");
+    for item in mine {
+        let Payload::Skill { source, generated } = &item.payload else {
+            r.tally(item.kind, item.action);
+            continue;
+        };
+        if item.action != Action::Import {
+            r.tally(item.kind, item.action);
+            continue;
+        }
+        let from = match generated {
+            None => Ok(item.source_path.clone()),
+            Some((name, text)) => {
+                let d = staging.join(name);
+                std::fs::create_dir_all(&d)
+                    .and_then(|_| std::fs::write(d.join("SKILL.md"), text))
+                    .map(|_| d)
+            }
+        };
+        let done = from
+            .map_err(|e| e.to_string())
+            .and_then(|dir| lib.install(&dir, source).map_err(|e| e.to_string()));
+        match done {
+            Ok(_) => r.tally(item.kind, Action::Import),
+            Err(e) => r.fail(item, e),
+        }
+    }
+    let _ = std::fs::remove_dir_all(&staging);
+}
+
+/// Aliases de modelo do Claude Code que não são nomes de modelo do Zerith.
+const MODEL_ALIASES: [&str; 5] = ["sonnet", "opus", "haiku", "fable", "inherit"];
+
+/// O arquivo de agente como o Zerith vai gravar: frontmatter igual (o Zerith
+/// lê os nomes de campo do Claude Code e mapeia as ferramentas), sem `model`
+/// quando é um alias (`sonnet`...), corpo com termos reescritos.
+fn convert_agent(text: &str) -> (String, bool) {
+    let text = text.trim_start_matches('\u{feff}');
+    let Some(rest) = text.strip_prefix("---") else {
+        return (rewrite_terms(text), false);
+    };
+    let Some(end) = rest.find("\n---") else {
+        return (rewrite_terms(text), false);
+    };
+    let mut dropped = false;
+    let header: Vec<&str> = rest[..end]
+        .lines()
+        .filter(|l| {
+            let alias = l
+                .strip_prefix("model:")
+                .is_some_and(|m| MODEL_ALIASES.contains(&m.trim().trim_matches(['"', '\''])));
+            dropped |= alias;
+            !alias
+        })
+        .collect();
+    let body = rest[end + 4..].trim_start_matches(['\r', '\n']);
+    (
+        format!("---{}\n---\n{}", header.join("\n"), rewrite_terms(body)),
+        dropped,
+    )
+}
+
+/// `agents/*.md` → `<raiz>/agents/<nome>.md`.
+pub(crate) fn plan_agents(dirs: &[PathBuf], paths: &Paths) -> Vec<Item> {
+    let mut seen = HashSet::new();
+    let mut items = Vec::new();
+    for file in dirs.iter().flat_map(|d| md_files(d)) {
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            items.push(Item::new(
+                Kind::Agent,
+                &file,
+                "ilegível".into(),
+                Action::Error,
+            ));
+            continue;
+        };
+        let stem = file
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let def = zerith_core::agents::parse(stem, &text, file.clone(), "user");
+        let name = def.name.clone();
+        let valid = !name.is_empty()
+            && name != zerith_core::agents::DEFAULT
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        if !valid {
+            items.push(Item::new(
+                Kind::Agent,
+                &file,
+                format!("{name}: nome inválido"),
+                Action::Error,
+            ));
+            continue;
+        }
+        let (content, dropped) = convert_agent(&text);
+        let dest = paths.agents().join(format!("{name}.md"));
+        let mut desc = name.clone();
+        if dropped {
+            desc.push_str(" (model alias removido: usa o modelo da conversa)");
+        }
+        let action = match std::fs::read_to_string(&dest) {
+            Ok(cur) if cur == content => {
+                desc.push_str(": já importado");
+                Action::Skip
+            }
+            Ok(_) => {
+                desc.push_str(": já existe agente com esse nome");
+                Action::Conflict
+            }
+            Err(_) if !seen.insert(name) => {
+                desc.push_str(": nome repetido");
+                Action::Conflict
+            }
+            Err(_) => Action::Import,
+        };
+        items.push(
+            Item::new(Kind::Agent, &file, desc, action).with(Payload::File { dest, content }),
+        );
+    }
+    items
+}
+
+/// Grava arquivos novos (agentes, scripts de hook) sem sobrescrever.
+pub fn apply_files(items: &[Item], kind: Kind, r: &mut Report) {
+    for item in items.iter().filter(|i| i.kind == kind) {
+        let Payload::File { dest, content } = &item.payload else {
+            r.tally(item.kind, item.action);
+            continue;
+        };
+        if item.action != Action::Import {
+            r.tally(item.kind, item.action);
+            continue;
+        }
+        if dest.exists() {
+            r.tally(item.kind, Action::Conflict);
+            continue;
+        }
+        let done = dest
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|_| std::fs::write(dest, content));
         match done {
             Ok(()) => r.tally(item.kind, Action::Import),
             Err(e) => r.fail(item, e),
@@ -1636,6 +2025,84 @@ pub(crate) mod tests {
         assert!(!toml.contains("sk-literal") && !toml.contains("\"abc\""));
         let _ = std::fs::remove_dir_all(&t);
     }
+    #[test]
+    fn skills_commands_and_agents_import_only_what_is_missing() {
+        let t = scratch("cc-skills");
+        let home = t.join("claude");
+        write(
+            &home.join("skills/revisar/SKILL.md"),
+            "---\nname: revisar\ndescription: Revisa diffs\n---\nOlhe o diff no Claude Code.\n",
+        );
+        write(&home.join("skills/revisar/ref.md"), "ref");
+        write(
+            &home.join("skills/.oculta/SKILL.md"),
+            "---\nname: x\ndescription: y\n---\n",
+        );
+        write(
+            &home.join("commands/Deploy Prod.md"),
+            "---\ndescription: Faz deploy\nallowed-tools: Bash\n---\nRode o deploy de $ARGUMENTS.\n",
+        );
+        write(
+            &home.join("agents/auditor.md"),
+            "---\nname: auditor\ndescription: Audita BGP\ntools: Read, Grep\nmodel: sonnet\n---\nVocê audita, como o Claude Code faria.\n",
+        );
+        let src = ClaudeSource {
+            home: home.clone(),
+            claude_json: t.join("none.json"),
+            desktop_config: None,
+            project: None,
+        };
+        let paths = Paths::with_root(t.join("zerith"));
+        let opt = Options {
+            sessions: false,
+            ..Options::default()
+        };
+        let items = plan(&src, &paths, &opt);
+        let of = |k: Kind| items.iter().filter(move |i| i.kind == k);
+        assert_eq!(of(Kind::Skill).count(), 1, "oculta fica de fora");
+        let cmd = of(Kind::Command).next().unwrap();
+        assert!(
+            cmd.description.contains("cmd-deploy-prod"),
+            "{}",
+            cmd.description
+        );
+        let ag = of(Kind::Agent).next().unwrap();
+        assert!(ag.description.contains("model alias removido"));
+        assert!(!paths.skills().exists(), "o plano não cria a biblioteca");
+        let r = apply(&items, &paths);
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(r.counts[&Kind::Skill].imported, 1);
+        assert_eq!(r.counts[&Kind::Command].imported, 1);
+        assert_eq!(r.counts[&Kind::Agent].imported, 1);
+        let lib = zerith_skills::Library::open(paths.skills()).unwrap();
+        assert!(lib.root().join("revisar/ref.md").is_file());
+        let body = lib.load_body("cmd-deploy-prod").unwrap();
+        assert!(body.contains("Rode o deploy de $ARGUMENTS."));
+        assert!(!paths.root().join(".import-staging").exists());
+        let agent = zerith_core::agents::find(&paths, None, "auditor").unwrap();
+        assert_eq!(agent.model, None);
+        assert_eq!(agent.tools, Some(vec!["Read".into(), "Grep".into()]));
+        assert!(agent.instructions.contains("como o Zerith faria"));
+        // De novo: tudo pulado.
+        let again = plan(&src, &paths, &opt);
+        assert!(
+            again.iter().all(|i| i.action == Action::Skip),
+            "{}",
+            render_plan(&again)
+        );
+        // Mesmo nome, outro conteúdo: conflito, nada sobrescrito.
+        write(
+            &home.join("agents/auditor.md"),
+            "---\nname: auditor\n---\noutro\n",
+        );
+        let p = plan(&src, &paths, &opt);
+        assert_eq!(
+            p.iter().find(|i| i.kind == Kind::Agent).unwrap().action,
+            Action::Conflict
+        );
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
     #[test]
     fn timestamps_parse_with_zone() {
         assert_eq!(parse_ts("1970-01-01T00:00:01.5Z"), Some(1500));

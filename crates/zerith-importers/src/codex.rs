@@ -14,7 +14,7 @@ use zerith_core::Paths;
 use zerith_sessions::{NewMessage, Role};
 
 use crate::claude_code::{
-    codex_mcp, parse_ts, plan_instructions, plan_mcp, plan_sessions, push_assistant,
+    codex_mcp, parse_ts, plan_instructions, plan_mcp, plan_sessions, plan_skills, push_assistant,
     title_from_user_text, tool_message, Action, Item, Kind, Options, Origin, ParsedSession,
     CODEX_MARKER,
 };
@@ -56,6 +56,9 @@ pub fn plan(src: &CodexSource, paths: &Paths, opt: &Options) -> Vec<Item> {
             Ok(found) => items.extend(plan_mcp(found, paths)),
             Err(e) => items.push(Item::new(Kind::Mcp, &config, e, Action::Error)),
         }
+        let mut skills = vec![src.home.join("skills")];
+        skills.extend(src.project.iter().map(|p| p.join(".agents/skills")));
+        items.extend(plan_skills(&skills, "codex", paths));
     }
     items
 }

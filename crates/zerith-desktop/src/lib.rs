@@ -13,6 +13,7 @@ pub mod learn;
 pub mod mcp;
 pub mod media;
 pub mod memory;
+pub mod migration;
 pub mod notify;
 pub mod prefs;
 pub mod providers;
@@ -317,6 +318,9 @@ pub fn run() {
             history::hermes_detect,
             history::hermes_preview,
             history::hermes_import,
+            migration::migration_offer,
+            migration::migration_plan,
+            migration::migration_apply,
             media::media_models,
             media::media_key,
             media::media_save_key,

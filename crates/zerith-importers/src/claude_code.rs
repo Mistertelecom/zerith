@@ -18,6 +18,8 @@ use std::path::{Path, PathBuf};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde_json::{json, Value};
 use zerith_core::Paths;
+use zerith_mcp::config::{add_server, set_enabled, set_extra};
+use zerith_mcp::{Extra, ServerConfig};
 use zerith_sessions::{NewMessage, Role, Session, SessionSource, Store};
 
 // ------------------------------------------------------------ plano comum
@@ -101,6 +103,7 @@ pub(crate) enum Payload {
         marker: &'static str,
         text: String,
     },
+    Mcp(Box<McpCandidate>),
 }
 
 /// De qual ferramenta veio uma sessão.
@@ -249,6 +252,7 @@ pub fn apply(items: &[Item], paths: &Paths) -> Report {
     let mut r = Report::default();
     apply_sessions(items, paths, &mut r);
     apply_instructions(items, paths, &mut r);
+    apply_mcp(items, paths, &mut r);
     r
 }
 
@@ -318,6 +322,7 @@ pub fn plan(src: &ClaudeSource, paths: &Paths, opt: &Options) -> Vec<Item> {
             CLAUDE_MARKER,
             paths,
         ));
+        items.extend(plan_mcp(claude_mcp(src), paths));
     }
     items
 }
@@ -448,6 +453,322 @@ pub fn apply_instructions(items: &[Item], paths: &Paths, r: &mut Report) {
         let current = std::fs::read_to_string(&file).unwrap_or_default();
         let done = std::fs::create_dir_all(paths.root())
             .and_then(|_| std::fs::write(&file, with_section(&current, marker, text)));
+        match done {
+            Ok(()) => r.tally(item.kind, Action::Import),
+            Err(e) => r.fail(item, e),
+        }
+    }
+}
+
+// ------------------------------------------------------------------- mcp
+
+/// Um servidor lido de outra ferramenta, já no formato do Zerith.
+#[derive(Debug, Clone, PartialEq)]
+pub struct McpCandidate {
+    pub cfg: ServerConfig,
+    pub extra: Extra,
+    pub enabled: bool,
+    /// Chaves de env/headers retiradas por parecerem segredo (só o nome).
+    pub removed: Vec<String>,
+    /// Por que não dá para importar (desabilitado, sse, inválido).
+    pub skip: Option<String>,
+}
+
+/// Nome de variável ou header que guarda segredo.
+fn secret_name(k: &str) -> bool {
+    let k = k.to_ascii_uppercase().replace('-', "_");
+    [
+        "API_KEY", "APIKEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "AUTH",
+    ]
+    .iter()
+    .any(|w| k.contains(w))
+}
+
+/// Mantém referências `${VAR}` (o valor fica no ambiente, não no arquivo);
+/// tira valores literais com nome de segredo ou com cara de chave.
+fn keep_safe(
+    map: impl IntoIterator<Item = (String, String)>,
+    removed: &mut Vec<String>,
+) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for (k, v) in map {
+        let reference = v.contains("${");
+        if !reference && (secret_name(&k) || zerith_security::redact(&v) != v) {
+            removed.push(k);
+        } else {
+            out.insert(k, v);
+        }
+    }
+    out
+}
+
+fn json_pairs(v: Option<&Value>) -> Vec<(String, String)> {
+    v.and_then(Value::as_object)
+        .map(|o| {
+            o.iter()
+                .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Um servidor no formato `mcpServers` do Claude Code / Claude Desktop.
+pub fn mcp_from_claude_json(name: &str, v: &Value, desktop: bool) -> McpCandidate {
+    let mut removed = Vec::new();
+    let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
+    let ty = s("type").unwrap_or_default();
+    let cfg = ServerConfig {
+        name: name.to_string(),
+        command: s("command").filter(|c| !c.trim().is_empty()),
+        args: v
+            .get("args")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        url: s("url").filter(|u| !u.is_empty()),
+        timeout_ms: None,
+        auth: None,
+        origin: zerith_mcp::Origin::User,
+    };
+    let extra = Extra {
+        env: keep_safe(json_pairs(v.get("env")), &mut removed),
+        headers: keep_safe(json_pairs(v.get("headers")), &mut removed),
+    };
+    let off = v.get("disabled").and_then(Value::as_bool) == Some(true)
+        || v.get("enabled").and_then(Value::as_bool) == Some(false);
+    let skip = if off && !desktop {
+        Some("desabilitado na origem".to_string())
+    } else if ty == "sse" {
+        Some("transporte sse não é suportado (só stdio e Streamable HTTP)".into())
+    } else {
+        cfg.validate().err()
+    };
+    McpCandidate {
+        cfg,
+        extra,
+        // Claude Desktop: entra desligado, a pessoa liga depois de revisar.
+        enabled: !desktop,
+        removed,
+        skip,
+    }
+}
+
+/// Um `[mcp_servers.<nome>]` do `config.toml` do Codex.
+pub fn mcp_from_codex_toml(name: &str, t: &toml::Table) -> McpCandidate {
+    let mut removed = Vec::new();
+    let s = |k: &str| t.get(k).and_then(toml::Value::as_str).map(str::to_string);
+    let pairs = |k: &str| -> Vec<(String, String)> {
+        t.get(k)
+            .and_then(toml::Value::as_table)
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let mut headers = pairs("http_headers");
+    // Cabeçalhos que o Codex lê de variáveis: viram referências `${VAR}`.
+    for (h, var) in pairs("env_http_headers") {
+        headers.push((h, format!("${{{var}}}")));
+    }
+    if let Some(var) = s("bearer_token_env_var") {
+        headers.push(("Authorization".into(), format!("Bearer ${{{var}}}")));
+    }
+    let timeout = t
+        .get("tool_timeout_sec")
+        .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64)))
+        .map(|s| (s * 1000.0) as u64);
+    let cfg = ServerConfig {
+        name: name.to_string(),
+        command: s("command").filter(|c| !c.trim().is_empty()),
+        args: t
+            .get("args")
+            .and_then(toml::Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        url: s("url").filter(|u| !u.is_empty()),
+        timeout_ms: timeout,
+        auth: None,
+        origin: zerith_mcp::Origin::User,
+    };
+    let extra = Extra {
+        env: keep_safe(pairs("env"), &mut removed),
+        headers: keep_safe(headers, &mut removed),
+    };
+    let skip = if t.get("enabled").and_then(toml::Value::as_bool) == Some(false) {
+        Some("desabilitado na origem".to_string())
+    } else {
+        cfg.validate().err()
+    };
+    McpCandidate {
+        cfg,
+        extra,
+        enabled: true,
+        removed,
+        skip,
+    }
+}
+
+fn read_json(p: &Path) -> Option<Value> {
+    serde_json::from_str(&std::fs::read_to_string(p).ok()?).ok()
+}
+
+/// `C:\X\` e `c:/x` são a mesma pasta de projeto no `~/.claude.json`.
+fn same_dir(a: &str, b: &Path) -> bool {
+    let norm = |s: &str| {
+        let s = s.replace('\\', "/").trim_end_matches('/').to_string();
+        if cfg!(windows) {
+            s.to_lowercase()
+        } else {
+            s
+        }
+    };
+    norm(a) == norm(&b.to_string_lossy())
+}
+
+/// Todos os servidores MCP do Claude Code (e do Claude Desktop), na ordem
+/// de leitura; o primeiro de cada nome vale.
+pub fn claude_mcp(src: &ClaudeSource) -> Vec<(PathBuf, McpCandidate)> {
+    let mut out = Vec::new();
+    let mut take = |file: &Path, servers: Option<&Value>, desktop: bool| {
+        if let Some(map) = servers.and_then(Value::as_object) {
+            for (name, v) in map {
+                out.push((file.to_path_buf(), mcp_from_claude_json(name, v, desktop)));
+            }
+        }
+    };
+    if let Some(j) = read_json(&src.claude_json) {
+        take(&src.claude_json, j.get("mcpServers"), false);
+        if let (Some(dir), Some(projects)) =
+            (&src.project, j.get("projects").and_then(Value::as_object))
+        {
+            for (k, p) in projects {
+                if same_dir(k, dir) {
+                    take(&src.claude_json, p.get("mcpServers"), false);
+                }
+            }
+        }
+    }
+    let settings = src.home.join("settings.json");
+    if let Some(j) = read_json(&settings) {
+        take(&settings, j.get("mcpServers"), false);
+    }
+    if let Some(dir) = &src.project {
+        let f = dir.join(".mcp.json");
+        if let Some(j) = read_json(&f) {
+            take(&f, j.get("mcpServers"), false);
+        }
+    }
+    if let Some(f) = &src.desktop_config {
+        if let Some(j) = read_json(f) {
+            take(f, j.get("mcpServers"), true);
+        }
+    }
+    out
+}
+
+/// Os `[mcp_servers]` do `config.toml` do Codex.
+pub fn codex_mcp(config: &Path) -> Result<Vec<(PathBuf, McpCandidate)>, String> {
+    let Ok(text) = std::fs::read_to_string(config) else {
+        return Ok(Vec::new());
+    };
+    let t: toml::Table = toml::from_str(&text).map_err(|e| e.message().to_string())?;
+    Ok(t.get("mcp_servers")
+        .and_then(toml::Value::as_table)
+        .map(|m| {
+            m.iter()
+                .filter_map(|(n, v)| {
+                    Some((config.to_path_buf(), mcp_from_codex_toml(n, v.as_table()?)))
+                })
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// Um item por servidor: importar, pular (desabilitado, inválido, igual ao
+/// que já existe) ou conflito (mesmo nome, outra definição).
+pub(crate) fn plan_mcp(found: Vec<(PathBuf, McpCandidate)>, paths: &Paths) -> Vec<Item> {
+    let loaded = zerith_mcp::load_servers(paths, None);
+    let have: Vec<&ServerConfig> = loaded.servers.iter().chain(&loaded.disabled).collect();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut items = Vec::new();
+    for (file, c) in found {
+        let name = c.cfg.name.clone();
+        let target = c
+            .cfg
+            .command
+            .clone()
+            .or_else(|| c.cfg.url.clone())
+            .unwrap_or_default();
+        let mut desc = format!("{name} ({target})");
+        if !c.enabled {
+            desc.push_str(", entra desligado");
+        }
+        if !c.removed.is_empty() {
+            desc.push_str(&format!(", segredos retirados: {}", c.removed.join(", ")));
+        }
+        let action = if let Some(why) = &c.skip {
+            desc.push_str(&format!(": {why}"));
+            Action::Skip
+        } else if let Some(h) = have.iter().find(|h| h.name == name) {
+            let same = h.command == c.cfg.command && h.args == c.cfg.args && h.url == c.cfg.url;
+            desc.push_str(if same {
+                ": já existe igual"
+            } else {
+                ": já existe outro com esse nome"
+            });
+            if same {
+                Action::Skip
+            } else {
+                Action::Conflict
+            }
+        } else if !seen.insert(name) {
+            desc.push_str(": nome repetido em outra origem");
+            Action::Conflict
+        } else {
+            Action::Import
+        };
+        items.push(Item::new(Kind::Mcp, &file, desc, action).with(Payload::Mcp(Box::new(c))));
+    }
+    items
+}
+
+/// Grava os servidores no `<raiz>/mcp.toml` (env/headers só com o que
+/// sobrou do filtro de segredos), nunca por cima de um nome existente.
+pub fn apply_mcp(items: &[Item], paths: &Paths, r: &mut Report) {
+    for item in items.iter().filter(|i| i.kind == Kind::Mcp) {
+        let Payload::Mcp(c) = &item.payload else {
+            r.tally(item.kind, item.action);
+            continue;
+        };
+        if item.action != Action::Import {
+            r.tally(item.kind, item.action);
+            continue;
+        }
+        let loaded = zerith_mcp::load_servers(paths, None);
+        if loaded
+            .servers
+            .iter()
+            .chain(&loaded.disabled)
+            .any(|s| s.name == c.cfg.name)
+        {
+            r.tally(item.kind, Action::Conflict);
+            continue;
+        }
+        let name = &c.cfg.name;
+        let done = add_server(paths, c.cfg.clone())
+            .and_then(|_| set_extra(paths, name, &c.extra))
+            .and_then(|_| set_enabled(paths, name, c.enabled));
         match done {
             Ok(()) => r.tally(item.kind, Action::Import),
             Err(e) => r.fail(item, e),
@@ -1219,6 +1540,102 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&t);
     }
 
+    #[test]
+    fn mcp_keeps_env_references_drops_secrets_and_never_overwrites() {
+        let t = scratch("cc-mcp");
+        let home = t.join("claude");
+        let proj = t.join("proj");
+        write(
+            &t.join("claude.json"),
+            &serde_json::json!({
+                "mcpServers": {
+                    "gh": {"command": "npx", "args": ["-y", "gh-mcp"],
+                           "env": {"GITHUB_TOKEN": "${GITHUB_TOKEN}", "API_KEY": "sk-literal-123", "LOG": "debug"}},
+                    "off": {"command": "x", "disabled": true},
+                    "web": {"type": "http", "url": "https://mcp.example.test/mcp",
+                            "headers": {"Authorization": "Bearer ${WEB_TOKEN}", "X-Api-Key": "abc"}},
+                    "old": {"type": "sse", "url": "https://sse.example.test"}
+                },
+                "projects": {proj.to_string_lossy().replace('\\', "/"): {"mcpServers": {"local": {"command": "node", "args": ["s.js"]}}}}
+            })
+            .to_string(),
+        );
+        write(
+            &proj.join(".mcp.json"),
+            r#"{"mcpServers":{"gh":{"command":"other"}}}"#,
+        );
+        write(
+            &t.join("desktop.json"),
+            r#"{"mcpServers":{"fs":{"command":"npx","args":["fs"]}}}"#,
+        );
+        let src = ClaudeSource {
+            home,
+            claude_json: t.join("claude.json"),
+            desktop_config: Some(t.join("desktop.json")),
+            project: Some(proj),
+        };
+        let paths = Paths::with_root(t.join("zerith"));
+        add_server(
+            &paths,
+            ServerConfig {
+                name: "local".into(),
+                command: Some("python".into()),
+                args: vec![],
+                url: None,
+                timeout_ms: None,
+                auth: None,
+                origin: zerith_mcp::Origin::User,
+            },
+        )
+        .unwrap();
+        let items = plan_mcp(claude_mcp(&src), &paths);
+        let act = |n: &str| {
+            items
+                .iter()
+                .find(|i| i.description.starts_with(&format!("{n} ")))
+                .unwrap()
+                .action
+        };
+        assert_eq!(act("gh"), Action::Import);
+        assert_eq!(act("off"), Action::Skip);
+        assert_eq!(act("old"), Action::Skip);
+        assert_eq!(act("local"), Action::Conflict);
+        assert_eq!(act("fs"), Action::Import);
+        assert_eq!(
+            items
+                .iter()
+                .filter(|i| i.action == Action::Conflict)
+                .count(),
+            2,
+            "gh repetido"
+        );
+        let gh = items
+            .iter()
+            .find(|i| i.description.starts_with("gh "))
+            .unwrap();
+        assert!(gh.description.contains("segredos retirados: API_KEY"));
+        let r = apply(&items, &paths);
+        assert_eq!(r.counts[&Kind::Mcp].imported, 3, "{:?}", r.errors);
+        let l = zerith_mcp::load_servers(&paths, None);
+        let gh = &l.extras["gh"];
+        assert_eq!(gh.env["GITHUB_TOKEN"], "${GITHUB_TOKEN}");
+        assert_eq!(gh.env["LOG"], "debug");
+        assert!(!gh.env.contains_key("API_KEY"));
+        assert_eq!(
+            l.extras["web"].headers["Authorization"],
+            "Bearer ${WEB_TOKEN}"
+        );
+        assert!(!l.extras["web"].headers.contains_key("X-Api-Key"));
+        assert!(
+            l.disabled.iter().any(|s| s.name == "fs"),
+            "Claude Desktop entra desligado"
+        );
+        let local = l.servers.iter().find(|s| s.name == "local").unwrap();
+        assert_eq!(local.command.as_deref(), Some("python"), "não sobrescreve");
+        let toml = std::fs::read_to_string(t.join("zerith/mcp.toml")).unwrap();
+        assert!(!toml.contains("sk-literal") && !toml.contains("\"abc\""));
+        let _ = std::fs::remove_dir_all(&t);
+    }
     #[test]
     fn timestamps_parse_with_zone() {
         assert_eq!(parse_ts("1970-01-01T00:00:01.5Z"), Some(1500));

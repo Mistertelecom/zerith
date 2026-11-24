@@ -14,8 +14,9 @@ use zerith_core::Paths;
 use zerith_sessions::{NewMessage, Role};
 
 use crate::claude_code::{
-    parse_ts, plan_instructions, plan_sessions, push_assistant, title_from_user_text, tool_message,
-    Item, Options, Origin, ParsedSession, CODEX_MARKER,
+    codex_mcp, parse_ts, plan_instructions, plan_mcp, plan_sessions, push_assistant,
+    title_from_user_text, tool_message, Action, Item, Kind, Options, Origin, ParsedSession,
+    CODEX_MARKER,
 };
 
 /// Onde estão os arquivos do Codex.
@@ -50,6 +51,11 @@ pub fn plan(src: &CodexSource, paths: &Paths, opt: &Options) -> Vec<Item> {
             CODEX_MARKER,
             paths,
         ));
+        let config = src.home.join("config.toml");
+        match codex_mcp(&config) {
+            Ok(found) => items.extend(plan_mcp(found, paths)),
+            Err(e) => items.push(Item::new(Kind::Mcp, &config, e, Action::Error)),
+        }
     }
     items
 }
@@ -288,8 +294,8 @@ pub fn parse_codex_session(text: &str, path: &Path) -> Option<ParsedSession> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::claude_code::apply;
     use crate::claude_code::tests::{scratch, write};
-    use crate::claude_code::{apply, Action, Kind};
     use zerith_sessions::{SessionSource, Store};
 
     pub(crate) const CX_SESSION: &str = r#"{"timestamp":"2026-11-20T10:00:00.000Z","type":"session_meta","payload":{"id":"0199-abc","timestamp":"2026-11-20T10:00:00.000Z","cwd":"/w/cx"}}
@@ -341,6 +347,58 @@ mod tests {
             (40, 60, 20)
         );
         assert!(parse_codex_session("{\"type\":\"x\"}", Path::new("y")).is_none());
+    }
+
+    #[test]
+    fn codex_mcp_servers_convert_with_env_references() {
+        let t = scratch("cx-mcp");
+        write(
+            &t.join("codex/config.toml"),
+            r#"model = "gpt-x"
+
+[mcp_servers.docs]
+command = "npx"
+args = ["-y", "docs-mcp"]
+env = { LOG = "1", OPENAI_API_KEY = "sk-literal" }
+tool_timeout_sec = 20
+
+[mcp_servers.remote]
+url = "https://mcp.example.test/mcp"
+bearer_token_env_var = "REMOTE_TOKEN"
+
+[mcp_servers.off]
+command = "x"
+enabled = false
+"#,
+        );
+        let src = CodexSource {
+            home: t.join("codex"),
+            project: None,
+        };
+        let paths = Paths::with_root(t.join("zerith"));
+        let opt = Options {
+            sessions: false,
+            ..Options::default()
+        };
+        let items = plan(&src, &paths, &opt);
+        let mcp: Vec<_> = items.iter().filter(|i| i.kind == Kind::Mcp).collect();
+        assert_eq!(mcp.len(), 3);
+        assert_eq!(mcp.iter().filter(|i| i.action == Action::Import).count(), 2);
+        let r = apply(&items, &paths);
+        assert_eq!(r.counts[&Kind::Mcp].imported, 2, "{:?}", r.errors);
+        let l = zerith_mcp::load_servers(&paths, None);
+        let docs = l.servers.iter().find(|s| s.name == "docs").unwrap();
+        assert_eq!(docs.timeout_ms, Some(20_000));
+        assert_eq!(
+            l.extras["docs"].env.get("LOG").map(String::as_str),
+            Some("1")
+        );
+        assert!(!l.extras["docs"].env.contains_key("OPENAI_API_KEY"));
+        assert_eq!(
+            l.extras["remote"].headers["Authorization"],
+            "Bearer ${REMOTE_TOKEN}"
+        );
+        let _ = std::fs::remove_dir_all(&t);
     }
 
     #[test]

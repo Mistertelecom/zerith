@@ -513,6 +513,7 @@ fn run_one(
         announce: None,
         isolation: None,
         parent_checkpoint: None,
+        control: None,
     })
     .map_err(|e| e.to_string())?;
     Ok(TaskOutcome {

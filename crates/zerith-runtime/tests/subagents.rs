@@ -2293,3 +2293,212 @@ fn a_stopped_turn_takes_its_monitors_with_it() {
         .iter()
         .all(|j| !j.command.contains("echo tarde")));
 }
+
+// ---- talking to a running child --------------------------------------------------
+
+fn saw(body: &Value, marker: &str) -> bool {
+    messages(body)
+        .iter()
+        .any(|m| m["content"].as_str().is_some_and(|c| c.contains(marker)))
+}
+
+fn first_word_of_first_tool_result(body: &Value) -> String {
+    tool_msgs(body)[0]["content"]
+        .as_str()
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string()
+}
+
+/// A child step that calls `glob` after `pause`, with real usage: something
+/// to stop between, and a cost that must reach the parent.
+fn child_glob(pause: Duration) -> Reply {
+    std::thread::sleep(pause);
+    Reply::Whole(format!(
+        "{HEAD}{}{}",
+        chunk(
+            &json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"g1","function":{"name":"glob","arguments":"{\"pattern\":\"*\"}"}}]}}]})
+        ),
+        done()
+    ))
+}
+
+#[test]
+fn the_orchestrator_lists_a_background_child_and_writes_to_it() {
+    let child_saw = Arc::new(Mutex::new(false));
+    let seen = child_saw.clone();
+    let listed = Arc::new(Mutex::new(String::new()));
+    let list_out = listed.clone();
+    let url = serve(move |b| match prompt_of(b).as_str() {
+        "PAI" => match tool_msgs(b).len() {
+            0 => calls(&[(
+                "c1",
+                "agent",
+                json!({"description": "fundo", "prompt": "BG", "agent": "explore", "run_in_background": true}),
+            )]),
+            1 => {
+                let id = first_word_of_first_tool_result(b);
+                calls(&[
+                    ("c2", "agent_list", json!({})),
+                    (
+                        "c3",
+                        "agent_send",
+                        json!({"id": id, "message": "use a pasta src"}),
+                    ),
+                ])
+            }
+            _ => {
+                *list_out.lock().unwrap() = tool_msgs(b)[1]["content"].as_str().unwrap().into();
+                text("fim")
+            }
+        },
+        _ if tool_msgs(b).is_empty() => child_glob(Duration::from_millis(800)),
+        _ => {
+            let got = saw(b, "[mensagem do orquestrador] use a pasta src");
+            *seen.lock().unwrap() = got;
+            text(if got { "recebi a nota" } else { "sem nota" })
+        }
+    });
+    let e = env(Mode::Default);
+    let reg = Registry::new();
+    turn(
+        &e,
+        &url,
+        &reg,
+        AgentOptions {
+            subagents: subs(2),
+            ..AgentOptions::default()
+        },
+        TurnContext::default(),
+        "PAI",
+        &Cancel::default(),
+        |_| {},
+    )
+    .unwrap();
+    let list = listed.lock().unwrap().clone();
+    assert!(
+        list.contains("explore: fundo") && list.contains("segundo plano"),
+        "{list}"
+    );
+    assert!(*child_saw.lock().unwrap(), "the note reached the child");
+    let rows = e.store.messages(&e.sid, 100, 0).unwrap();
+    assert!(
+        rows.iter().any(|m| m.content.contains("recebi a nota")),
+        "the child's answer was handed back"
+    );
+}
+
+#[test]
+fn agent_stop_ends_a_background_child_and_hands_back_what_it_did_and_spent() {
+    let url = serve(|b| match prompt_of(b).as_str() {
+        "PAI" => match tool_msgs(b).len() {
+            0 => calls(&[(
+                "c1",
+                "agent",
+                json!({"description": "longo", "prompt": "LONGO", "agent": "explore", "run_in_background": true}),
+            )]),
+            1 => {
+                let id = first_word_of_first_tool_result(b);
+                // Let the child get into its second step first.
+                std::thread::sleep(Duration::from_millis(600));
+                calls(&[("c2", "agent_stop", json!({"id": id}))])
+            }
+            _ => text(&format!(
+                "parei: {}",
+                tool_msgs(b)[1]["content"].as_str().unwrap()
+            )),
+        },
+        _ if tool_msgs(b).is_empty() => child_glob(Duration::ZERO),
+        _ => slow("nunca termina", Duration::from_secs(8)),
+    });
+    let e = env(Mode::Default);
+    let reg = Registry::new();
+    let started = Instant::now();
+    let r = turn(
+        &e,
+        &url,
+        &reg,
+        AgentOptions {
+            subagents: subs(2),
+            ..AgentOptions::default()
+        },
+        TurnContext::default(),
+        "PAI",
+        &Cancel::default(),
+        |_| {},
+    )
+    .unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(6),
+        "no wait for the child"
+    );
+    assert!(
+        r.text.contains("parado a pedido após 2 passo(s)"),
+        "{}",
+        r.text
+    );
+    // The child's first request (5 prompt tokens) counts for the parent, on
+    // top of the parent's own final request.
+    assert_eq!(r.prompt_tokens, 10, "{}", r.text);
+}
+
+#[test]
+fn a_message_from_the_person_reaches_the_running_child() {
+    let child_saw = Arc::new(Mutex::new(false));
+    let seen = child_saw.clone();
+    let parent_saw = Arc::new(Mutex::new(false));
+    let p_seen = parent_saw.clone();
+    let url = serve(move |b| match prompt_of(b).as_str() {
+        "PAI" if tool_msgs(b).is_empty() => calls(&[(
+            "c1",
+            "agent",
+            json!({"description": "busca", "prompt": "FILHO", "agent": "explore"}),
+        )]),
+        "PAI" => {
+            *p_seen.lock().unwrap() = saw(b, "já repassada a sub-");
+            text("ok")
+        }
+        _ if tool_msgs(b).is_empty() => child_glob(Duration::from_millis(800)),
+        _ => {
+            *seen.lock().unwrap() = saw(
+                b,
+                "[mensagem do usuário, repassada pelo Zerith] olhe também os testes",
+            );
+            text("feito")
+        }
+    });
+    let e = env(Mode::Default);
+    let reg = Registry::new();
+    let (tx, rx) = zerith_runtime::inbox_channel();
+    let sender = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        tx.send("olhe também os testes");
+        tx
+    });
+    turn(
+        &e,
+        &url,
+        &reg,
+        AgentOptions {
+            subagents: subs(2),
+            inbox: Some(&rx),
+            ..AgentOptions::default()
+        },
+        TurnContext::default(),
+        "PAI",
+        &Cancel::default(),
+        |_| {},
+    )
+    .unwrap();
+    let _tx = sender.join().unwrap();
+    assert!(
+        *child_saw.lock().unwrap(),
+        "the child read the person's message"
+    );
+    assert!(
+        *parent_saw.lock().unwrap(),
+        "the parent reads it too, marked as relayed"
+    );
+}

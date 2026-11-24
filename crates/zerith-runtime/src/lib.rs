@@ -1328,6 +1328,11 @@ pub(crate) fn tool_guidance(tools: &zerith_tools::Registry) -> String {
         out.push_str(
             "\n\n# Subagentes\nUse `agent` para explorar o código ou pesquisar sem encher o seu contexto: só a resposta final volta. Para trabalho independente, chame vários `agent` na mesma mensagem. O prompt precisa bastar sozinho.",
         );
+        if has("agent_send") {
+            out.push_str(
+                " Um subagente em segundo plano pode ser acompanhado com `agent_list`, corrigido com `agent_send` e parado com `agent_stop` (devolve o que ele já fez).",
+            );
+        }
     }
     if has("skill") {
         out.push_str(

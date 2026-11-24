@@ -109,6 +109,9 @@ pub(crate) struct Pipeline<'a> {
     /// The root turn emits the approval prompts its subagents queue on the
     /// shared gate while an `agent` call runs. Children only queue.
     pub relay: bool,
+    /// The root turn's inbox: what the person writes while a subagent runs
+    /// goes to that subagent too (see [`crate::subagent::relay_steer`]).
+    pub inbox: Option<&'a crate::InboxReceiver>,
     pub spill_dir: Option<&'a Path>,
     pub session_id: &'a str,
     pub cancel: &'a Cancel,
@@ -530,6 +533,7 @@ impl Pipeline<'_> {
                 }
             }
             while finished.load(Ordering::SeqCst) < pool.len() {
+                self.steer_children();
                 if self.relays() {
                     self.pump(on_event);
                 }
@@ -549,6 +553,14 @@ impl Pipeline<'_> {
             if let HostEvent::ToolProgress { tool, chunk } = ev {
                 on_event(RunEvent::ToolProgress { tool, chunk });
             }
+        }
+    }
+
+    /// The root only: hands what the person just wrote to the subagents its
+    /// running `agent` calls are waiting on.
+    fn steer_children(&self) {
+        if let (true, Some(inbox)) = (self.relay, self.inbox) {
+            crate::subagent::relay_steer(self.session_id, inbox, false);
         }
     }
 
@@ -582,6 +594,7 @@ impl Pipeline<'_> {
                 std::thread::yield_now();
             }
             while !h.is_finished() {
+                self.steer_children();
                 if self.relays() {
                     self.pump(on_event);
                 }
@@ -1373,6 +1386,7 @@ mod parallel_panic_tests {
             middleware: &[],
             approvals: None,
             relay: false,
+            inbox: None,
             spill_dir: None,
             session_id: "s1",
             cancel: &cancel,
@@ -1534,6 +1548,7 @@ mod parallel_panic_tests {
             middleware: &[],
             approvals: Some(&gate),
             relay: true,
+            inbox: None,
             spill_dir: None,
             session_id: "s-always",
             cancel: &cancel,
@@ -1622,6 +1637,7 @@ mod parallel_panic_tests {
             middleware: &[],
             approvals: Some(&gate),
             relay: true,
+            inbox: None,
             spill_dir: None,
             session_id: "s-bound",
             cancel: &cancel,
@@ -1747,6 +1763,7 @@ mod parallel_panic_tests {
                     middleware: &[],
                     approvals: Some(&g1),
                     relay: true,
+                    inbox: None,
                     spill_dir: None,
                     session_id: "s-serial",
                     cancel: cancel_ref,
@@ -1777,6 +1794,7 @@ mod parallel_panic_tests {
                     middleware: &[],
                     approvals: Some(&g2),
                     relay: false,
+                    inbox: None,
                     spill_dir: None,
                     session_id: "s-serial",
                     cancel: cancel_ref,
@@ -1820,6 +1838,7 @@ mod parallel_panic_tests {
             middleware: &[],
             approvals: Some(&gate),
             relay: true,
+            inbox: None,
             spill_dir: None,
             session_id: "s-serial",
             cancel: &cancel,
@@ -1896,6 +1915,7 @@ mod parallel_panic_tests {
             middleware: &[],
             approvals: None,
             relay: true,
+            inbox: None,
             spill_dir: None,
             session_id: "s-orch",
             cancel: &cancel,
@@ -1983,6 +2003,7 @@ mod external_tests {
             middleware: &[],
             approvals: None,
             relay: false,
+            inbox: None,
             spill_dir,
             session_id: "s-ext",
             cancel: &cancel,

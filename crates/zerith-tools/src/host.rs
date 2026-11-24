@@ -117,6 +117,17 @@ pub trait Services: Send + Sync {
     /// The state or final text of a background subagent.
     fn agent_result(&self, session: &str, id: &str) -> std::result::Result<String, String>;
 
+    /// `agent_list`, `agent_send` or `agent_stop` on the subagents `session`
+    /// has running; returns the text the model reads.
+    fn agent_control(
+        &self,
+        _session: &str,
+        _op: &str,
+        _args: &Value,
+    ) -> std::result::Result<String, String> {
+        Err("subagentes indisponíveis neste contexto".into())
+    }
+
     /// `task_create`, `task_update` or `task_list` on the session's checklist;
     /// returns the text the model reads.
     fn tasks(&self, session: &str, op: &str, args: &Value) -> std::result::Result<String, String>;

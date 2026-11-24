@@ -53,7 +53,51 @@ pub(crate) fn all(parallel: bool) -> Vec<Box<dyn Tool>> {
             true,
             |a, _, exec| result(a, exec),
         ),
+        // Talking to children that run while this turn works (background, or
+        // in parallel): concept after Codex multi-agent v2 (openai/codex,
+        // Apache-2.0).
+        make(
+            "agent_list",
+            "Lista os subagentes desta conversa que ainda estão rodando: id, descrição, passos feitos e estado.",
+            json!({"type": "object", "properties": {}}),
+            "uma linha por subagente ativo",
+            Permission::Read,
+            10,
+            true,
+            |a, _, exec| control("list", a, exec),
+        ),
+        make(
+            "agent_send",
+            "Manda uma mensagem a um subagente em execução (iniciado com run_in_background); ele a lê no próximo passo, como nota no contexto dele. Use para corrigir o rumo ou acrescentar uma informação sem pará-lo.",
+            json!({"type": "object", "properties": {
+                "id": {"type": "string", "description": "id do subagente (sub-N)"},
+                "message": {"type": "string"}
+            }, "required": ["id", "message"]}),
+            "confirmação de entrega",
+            Permission::Read,
+            10,
+            true,
+            |a, _, exec| control("send", a, exec),
+        ),
+        make(
+            "agent_stop",
+            "Para um subagente em execução e os subagentes dele. Devolve o que ele já produziu; o custo dele conta para esta conversa.",
+            json!({"type": "object", "properties": {
+                "id": {"type": "string", "description": "id do subagente (sub-N)"}
+            }, "required": ["id"]}),
+            "o que o subagente já tinha produzido",
+            Permission::Read,
+            60,
+            true,
+            |a, _, exec| control("stop", a, exec),
+        ),
     ]
+}
+
+fn control(op: &str, args: &Value, exec: &Exec<'_>) -> Result<String> {
+    let (session, svc) = exec.host.bound()?;
+    svc.agent_control(&session, op, args)
+        .map_err(ToolError::Failed)
 }
 
 fn result(args: &Value, exec: &Exec<'_>) -> Result<String> {

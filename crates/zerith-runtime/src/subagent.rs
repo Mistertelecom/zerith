@@ -27,7 +27,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -40,7 +40,7 @@ use zerith_sessions::{Role, Store};
 use zerith_tools::{AgentRequest, EventSink, HostEvent, Registry, Services, SkillLoad};
 
 use crate::pipeline::{Flow, Middleware, ToolInvocation, ToolOutcome};
-use crate::{ApprovalGate, RunError, RunEvent, TurnContext};
+use crate::{ApprovalGate, InboxReceiver, InboxSender, RunError, RunEvent, TurnContext};
 
 /// A turn's middleware as its subagents hold it: outlives the turn's borrow
 /// (a background child may still be stopping when the turn returns).
@@ -310,7 +310,7 @@ pub fn child_registry(base: &Registry, r: &Resolved, depth: usize) -> Registry {
             && !matches!(n, "create_skill" | "create_agent" | "delete_ai_item")
             // The plan tools switch the parent's shared mode handle.
             && !matches!(n, "enter_plan_mode" | "exit_plan_mode")
-            && (can_spawn || !matches!(n, "agent" | "agent_result"))
+            && (can_spawn || !matches!(n, "agent" | "agent_result" | "agent_list" | "agent_send" | "agent_stop"))
     });
     if can_spawn {
         // The child holds a permit already: its own children run one at a time.
@@ -357,6 +357,9 @@ pub struct ChildSpec {
     pub isolation: Option<String>,
     /// Parent turn checkpoint so child mutations stay backed up and undoable.
     pub parent_checkpoint: Option<Arc<zerith_sessions::checkpoints::Checkpoint>>,
+    /// The child's entry in the live registry: its step counter, its inbox
+    /// (`agent_send`) and its stop token (`agent_stop`). `None`: not listed.
+    pub control: Option<Arc<Control>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -367,6 +370,9 @@ pub enum ChildError {
     /// Stopped at the step limit: it did not finish, but what it spent is
     /// real and counts for the turn that delegated.
     StepLimit(String, Saved),
+    /// Stopped by `agent_stop` (or the person): what it said so far, and
+    /// what it spent, which also counts for the parent.
+    Stopped(String, Saved),
 }
 
 impl std::fmt::Display for ChildError {
@@ -374,7 +380,9 @@ impl std::fmt::Display for ChildError {
         match self {
             ChildError::Cancelled => f.write_str("cancelado"),
             ChildError::TimedOut => f.write_str("tempo esgotado"),
-            ChildError::Failed(m) | ChildError::StepLimit(m, _) => f.write_str(m),
+            ChildError::Failed(m) | ChildError::StepLimit(m, _) | ChildError::Stopped(m, _) => {
+                f.write_str(m)
+            }
         }
     }
 }
@@ -548,7 +556,16 @@ pub(crate) fn run_child_with(
         .and_then(|_| SqliteMemory::open(&spec.db).ok());
     let skills = spec.skills_root.clone();
 
-    let cancel = Cancel::default();
+    // A listed child's token is its control's: `agent_stop` pulls it, and
+    // through it the grandchildren (their watchdogs forward it).
+    let control = spec.control.clone();
+    let cancel = control
+        .as_ref()
+        .map(|c| c.cancel.clone())
+        .unwrap_or_default();
+    let inbox = control
+        .as_ref()
+        .and_then(|c| c.rx.lock().ok().and_then(|mut r| r.take()));
     // Every child ends: with no deadline from the caller (plan runner without
     // a time budget) it gets the background limit.
     let deadline = spec
@@ -562,6 +579,7 @@ pub(crate) fn run_child_with(
         approvals: spec.approvals.as_ref(),
         middleware: boxed(middleware),
         max_steps: spec.max_steps.max(1),
+        inbox: inbox.as_ref(),
         subagents: SubagentOptions {
             depth: spec.depth,
             gate: spec.gate.clone(),
@@ -607,6 +625,9 @@ pub(crate) fn run_child_with(
             &spec.prompt,
             &cancel,
             |e| {
+                if let (RunEvent::Step { n }, Some(c)) = (&e, &control) {
+                    c.steps.store(*n, Ordering::Relaxed);
+                }
                 // Live progress: what step the child is on and what it is
                 // running, while it runs. The shared gate is pumped by the
                 // root turn during the `agent` call; the sink only between
@@ -683,6 +704,31 @@ pub(crate) fn run_child_with(
     };
     match run {
         Err(_) => Err(fail("o subagente entrou em pânico".into())),
+        Ok(Err(RunError::Provider(ProviderError::Cancelled)))
+            if control
+                .as_ref()
+                .is_some_and(|c| c.stopped.load(Ordering::SeqCst)) =>
+        {
+            // Asked to stop: hand back what it said and what it cost, as the
+            // step limit does (after Codex's `interrupt_agent`, Apache-2.0).
+            let partial = last_real_text(&store, &session.id).unwrap_or_default();
+            let steps = control
+                .as_ref()
+                .map_or(0, |c| c.steps.load(Ordering::Relaxed));
+            let note = wt_guard.take().and_then(WorktreeGuard::finish);
+            Err(ChildError::Stopped(
+                format!(
+                    "[parado a pedido após {steps} passo(s), antes de concluir]{}{}",
+                    if partial.is_empty() {
+                        String::new()
+                    } else {
+                        format!("\nÚltimo texto: {partial}")
+                    },
+                    note.as_deref().unwrap_or("")
+                ),
+                spent(&store, &session.id),
+            ))
+        }
         Ok(Err(RunError::Provider(ProviderError::Cancelled))) => Err(if timed_out {
             ChildError::TimedOut
         } else {
@@ -730,6 +776,35 @@ pub(crate) fn run_child_with(
             })
         }
     }
+}
+
+/// What a child (and its own children) spent so far, from the usage rows:
+/// a stopped turn returns no report.
+fn spent(store: &Store, session: &str) -> Saved {
+    store
+        .conn()
+        .query_row(
+            "SELECT COALESCE(SUM(saved_rtk_tokens), 0), COALESCE(SUM(saved_ponytail_tokens), 0),
+                    COALESCE(SUM(saved_caveman_tokens), 0), COALESCE(SUM(prompt_tokens), 0),
+                    COALESCE(SUM(completion_tokens), 0), COALESCE(SUM(cache_read_tokens), 0),
+                    COALESCE(SUM(cache_write_tokens), 0)
+             FROM usage_records WHERE session_id = ?1 OR session_id IN
+                 (SELECT id FROM sessions WHERE source = 'subagent' AND source_id = ?1)",
+            [session],
+            |r| {
+                let n = |i| r.get::<_, i64>(i).map(|v| v.max(0) as u64);
+                Ok(Saved {
+                    rtk: n(0)?,
+                    ponytail: n(1)?,
+                    caveman: n(2)?,
+                    prompt: n(3)?,
+                    completion: n(4)?,
+                    cache_read: n(5)?,
+                    cache_write: n(6)?,
+                })
+            },
+        )
+        .unwrap_or_default()
 }
 
 fn last_real_text(store: &Store, session: &str) -> Option<String> {
@@ -837,6 +912,116 @@ pub(crate) fn abandon(session: &str) -> Vec<(String, String)> {
             (id, s.name.clone())
         })
         .collect()
+}
+
+// --- the live registry ------------------------------------------------------------
+//
+// Every child the `agent` tool starts is listed here while it runs, so the
+// turn that started it can list it, write to it and stop it (`agent_list`,
+// `agent_send`, `agent_stop`), and the person's messages reach it. Concept
+// after Codex multi-agent v2 (`list_agents`, `send_message`,
+// `interrupt_agent`; openai/codex, Apache-2.0) and opencode's
+// `session-interrupt.ts` (anomalyco/opencode, MIT).
+
+/// A running child, as its parent turn sees it.
+pub struct Control {
+    parent: String,
+    name: String,
+    background: bool,
+    max_steps: usize,
+    steps: AtomicUsize,
+    stopped: AtomicBool,
+    /// The child turn's own token.
+    cancel: Cancel,
+    tx: InboxSender,
+    rx: Mutex<Option<InboxReceiver>>,
+}
+
+impl Control {
+    fn new(parent: &str, name: String, background: bool, max_steps: usize) -> Arc<Self> {
+        let (tx, rx) = crate::inbox_channel();
+        Arc::new(Self {
+            parent: parent.to_string(),
+            name,
+            background,
+            max_steps,
+            steps: AtomicUsize::new(0),
+            stopped: AtomicBool::new(false),
+            cancel: Cancel::default(),
+            tx,
+            rx: Mutex::new(Some(rx)),
+        })
+    }
+
+    /// Queued for the child's next step. False once its turn has ended.
+    fn send(&self, text: String) -> bool {
+        !self.stopped.load(Ordering::SeqCst) && self.tx.send(text)
+    }
+
+    fn stop(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+        self.cancel.cancel();
+    }
+}
+
+fn live() -> &'static Mutex<HashMap<String, Arc<Control>>> {
+    static M: OnceLock<Mutex<HashMap<String, Arc<Control>>>> = OnceLock::new();
+    M.get_or_init(Default::default)
+}
+
+/// Takes a child off the live registry however its run ends (panic too).
+struct Listed(String);
+
+impl Drop for Listed {
+    fn drop(&mut self) {
+        if let Ok(mut m) = live().lock() {
+            m.remove(&self.0);
+        }
+    }
+}
+
+fn children_of(session: &str) -> Vec<(String, Arc<Control>)> {
+    let mut v: Vec<(String, Arc<Control>)> = live()
+        .lock()
+        .map(|m| {
+            m.iter()
+                .filter(|(_, c)| c.parent == session)
+                .map(|(k, c)| (k.clone(), c.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    v.sort_by_key(|(k, _)| k.trim_start_matches("sub-").parse::<u64>().unwrap_or(0));
+    v
+}
+
+/// Stops a running child by id, whoever started it (the desktop's stop
+/// button). False: no such child is running.
+pub fn stop(id: &str) -> bool {
+    let c = live().lock().ok().and_then(|m| m.get(id).cloned());
+    c.inspect(|c| c.stop()).is_some()
+}
+
+/// Hands what the person wrote, while the root turn waits on its children,
+/// to those children: the foreground ones while an `agent` call runs, the
+/// background ones while the turn waits for them to end. The root still
+/// reads the message at its next step, marked as already relayed.
+pub(crate) fn relay_steer(session: &str, inbox: &InboxReceiver, background: bool) {
+    inbox.relay(|msgs| {
+        let got: Vec<String> = children_of(session)
+            .into_iter()
+            .filter(|(_, c)| c.background == background)
+            .filter(|(_, c)| {
+                msgs.iter()
+                    .all(|m| c.send(format!("[mensagem do usuário, repassada pelo Zerith] {m}")))
+            })
+            .map(|(id, _)| id)
+            .collect();
+        (!got.is_empty()).then(|| {
+            msgs.iter()
+                .map(|m| format!("{m}\n\n[já repassada a {} enquanto rodava]", got.join(", ")))
+                .collect()
+        })
+    });
 }
 
 fn background() -> &'static Mutex<HashMap<String, Arc<BgSlot>>> {
@@ -1107,6 +1292,12 @@ impl Services for Runtime {
             announce: Some((id.clone(), format!("{name}: {description}"))),
             isolation: req.isolation.clone(),
             parent_checkpoint: self.parent_checkpoint.clone(),
+            control: Some(Control::new(
+                session,
+                format!("{name}: {description}"),
+                req.background,
+                steps,
+            )),
         };
         let totals = self.saved.clone();
         let middleware = self.middleware.clone();
@@ -1127,7 +1318,12 @@ impl Services for Runtime {
                 });
             }
         };
+        let listed = Listed(id.clone());
+        if let (Ok(mut m), Some(c)) = (live().lock(), &spec.control) {
+            m.insert(id.clone(), c.clone());
+        }
         let work = move || -> Result<String, String> {
+            let _listed = listed;
             // The permit is held for the whole child, and never for a plain
             // wait: acquiring honours cancel and the call's deadline.
             let _permit = match permit_gate {
@@ -1142,6 +1338,13 @@ impl Services for Runtime {
                     }
                     announce("done", &o.text);
                     Ok(o.text)
+                }
+                Err(ChildError::Stopped(text, s)) => {
+                    if let Ok(mut t) = totals.lock() {
+                        t.add(s);
+                    }
+                    announce("cancelled", &text);
+                    Ok(text)
                 }
                 Err(e) => {
                     if let ChildError::StepLimit(_, s) = &e {
@@ -1203,6 +1406,85 @@ impl Services for Runtime {
             m.remove(id);
         }
         r
+    }
+
+    fn agent_control(&self, session: &str, op: &str, args: &Value) -> Result<String, String> {
+        if op == "list" {
+            let mut lines: Vec<String> = children_of(session)
+                .iter()
+                .map(|(id, c)| {
+                    format!(
+                        "{id} · {} · passo {} de {} · rodando{}",
+                        c.name,
+                        c.steps.load(Ordering::Relaxed),
+                        c.max_steps,
+                        if c.background { " (segundo plano)" } else { "" }
+                    )
+                })
+                .collect();
+            // Ended in the background, not collected yet.
+            if let Ok(m) = background().lock() {
+                let mut done: Vec<String> = m
+                    .iter()
+                    .filter(|(_, s)| s.parent == session && s.result().is_some())
+                    .map(|(id, s)| format!("{id} · {} · terminou; busque com agent_result", s.name))
+                    .collect();
+                done.sort();
+                lines.extend(done);
+            }
+            return Ok(if lines.is_empty() {
+                "nenhum subagente ativo".into()
+            } else {
+                lines.join("\n")
+            });
+        }
+        let id = args["id"].as_str().unwrap_or("").trim();
+        let c = live()
+            .lock()
+            .ok()
+            .and_then(|m| m.get(id).cloned())
+            .filter(|c| c.parent == session)
+            .ok_or_else(|| format!("subagente não está rodando: {id}"))?;
+        match op {
+            "send" => {
+                let msg = args["message"].as_str().unwrap_or("").trim();
+                if msg.is_empty() {
+                    return Err("`message` vazia".into());
+                }
+                if !c.send(format!("[mensagem do orquestrador] {msg}")) {
+                    return Err(format!("{id} já terminou; busque com agent_result"));
+                }
+                Ok(format!("entregue a {id}; ele lê no próximo passo"))
+            }
+            "stop" => {
+                c.stop();
+                if !c.background {
+                    return Ok(format!(
+                        "{id} parado; o que ele produziu volta na chamada `agent` dele"
+                    ));
+                }
+                // Background: wait for it to wrap up and hand its text back
+                // here, so the turn's end has nothing left to report for it.
+                let until = Instant::now() + Duration::from_secs(15);
+                loop {
+                    let slot = background().lock().ok().and_then(|m| m.get(id).cloned());
+                    let Some(slot) = slot else {
+                        return Ok(format!("{id} parado"));
+                    };
+                    if let Some(r) = slot.result() {
+                        if let Ok(mut m) = background().lock() {
+                            m.remove(id);
+                        }
+                        return r;
+                    }
+                    if Instant::now() >= until {
+                        return Ok(format!("{id} parando; busque o resto com agent_result"));
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+            _ => Err(format!("operação desconhecida: {op}")),
+        }
     }
 
     fn tasks(&self, session: &str, op: &str, args: &Value) -> Result<String, String> {

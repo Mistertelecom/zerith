@@ -274,7 +274,13 @@ impl InboxSender {
 /// The turn's half. Messages sent while a turn runs are drained at the next
 /// step boundary (before the next model request, or before the turn would
 /// end) and appended as user messages, stored and logged like any other.
-pub struct InboxReceiver(Mutex<Option<mpsc::Receiver<String>>>, Mutex<Vec<String>>);
+/// The third slot holds what was already relayed to a running subagent: the
+/// turn still reads it, but it no longer counts as pending.
+pub struct InboxReceiver(
+    Mutex<Option<mpsc::Receiver<String>>>,
+    Mutex<Vec<String>>,
+    Mutex<Vec<String>>,
+);
 
 impl InboxReceiver {
     /// What arrived so far. `close` also drops the receiver, so a later
@@ -284,12 +290,18 @@ impl InboxReceiver {
         let Ok(mut slot) = self.0.lock() else {
             return Vec::new();
         };
-        // What `has_pending` already pulled out comes first, in order.
+        // What was relayed, then what `has_pending` pulled out: in order.
         let mut msgs: Vec<String> = self
-            .1
+            .2
             .lock()
             .map(|mut b| std::mem::take(&mut *b))
             .unwrap_or_default();
+        msgs.extend(
+            self.1
+                .lock()
+                .map(|mut b| std::mem::take(&mut *b))
+                .unwrap_or_default(),
+        );
         msgs.extend(
             slot.as_ref()
                 .map(|rx| {
@@ -326,13 +338,29 @@ impl InboxReceiver {
         buf.extend(fresh);
         !buf.is_empty()
     }
+
+    /// Hands what the person wrote to `deliver` (the subagents running while
+    /// the turn waits on them). `Some(notes)`: delivered; the notes reach the
+    /// turn at its next step instead, and are not handed over twice.
+    pub(crate) fn relay(&self, deliver: impl FnOnce(&[String]) -> Option<Vec<String>>) {
+        if !self.has_pending() {
+            return;
+        }
+        let Ok(mut buf) = self.1.lock() else { return };
+        if let Some(notes) = deliver(&buf) {
+            buf.clear();
+            if let Ok(mut r) = self.2.lock() {
+                r.extend(notes);
+            }
+        }
+    }
 }
 
 pub fn inbox_channel() -> (InboxSender, InboxReceiver) {
     let (tx, rx) = mpsc::channel();
     (
         InboxSender(tx),
-        InboxReceiver(Mutex::new(Some(rx)), Mutex::new(Vec::new())),
+        InboxReceiver(Mutex::new(Some(rx)), Mutex::default(), Mutex::default()),
     )
 }
 
@@ -784,6 +812,7 @@ fn turn_body(
         middleware: &agent.middleware,
         approvals: agent.approvals,
         relay: agent.subagents.depth == 0,
+        inbox: agent.inbox,
         spill_dir: agent.spill_dir.as_deref(),
         session_id,
         cancel,
@@ -996,6 +1025,9 @@ fn turn_body(
             // instead of ending with work still running unseen.
             if step < max_steps {
                 let joined = subagent::join_background(session_id, cancel, || {
+                    if let Some(i) = agent.inbox {
+                        subagent::relay_steer(session_id, i, true);
+                    }
                     subagent::flush(store, session_id, agent.tools, on_event);
                     if let (0, Some(g)) = (agent.subagents.depth, agent.approvals) {
                         for e in g.take_relayed() {
@@ -1614,7 +1646,16 @@ fn steer(
             json!({"message_id": id, "chars": text.chars().count()}),
         );
         on_event(RunEvent::Steered { text: text.clone() });
-        hist.push(ChatMessage::user(text.clone()), id);
+        // A child's inbox carries notes from the runtime (orchestrator or
+        // relayed person), not a real user turn: synthetic, like a monitor's.
+        hist.push(
+            if agent.subagents.depth > 0 {
+                ChatMessage::synthetic_user(text.clone())
+            } else {
+                ChatMessage::user(text.clone())
+            },
+            id,
+        );
     }
     Ok(msgs.len())
 }
@@ -2341,6 +2382,9 @@ pub(crate) fn is_orchestrator_root_tool(name: &str) -> bool {
         name,
         "agent"
             | "agent_result"
+            | "agent_list"
+            | "agent_send"
+            | "agent_stop"
             | "read_file"
             | "list_dir"
             | "glob"

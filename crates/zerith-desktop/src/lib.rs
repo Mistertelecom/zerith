@@ -168,6 +168,7 @@ pub fn run() {
     tauri::Builder::default()
         .setup(move |app| {
             learn::bind(app.handle());
+            chat::spawn_monitor_waker(app.handle().clone());
             workflows::spawn_scheduler(app.handle().clone(), scheduler_root);
             let term_handle = app.handle().clone();
             zerith_tools::set_terminal_change_hook(std::sync::Arc::new(move || {

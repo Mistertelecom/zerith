@@ -201,6 +201,53 @@ pub fn kill_all_jobs() {
     }
 }
 
+/// Sessions with a monitor that still has something to say, from every live
+/// registry: the host wakes those conversations when their turn has ended.
+pub fn sessions_with_monitor_news() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for table in tables() {
+        let Ok(mut jobs) = table.lock() else { continue };
+        for (_, j) in jobs.iter_mut() {
+            let Some(w) = j.watch.as_ref().filter(|w| !w.closed) else {
+                continue;
+            };
+            let sent = w.sent;
+            let deadline = w.deadline;
+            let exited = j.exit.is_some() || matches!(j.jailed.child.try_wait(), Ok(Some(_)));
+            let line = j.out.lock().is_ok_and(|o| {
+                o.text.len() > sent
+                    && o.text.is_char_boundary(sent)
+                    && o.text[sent..].contains('\n')
+            });
+            if exited || line || Instant::now() >= deadline {
+                if let Some(s) = &j.session {
+                    if !out.contains(s) {
+                        out.push(s.clone());
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The monitor notices of `session` across every live registry (the
+/// registry of the turn that started them may be gone): what the host hands
+/// to the new turn it starts for them.
+pub fn take_monitor_notices(session: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for table in tables() {
+        let owns = table.lock().is_ok_and(|jobs| {
+            jobs.iter()
+                .any(|(_, j)| j.session.as_deref() == Some(session) && j.watch.is_some())
+        });
+        if owns {
+            out.extend(Jobs { jobs: table }.monitor_notices());
+        }
+    }
+    out
+}
+
 pub fn stop_background_job(id: &str) -> Result<String> {
     let table = tables()
         .into_iter()
@@ -772,6 +819,53 @@ mod tests {
             jobs.monitor_notices().is_empty(),
             "nothing is reported twice"
         );
+    }
+
+    /// The turn that started a monitor is gone (its registry dropped); the
+    /// host still finds which conversation has news and takes the notices.
+    #[test]
+    fn a_monitor_outlives_its_turn_and_the_host_can_wake_the_conversation() {
+        let _serial = serial();
+        let (dir, policy) = scratch_policy();
+        let session = "s-wake-1".to_string();
+        {
+            let jobs = Jobs::default();
+            jobs.start_monitor(
+                "echo pronto",
+                "deploy",
+                30,
+                dir.path(),
+                &policy,
+                Some(session.clone()),
+            )
+            .unwrap();
+        } // the turn's registry is dropped here; KEEP holds the table
+        let mut woke = false;
+        for _ in 0..100 {
+            if sessions_with_monitor_news().contains(&session) {
+                woke = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(woke, "the conversation has news");
+        let mut text = String::new();
+        for _ in 0..40 {
+            text.push_str(&take_monitor_notices(&session).join("\n"));
+            if text.contains("terminou") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            text.contains("pronto") && text.contains("terminou"),
+            "{text}"
+        );
+        assert!(
+            !sessions_with_monitor_news().contains(&session),
+            "nothing twice"
+        );
+        assert!(take_monitor_notices(&session).is_empty());
     }
 
     #[test]

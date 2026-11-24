@@ -806,6 +806,14 @@ export function onTurnDone(
   return listen<string>("turn:done", (e) => handler(e.payload));
 }
 
+/** The app started a turn on its own: a monitor kept running after the last
+ * answer and printed something. `text` is the notice handed to the model. */
+export function onTurnWake(
+  handler: (sessionId: string, text: string) => void,
+): Promise<UnlistenFn> {
+  return listen<[string, string]>("turn:wake", (e) => handler(e.payload[0], e.payload[1]));
+}
+
 /** The authorize link of the login in progress (shown so it can be copied). */
 /** Subscription windows, as the plan reports them (Claude Code). */
 export type QuotaWindow = {

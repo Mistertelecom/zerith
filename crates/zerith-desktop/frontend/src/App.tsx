@@ -32,6 +32,7 @@ import {
   onBotWorkflowReport,
   onTurnDone,
   onTurnEvent,
+  onTurnWake,
   onTurnLearned,
   onWorkflowsChanged,
   workflowsApi,
@@ -774,11 +775,38 @@ export default function App() {
         prev.busy ? prev : { ...prev, blocks: [...prev.blocks, noteBlock] },
       );
     });
+    // A monitor woke the conversation: show the notice and mark it busy, the
+    // same way a sent message does, so the stream that follows has a home.
+    const wake = onTurnWake((id, text) => {
+      flushDeltas();
+      bumpSessionEpoch(id);
+      if (id === selectedRef.current) {
+        const prevBlocks = turnsRef.current[id]?.blocks ?? [];
+        const done = prevBlocks.map((b) =>
+          b.kind === "assistant" ? { ...b, streaming: false } : b,
+        );
+        // "[Monitor job-3: deploy]\nDEPLOY OK..." -> "Monitor (deploy): DEPLOY OK..."
+        const lines = text
+          .split("\n")
+          .filter((l) => l.trim() && !l.startsWith("[aviso automático"));
+        const head = /^\[Monitor [^:]+: (.+)\]/.exec(lines[0] ?? "")?.[1] ?? "monitor";
+        const body = lines.find((l) => !l.startsWith("[Monitor ")) ?? lines[0] ?? "";
+        setMessages((prev) => [
+          ...prev,
+          ...done,
+          { kind: "note", text: `Monitor (${head}): ${body}` },
+        ]);
+      }
+      const busyTurn: TurnState = { ...emptyTurn, busy: true };
+      turnsRef.current = { ...turnsRef.current, [id]: busyTurn };
+      updateTurn(id, () => busyTurn);
+    });
     return () => {
       flushDeltas();
       void ev.then((u) => u());
       void done.then((u) => u());
       void learned.then((u) => u());
+      void wake.then((u) => u());
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [updateTurn, flushDeltas, bumpSessionEpoch]);

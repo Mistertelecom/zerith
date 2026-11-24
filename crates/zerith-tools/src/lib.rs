@@ -43,7 +43,8 @@ pub use authoring::{tools as authoring_tools, Authoring};
 pub use builtin::{shell_command, IMAGE_MARKER};
 pub use host::{AgentRequest, EventSink, Host, HostEvent, LiveHook, Services, SkillLoad};
 pub use jobs::{
-    background_job_tail, background_jobs, kill_all_jobs, stop_background_job, BackgroundJob,
+    background_job_tail, background_jobs, kill_all_jobs, sessions_with_monitor_news,
+    stop_background_job, take_monitor_notices, BackgroundJob,
 };
 pub use media::{tools as media_tools, tools_with_key as media_tools_with_key};
 pub use skill_tool::check as check_skill_args;

@@ -40,6 +40,9 @@ pub struct Running {
 pub struct Turns {
     running: Mutex<HashMap<String, Running>>,
     grants: Mutex<HashMap<String, SharedGrants>>,
+    /// The last turn's arguments per conversation: a turn the app starts on
+    /// its own (a monitor's notice) runs with the same model, mode and agent.
+    last: Mutex<HashMap<String, SendArgs>>,
     precompacts: Arc<Mutex<HashMap<String, Cancel>>>,
 }
 
@@ -118,7 +121,7 @@ impl Turns {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct SendArgs {
     pub session_id: String,
     pub model: String,
@@ -144,10 +147,58 @@ pub fn send_turn(
     turns: tauri::State<'_, Turns>,
     args: SendArgs,
 ) -> Result<(), String> {
-    let prompt = args.prompt.trim().to_string();
-    if prompt.is_empty() {
+    if args.prompt.trim().is_empty() {
         return Err("Escreva uma mensagem".into());
     }
+    if let Ok(mut last) = turns.last.lock() {
+        last.insert(args.session_id.clone(), args.clone());
+    }
+    start_turn(app, &state, &turns, args)
+}
+
+/// A conversation whose turn ended while a monitor kept running: when the
+/// monitor has news, the app starts a turn on its own with the notice, as
+/// opencode's `synthetic` + `wake` does for a finished background command
+/// (MIT) and Claude Code's Monitor describes. Hermes queues the same kind of
+/// event as a new turn when the session is idle (MIT). No code copied.
+pub fn spawn_monitor_waker(app: AppHandle) {
+    let _ = std::thread::Builder::new()
+        .name("monitor-waker".into())
+        .spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(1000));
+            let turns = app.state::<Turns>();
+            for session in zerith_tools::sessions_with_monitor_news() {
+                if turns.with(&session, |_| ()).is_some() {
+                    continue; // a running turn collects its own notices
+                }
+                let Some(mut args) = turns.last.lock().ok().and_then(|l| l.get(&session).cloned())
+                else {
+                    continue; // started outside this window: nobody to resume
+                };
+                let notices = zerith_tools::take_monitor_notices(&session);
+                if notices.is_empty() {
+                    continue;
+                }
+                args.prompt = format!(
+                    "{}\n[aviso automático do Zerith, não escrito pelo usuário: o monitor seguiu rodando depois da sua última resposta]",
+                    notices.join("\n\n")
+                );
+                let _ = app.emit("turn:wake", (&session, &args.prompt));
+                let state = app.state::<AppState>();
+                if let Err(e) = start_turn(app.clone(), &state, &turns, args) {
+                    eprintln!("zerith: monitor não conseguiu retomar a conversa: {e}");
+                }
+            }
+        });
+}
+
+fn start_turn(
+    app: AppHandle,
+    state: &AppState,
+    turns: &Turns,
+    args: SendArgs,
+) -> Result<(), String> {
+    let prompt = args.prompt.trim().to_string();
 
     let turn_id = NEXT_TURN_ID.fetch_add(1, Ordering::Relaxed);
     let cancel = Cancel::default();

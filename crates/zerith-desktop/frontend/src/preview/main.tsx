@@ -105,6 +105,22 @@ async function drive() {
   if (scene === "approval") {
     await turn({ type: "approval", id: 7, tool: "bash", summary: "cargo test -p zerith-providers --all-features" });
   }
+  // The turn ended with a monitor still running; it prints, and the app
+  // starts a turn on its own (`turn:wake`) that answers the notice.
+  if (scene === "wake") {
+    const done = { type: "done", stored: 9, text: "", promptTokens: 0, completionTokens: 0, savedTokens: 0, modelUsed: null };
+    await turn(done);
+    await emit("turn:done", "s1");
+    await wait(400);
+    await emit("turn:wake", [
+      "s1",
+      "[Monitor job-3: deploy em produção]\nDEPLOY CONCLUIDO: 4/4 etapas ok\n\n[Monitor job-3: deploy em produção] terminou (exit 0).\n[aviso automático do Zerith, não escrito pelo usuário]",
+    ]);
+    await wait(200);
+    await turn({ type: "delta", text: "O deploy terminou: as 4 etapas passaram e o monitor saiu com exit 0." });
+    await turn({ ...done, stored: 10 });
+    await emit("turn:done", "s1");
+  }
   // &learned=1: the background review's note under the answer.
   if (q.get("learned")) {
     await turn({ type: "done", stored: 9, text: "", promptTokens: 0, completionTokens: 0, savedTokens: 0, modelUsed: null });

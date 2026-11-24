@@ -92,7 +92,15 @@ pub struct Item {
 #[derive(Debug, Clone)]
 pub(crate) enum Payload {
     None,
-    Session { origin: Origin, archived: bool },
+    Session {
+        origin: Origin,
+        archived: bool,
+    },
+    /// Seção marcada `marker` do `AGENTS.md` do Zerith com `text`.
+    Instructions {
+        marker: &'static str,
+        text: String,
+    },
 }
 
 /// De qual ferramenta veio uma sessão.
@@ -240,6 +248,7 @@ impl Default for Options {
 pub fn apply(items: &[Item], paths: &Paths) -> Report {
     let mut r = Report::default();
     apply_sessions(items, paths, &mut r);
+    apply_instructions(items, paths, &mut r);
     r
 }
 
@@ -303,7 +312,147 @@ pub fn plan(src: &ClaudeSource, paths: &Paths, opt: &Options) -> Vec<Item> {
         let files = claude_session_files(&src.home);
         items.extend(plan_sessions(Origin::ClaudeCode, files, paths, opt));
     }
+    if opt.config {
+        items.extend(plan_instructions(
+            &src.home.join("CLAUDE.md"),
+            CLAUDE_MARKER,
+            paths,
+        ));
+    }
     items
+}
+
+// ------------------------------------------------------------ instruções
+
+pub(crate) const CLAUDE_MARKER: &str = "claude-code";
+pub(crate) const CODEX_MARKER: &str = "codex";
+
+fn word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Troca `needle` por `repl` só quando é palavra inteira.
+fn replace_word(input: &str, needle: &str, repl: &str, ignore_case: bool) -> String {
+    let fold = |x: &str| {
+        if ignore_case {
+            x.to_ascii_lowercase()
+        } else {
+            x.to_string()
+        }
+    };
+    let (hay, needle) = (fold(input), fold(needle));
+    let b = input.as_bytes();
+    let (mut out, mut last, mut from) = (String::new(), 0, 0);
+    while let Some(pos) = hay[from..].find(&needle) {
+        let (s, e) = (from + pos, from + pos + needle.len());
+        let before = s == 0 || !word_byte(b[s - 1]);
+        let after = e == b.len() || !word_byte(b[e]);
+        if before && after {
+            out.push_str(&input[last..s]);
+            out.push_str(repl);
+            last = e;
+        }
+        from = e;
+    }
+    out.push_str(&input[last..]);
+    out
+}
+
+/// "CLAUDE.md" → "AGENTS.md", "Claude Code"/"Codex" → "Zerith", fora de
+/// palavras que são URL ou caminho (têm `://`, `/` ou `\`), que ficam como
+/// estão. Ideia do `rewrite.rs` do Codex (openai/codex, Apache-2.0).
+pub(crate) fn rewrite_terms(text: &str) -> String {
+    let fix = |chunk: &str| {
+        let t = replace_word(chunk, "CLAUDE.md", "AGENTS.md", true);
+        let t = replace_word(&t, "Claude Code", "Zerith", false);
+        replace_word(&t, "Codex", "Zerith", false)
+    };
+    let mut out = String::with_capacity(text.len());
+    let mut plain = String::new();
+    for piece in text.split_inclusive(char::is_whitespace) {
+        let word = piece.trim_end();
+        if word.contains("://") || word.contains('/') || word.contains('\\') {
+            out.push_str(&fix(&plain));
+            plain.clear();
+            out.push_str(piece);
+        } else {
+            plain.push_str(piece);
+        }
+    }
+    out.push_str(&fix(&plain));
+    out
+}
+
+fn section_bounds(marker: &str) -> (String, String) {
+    (
+        format!("<!-- zerith-import:{marker}:begin -->"),
+        format!("<!-- zerith-import:{marker}:end -->"),
+    )
+}
+
+/// `doc` com a seção marcada trocada por `body` (ou acrescentada no fim).
+pub(crate) fn with_section(doc: &str, marker: &str, body: &str) -> String {
+    let (begin, end) = section_bounds(marker);
+    let block = format!("{begin}\n{}\n{end}", body.trim());
+    if let (Some(s), Some(e)) = (doc.find(&begin), doc.find(&end)) {
+        if s < e {
+            return format!("{}{block}{}", &doc[..s], &doc[e + end.len()..]);
+        }
+    }
+    if doc.trim().is_empty() {
+        format!("{block}\n")
+    } else {
+        format!("{}\n\n{block}\n", doc.trim_end())
+    }
+}
+
+/// Um item para o arquivo de instruções `file` (se existir).
+pub(crate) fn plan_instructions(file: &Path, marker: &'static str, paths: &Paths) -> Vec<Item> {
+    let Ok(raw) = std::fs::read_to_string(file) else {
+        return Vec::new();
+    };
+    if raw.trim().is_empty() {
+        return vec![Item::new(
+            Kind::Instructions,
+            file,
+            "vazio".into(),
+            Action::Skip,
+        )];
+    }
+    let text = rewrite_terms(raw.trim());
+    let current = std::fs::read_to_string(paths.instructions()).unwrap_or_default();
+    let (action, what) = if with_section(&current, marker, &text) == current {
+        (Action::Skip, "já está no AGENTS.md do Zerith")
+    } else if current.contains(&section_bounds(marker).0) {
+        (Action::Import, "atualizar a seção no AGENTS.md do Zerith")
+    } else {
+        (Action::Import, "nova seção no AGENTS.md do Zerith")
+    };
+    let desc = format!("{what} ({} linhas)", text.lines().count());
+    vec![Item::new(Kind::Instructions, file, desc, action)
+        .with(Payload::Instructions { marker, text })]
+}
+
+/// Grava a seção marcada no `<raiz>/AGENTS.md`, sem tocar no resto.
+pub fn apply_instructions(items: &[Item], paths: &Paths, r: &mut Report) {
+    for item in items.iter().filter(|i| i.kind == Kind::Instructions) {
+        let Payload::Instructions { marker, text } = &item.payload else {
+            r.tally(item.kind, item.action);
+            continue;
+        };
+        if item.action != Action::Import {
+            r.tally(item.kind, item.action);
+            continue;
+        }
+        let file = paths.instructions();
+        let current = std::fs::read_to_string(&file).unwrap_or_default();
+        let done = std::fs::create_dir_all(paths.root())
+            .and_then(|_| std::fs::write(&file, with_section(&current, marker, text)));
+        match done {
+            Ok(()) => r.tally(item.kind, Action::Import),
+            Err(e) => r.fail(item, e),
+        }
+    }
 }
 
 // --------------------------------------------------------------- sessões
@@ -1026,6 +1175,48 @@ pub(crate) mod tests {
             parse_claude_session(&cont).unwrap().continued_in.as_deref(),
             Some("s2")
         );
+    }
+
+    #[test]
+    fn instructions_go_to_a_marked_section_and_rewrite_terms_outside_paths() {
+        assert_eq!(
+            rewrite_terms(
+                "Use CLAUDE.md no Claude Code; veja ~/.claude/CLAUDE.md e https://x.dev/Codex"
+            ),
+            "Use AGENTS.md no Zerith; veja ~/.claude/CLAUDE.md e https://x.dev/Codex"
+        );
+        assert_eq!(rewrite_terms("Codexy e Codex."), "Codexy e Zerith.");
+        let t = scratch("cc-instr");
+        let paths = Paths::with_root(t.join("zerith"));
+        write(&paths.instructions(), "# Minhas regras\n\nnão mexa\n");
+        write(
+            &t.join("CLAUDE.md"),
+            "Sempre rode os testes do Claude Code.\n",
+        );
+        write(&t.join("vazio.md"), "  \n");
+        assert_eq!(
+            plan_instructions(&t.join("vazio.md"), "x", &paths)[0].action,
+            Action::Skip
+        );
+        assert!(plan_instructions(&t.join("nao-existe.md"), "x", &paths).is_empty());
+        let p = plan_instructions(&t.join("CLAUDE.md"), CLAUDE_MARKER, &paths);
+        assert_eq!(p[0].action, Action::Import);
+        apply(&p, &paths);
+        let doc = std::fs::read_to_string(paths.instructions()).unwrap();
+        assert!(doc.starts_with("# Minhas regras\n\nnão mexa\n"));
+        assert!(doc.contains("Sempre rode os testes do Zerith."));
+        // De novo: nada; a origem mudou: troca só a seção.
+        let p = plan_instructions(&t.join("CLAUDE.md"), CLAUDE_MARKER, &paths);
+        assert_eq!(p[0].action, Action::Skip);
+        write(&t.join("CLAUDE.md"), "Outra regra.\n");
+        apply(
+            &plan_instructions(&t.join("CLAUDE.md"), CLAUDE_MARKER, &paths),
+            &paths,
+        );
+        let doc = std::fs::read_to_string(paths.instructions()).unwrap();
+        assert!(doc.contains("Outra regra.") && !doc.contains("Sempre rode"));
+        assert_eq!(doc.matches("zerith-import:claude-code:begin").count(), 1);
+        let _ = std::fs::remove_dir_all(&t);
     }
 
     #[test]

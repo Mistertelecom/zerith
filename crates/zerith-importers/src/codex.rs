@@ -14,8 +14,8 @@ use zerith_core::Paths;
 use zerith_sessions::{NewMessage, Role};
 
 use crate::claude_code::{
-    parse_ts, plan_sessions, push_assistant, title_from_user_text, tool_message, Item, Options,
-    Origin, ParsedSession,
+    parse_ts, plan_instructions, plan_sessions, push_assistant, title_from_user_text, tool_message,
+    Item, Options, Origin, ParsedSession, CODEX_MARKER,
 };
 
 /// Onde estão os arquivos do Codex.
@@ -43,6 +43,13 @@ pub fn plan(src: &CodexSource, paths: &Paths, opt: &Options) -> Vec<Item> {
     if opt.sessions {
         let files = codex_session_files(&src.home);
         items.extend(plan_sessions(Origin::Codex, files, paths, opt));
+    }
+    if opt.config {
+        items.extend(plan_instructions(
+            &src.home.join("AGENTS.md"),
+            CODEX_MARKER,
+            paths,
+        ));
     }
     items
 }

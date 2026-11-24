@@ -12,7 +12,7 @@
     {
       "name": "zerith-infra",
       "description": "Especialista único de infraestrutura para provedores e empresas: roteamento e borda (BGP/OSPF/MPLS/CGNAT, Cisco ASR 9000/IOS-XR, Huawei, Juniper, MikroTik), OLTs GPON/XGS-PON (Huawei, ZTE, Fiberhome, Parks, VSOL), servidores Linux, cluster Proxmox VE (quorum, HA, ZFS, PBS) e NOC (Zabbix, LibreNMS, NetFlow). Mudança segura com backup antes e depois e proteção do link de gerência.",
-      "version": "0.4.6",
+      "version": "0.4.7",
       "category": "networking",
       "license": "GPL-3.0-only",
       "homepage": "https://github.com/Mistertelecom/zerith",
@@ -21,7 +21,7 @@
     {
       "name": "zerith-dev",
       "description": "Programação: a IA lê a falha do GitHub Actions com o gh, reproduz localmente, corrige, faz push e acompanha o CI até ficar verde.",
-      "version": "0.4.6",
+      "version": "0.4.7",
       "category": "development",
       "license": "GPL-3.0-only",
       "homepage": "https://github.com/Mistertelecom/zerith",

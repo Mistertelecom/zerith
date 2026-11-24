@@ -3,8 +3,10 @@
 //!
 //! `no_agent` schedules execute shell commands directly with zero LLM tokens and
 //! zero provider calls; agent schedules run fail-closed (`approvals: None`).
-//! Failed jobs or agent responses starting with `"ALERTA:"` dispatch Telegram
-//! notifications when `gateway.telegram` is configured.
+//! Failed jobs, agent responses starting with `"ALERTA:"`, agent turns cut at
+//! the step limit and jobs longer than [`LONG_JOB`] dispatch a short Telegram
+//! summary (name, status, duration, first lines) when `gateway.telegram` is
+//! configured. Ideia: notificação de fim de tarefa do Claude Code e `notify` do Codex.
 
 use std::collections::HashSet;
 use std::fs::OpenOptions;
@@ -473,13 +475,63 @@ pub fn daemon_cmd(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::err
     Ok(())
 }
 
-fn maybe_alert_telegram(settings: &Settings, schedule_name: &str, status: &str, body: &str) {
+/// Tarefa que passa disso avisa ao terminar mesmo dando certo: quem agendou
+/// algo demorado quer saber que acabou. As curtas e bem-sucedidas ficam quietas
+/// (um cron de minuto em minuto encheria o chat), a não ser que digam `ALERTA:`.
+const LONG_JOB: Duration = Duration::from_secs(120);
+
+/// Linhas e caracteres da resposta que vão no aviso.
+const ALERT_LINES: usize = 12;
+const ALERT_CHARS: usize = 1500;
+
+/// `1h02m`, `3m05s`, `42s`.
+fn fmt_duration(d: Duration) -> String {
+    let s = d.as_secs();
+    match (s / 3600, s % 3600 / 60, s % 60) {
+        (0, 0, sec) => format!("{sec}s"),
+        (0, m, sec) => format!("{m}m{sec:02}s"),
+        (h, m, _) => format!("{h}h{m:02}m"),
+    }
+}
+
+/// Aviso do fim de uma tarefa: cabeçalho com nome, status e duração, e as
+/// primeiras linhas da resposta.
+fn format_alert(
+    schedule_name: &str,
+    status: &str,
+    stop_reason: Option<&str>,
+    elapsed: Duration,
+    body: &str,
+) -> String {
+    let mut head = format!(
+        "[zerith daemon · {schedule_name}] {status} em {}",
+        fmt_duration(elapsed)
+    );
+    if stop_reason == Some("max_steps") {
+        head.push_str(" · parou no limite de passos (tarefa incompleta)");
+    }
+    let lines: Vec<&str> = body.trim().lines().take(ALERT_LINES + 1).collect();
+    let mut preview = lines[..lines.len().min(ALERT_LINES)].join("\n");
+    let mut cut = lines.len() > ALERT_LINES;
+    if preview.chars().count() > ALERT_CHARS {
+        preview = preview.chars().take(ALERT_CHARS).collect();
+        cut = true;
+    }
+    if cut {
+        preview.push_str("\n…");
+    }
+    if preview.trim().is_empty() {
+        head
+    } else {
+        format!("{head}\n\n{preview}")
+    }
+}
+
+fn maybe_alert_telegram(settings: &Settings, msg: &str) {
     if !settings.gateway.telegram.enabled || settings.gateway.telegram.allowed_chats.is_empty() {
         return;
     }
-    let preview: String = body.chars().take(1500).collect();
-    let msg = format!("[zerith daemon · {schedule_name}] status={status}\n\n{preview}");
-    if let Err(e) = telegram::send_telegram_alert(settings, &msg) {
+    if let Err(e) = telegram::send_telegram_alert(settings, msg) {
         eprintln!("zerith: falha ao enviar alerta Telegram: {e}");
     }
 }
@@ -588,7 +640,9 @@ fn run_one_schedule(
         c.apply_hooks(&mut settings);
     }
 
-    let (status, output, should_alert) = if s.no_agent {
+    let started = Instant::now();
+    let mut stop_reason = None;
+    let (status, output, mut should_alert) = if s.no_agent {
         let Some(cmd) = s.command.as_deref().filter(|c| !c.trim().is_empty()) else {
             let msg = "tarefa no_agent sem command configurado".to_string();
             let _ = store.schedule_record_run(&s.id, now_ms(), "error", &msg);
@@ -602,8 +656,9 @@ fn run_one_schedule(
         }
     } else {
         match run_agent_schedule(paths, store, &settings, contrib.as_ref(), s, &ws, cancel) {
-            Ok(text) => {
-                let alert = text.trim_start().starts_with("ALERTA:");
+            Ok((text, stop)) => {
+                let alert = text.trim_start().starts_with("ALERTA:") || stop == "max_steps";
+                stop_reason = Some(stop);
                 ("ok", text, alert)
             }
             Err(e) => ("error", e, true),
@@ -613,8 +668,11 @@ fn run_one_schedule(
     if let Err(e) = store.schedule_record_run(&s.id, now_ms(), status, &output) {
         eprintln!("zerith: falha ao registrar execução da tarefa: {e}");
     }
+    let elapsed = started.elapsed();
+    should_alert |= elapsed >= LONG_JOB;
     if should_alert {
-        maybe_alert_telegram(&settings, &s.name, status, &output);
+        let msg = format_alert(&s.name, status, stop_reason, elapsed, &output);
+        maybe_alert_telegram(&settings, &msg);
     }
     (status, output)
 }
@@ -627,7 +685,7 @@ fn run_agent_schedule(
     s: &Schedule,
     ws: &std::path::Path,
     cancel: &Cancel,
-) -> Result<String, String> {
+) -> Result<(String, &'static str), String> {
     let prompt = s
         .prompt
         .as_deref()
@@ -695,7 +753,7 @@ fn run_agent_schedule(
     )
     .map_err(|e| e.to_string())?;
 
-    Ok(report.text)
+    Ok((report.text, report.stop_reason))
 }
 
 #[cfg(test)]
@@ -787,6 +845,50 @@ mod tests {
         // Dropped -> removed cleanly.
         assert!(!lock_path.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn alert_has_name_status_duration_stop_reason_and_first_lines() {
+        assert_eq!(fmt_duration(Duration::from_secs(42)), "42s");
+        assert_eq!(fmt_duration(Duration::from_secs(185)), "3m05s");
+        assert_eq!(fmt_duration(Duration::from_secs(3720)), "1h02m");
+
+        let msg = format_alert(
+            "backup",
+            "ok",
+            Some("done"),
+            Duration::from_secs(185),
+            "\nTudo certo.\nSegunda linha.\n",
+        );
+        assert_eq!(
+            msg,
+            "[zerith daemon · backup] ok em 3m05s\n\nTudo certo.\nSegunda linha."
+        );
+
+        let body: String = (1..=20).map(|i| format!("linha {i}\n")).collect();
+        let msg = format_alert(
+            "rel",
+            "ok",
+            Some("max_steps"),
+            Duration::from_secs(9),
+            &body,
+        );
+        assert!(msg.contains("limite de passos"), "{msg}");
+        assert!(msg.contains("linha 12\n…"), "{msg}");
+        assert!(!msg.contains("linha 13"), "{msg}");
+
+        let msg = format_alert("x", "error", None, Duration::ZERO, &"é".repeat(3000));
+        assert!(
+            msg.starts_with("[zerith daemon · x] error em 0s\n\n"),
+            "{msg}"
+        );
+        assert!(msg.chars().count() < ALERT_CHARS + 60);
+        assert!(msg.ends_with('…'));
+
+        assert_eq!(
+            format_alert("y", "ok", None, Duration::from_secs(1), "  "),
+            "[zerith daemon · y] ok em 1s"
+        );
     }
 
     #[test]

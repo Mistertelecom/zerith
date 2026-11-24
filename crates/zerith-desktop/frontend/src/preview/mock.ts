@@ -1002,7 +1002,7 @@ export function installMock(theme: string) {
           return state.jobs;
         case "btw_ask":
           return {
-            text: `No NX-OS: `route-map NOME permit 10` e depois `match ip address prefix-list LISTA`.`,
+            text: "No NX-OS: `route-map NOME permit 10` e depois `match ip address prefix-list LISTA`.",
             model: a.model as string,
             prompt_tokens: 1200,
             completion_tokens: 40,

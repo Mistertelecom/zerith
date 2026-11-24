@@ -832,8 +832,6 @@ export default function App() {
       if (!model) return setError("Escolha um modelo antes de perguntar");
       if (!overridePrompt) setDraft("");
       const btwId = Date.now();
-      // O cartão fica nos blocos do turno (desenhados depois da conversa e
-      // levados para ela no próximo envio), rodando ou não.
       // Nasce nos blocos do turno; um novo envio pode tê-lo levado para a
       // conversa, então a resposta troca o cartão onde ele estiver.
       const mine = (x: Block) => x.kind === "note" && x.btw?.id === btwId;

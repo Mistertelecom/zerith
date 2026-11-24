@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
+use crate::alert::{check_after_run, AlertSink};
 use crate::local_offset_minutes;
 use crate::model::{NodeEvent, NodeKind, Workflow, WorkflowNode, WorkflowRun};
 use crate::runner::{execute_workflow, AiExecutor, RunOptions};
@@ -217,6 +218,8 @@ pub struct TickOptions {
     /// Fuso padrão do servidor; `None` = horário local do sistema.
     pub tz_offset_minutes: Option<i32>,
     pub hooks: Arc<dyn RunHooks>,
+    /// Aviso de falha/recuperação ([`crate::alert`]); `None` desliga.
+    pub alerts: Option<Arc<dyn AlertSink>>,
 }
 
 /// Um ciclo do agendador: dispara cada workflow vencido numa thread própria
@@ -242,6 +245,7 @@ pub fn tick(
             continue;
         };
         let (store, ai, hooks) = (Arc::clone(store), Arc::clone(ai), Arc::clone(&opts.hooks));
+        let alerts = opts.alerts.clone();
         let root = opts.data_root.clone();
         handles.push(std::thread::spawn(move || {
             let _guard = guard;
@@ -255,8 +259,17 @@ pub fn tick(
                 initial_input: None,
                 on_event: &mut emit,
             };
-            if let Ok(run) = execute_workflow(&wf, &mut ro) {
-                hooks.on_done(&wf, &run);
+            let summary = match execute_workflow(&wf, &mut ro) {
+                Ok(run) => {
+                    hooks.on_done(&wf, &run);
+                    run.summary
+                }
+                Err(e) => e.to_string(),
+            };
+            if let Some(sink) = alerts {
+                if let Err(e) = check_after_run(&store, &wf, &summary, sink.as_ref()) {
+                    sink.log(&format!("falha ao conferir aviso de '{}': {e}", wf.name));
+                }
             }
         }));
     }
@@ -270,6 +283,7 @@ mod tests {
 
     pub(crate) fn cron_wf(id: &str, nodes: Vec<WorkflowNode>) -> Workflow {
         Workflow {
+            alert: Default::default(),
             id: id.into(),
             name: id.into(),
             description: String::new(),
@@ -415,6 +429,7 @@ mod tests {
             now_secs: now,
             tz_offset_minutes: None,
             hooks: Arc::new(NoHooks),
+            alerts: None,
         };
 
         // Rodando: o minuto seguinte não sobrepõe.

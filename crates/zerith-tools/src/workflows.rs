@@ -328,6 +328,10 @@ fn workflow_create_or_update(args: &Value, _: &CallCtx<'_>, _: &Exec<'_>) -> Res
 
     let now = now_ms();
     let wf = Workflow {
+        alert: existing
+            .as_ref()
+            .map(|e| e.alert.clone())
+            .unwrap_or_default(),
         id: existing_id.unwrap_or_else(|| format!("wf-{now}")),
         name,
         description: args["description"]
@@ -586,6 +590,7 @@ mod tests {
         }
 
         let shell_wf = Workflow {
+            alert: Default::default(),
             id: "wf-1".into(),
             name: "sh".into(),
             description: String::new(),
@@ -620,6 +625,7 @@ mod tests {
         ));
 
         let save_wf = Workflow {
+            alert: Default::default(),
             id: "wf-2".into(),
             name: "save".into(),
             description: String::new(),

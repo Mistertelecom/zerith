@@ -1254,6 +1254,7 @@ mod tests {
         assert_eq!(store.list_workflows().unwrap().len(), 5);
 
         let wf = Workflow {
+            alert: Default::default(),
             id: "test-wf".into(),
             name: "Test Pipeline".into(),
             description: "".into(),
@@ -1434,6 +1435,7 @@ mod tests {
             on_event: &mut |_| {},
         };
         let wf = Workflow {
+            alert: Default::default(),
             id: "hook-wf".into(),
             name: "Hook + Loop + Mock + Bot".into(),
             description: "".into(),
@@ -1589,6 +1591,7 @@ mod tests {
 
     fn wf_of(nodes: Vec<WorkflowNode>, edges: Vec<WorkflowEdge>) -> Workflow {
         Workflow {
+            alert: Default::default(),
             id: "wf".into(),
             name: "wf".into(),
             description: String::new(),
@@ -1782,6 +1785,7 @@ mod tests {
 
         // Trigger -> A -> B -> A cycle
         let wf_cycle = Workflow {
+            alert: Default::default(),
             id: "cycle-wf".into(),
             name: "Cycle".into(),
             description: "".into(),

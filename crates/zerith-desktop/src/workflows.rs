@@ -940,6 +940,9 @@ fn tick_due_workflows(app: &AppHandle, root: &Path, state: &SchedulerState) {
             app: app.clone(),
             root: root.to_path_buf(),
         }),
+        // ponytail: aviso de falha só no daemon; ligar aqui quando o desktop
+        // tiver onde configurar canais de aviso.
+        alerts: None,
     };
     let _ = scheduler::tick(&Arc::new(store), &ai, &opts, state);
 }
@@ -1145,6 +1148,7 @@ Layout rules:
             .unwrap_or_default();
 
         let wf = Workflow {
+            alert: Default::default(),
             id: format!("wf-{now}"),
             name: parsed
                 .get("name")
@@ -1328,6 +1332,7 @@ mod webhook_tests {
     #[test]
     fn slug_lookup_uses_matched_webhook_nodes_secret() {
         let wf = Workflow {
+            alert: Default::default(),
             id: "wf-multi".into(),
             name: "multi".into(),
             description: String::new(),
@@ -1373,6 +1378,7 @@ mod webhook_tests {
         let store = open_store(&scratch).unwrap();
         store
             .save_workflow(&Workflow {
+                alert: Default::default(),
                 id: "wf-hook".into(),
                 name: "hook".into(),
                 description: String::new(),
@@ -1502,6 +1508,7 @@ mod webhook_tests {
 
     fn cron_wf(id: &str, nodes: Vec<WorkflowNode>) -> Workflow {
         Workflow {
+            alert: Default::default(),
             id: id.into(),
             name: id.into(),
             description: String::new(),

@@ -1,5 +1,6 @@
 //! Zerith global visual workflow engine, cron scheduler, and notification channels.
 
+pub mod alert;
 pub mod channels;
 pub mod model;
 pub mod remote;
@@ -10,7 +11,7 @@ pub mod store;
 
 pub use model::{
     ChannelConfig, ChannelKind, DaemonStatus, NextRun, NodeEvent, NodeKind, NodeRunLog, Workflow,
-    WorkflowEdge, WorkflowNode, WorkflowRun,
+    WorkflowAlert, WorkflowEdge, WorkflowNode, WorkflowRun,
 };
 pub use runner::{execute_workflow, test_single_node, AiExecutor, NoopAiExecutor, RunOptions};
 pub use schedule::{CronSchedule, LocalDateTime};

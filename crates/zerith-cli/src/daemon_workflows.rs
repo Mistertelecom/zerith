@@ -7,6 +7,7 @@ use std::thread::JoinHandle;
 
 use zerith_core::{Paths, Settings};
 use zerith_providers::{Cancel, ChatMessage, ChatRequest, Client};
+use zerith_workflows::alert::ChannelAlerts;
 use zerith_workflows::scheduler::{self, NoHooks, SchedulerState, TickOptions};
 use zerith_workflows::{AiExecutor, DaemonStatus, NextRun, Store, WorkflowError};
 
@@ -93,6 +94,7 @@ impl WorkflowDaemon {
             now_secs,
             tz_offset_minutes: tz,
             hooks: Arc::new(NoHooks),
+            alerts: Some(Arc::new(ChannelAlerts)),
         };
         let handles =
             scheduler::tick(&self.store, &self.ai, &opts, &self.state).unwrap_or_else(|e| {
@@ -155,6 +157,7 @@ mod tests {
 
     fn every_minute_wf(id: &str, second: WorkflowNode) -> Workflow {
         Workflow {
+            alert: Default::default(),
             id: id.into(),
             name: id.into(),
             description: String::new(),

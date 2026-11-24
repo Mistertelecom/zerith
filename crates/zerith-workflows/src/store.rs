@@ -5,10 +5,12 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::json;
 
 use crate::model::{
-    ChannelConfig, ChannelKind, DaemonStatus, NodeKind, NodeRunLog, Workflow, WorkflowEdge,
-    WorkflowNode, WorkflowRun,
+    ChannelConfig, ChannelKind, DaemonStatus, NodeKind, NodeRunLog, Workflow, WorkflowAlert,
+    WorkflowEdge, WorkflowNode, WorkflowRun,
 };
 use crate::{now_ms, Result, WorkflowError};
+
+const DAEMON_STATUS_KEY: &str = "daemon_status";
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -45,7 +47,8 @@ impl Store {
                 updated_at_ms INTEGER NOT NULL,
                 last_run_at_ms INTEGER,
                 last_status TEXT,
-                bot_name TEXT
+                bot_name TEXT,
+                alert_json TEXT
             );
 
             CREATE TABLE IF NOT EXISTS channels (
@@ -86,6 +89,7 @@ impl Store {
         )?;
         // Idempotent migration for existing databases created prior to v0.3.3.
         let _ = conn.execute("ALTER TABLE workflows ADD COLUMN bot_name TEXT", []);
+        let _ = conn.execute("ALTER TABLE workflows ADD COLUMN alert_json TEXT", []);
         Ok(())
     }
 
@@ -122,7 +126,7 @@ impl Store {
         let conn = self.conn.lock().map_err(|_| WorkflowError::Lock)?;
         let mut stmt = conn.prepare(
             "SELECT id, name, description, icon, enabled, nodes_json, edges_json,
-                    created_at_ms, updated_at_ms, last_run_at_ms, last_status, bot_name
+                    created_at_ms, updated_at_ms, last_run_at_ms, last_status, bot_name, alert_json
              FROM workflows
              ORDER BY updated_at_ms DESC, name ASC",
         )?;
@@ -144,7 +148,7 @@ impl Store {
         let conn = self.conn.lock().map_err(|_| WorkflowError::Lock)?;
         conn.query_row(
             "SELECT id, name, description, icon, enabled, nodes_json, edges_json,
-                    created_at_ms, updated_at_ms, last_run_at_ms, last_status, bot_name
+                    created_at_ms, updated_at_ms, last_run_at_ms, last_status, bot_name, alert_json
              FROM workflows WHERE id = ?1",
             params![id],
             row_to_workflow,
@@ -307,29 +311,46 @@ impl Store {
         Ok(out)
     }
 
+    /// Valor de configuração do servidor de workflows (tabela `workflow_meta`),
+    /// ex. `workflows.default_alert_channel`, `workflows.tz_offset_minutes`.
+    pub fn setting(&self, key: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().map_err(|_| WorkflowError::Lock)?;
+        conn.query_row(
+            "SELECT value FROM workflow_meta WHERE key = ?1",
+            params![key],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        let conn = self.conn.lock().map_err(|_| WorkflowError::Lock)?;
+        conn.execute(
+            "INSERT INTO workflow_meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_setting(&self, key: &str) -> Result<()> {
+        let conn = self.conn.lock().map_err(|_| WorkflowError::Lock)?;
+        conn.execute("DELETE FROM workflow_meta WHERE key = ?1", params![key])?;
+        Ok(())
+    }
+
     /// Último sinal de vida gravado pelo `zerith daemon` (`None` se o daemon
     /// nunca rodou com este banco). API estável para a API HTTP do servidor.
     pub fn daemon_status(&self) -> Result<Option<DaemonStatus>> {
-        let conn = self.conn.lock().map_err(|_| WorkflowError::Lock)?;
-        let raw: Option<String> = conn
-            .query_row(
-                "SELECT value FROM workflow_meta WHERE key = 'daemon_status'",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?;
-        Ok(raw.and_then(|r| serde_json::from_str(&r).ok()))
+        Ok(self
+            .setting(DAEMON_STATUS_KEY)?
+            .and_then(|r| serde_json::from_str(&r).ok()))
     }
 
     /// Grava o sinal de vida do daemon (substitui o anterior).
     pub fn set_daemon_status(&self, status: &DaemonStatus) -> Result<()> {
-        let conn = self.conn.lock().map_err(|_| WorkflowError::Lock)?;
-        conn.execute(
-            "INSERT INTO workflow_meta (key, value) VALUES ('daemon_status', ?1)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![serde_json::to_string(status)?],
-        )?;
-        Ok(())
+        self.set_setting(DAEMON_STATUS_KEY, &serde_json::to_string(status)?)
     }
 
     /// Persistent deduplication (`Seen Store`), read half: items not yet seen
@@ -435,6 +456,9 @@ fn upsert_workflow(conn: &Connection, wf: &Workflow) -> Result<()> {
     } else {
         now
     };
+    let alert_json = (wf.alert != WorkflowAlert::default())
+        .then(|| serde_json::to_string(&wf.alert))
+        .transpose()?;
     let bot_name = wf
         .bot_name
         .as_deref()
@@ -444,8 +468,8 @@ fn upsert_workflow(conn: &Connection, wf: &Workflow) -> Result<()> {
     conn.execute(
         "INSERT INTO workflows (
             id, name, description, icon, enabled, nodes_json, edges_json,
-            created_at_ms, updated_at_ms, last_run_at_ms, last_status, bot_name
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            created_at_ms, updated_at_ms, last_run_at_ms, last_status, bot_name, alert_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
          ON CONFLICT(id) DO UPDATE SET
             name = excluded.name,
             description = excluded.description,
@@ -454,7 +478,8 @@ fn upsert_workflow(conn: &Connection, wf: &Workflow) -> Result<()> {
             nodes_json = excluded.nodes_json,
             edges_json = excluded.edges_json,
             updated_at_ms = excluded.updated_at_ms,
-            bot_name = excluded.bot_name",
+            bot_name = excluded.bot_name,
+            alert_json = excluded.alert_json",
         params![
             wf.id,
             wf.name,
@@ -467,7 +492,8 @@ fn upsert_workflow(conn: &Connection, wf: &Workflow) -> Result<()> {
             updated,
             wf.last_run_at_ms,
             wf.last_status,
-            bot_name
+            bot_name,
+            alert_json
         ],
     )?;
     Ok(())
@@ -485,6 +511,11 @@ fn row_to_workflow(row: &rusqlite::Row<'_>) -> rusqlite::Result<Workflow> {
     let edges: Vec<WorkflowEdge> = serde_json::from_str(&edges_raw).map_err(|e| bad(6, e))?;
     let enabled_i: i32 = row.get(4)?;
     Ok(Workflow {
+        // Config de aviso ilegível não esconde o workflow: volta ao padrão.
+        alert: row
+            .get::<_, Option<String>>(12)?
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default(),
         id: row.get(0)?,
         name: row.get(1)?,
         description: row.get(2)?,
@@ -536,6 +567,7 @@ pub fn starter_templates() -> Vec<Workflow> {
     let now = now_ms();
     let mut base = default_templates(now);
     base.push(Workflow {
+        alert: Default::default(),
         id: "linux-proxmox-health".into(),
         name: "Server / Proxmox SSH Health".into(),
         description: "Runs SSH health checks (uptime, disk, RAM) on a Linux or Proxmox host and notifies you if usage is critical.".into(),
@@ -610,6 +642,7 @@ pub fn starter_templates() -> Vec<Workflow> {
         bot_name: Some("noc-engineer".into()),
     });
     base.push(Workflow {
+        alert: Default::default(),
         id: "api-ai-executive-brief".into(),
         name: "API Data → Transform → AI Brief".into(),
         description: "Fetches JSON from any external API or ERP, extracts the key field without spending AI tokens, summarizes via AI, and notifies your channel.".into(),
@@ -693,6 +726,7 @@ pub fn starter_templates() -> Vec<Workflow> {
 fn default_templates(now: i64) -> Vec<Workflow> {
     vec![
         Workflow {
+            alert: Default::default(),
             id: "noc-daily-report".into(),
             name: "Daily NOC Offline Report".into(),
             description: "Checks hosts/equipment every day at 08:00, summarizes incidents with AI, and alerts your WhatsApp if anything is offline.".into(),
@@ -764,6 +798,7 @@ fn default_templates(now: i64) -> Vec<Workflow> {
             bot_name: Some("noc-engineer".into()),
         },
         Workflow {
+            alert: Default::default(),
             id: "api-health-monitor".into(),
             name: "Global HTTP Healthcheck".into(),
             description: "Polls an HTTP endpoint every 15 minutes and triggers an alert if it stops responding.".into(),
@@ -825,6 +860,7 @@ fn default_templates(now: i64) -> Vec<Workflow> {
             bot_name: Some("noc-engineer".into()),
         },
         Workflow {
+            alert: Default::default(),
             id: "daily-workspace-digest".into(),
             name: "Daily Git & System Digest".into(),
             description: "Collects local system info, summarizes it with your AI model, and saves a daily Markdown log.".into(),
@@ -911,6 +947,26 @@ mod tests {
     }
 
     #[test]
+    fn alert_config_round_trips_and_old_json_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("a.db")).unwrap();
+        let mut wf: Workflow = serde_json::from_value(
+            json!({"id": "w", "name": "w", "created_at_ms": 1, "updated_at_ms": 1}),
+        )
+        .unwrap();
+        assert_eq!(wf.alert, WorkflowAlert::default());
+        wf.alert.alert_after_failures = Some(3);
+        wf.alert.alert_channels = vec!["zap".into()];
+        wf.alert.alert_target.insert("zap".into(), "5511".into());
+        store.save_workflow(&wf).unwrap();
+        let back = store.get_workflow("w").unwrap().unwrap();
+        assert_eq!(back.alert, wf.alert);
+        let v = serde_json::to_value(&back).unwrap();
+        assert_eq!(v["alert_channels"], json!(["zap"]));
+        assert_eq!(v["alert_after_failures"], json!(3));
+    }
+
+    #[test]
     fn seed_defaults_does_not_resurrect_after_user_deletes_all() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("workflows.db")).unwrap();
@@ -934,6 +990,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("legacy.db")).unwrap();
         let custom = Workflow {
+            alert: Default::default(),
             id: "custom-1".into(),
             name: "Custom".into(),
             description: String::new(),

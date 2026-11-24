@@ -91,6 +91,25 @@ pub struct Workflow {
     /// Optional owning specialist bot name (Bots <-> Workflows integration).
     #[serde(default)]
     pub bot_name: Option<String>,
+    /// Aviso de falha das execuções agendadas (campos `alert_*` no JSON).
+    #[serde(flatten, default)]
+    pub alert: WorkflowAlert,
+}
+
+/// Aviso quando o workflow falha N vezes seguidas e quando volta a funcionar.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowAlert {
+    /// Falhas seguidas que disparam o aviso; `None` = 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alert_after_failures: Option<u32>,
+    /// Ids de canal que recebem o aviso; vazio = canal padrão do servidor
+    /// (setting `workflows.default_alert_channel`), senão só log.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alert_channels: Vec<String>,
+    /// Destino por id de canal (número, chat, grupo); sem entrada usa o
+    /// `default_target` do canal.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub alert_target: BTreeMap<String, String>,
 }
 
 fn default_icon() -> String {

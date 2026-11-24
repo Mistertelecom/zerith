@@ -9,6 +9,7 @@
 //! (anomalyco/opencode, MIT, `packages/opencode/src/server/`, v1.19.6) e o
 //! pareamento por código do Hermes (MIT, `gateway/pairing.py`).
 
+mod auth;
 mod http;
 
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -32,6 +33,8 @@ pub(crate) struct Ctx {
     pub root: PathBuf,
     pub started: Instant,
     conns: AtomicUsize,
+    limiter: auth::FailLimiter,
+    usage_lock: std::sync::Mutex<()>,
 }
 
 impl Ctx {
@@ -40,6 +43,8 @@ impl Ctx {
             root: paths.root().to_path_buf(),
             started: Instant::now(),
             conns: AtomicUsize::new(0),
+            limiter: auth::FailLimiter::default(),
+            usage_lock: std::sync::Mutex::new(()),
         }
     }
 }
@@ -84,7 +89,10 @@ fn handle_conn(ctx: &Ctx, mut stream: TcpStream) {
         }
         Err(None) => return,
     };
-    let (status, body) = route(ctx, &req, peer);
+    let (status, body) = match authorize(ctx, &req, peer) {
+        Ok(()) => route(ctx, &req),
+        Err(denied) => denied,
+    };
     let _ = http::write_json(&mut stream, status, &body.to_string());
     finish(stream);
 }
@@ -105,7 +113,33 @@ fn finish(mut stream: TcpStream) {
     }
 }
 
-fn route(_ctx: &Ctx, req: &http::Request, _peer: Option<SocketAddr>) -> (u16, Value) {
+/// Bearer obrigatório em tudo menos `GET /v1/ping`. Falhas contam por IP;
+/// passou do limite, 429 até a janela de 1 minuto esvaziar. O token nunca
+/// aparece em resposta nem em log.
+fn authorize(ctx: &Ctx, req: &http::Request, peer: Option<SocketAddr>) -> Result<(), (u16, Value)> {
+    if req.method == "GET" && req.path == "/v1/ping" {
+        return Ok(());
+    }
+    let ip = peer.map_or(std::net::IpAddr::from([0, 0, 0, 0]), |p| p.ip());
+    if ctx.limiter.blocked(ip) {
+        return Err((
+            429,
+            json!({ "error": "muitas falhas de autenticação; tente em 1 minuto" }),
+        ));
+    }
+    match req.bearer().and_then(|t| auth::authenticate(&ctx.root, t)) {
+        Some(device) => {
+            auth::touch_usage(&ctx.root, &device, &ctx.usage_lock);
+            Ok(())
+        }
+        None => {
+            ctx.limiter.fail(ip);
+            Err((401, json!({ "error": "token ausente ou inválido" })))
+        }
+    }
+}
+
+fn route(_ctx: &Ctx, req: &http::Request) -> (u16, Value) {
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/v1/ping") => (
             200,
@@ -119,10 +153,27 @@ fn route(_ctx: &Ctx, req: &http::Request, _peer: Option<SocketAddr>) -> (u16, Va
 /// aceita conexões. Pensado para o `zerith daemon` chamar
 /// (`let _h = server::spawn(&paths)?;`) e seguir com o agendador; `zerith
 /// server serve` chama e espera a thread.
+///
+/// Falha se não houver `config.toml` (rode `zerith server init`), se o
+/// endereço for público sem `allow_public = true`, ou se a porta estiver em uso.
 pub fn spawn(paths: &Paths) -> Result<JoinHandle<()>, Boxed> {
-    let addr: SocketAddr = DEFAULT_BIND.parse()?;
+    let cfg = auth::load_config(paths.root())?;
+    let addr = auth::check_bind(&cfg.bind, cfg.allow_public)?;
     let listener = TcpListener::bind(addr)?;
-    eprintln!("zerith server ouvindo em http://{}", listener.local_addr()?);
+    if auth::classify(addr.ip()) == auth::BindKind::Public {
+        eprintln!(
+            "
+{}
+",
+            auth::PUBLIC_WARNING
+        );
+    }
+    eprintln!(
+        "zerith server '{}' ouvindo em http://{} ({} dispositivo(s) pareado(s))",
+        cfg.name,
+        listener.local_addr()?,
+        auth::load_tokens(paths.root()).len()
+    );
     Ok(run_on(listener, Arc::new(Ctx::new(paths))))
 }
 
@@ -136,5 +187,87 @@ pub fn cmd(paths: &Paths, args: &[String]) -> Result<(), Boxed> {
             Ok(())
         }
         _ => Err("uso: zerith server serve".into()),
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    /// Sobe o servidor numa porta efêmera de 127.0.0.1 sobre uma raiz temporária.
+    pub(crate) fn start(root: &std::path::Path) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        run_on(listener, Arc::new(Ctx::new(&Paths::with_root(root))));
+        addr
+    }
+
+    /// Requisição crua; devolve (status, corpo JSON).
+    pub(crate) fn call(
+        addr: SocketAddr,
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+        body: Option<&Value>,
+    ) -> (u16, Value) {
+        let mut s = TcpStream::connect(addr).unwrap();
+        let body = body.map(Value::to_string).unwrap_or_default();
+        let auth = token.map_or(String::new(), |t| format!("Authorization: Bearer {t}\r\n"));
+        write!(
+            s,
+            "{method} {path} HTTP/1.1\r\nHost: x\r\n{auth}Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).unwrap();
+        let status = out[9..12].parse().unwrap();
+        let json = out
+            .split_once("\r\n\r\n")
+            .and_then(|(_, b)| serde_json::from_str(b).ok())
+            .unwrap_or(Value::Null);
+        (status, json)
+    }
+
+    #[test]
+    fn ping_livre_e_resto_exige_token_valido() {
+        let dir = tempfile::tempdir().unwrap();
+        let addr = start(dir.path());
+        let (st, v) = call(addr, "GET", "/v1/ping", None, None);
+        assert_eq!((st, v["name"].as_str()), (200, Some("zerith")));
+        assert_eq!(call(addr, "GET", "/v1/health", None, None).0, 401);
+        assert_eq!(call(addr, "GET", "/v1/health", Some("zt_x"), None).0, 401);
+
+        let tok = auth::add_token(dir.path(), "pc").unwrap();
+        assert_ne!(call(addr, "GET", "/v1/health", Some(&tok), None).0, 401);
+        assert!(
+            auth::load_usage(dir.path()).contains_key("pc"),
+            "último uso gravado"
+        );
+        auth::revoke_token(dir.path(), "pc").unwrap();
+        let (st, v) = call(addr, "GET", "/v1/health", Some(&tok), None);
+        assert_eq!(st, 401, "revogado vale sem reiniciar");
+        assert!(!v.to_string().contains(&tok), "resposta não ecoa o token");
+    }
+
+    #[test]
+    fn falhas_demais_viram_429() {
+        let dir = tempfile::tempdir().unwrap();
+        let addr = start(dir.path());
+        let tok = auth::add_token(dir.path(), "pc").unwrap();
+        for _ in 0..auth::MAX_AUTH_FAILURES {
+            assert_eq!(
+                call(addr, "GET", "/v1/workflows", Some("zt_x"), None).0,
+                401
+            );
+        }
+        assert_eq!(
+            call(addr, "GET", "/v1/workflows", Some("zt_x"), None).0,
+            429
+        );
+        // Bloqueado por IP: nem o token certo passa até a janela esvaziar.
+        assert_eq!(call(addr, "GET", "/v1/workflows", Some(&tok), None).0, 429);
+        assert_eq!(call(addr, "GET", "/v1/ping", None, None).0, 200);
     }
 }

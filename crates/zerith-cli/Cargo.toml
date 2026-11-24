@@ -20,5 +20,16 @@ zerith-tools = { path = "../zerith-tools" }
 zerith-plugins = { path = "../zerith-plugins" }
 zerith-mcp = { path = "../zerith-mcp" }
 zerith-security = { path = "../zerith-security" }
+zerith-workflows = { path = "../zerith-workflows" }
+serde.workspace = true
 serde_json.workspace = true
 ureq.workspace = true
+toml.workspace = true
+# `zerith server`: já no Cargo.lock (sha2 via importers/lopdf, getrandom via
+# ring/ureq, base64 via ureq). Nenhuma dependência nova na árvore.
+sha2 = "0.10"
+getrandom = "0.2"
+base64 = "0.22"
+
+[dev-dependencies]
+tempfile.workspace = true

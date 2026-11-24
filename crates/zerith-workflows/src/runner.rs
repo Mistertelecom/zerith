@@ -779,7 +779,8 @@ fn run_node(
             let target = cfg_str(cfg, "target").map(|t| interpolate(t, prev, outputs, now_dt));
             let msg_tpl = cfg_str(cfg, "message").unwrap_or("{{prev}}");
             let msg = interpolate(msg_tpl, prev, outputs, now_dt);
-            let res = channels::dispatch(&ch, target.as_deref(), &msg)?;
+            let attachment = notify_attachment(cfg, prev, outputs, now_dt, opts)?;
+            let res = channels::dispatch_with(&ch, target.as_deref(), &msg, attachment.as_ref())?;
             Ok((res, None))
         }
         NodeKind::SaveFile => {
@@ -811,9 +812,51 @@ fn run_node(
             } else {
                 std::fs::write(&target, &content)?;
             }
-            Ok((format!("Arquivo salvo em {}", target.display()), None))
+            Ok((format!("{SAVED_PREFIX}{}", target.display()), None))
         }
     }
+}
+
+/// Início da saída do nó SaveFile; o resto é o caminho gravado (lido pelo
+/// anexo do NotifyChannel).
+const SAVED_PREFIX: &str = "Arquivo salvo em ";
+
+/// Anexo do NotifyChannel: `attach_node` (id de um nó SaveFile já executado)
+/// ou `attachment` (caminho, relativo à pasta de dados, ou URL http(s)).
+/// Valores interpolados no caminho não podem trocar de pasta.
+fn notify_attachment(
+    cfg: &Value,
+    prev: &str,
+    outputs: &HashMap<String, String>,
+    now_dt: &LocalDateTime,
+    opts: &RunOptions<'_>,
+) -> Result<Option<channels::Attachment>> {
+    if let Some(id) = cfg_str(cfg, "attach_node") {
+        let out = outputs.get(id).ok_or_else(|| {
+            WorkflowError::Exec(format!("anexo: o nó '{id}' ainda não rodou nesta execução"))
+        })?;
+        let path = out.strip_prefix(SAVED_PREFIX).ok_or_else(|| {
+            WorkflowError::Exec(format!("anexo: o nó '{id}' não é um nó Salvar arquivo"))
+        })?;
+        return channels::Attachment::from_path(Path::new(path.trim())).map(Some);
+    }
+    let Some(raw) = cfg_str(cfg, "attachment") else {
+        return Ok(None);
+    };
+    if raw.starts_with("http://") || raw.starts_with("https://") {
+        let url = interpolate_inner(raw, prev, outputs, now_dt, None, &mut |v| {
+            v.chars().filter(|c| !c.is_whitespace()).collect()
+        });
+        return Ok(Some(channels::Attachment::from_url(&url)));
+    }
+    let rel = interpolate_inner(raw, prev, outputs, now_dt, None, &mut path_segment);
+    let p = PathBuf::from(&rel);
+    let path = if p.is_absolute() {
+        p
+    } else {
+        opts.data_root.join(p)
+    };
+    channels::Attachment::from_path(&path).map(Some)
 }
 
 /// Tests a single workflow node with optional sample upstream input (`prev`)
@@ -1915,5 +1958,59 @@ mod tests {
             out,
             "#0={{date}} {{index}} {{item}}|{{date}} {{index}} {{item}}"
         );
+    }
+
+    #[test]
+    fn notify_anexa_arquivo_do_save_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("w.db")).unwrap();
+        let ch = crate::model::ChannelConfig {
+            id: "local".into(),
+            name: "local".into(),
+            kind: crate::model::ChannelKind::DesktopNotify,
+            enabled: true,
+            config: json!({}),
+            updated_at_ms: 0,
+        };
+        store.save_channel(&ch).unwrap();
+        let wf = wf_of(
+            vec![
+                node("m", NodeKind::TriggerManual, json!({})),
+                node(
+                    "f",
+                    NodeKind::SaveFile,
+                    json!({"path": "r/rel.md", "content": "x"}),
+                ),
+                node(
+                    "n",
+                    NodeKind::NotifyChannel,
+                    json!({"channel_id": "local", "message": "ok", "attach_node": "f"}),
+                ),
+                node(
+                    "p",
+                    NodeKind::NotifyChannel,
+                    json!({"channel_id": "local", "attachment": "r/{{prev}}"}),
+                ),
+            ],
+            vec![edge("m", "f"), edge("f", "n"), edge("n", "p")],
+        );
+        let mut opts = RunOptions {
+            store: &store,
+            data_root: dir.path(),
+            ai: &EchoAi,
+            trigger_source: "manual",
+            tz_offset_minutes: 0,
+            initial_input: None,
+            on_event: &mut |_| {},
+        };
+        let run = execute_workflow(&wf, &mut opts).unwrap();
+        assert!(
+            run.node_logs[2].output.contains("anexo ignorado"),
+            "{:?}",
+            run.node_logs
+        );
+        // `{{prev}}` vira um nome sem barras (não sai de r/) e inexistente.
+        assert_eq!(run.status, "error");
+        assert!(run.summary.contains("nó 'p'"), "{}", run.summary);
     }
 }

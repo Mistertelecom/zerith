@@ -25,7 +25,7 @@ não significa paridade de comportamento.
 | `/rewind` (checkpoints de arquivos e conversa) | Implementado: runtime abre checkpoint por turno e `write_file`/`edit_file` chamam `before_write` → `record_file` (`shell` fica fora do rastreamento) | `docs/checkpoints.md` |
 | `--resume`, `--continue`, `--fork`, nome de sessão | Implementado | `zerith-cli` |
 | Modo headless `-p` com `--output-format`, `--max-turns`, `--allowed-tools`, `--permission-mode`, `--json-schema` | Implementado (schema mínimo) | `zerith-cli` |
-| `--max-budget-usd` | Implementado **com preços informados pelo usuário** (sem tabela própria) | `zerith-cli` |
+| `--max-budget-usd` | Implementado: preço informado (`--price-in`/`--price-out`) ou, sem ele, o catálogo público do OpenRouter (cópia de 24 h, nunca tabela fixa) | `zerith-cli` |
 | Memória entre sessões | Implementado (SQLite + FTS5), com pausa e exportação | `zerith-memory` |
 | Compactação de contexto | Existe em `zerith-runtime` (`compact.rs`); critérios em constante evolução | |
 | Rebobinar e interface na janela | Implementado em Tauri 2 (`zerith-desktop`): alterações por arquivo com `Desfazer`, `/rewind` e `/mode`, diffs inline, edição/fork de conversa e auto-updater com assinatura Ed25519 | `zerith-desktop` |

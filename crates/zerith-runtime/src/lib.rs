@@ -24,6 +24,7 @@ pub mod pipeline;
 pub mod plan;
 pub mod question;
 pub mod spill;
+mod stuck;
 pub mod subagent;
 mod tasks;
 pub mod tokensaver;

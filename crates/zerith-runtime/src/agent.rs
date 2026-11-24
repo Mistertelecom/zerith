@@ -785,13 +785,11 @@ fn turn_body(
     let mut last = (0i64, String::new(), None::<String>);
     let max_steps = agent.max_steps.max(1);
     let mut reason = "done";
-    let mut fail_counts: std::collections::HashMap<(String, String), u8> =
-        std::collections::HashMap::new();
+    // Repetições, falhas idênticas, ciclos e texto repetido: avisa o modelo.
+    let mut stuck = crate::stuck::Stuck::default();
     // Text answers the output cap cut that the turn resumed: a long plan or
     // file pasted as text would otherwise end the task mid-sentence.
     let mut cut_resumes = 0u8;
-    let mut exec_counts: std::collections::HashMap<(String, String), u8> =
-        std::collections::HashMap::new();
     // Skills already named to the model this turn (by the prompt's ranking or
     // by a hint below): each is suggested once.
     let mut skill_hinted = false;
@@ -942,6 +940,7 @@ fn turn_body(
                    "completion_tokens": out.usage.as_ref().map(|u| u.completion_tokens)}),
         );
         last = (id, out.text.clone(), out.reasoning.clone());
+        let text_loop = stuck.observe_text(&out.text);
         hist.push(
             ChatMessage::assistant(out.text, out.calls.clone())
                 .with_thinking_blocks(out.thinking_blocks),
@@ -1087,7 +1086,7 @@ fn turn_body(
             break;
         }
 
-        let mut context: Vec<String> = Vec::new();
+        let mut context: Vec<String> = text_loop.into_iter().collect();
         // Images `view_image` checked this step: sent as a real (non-synthetic)
         // message so the provider attaches them; only this exact text is.
         let mut images: Vec<String> = Vec::new();
@@ -1142,6 +1141,22 @@ fn turn_body(
                     "tool/call",
                     json!({"id": call.id, "name": call.name, "args": call.arguments}),
                 );
+                // Já falhou idêntica vezes demais: não executa (nem pede
+                // aprovação) e diz ao modelo para mudar de abordagem.
+                if let Some(msg) = stuck.blocked(&call.name, &call.arguments) {
+                    log.emit("tool/stuck", json!({"id": call.id, "name": call.name}));
+                    prepared.push(crate::pipeline::Prepared {
+                        inv: crate::ToolInvocation {
+                            id: call.id.clone(),
+                            name: call.name.clone(),
+                            args: p_args(&call.arguments),
+                            session_id: session_id.to_string(),
+                            cwd: cwd.clone(),
+                        },
+                        settled: Some(crate::pipeline::ToolOutcome::new(false, msg)),
+                    });
+                    continue;
+                }
                 prepared.push(pipe.prepare(call, on_event));
             }
             let prepared_len = prepared.len();
@@ -1295,45 +1310,9 @@ fn turn_body(
                         context.push(hint);
                     }
                 }
-                let sig = (call.name.clone(), call.arguments.clone());
-                // Edit, then rerun the same test: that is the fix loop, not a stuck one.
-                if outcome.ok
-                    && matches!(
-                        call.name.as_str(),
-                        "write_file" | "edit_file" | "multi_edit"
-                    )
-                {
-                    fail_counts.retain(|(name, _), _| name != "shell");
-                    exec_counts.retain(|(name, _), _| name != "shell");
-                }
-                if outcome.ok {
-                    if matches!(
-                        call.name.as_str(),
-                        "shell" | "agent" | "write_file" | "edit_file" | "multi_edit"
-                    ) {
-                        let count = exec_counts
-                            .entry(sig)
-                            .and_modify(|c| *c = c.saturating_add(1))
-                            .or_insert(1);
-                        if *count >= 3 {
-                            context.push(format!(
-                                "[Loop Detectado] A ferramenta `{}` foi executada {}x com os mesmos argumentos neste turno sem nenhuma edição entre elas. NÃO repita a mesma ação: use o resultado anterior ou responda ao usuário.",
-                                call.name, *count
-                            ));
-                        }
-                    }
-                } else {
-                    let count = fail_counts
-                        .entry(sig)
-                        .and_modify(|c| *c = c.saturating_add(1))
-                        .or_insert(1);
-                    if *count >= 2 {
-                        context.push(format!(
-                            "[Loop Detectado] A chamada `{}` com os mesmos argumentos falhou {}x neste turno sem nenhuma edição entre elas. Não repita sem mudar algo: leia o erro, corrija a causa ou explique o bloqueio ao usuário. Se travou por ser app GUI ou servidor contínuo, use `run_in_background: true` uma única vez.",
-                            call.name, *count
-                        ));
-                    }
-                }
+                // Edit, then rerun the same test: that is the fix loop, not a
+                // stuck one (the detector resets on a successful edit).
+                context.extend(stuck.observe(&call.name, &call.arguments, outcome.ok));
                 let preview: String = outcome.output.chars().take(PREVIEW_CHARS).collect();
                 log.emit(
                     "tool/result",

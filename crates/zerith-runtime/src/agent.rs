@@ -795,6 +795,19 @@ fn turn_body(
     // Skills already named to the model this turn (by the prompt's ranking or
     // by a hint below): each is suggested once.
     let mut skill_hinted = false;
+    // AGENTS.md de subpasta tocada por uma ferramenta, uma vez por sessão:
+    // o histórico diz quais já foram mostrados.
+    let mut subdir_hints = (!ctx.no_project_instructions).then(|| {
+        let start = ctx
+            .project_dir
+            .map(Path::to_path_buf)
+            .or_else(|| std::env::current_dir().ok());
+        let mut h = zerith_core::subdir_hints::SubdirHints::new(&cwd, start.as_deref());
+        for row in &rows {
+            h.seed(&row.content);
+        }
+        h
+    });
     // Code files the turn edited since its last check, and whether it was
     // already sent back once to verify them (verify-on-stop).
     let mut unverified: Vec<String> = Vec::new();
@@ -1242,6 +1255,16 @@ fn turn_body(
                             after_bytes,
                             filter: compressed.filter.map(str::to_string),
                         });
+                    }
+                }
+                if let Some(h) = subdir_hints.as_mut().filter(|_| outcome.ok) {
+                    let paths = zerith_core::subdir_hints::tool_paths(
+                        &call.name,
+                        &p_args(&call.arguments),
+                        &cwd,
+                    );
+                    if let Some(text) = h.on_paths(&paths) {
+                        outcome.output.push_str(&text);
                     }
                 }
                 record(store, session_id, call, &outcome.output, &mut hist)?;

@@ -12,6 +12,7 @@ pub mod paths;
 pub mod secrets;
 pub mod settings;
 pub mod shellparse;
+pub mod subdir_hints;
 
 pub use instructions::{
     load_instructions, system_prompt_base_with_instructions, system_prompt_with_instructions,

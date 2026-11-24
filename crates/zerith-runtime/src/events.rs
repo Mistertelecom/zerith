@@ -67,6 +67,30 @@ pub fn cancel_with(cancel: &Cancel, slot: &CauseSlot, cause: CancelCause) {
     cancel.cancel();
 }
 
+/// A turn longer than this tells the person it ended (`Notification`,
+/// `idle_prompt`): they likely switched away while it ran.
+pub(crate) const LONG_TURN: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The `Notification` an event deserves, as `(notification_type, message)`:
+/// the turn is blocked on the person.
+pub(crate) fn notification_for(e: &crate::RunEvent) -> Option<(&'static str, String)> {
+    let clip = |s: &str| s.chars().take(300).collect::<String>();
+    match e {
+        crate::RunEvent::ApprovalNeeded { tool, summary, .. } => Some((
+            "permission_prompt",
+            clip(&format!("Zerith pede aprovação ({tool}): {summary}")),
+        )),
+        crate::RunEvent::Question { questions, .. } => Some((
+            "ask_user",
+            clip(&format!(
+                "Zerith tem uma pergunta: {}",
+                questions.first().map_or("", |q| q.question.as_str())
+            )),
+        )),
+        _ => None,
+    }
+}
+
 static NEXT_TURN: AtomicU64 = AtomicU64::new(1);
 
 /// Appends events for one turn (or, with `turn_id: None`, outside any turn).

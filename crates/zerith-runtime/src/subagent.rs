@@ -33,6 +33,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use zerith_core::agents::{self, AgentDef};
+use zerith_core::hooks::{run_hooks, HookEvent, HookPayload};
 use zerith_memory::{MemoryBackend, Scope, SqliteMemory};
 use zerith_providers::{Cancel, Client, ProviderConfig, ProviderError};
 use zerith_security::{Mode, ModeHandle, Policy};
@@ -573,25 +574,7 @@ pub(crate) fn run_child_with(
         .unwrap_or_else(|| Instant::now() + BACKGROUND_LIMIT);
     let watchdog = watch(spec.cancel.clone(), cancel.clone(), Some(deadline));
     let sink = spec.sink.clone();
-    let opts = crate::AgentOptions {
-        tools: Some(&spec.registry),
-        policy: Some(&spec.policy),
-        approvals: spec.approvals.as_ref(),
-        middleware: boxed(middleware),
-        max_steps: spec.max_steps.max(1),
-        inbox: inbox.as_ref(),
-        subagents: SubagentOptions {
-            depth: spec.depth,
-            gate: spec.gate.clone(),
-            max_concurrent: None,
-        },
-        parent_checkpoint: if wt_guard.is_some() {
-            None
-        } else {
-            spec.parent_checkpoint.clone()
-        },
-        ..crate::AgentOptions::default()
-    };
+    let isolated = wt_guard.is_some();
     // `..default()` stays so a field added to `TurnContext` later is not a
     // compile error here.
     #[allow(clippy::needless_update)]
@@ -604,6 +587,42 @@ pub(crate) fn run_child_with(
         project_dir: Some(&spec.policy.workspace),
         ..TurnContext::default()
     };
+    // SubagentStart / SubagentStop (Claude Code's names): `agent_id` is the
+    // `sub-N` the person sees, else the child's session.
+    let agent_id = spec
+        .announce
+        .as_ref()
+        .map_or_else(|| session.id.clone(), |(id, _)| id.clone());
+    let agent_type = spec
+        .def
+        .as_ref()
+        .map_or_else(|| "general".to_string(), |d| d.name.clone());
+    let hook_payload = |extra: Value| HookPayload {
+        session_id: spec.parent.clone(),
+        cwd: spec.policy.workspace.clone(),
+        subject: Some(agent_type.clone()),
+        extra: match extra {
+            Value::Object(m) => m,
+            _ => Default::default(),
+        },
+        ..Default::default()
+    };
+    let base = serde_json::json!({
+        "agent_id": agent_id,
+        "agent_type": agent_type,
+        "agent_session_id": session.id,
+        "description": spec.title,
+        "model": spec.model,
+    });
+    let mut prompt = spec.prompt.clone();
+    if let Some(st) = &spec.settings {
+        let out = run_hooks(HookEvent::SubagentStart, &hook_payload(base.clone()), st);
+        hook_errors(&store, &session.id, HookEvent::SubagentStart, &out.errors);
+        // Informational: what a hook prints goes to the child, as context.
+        if !out.additional_context.is_empty() {
+            prompt = format!("{prompt}\n\n{}", out.additional_context.join("\n"));
+        }
+    }
     let mut step = 0usize;
     let turn_model = if spec.settings.is_some() {
         spec.raw_model
@@ -614,87 +633,162 @@ pub(crate) fn run_child_with(
     } else {
         &spec.model
     };
-    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::run_agent_turn(
-            &store,
-            &client,
-            ctx,
-            opts,
-            &session.id,
-            turn_model,
-            &spec.prompt,
-            &cancel,
-            |e| {
-                if let (RunEvent::Step { n }, Some(c)) = (&e, &control) {
-                    c.steps.store(*n, Ordering::Relaxed);
-                }
-                // Live progress: what step the child is on and what it is
-                // running, while it runs. The shared gate is pumped by the
-                // root turn during the `agent` call; the sink only between
-                // tool groups.
-                let progress = match (&e, &spec.announce) {
-                    (RunEvent::Step { n }, Some(_)) => {
-                        step = *n;
-                        Some(format!("passo {n} de {}", spec.max_steps))
+    let steps_total = std::cell::Cell::new(0usize);
+    // One child turn; a SubagentStop hook that blocks runs another on the
+    // same session, with its reason as the prompt.
+    let mut turn = |prompt: &str| {
+        let opts = crate::AgentOptions {
+            tools: Some(&spec.registry),
+            policy: Some(&spec.policy),
+            approvals: spec.approvals.as_ref(),
+            middleware: boxed(middleware),
+            max_steps: spec.max_steps.max(1),
+            inbox: inbox.as_ref(),
+            subagents: SubagentOptions {
+                depth: spec.depth,
+                gate: spec.gate.clone(),
+                max_concurrent: None,
+            },
+            parent_checkpoint: if isolated {
+                None
+            } else {
+                spec.parent_checkpoint.clone()
+            },
+            ..crate::AgentOptions::default()
+        };
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::run_agent_turn(
+                &store,
+                &client,
+                ctx,
+                opts,
+                &session.id,
+                turn_model,
+                prompt,
+                &cancel,
+                |e| {
+                    if let RunEvent::Step { n } = &e {
+                        steps_total.set(steps_total.get() + 1);
+                        if let Some(c) = &control {
+                            c.steps.store(*n, Ordering::Relaxed);
+                        }
                     }
-                    (RunEvent::ToolCall { name, .. }, Some(_)) => {
-                        Some(format!("passo {step} de {} · {name}", spec.max_steps))
-                    }
-                    _ => None,
-                };
-                if let (Some(summary), Some((id, name))) = (progress, &spec.announce) {
-                    let ev = RunEvent::Subagent {
-                        id: id.clone(),
-                        name: name.clone(),
-                        state: "running".into(),
-                        summary,
-                        model: spec.model.clone(),
+                    // Live progress: what step the child is on and what it is
+                    // running, while it runs. The shared gate is pumped by the
+                    // root turn during the `agent` call; the sink only between
+                    // tool groups.
+                    let progress = match (&e, &spec.announce) {
+                        (RunEvent::Step { n }, Some(_)) => {
+                            step = *n;
+                            Some(format!("passo {n} de {}", spec.max_steps))
+                        }
+                        (RunEvent::ToolCall { name, .. }, Some(_)) => {
+                            Some(format!("passo {step} de {} · {name}", spec.max_steps))
+                        }
+                        _ => None,
                     };
-                    match (&spec.approvals, &sink) {
-                        (Some(g), _) => g.relay(ev),
-                        (None, Some(s)) => {
-                            if let RunEvent::Subagent {
-                                id,
-                                name,
-                                state,
-                                summary,
-                                model,
-                            } = ev
-                            {
-                                s.push(HostEvent::Subagent {
+                    if let (Some(summary), Some((id, name))) = (progress, &spec.announce) {
+                        let ev = RunEvent::Subagent {
+                            id: id.clone(),
+                            name: name.clone(),
+                            state: "running".into(),
+                            summary,
+                            model: spec.model.clone(),
+                        };
+                        match (&spec.approvals, &sink) {
+                            (Some(g), _) => g.relay(ev),
+                            (None, Some(s)) => {
+                                if let RunEvent::Subagent {
                                     id,
                                     name,
                                     state,
                                     summary,
                                     model,
-                                });
+                                } = ev
+                                {
+                                    s.push(HostEvent::Subagent {
+                                        id,
+                                        name,
+                                        state,
+                                        summary,
+                                        model,
+                                    });
+                                }
                             }
+                            (None, None) => {}
                         }
-                        (None, None) => {}
                     }
-                }
-                if let (
-                    RunEvent::Subagent {
-                        id,
-                        name,
-                        state,
-                        summary,
-                        model,
-                    },
-                    Some(s),
-                ) = (e, &sink)
+                    if let (
+                        RunEvent::Subagent {
+                            id,
+                            name,
+                            state,
+                            summary,
+                            model,
+                        },
+                        Some(s),
+                    ) = (e, &sink)
+                    {
+                        s.push(HostEvent::Subagent {
+                            id,
+                            name,
+                            state,
+                            summary,
+                            model,
+                        });
+                    }
+                },
+            )
+        }))
+    };
+    let mut rounds = 0usize;
+    let run = loop {
+        let r = turn(&prompt);
+        let Some(st) = &spec.settings else { break r };
+        let stop_reason = match &r {
+            Err(_) => "panic",
+            Ok(Ok(report)) => report.stop_reason,
+            Ok(Err(RunError::Provider(ProviderError::Cancelled))) => {
+                if control
+                    .as_ref()
+                    .is_some_and(|c| c.stopped.load(Ordering::SeqCst))
                 {
-                    s.push(HostEvent::Subagent {
-                        id,
-                        name,
-                        state,
-                        summary,
-                        model,
-                    });
+                    "stopped"
+                } else if watchdog.timed_out.load(Ordering::SeqCst) {
+                    "timed_out"
+                } else {
+                    "cancelled"
                 }
-            },
-        )
-    }));
+            }
+            Ok(Err(_)) => "failed",
+        };
+        let mut extra = base.clone();
+        extra["stop_reason"] = stop_reason.into();
+        extra["steps"] = steps_total.get().into();
+        extra["stop_hook_active"] = (rounds > 0).into();
+        if let Ok(Ok(report)) = &r {
+            extra["last_assistant_message"] = report.text.clone().into();
+        }
+        let s = spent(&store, &session.id);
+        extra["tokens"] = serde_json::json!({
+            "prompt": s.prompt, "completion": s.completion,
+            "cache_read": s.cache_read, "cache_write": s.cache_write,
+        });
+        let out = run_hooks(HookEvent::SubagentStop, &hook_payload(extra), st);
+        hook_errors(&store, &session.id, HookEvent::SubagentStop, &out.errors);
+        // Only a child that finished can be sent back to work; the cap keeps
+        // a hook that always blocks from looping forever.
+        if stop_reason == "done"
+            && out.blocked()
+            && rounds < SUBAGENT_STOP_ROUNDS
+            && !cancel.is_cancelled()
+        {
+            rounds += 1;
+            prompt = crate::agent::stop_message(&out);
+            continue;
+        }
+        break r;
+    };
     let timed_out = watchdog.timed_out.load(Ordering::SeqCst);
     drop(watchdog);
     // A failure still tells where the kept edits are.
@@ -736,14 +830,20 @@ pub(crate) fn run_child_with(
         }),
         Ok(Err(e)) => Err(fail(e.to_string())),
         Ok(Ok(report)) => {
-            let saved = Saved {
-                rtk: report.saved_rtk_tokens,
-                ponytail: report.saved_ponytail_tokens,
-                caveman: report.saved_caveman_tokens,
-                prompt: report.prompt_tokens,
-                completion: report.completion_tokens,
-                cache_read: report.cache_read_tokens,
-                cache_write: report.cache_write_tokens,
+            // Sent back by a SubagentStop hook: the report holds the last
+            // round only; the usage rows hold all of them.
+            let saved = if rounds > 0 {
+                spent(&store, &session.id)
+            } else {
+                Saved {
+                    rtk: report.saved_rtk_tokens,
+                    ponytail: report.saved_ponytail_tokens,
+                    caveman: report.saved_caveman_tokens,
+                    prompt: report.prompt_tokens,
+                    completion: report.completion_tokens,
+                    cache_read: report.cache_read_tokens,
+                    cache_write: report.cache_write_tokens,
+                }
             };
             // The loop's own verdict: a child that obeyed the wrap-up request
             // ends with a summary, not the `[parado: limite` note.
@@ -775,6 +875,20 @@ pub(crate) fn run_child_with(
                 saved,
             })
         }
+    }
+}
+
+/// Times a SubagentStop hook may send one child back to work.
+const SUBAGENT_STOP_ROUNDS: usize = 3;
+
+fn hook_errors(store: &Store, session: &str, event: HookEvent, errors: &[String]) {
+    for err in errors {
+        let _ = store.append_event(
+            session,
+            None,
+            "hook/error",
+            &serde_json::json!({"event": event.as_str(), "error": err}),
+        );
     }
 }
 
@@ -1488,6 +1602,16 @@ impl Services for Runtime {
     }
 
     fn tasks(&self, session: &str, op: &str, args: &Value) -> Result<String, String> {
+        if let Some(st) = &self.settings {
+            crate::tasks::completion_hook(
+                self.db()?,
+                st,
+                &self.policy.workspace,
+                session,
+                op,
+                args,
+            )?;
+        }
         crate::tasks::run(self.db()?, session, op, args)
     }
 

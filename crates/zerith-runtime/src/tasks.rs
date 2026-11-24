@@ -40,6 +40,68 @@ fn line(t: &Todo, all: &[Todo]) -> String {
     s
 }
 
+/// `TaskCompleted` (Claude Code's name): before `task_update` marks an open
+/// task `completed`. A blocking hook keeps it open; its reason is the
+/// model's error. Any other call passes untouched.
+pub fn completion_hook(
+    db: &Path,
+    settings: &zerith_core::Settings,
+    cwd: &Path,
+    session: &str,
+    op: &str,
+    args: &Value,
+) -> Result<(), String> {
+    use zerith_core::hooks::{run_hooks, HookEvent, HookPayload};
+    if op != "task_update"
+        || args["status"].as_str() != Some("completed")
+        || settings.hooks.task_completed.is_empty()
+    {
+        return Ok(());
+    }
+    let store = Store::open(db).map_err(|e| format!("banco: {e}"))?;
+    let id = args["id"].as_i64().unwrap_or(0);
+    let Some(t) = store.todo(session, id).map_err(|e| e.to_string())? else {
+        return Ok(()); // `run` reports the missing task
+    };
+    if t.status == TodoStatus::Completed {
+        return Ok(());
+    }
+    let mut extra = serde_json::Map::new();
+    extra.insert("task_id".into(), id.into());
+    extra.insert("task_subject".into(), t.subject.clone().into());
+    extra.insert("task_description".into(), t.description.into());
+    let out = run_hooks(
+        HookEvent::TaskCompleted,
+        &HookPayload {
+            session_id: session.to_string(),
+            cwd: cwd.to_path_buf(),
+            extra,
+            ..Default::default()
+        },
+        settings,
+    );
+    for err in &out.errors {
+        let _ = store.append_event(
+            session,
+            None,
+            "hook/error",
+            &serde_json::json!({"event": "TaskCompleted", "error": err}),
+        );
+    }
+    if out.blocked() {
+        let why = out.reasons.join("; ");
+        return Err(format!(
+            "tarefa #{id} continua aberta: um hook TaskCompleted recusou{}",
+            if why.trim().is_empty() {
+                String::new()
+            } else {
+                format!(": {why}")
+            }
+        ));
+    }
+    Ok(())
+}
+
 /// Runs one task tool for `session`. `Err` is text for the model.
 pub fn run(db: &Path, session: &str, op: &str, args: &Value) -> Result<String, String> {
     let store = Store::open(db).map_err(|e| format!("banco: {e}"))?;

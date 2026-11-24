@@ -589,8 +589,11 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
 pub struct HookSpec {
     /// `|`-separated entries, each `tool` (a `*` glob) or `tool(specifier)`
     /// (specifier: a `*` glob over the command / path / URL, as in permission
-    /// rules). Empty or absent: every tool. Only used by the tool events
-    /// (`PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `PermissionRequest`).
+    /// rules). Empty or absent: every tool. The tool events (`PreToolUse`,
+    /// `PostToolUse`, `PostToolUseFailure`, `PermissionRequest`) test it
+    /// against the tool; `Notification`, `SubagentStart`/`SubagentStop` and
+    /// `PreCompact`/`PostCompact` against their kind (notification type, agent
+    /// name, `auto`/`manual`). Other events ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matcher: Option<String>,
     pub command: String,
@@ -614,6 +617,11 @@ pub struct Hooks {
     pub stop: Vec<HookSpec>,
     pub pre_compact: Vec<HookSpec>,
     pub session_end: Vec<HookSpec>,
+    pub subagent_start: Vec<HookSpec>,
+    pub subagent_stop: Vec<HookSpec>,
+    pub notification: Vec<HookSpec>,
+    pub post_compact: Vec<HookSpec>,
+    pub task_completed: Vec<HookSpec>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

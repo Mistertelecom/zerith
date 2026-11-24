@@ -303,6 +303,11 @@ fn valid_hook_event(ev: &str) -> bool {
             | "Stop"
             | "PreCompact"
             | "SessionEnd"
+            | "SubagentStart"
+            | "SubagentStop"
+            | "Notification"
+            | "PostCompact"
+            | "TaskCompleted"
     )
 }
 

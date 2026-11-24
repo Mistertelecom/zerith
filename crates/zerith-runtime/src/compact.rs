@@ -757,6 +757,66 @@ fn compact_with(
     .map_err(|e| RunError::Provider(ProviderError::Transport(e)))
 }
 
+/// What one compaction did, for the `PostCompact` hook.
+#[derive(Debug, Default)]
+pub(crate) struct CompactDone<'a> {
+    /// `auto` (pressure inside a turn or before one) or `manual` (`/compact`).
+    pub trigger: &'a str,
+    pub tokens_before: usize,
+    pub tokens_after: usize,
+    /// Repeated tool outputs collapsed, old big ones demoted (cheap passes).
+    pub deduped: usize,
+    pub demoted: usize,
+    /// Old turns dropped whole (the last resort).
+    pub dropped: usize,
+    pub summary: Option<&'a CompactReport>,
+}
+
+/// Fires `PostCompact` (informational: its output changes nothing). Called
+/// only when something was compacted.
+pub(crate) fn post_compact(
+    settings: &zerith_core::Settings,
+    log: &TurnLog<'_>,
+    session_id: &str,
+    cwd: &std::path::Path,
+    done: &CompactDone<'_>,
+) {
+    use zerith_core::hooks::{run_hooks, HookEvent, HookPayload};
+    if settings.hooks.post_compact.is_empty() {
+        return;
+    }
+    let mut extra = json!({
+        "trigger": done.trigger,
+        "tokens_before": done.tokens_before,
+        "tokens_after": done.tokens_after,
+        "deduped": done.deduped,
+        "demoted": done.demoted,
+        "dropped": done.dropped,
+        "summarized": done.summary.is_some(),
+    });
+    if let Some(r) = done.summary {
+        extra["summary"] = json!({"messages": r.summarized, "start_id": r.start_id,
+                                  "end_id": r.end_id, "summary_id": r.summary_id});
+    }
+    let serde_json::Value::Object(extra) = extra else {
+        return;
+    };
+    let out = run_hooks(
+        HookEvent::PostCompact,
+        &HookPayload {
+            session_id: session_id.to_string(),
+            cwd: cwd.to_path_buf(),
+            subject: Some(done.trigger.to_string()),
+            extra,
+            ..Default::default()
+        },
+        settings,
+    );
+    for err in &out.errors {
+        log.emit("hook/error", json!({"event": "PostCompact", "error": err}));
+    }
+}
+
 /// Whether a history of `tokens` should be summarized before the next turn:
 /// past `pct`% of the window (`context_limit`, else [`DEFAULT_CONTEXT`]).
 pub fn needs_compaction_at(tokens: usize, context_limit: Option<u32>, pct: usize) -> bool {
@@ -883,7 +943,7 @@ pub fn auto_compact_routed_at(
         Some((cl, m)) => (cl, m.as_str()),
         None => (client, model),
     };
-    auto_compact_at(
+    let r = auto_compact_at(
         store,
         session_id,
         history,
@@ -894,7 +954,22 @@ pub fn auto_compact_routed_at(
             model: sum_model,
         },
         cancel,
-    )
+    )?;
+    if let Some(rep) = &r {
+        // ponytail: the host path does not know the session's folder; the
+        // hook runs in the process's. Pass the workspace if a hook needs it.
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let done = CompactDone {
+            trigger: "auto",
+            tokens_before: rep.tokens_before,
+            tokens_after: rep.tokens_after,
+            summary: Some(rep),
+            ..CompactDone::default()
+        };
+        let log = TurnLog::outside_turn(store, session_id);
+        post_compact(settings, &log, session_id, &cwd, &done);
+    }
+    Ok(r)
 }
 
 /// Before a turn: when the `history` rows the turn will replay pass the

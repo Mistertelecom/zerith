@@ -124,6 +124,11 @@ impl Contributions {
                 "Stop" => &mut settings.hooks.stop,
                 "PreCompact" => &mut settings.hooks.pre_compact,
                 "SessionEnd" => &mut settings.hooks.session_end,
+                "SubagentStart" => &mut settings.hooks.subagent_start,
+                "SubagentStop" => &mut settings.hooks.subagent_stop,
+                "Notification" => &mut settings.hooks.notification,
+                "PostCompact" => &mut settings.hooks.post_compact,
+                "TaskCompleted" => &mut settings.hooks.task_completed,
                 _ => continue,
             };
             slot.push(zerith_core::settings::HookSpec {

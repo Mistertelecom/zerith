@@ -165,6 +165,11 @@ fn contributions_helpers_expose_skills_agents_and_hooks() {
                 {"event":"Stop","command":"echo stop"},
                 {"event":"PreCompact","command":"echo compact"},
                 {"event":"SessionEnd","command":"echo end"},
+                {"event":"SubagentStart","matcher":"explore","command":"echo sub"},
+                {"event":"SubagentStop","command":"echo substop"},
+                {"event":"Notification","command":"echo notify"},
+                {"event":"PostCompact","command":"echo compacted"},
+                {"event":"TaskCompleted","command":"echo task"},
                 {"event":"UnknownEvent","command":"echo ignored"}
             ]}"#,
     );
@@ -213,6 +218,15 @@ fn contributions_helpers_expose_skills_agents_and_hooks() {
     assert_eq!(settings.hooks.stop[0].timeout_ms, 60_000);
     assert_eq!(settings.hooks.pre_compact.len(), 1);
     assert_eq!(settings.hooks.session_end.len(), 1);
+    assert_eq!(settings.hooks.subagent_start.len(), 1);
+    assert_eq!(
+        settings.hooks.subagent_start[0].matcher.as_deref(),
+        Some("explore")
+    );
+    assert_eq!(settings.hooks.subagent_stop.len(), 1);
+    assert_eq!(settings.hooks.notification.len(), 1);
+    assert_eq!(settings.hooks.post_compact.len(), 1);
+    assert_eq!(settings.hooks.task_completed.len(), 1);
 }
 
 /// One bundled plugin in Claude Code layout, `version` and a `demo` skill whose

@@ -2,9 +2,12 @@
 //!
 //! Contract, close in spirit to Claude Code's:
 //! - the command gets one JSON object on stdin:
-//!   `{event, session_id, tool_name?, tool_input?, tool_output?, prompt?, cwd}`;
+//!   `{event, hook_event_name, session_id, tool_name?, tool_input?,
+//!   tool_output?, prompt?, cwd, ...}` plus the event's own fields;
 //! - exit 0: stdout may hold `{decision?, reason?, updated_input?,
-//!   additional_context?, continue?}` (empty or non-JSON stdout is fine);
+//!   additional_context?, continue?}` or Claude Code's
+//!   `hookSpecificOutput: {permissionDecision?, permissionDecisionReason?,
+//!   updatedInput?, additionalContext?}` (empty or non-JSON stdout is fine);
 //! - exit 2: block, stderr is the reason;
 //! - any other exit, spawn failure or timeout: non-blocking error, recorded in
 //!   `HookOutcome::errors` for the caller to log.
@@ -34,6 +37,18 @@ pub enum HookEvent {
     Stop,
     PreCompact,
     SessionEnd,
+    /// A subagent is about to run (informational; context goes to the child).
+    SubagentStart,
+    /// A subagent finished; a block sends it back to work with the reason,
+    /// as `Stop` does for the main turn.
+    SubagentStop,
+    /// Zerith needs the person (approval, `ask_user`, a long turn ended, a
+    /// monitor woke the conversation). Informational, run in the background.
+    Notification,
+    /// After the context was compacted (cheap passes and/or summary).
+    PostCompact,
+    /// `task_update` is about to mark a task `completed`; a block keeps it open.
+    TaskCompleted,
 }
 
 impl HookEvent {
@@ -48,6 +63,20 @@ impl HookEvent {
         )
     }
 
+    /// Events whose `matcher` is tested against `HookPayload::subject` (a
+    /// kind: notification type, agent name, compaction trigger). With no
+    /// subject the matcher is ignored.
+    fn has_kind(self) -> bool {
+        matches!(
+            self,
+            HookEvent::Notification
+                | HookEvent::SubagentStart
+                | HookEvent::SubagentStop
+                | HookEvent::PreCompact
+                | HookEvent::PostCompact
+        )
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             HookEvent::SessionStart => "SessionStart",
@@ -59,6 +88,11 @@ impl HookEvent {
             HookEvent::Stop => "Stop",
             HookEvent::PreCompact => "PreCompact",
             HookEvent::SessionEnd => "SessionEnd",
+            HookEvent::SubagentStart => "SubagentStart",
+            HookEvent::SubagentStop => "SubagentStop",
+            HookEvent::Notification => "Notification",
+            HookEvent::PostCompact => "PostCompact",
+            HookEvent::TaskCompleted => "TaskCompleted",
         }
     }
 
@@ -74,6 +108,11 @@ impl HookEvent {
             HookEvent::Stop => &h.stop,
             HookEvent::PreCompact => &h.pre_compact,
             HookEvent::SessionEnd => &h.session_end,
+            HookEvent::SubagentStart => &h.subagent_start,
+            HookEvent::SubagentStop => &h.subagent_stop,
+            HookEvent::Notification => &h.notification,
+            HookEvent::PostCompact => &h.post_compact,
+            HookEvent::TaskCompleted => &h.task_completed,
         }
     }
 }
@@ -92,20 +131,49 @@ pub struct HookPayload {
     pub prompt: Option<String>,
     pub cwd: PathBuf,
     /// What a `Tool(specifier)` matcher is tested against: the command for
-    /// `shell`, the path for file tools, the URL for network tools. Not sent
-    /// to the hook (it is already inside `tool_input`).
+    /// `shell`, the path for file tools, the URL for network tools. For the
+    /// events with a kind (see `HookEvent::has_kind`), the kind. Not sent to
+    /// the hook (it is already in the payload).
     #[serde(skip)]
     pub subject: Option<String>,
+    /// The event's own fields, sent at the top level (`agent_id`,
+    /// `notification_type`, `trigger`, ...).
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct HookReply {
-    decision: Option<Decision>,
+    /// `allow`/`ask`/`deny`, plus Claude Code's `block` (= deny) and
+    /// `approve` (= allow). Text, so an unknown word is ignored instead of
+    /// turning the whole reply into plain context.
+    decision: Option<String>,
     reason: Option<String>,
     updated_input: Option<Value>,
     additional_context: Option<String>,
     #[serde(rename = "continue")]
     continue_: Option<bool>,
+    #[serde(rename = "hookSpecificOutput")]
+    specific: Option<SpecificOutput>,
+}
+
+/// Claude Code's `hookSpecificOutput`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SpecificOutput {
+    permission_decision: Option<String>,
+    permission_decision_reason: Option<String>,
+    updated_input: Option<Value>,
+    additional_context: Option<String>,
+}
+
+fn parse_decision(word: &str) -> Option<Decision> {
+    match word.trim().to_ascii_lowercase().as_str() {
+        "allow" | "approve" => Some(Decision::Allow),
+        "ask" => Some(Decision::Ask),
+        "deny" | "block" => Some(Decision::Deny),
+        _ => None,
+    }
 }
 
 /// The combined result of every hook that ran for one event.
@@ -116,7 +184,8 @@ pub struct HookOutcome {
     pub decision: Option<Decision>,
     /// Reasons from hooks that denied or asked, in run order.
     pub reasons: Vec<String>,
-    /// Replacement tool input; the last hook that set one wins.
+    /// Replacement tool input (the whole arguments object, as in Claude
+    /// Code); the last hook that set one wins. A non-object is ignored.
     pub updated_input: Option<Value>,
     /// Text to add to the model's context.
     pub additional_context: Vec<String>,
@@ -173,7 +242,10 @@ impl HookOutcome {
 ///   `PermissionRequest`: per tool call (the guards middleware does this);
 /// - `Stop`: when the model ends a turn; `continue_ == false` or a deny asks
 ///   the host to keep the agent going with the reason as the next prompt;
-/// - `PreCompact`: before the context is compacted.
+/// - `PreCompact` / `PostCompact`: around the context compaction;
+/// - `SubagentStart` / `SubagentStop`: around each subagent run;
+/// - `Notification`: via [`notify`], in the background;
+/// - `TaskCompleted`: before `task_update` marks a task completed.
 ///
 /// Fail-open: a hook that crashes, times out or exits with anything but 0/2 is
 /// recorded in `errors` and changes nothing. Only exit 2 or an explicit
@@ -183,7 +255,14 @@ pub fn run_hooks(event: HookEvent, payload: &HookPayload, settings: &Settings) -
     let tool = payload.tool_name.as_deref().unwrap_or("");
     let subject = payload.subject.as_deref();
     for spec in event.specs(settings) {
-        if event.is_tool_event() && !matcher_hits(spec.matcher.as_deref(), tool, subject) {
+        let hit = if event.is_tool_event() {
+            matcher_hits(spec.matcher.as_deref(), tool, subject)
+        } else if event.has_kind() {
+            subject.is_none_or(|kind| matcher_hits(spec.matcher.as_deref(), kind, None))
+        } else {
+            true
+        };
+        if !hit {
             continue;
         }
         run_one(spec, event, payload, &mut out);
@@ -192,6 +271,46 @@ pub fn run_hooks(event: HookEvent, payload: &HookPayload, settings: &Settings) -
         }
     }
     out
+}
+
+/// Runs `event`'s hooks on a thread of their own: nothing waits for them and
+/// their failures are dropped. For informational events (`Notification`),
+/// whose hooks may be slow (a toast, a push to the phone).
+pub fn run_hooks_detached(event: HookEvent, payload: HookPayload, settings: &Settings) {
+    if event.specs(settings).is_empty() {
+        return;
+    }
+    let only_hooks = Settings {
+        hooks: settings.hooks.clone(),
+        ..Settings::default()
+    };
+    std::thread::spawn(move || run_hooks(event, &payload, &only_hooks));
+}
+
+/// Fires `Notification`: Zerith needs the person. `kind` is what a matcher
+/// sees (`permission_prompt`, `ask_user`, `idle_prompt`, `monitor_wake`).
+pub fn notify(
+    settings: &Settings,
+    session_id: &str,
+    cwd: &std::path::Path,
+    kind: &str,
+    message: &str,
+) {
+    let mut extra = serde_json::Map::new();
+    extra.insert("notification_type".into(), kind.into());
+    extra.insert("message".into(), message.into());
+    extra.insert("title".into(), "Zerith".into());
+    run_hooks_detached(
+        HookEvent::Notification,
+        HookPayload {
+            session_id: session_id.to_string(),
+            cwd: cwd.to_path_buf(),
+            subject: Some(kind.to_string()),
+            extra,
+            ..Default::default()
+        },
+        settings,
+    );
 }
 
 /// `matcher`: `|`-separated entries, each `tool` (`*` glob) or
@@ -256,6 +375,8 @@ fn subject_hits(tool: &str, spec: &str, subject: &str) -> bool {
 fn run_one(spec: &HookSpec, event: HookEvent, payload: &HookPayload, out: &mut HookOutcome) {
     let mut input = serde_json::to_value(payload).unwrap_or_default();
     input["event"] = Value::String(event.as_str().into());
+    // Claude Code's name for the same field: its scripts read this one.
+    input["hook_event_name"] = Value::String(event.as_str().into());
     let label = format!("hook {} `{}`", event.as_str(), spec.command);
     match exec(
         &spec.command,
@@ -274,13 +395,29 @@ fn run_one(spec: &HookSpec, event: HookEvent, payload: &HookPayload, out: &mut H
                 out.additional_context.push(text.to_string());
                 return;
             };
-            if let Some(d) = reply.decision {
-                out.decide(d, reply.reason.clone());
+            let specific = reply.specific.unwrap_or_default();
+            let decision = specific
+                .permission_decision
+                .as_deref()
+                .or(reply.decision.as_deref())
+                .and_then(parse_decision);
+            if let Some(d) = decision {
+                let why = specific
+                    .permission_decision_reason
+                    .or_else(|| reply.reason.clone());
+                out.decide(d, why);
             }
-            if reply.updated_input.is_some() {
-                out.updated_input = reply.updated_input;
+            match specific.updated_input.or(reply.updated_input) {
+                Some(new @ Value::Object(_)) => out.updated_input = Some(new),
+                Some(other) => out.errors.push(format!(
+                    "{label}: updated_input ignorado (não é objeto JSON): {other}"
+                )),
+                None => {}
             }
-            if let Some(c) = reply.additional_context {
+            for c in [specific.additional_context, reply.additional_context]
+                .into_iter()
+                .flatten()
+            {
                 out.additional_context.push(c);
             }
             if reply.continue_ == Some(false) {
@@ -508,6 +645,95 @@ mod tests {
         assert!(none.additional_context.is_empty());
         let s = settings("PermissionRequest", &[("", DENY_JSON, 10_000)]);
         assert!(run_hooks(HookEvent::PermissionRequest, &payload("shell"), &s).blocked());
+    }
+
+    #[cfg(windows)]
+    const CC_REWRITE: &str = r#"echo {"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask","permissionDecisionReason":"confira","updatedInput":{"command":"commit confirmed 5"}}}"#;
+    #[cfg(not(windows))]
+    const CC_REWRITE: &str = r#"echo '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask","permissionDecisionReason":"confira","updatedInput":{"command":"commit confirmed 5"}}}'"#;
+    #[cfg(windows)]
+    const BAD_INPUT: &str = r#"echo {"updated_input":"x","decision":"talvez"}"#;
+    #[cfg(not(windows))]
+    const BAD_INPUT: &str = r#"echo '{"updated_input":"x","decision":"talvez"}'"#;
+    #[cfg(windows)]
+    const BLOCK: &str = r#"echo {"decision":"block","reason":"falta teste"}"#;
+    #[cfg(not(windows))]
+    const BLOCK: &str = r#"echo '{"decision":"block","reason":"falta teste"}'"#;
+
+    #[test]
+    fn claude_code_specific_output_and_plain_updated_input_both_work() {
+        let s = settings("PreToolUse", &[("", CC_REWRITE, 10_000)]);
+        let o = run_hooks(HookEvent::PreToolUse, &payload("terminal_send"), &s);
+        assert_eq!(o.decision, Some(Decision::Ask));
+        assert_eq!(o.reasons, vec!["confira"]);
+        assert_eq!(
+            o.updated_input,
+            Some(serde_json::json!({"command": "commit confirmed 5"}))
+        );
+        // Not an object, unknown decision word: ignored, reported, not context.
+        let s = settings("PreToolUse", &[("", BAD_INPUT, 10_000)]);
+        let o = run_hooks(HookEvent::PreToolUse, &payload("shell"), &s);
+        assert_eq!(o.updated_input, None);
+        assert_eq!(o.decision, None);
+        assert!(o.additional_context.is_empty(), "{o:?}");
+        assert_eq!(o.errors.len(), 1, "{o:?}");
+        // Claude Code's `block` is a deny (Stop / SubagentStop use it).
+        let s = settings("SubagentStop", &[("", BLOCK, 10_000)]);
+        let o = run_hooks(HookEvent::SubagentStop, &payload("x"), &s);
+        assert!(o.blocked());
+        assert_eq!(o.reasons, vec!["falta teste"]);
+    }
+
+    #[test]
+    fn kind_events_match_their_kind_and_send_their_fields() {
+        // Prints only when stdin carries the event's own field.
+        #[cfg(windows)]
+        let probe = "findstr /C:sub-7 >nul && echo visto";
+        #[cfg(not(windows))]
+        let probe = r#"grep -q '"agent_id":"sub-7"' && echo visto"#;
+        let s = settings("SubagentStart", &[("explore|plan", probe, 10_000)]);
+        let mut p = payload("x");
+        p.tool_name = None;
+        p.extra.insert("agent_id".into(), "sub-7".into());
+        p.subject = Some("explore".into());
+        let o = run_hooks(HookEvent::SubagentStart, &p, &s);
+        assert_eq!(o.additional_context, vec!["visto"], "{o:?}");
+        p.subject = Some("general".into());
+        assert_eq!(
+            run_hooks(HookEvent::SubagentStart, &p, &s),
+            HookOutcome::default()
+        );
+        // Events without a kind ignore the matcher.
+        let s = settings("TaskCompleted", &[("nada", CONTEXT, 10_000)]);
+        let o = run_hooks(HookEvent::TaskCompleted, &payload("x"), &s);
+        assert_eq!(o.additional_context, vec!["lembrete"]);
+    }
+
+    #[test]
+    fn notify_runs_in_the_background_with_the_type() {
+        let dir = std::env::temp_dir().join(format!("zerith-notify-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("n.json");
+        #[cfg(windows)]
+        let cmd = format!("more > \"{}\"", out.display());
+        #[cfg(not(windows))]
+        let cmd = format!("cat > '{}'", out.display());
+        let s = settings("Notification", &[("permission_prompt", &cmd, 10_000)]);
+        notify(&s, "s1", &dir, "ask_user", "pergunta");
+        notify(&s, "s1", &dir, "permission_prompt", "aprovar shell");
+        let t = Instant::now();
+        let text = loop {
+            let text = std::fs::read_to_string(&out).unwrap_or_default();
+            if text.contains('}') || t.elapsed() > Duration::from_secs(10) {
+                break text;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let v: Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(v["event"], "Notification");
+        assert_eq!(v["notification_type"], "permission_prompt");
+        assert_eq!(v["message"], "aprovar shell");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

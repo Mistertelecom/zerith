@@ -468,6 +468,22 @@ pub fn run_agent_turn(
     cancel: &Cancel,
     mut on_event: impl FnMut(RunEvent),
 ) -> Result<TurnReport> {
+    let started = Instant::now();
+    let hook_cwd = agent
+        .policy
+        .map(|p| p.workspace.clone())
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    // Notification hooks: the root turn sees every prompt for the person
+    // (its children's are relayed through it).
+    let notify_settings = ctx.settings.filter(|_| agent.subagents.depth == 0);
+    let mut on_event = |e: RunEvent| {
+        if let (Some(st), Some((kind, msg))) =
+            (notify_settings, crate::events::notification_for(&e))
+        {
+            zerith_core::hooks::notify(st, session_id, &hook_cwd, kind, &msg);
+        }
+        on_event(e)
+    };
     let on_event: &mut dyn FnMut(RunEvent) = &mut on_event;
     let mut agent = agent;
     // Subagents run their tools through the very same instances: a hook's
@@ -526,6 +542,15 @@ pub fn run_agent_turn(
             log.end("cancelled", Some(cause), None);
         }
         Err(e) => log.end("error", None, Some(e.to_string())),
+    }
+    if let (Some(st), Ok(_)) = (notify_settings, &result) {
+        if started.elapsed() >= crate::events::LONG_TURN {
+            let msg = format!(
+                "Zerith terminou ({}s) e espera a próxima mensagem",
+                started.elapsed().as_secs()
+            );
+            zerith_core::hooks::notify(st, session_id, &hook_cwd, "idle_prompt", &msg);
+        }
     }
     result.map(|(report, _)| report)
 }
@@ -1074,6 +1099,10 @@ fn turn_body(
                         },
                     )?;
                     log.emit("monitor/notice", json!({"message_id": id}));
+                    if let (Some(st), 0) = (ctx.settings, agent.subagents.depth) {
+                        let msg: String = text.chars().take(300).collect();
+                        zerith_core::hooks::notify(st, session_id, &cwd, "monitor_wake", &msg);
+                    }
                     hist.push(ChatMessage::synthetic_user(text), id);
                     continue;
                 }
@@ -1531,6 +1560,7 @@ fn shrink(
         );
     }
     hist.prune_tools(budget);
+    let mut summary = None;
     if hist.tokens() > budget && !*summary_failed {
         let blocked = if let Some(st) = settings {
             let out = run_hooks(
@@ -1538,6 +1568,11 @@ fn shrink(
                 &HookPayload {
                     session_id: session_id.to_string(),
                     cwd: cwd.to_path_buf(),
+                    subject: Some("auto".into()),
+                    extra: json!({"trigger": "auto"})
+                        .as_object()
+                        .cloned()
+                        .unwrap_or_default(),
                     ..Default::default()
                 },
                 st,
@@ -1563,10 +1598,13 @@ fn shrink(
                 log,
                 "pressure",
             ) {
-                Ok(Some(r)) => on_event(RunEvent::Compacted {
-                    before: r.tokens_before,
-                    after: r.tokens_after,
-                }),
+                Ok(Some(r)) => {
+                    on_event(RunEvent::Compacted {
+                        before: r.tokens_before,
+                        after: r.tokens_after,
+                    });
+                    summary = Some(r);
+                }
                 Ok(None) => {}
                 // A failed summary must not fail the turn: drop instead, and do
                 // not retry it on every step.
@@ -1581,6 +1619,21 @@ fn shrink(
             json!({"dropped_items": dropped, "tokens_before": before,
                    "tokens_after": hist.tokens()}),
         );
+    }
+    if let (Some(st), true) = (
+        settings,
+        deduped + demoted + dropped > 0 || summary.is_some(),
+    ) {
+        let done = crate::compact::CompactDone {
+            trigger: "auto",
+            tokens_before: before,
+            tokens_after: hist.tokens(),
+            deduped,
+            demoted,
+            dropped,
+            summary: summary.as_ref(),
+        };
+        crate::compact::post_compact(st, log, session_id, cwd, &done);
     }
 }
 
@@ -1604,7 +1657,7 @@ fn hook_reason(out: &HookOutcome, fallback: &str) -> String {
     }
 }
 
-fn stop_message(out: &HookOutcome) -> String {
+pub(crate) fn stop_message(out: &HookOutcome) -> String {
     let parts: Vec<&str> = out
         .reasons
         .iter()

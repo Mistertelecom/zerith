@@ -235,6 +235,7 @@ pub fn run() {
             commands::background_jobs,
             commands::background_job_tail,
             commands::background_job_stop,
+            commands::subagent_stop,
             commands::terminals_list,
             commands::terminal_tail,
             commands::terminal_interrupt,

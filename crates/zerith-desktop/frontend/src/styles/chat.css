@@ -2020,6 +2020,29 @@
   font-size: var(--fs-small);
   cursor: pointer;
 }
+.subagent-row {
+  display: flex;
+  align-items: center;
+}
+.subagent-row .subagent-head {
+  flex: 1;
+  min-width: 0;
+}
+.subagent-stop {
+  flex: none;
+  margin-right: 8px;
+  padding: 2px 10px;
+  border-radius: var(--r-full, 999px);
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--label-secondary);
+  font-size: 11px;
+  cursor: pointer;
+}
+.subagent-stop:hover:not(:disabled) {
+  color: var(--danger-text, #f87171);
+  border-color: currentColor;
+}
 .subagent-head:hover:not(:disabled) {
   background: var(--hover);
 }

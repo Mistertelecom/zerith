@@ -968,6 +968,8 @@ export function installMock(theme: string) {
           return state.theme;
         case "background_jobs":
           return state.jobs;
+        case "subagent_stop":
+          return true;
         case "background_job_stop":
           state.jobs = state.jobs.filter((j) => j.id !== a.id);
           return `${a.id} encerrado`;

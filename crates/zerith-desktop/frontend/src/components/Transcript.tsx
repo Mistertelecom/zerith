@@ -1,5 +1,5 @@
 import { Fragment, memo, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
-import { api, learnApi, type LearnedItem } from "../lib/api";
+import { api, jobsApi, learnApi, type LearnedItem } from "../lib/api";
 import {
   AlertTriangle,
   BookOpen,
@@ -233,6 +233,7 @@ function splitSubagentName(raw: string): { role: string; title: string } {
 
 function SubagentCard({ block }: { block: Extract<Block, { kind: "subagent" }> }) {
   const [open, setOpen] = useState(false);
+  const [stopping, setStopping] = useState(false);
   const { role, title } = splitSubagentName(block.name);
   const st =
     block.state === "running" ||
@@ -247,38 +248,54 @@ function SubagentCard({ block }: { block: Extract<Block, { kind: "subagent" }> }
 
   return (
     <div className={`subagent-card ${st}` + (open ? " open" : "")}>
-      <button
-        type="button"
-        className="subagent-head"
-        disabled={!hasDetails}
-        aria-expanded={hasDetails ? open : undefined}
-        onClick={() => hasDetails && setOpen((v) => !v)}
-      >
-        <span className={`subagent-icon ${st}`} aria-hidden>
-          {st === "running" ? (
-            <span className="spinner" />
-          ) : st === "done" ? (
-            <Check size={14} strokeWidth={2.25} />
-          ) : st === "failed" ? (
-            <AlertTriangle size={14} strokeWidth={2} />
-          ) : (
-            <X size={14} strokeWidth={2.25} />
-          )}
-        </span>
-        <span className="subagent-role">{role}</span>
-        <span className="subagent-title" title={title}>
-          {title}
-        </span>
-        {modelLabel ? (
-          <span className="subagent-model" title={block.model}>
-            {modelLabel}
+      <div className="subagent-row">
+        <button
+          type="button"
+          className="subagent-head"
+          disabled={!hasDetails}
+          aria-expanded={hasDetails ? open : undefined}
+          onClick={() => hasDetails && setOpen((v) => !v)}
+        >
+          <span className={`subagent-icon ${st}`} aria-hidden>
+            {st === "running" ? (
+              <span className="spinner" />
+            ) : st === "done" ? (
+              <Check size={14} strokeWidth={2.25} />
+            ) : st === "failed" ? (
+              <AlertTriangle size={14} strokeWidth={2} />
+            ) : (
+              <X size={14} strokeWidth={2.25} />
+            )}
           </span>
+          <span className="subagent-role">{role}</span>
+          <span className="subagent-title" title={title}>
+            {title}
+          </span>
+          {modelLabel ? (
+            <span className="subagent-model" title={block.model}>
+              {modelLabel}
+            </span>
+          ) : null}
+          <span className={`subagent-status ${st}`}>{statusLabel}</span>
+          {hasDetails ? (
+            <ChevronRight size={14} strokeWidth={2} className="chev" />
+          ) : null}
+        </button>
+        {st === "running" ? (
+          <button
+            type="button"
+            className="subagent-stop"
+            disabled={stopping}
+            title="Parar este subagente; o que ele já fez volta para a conversa"
+            onClick={() => {
+              setStopping(true);
+              void jobsApi.stopSubagent(block.id).catch(() => setStopping(false));
+            }}
+          >
+            {stopping ? "Parando..." : "Parar"}
+          </button>
         ) : null}
-        <span className={`subagent-status ${st}`}>{statusLabel}</span>
-        {hasDetails ? (
-          <ChevronRight size={14} strokeWidth={2} className="chev" />
-        ) : null}
-      </button>
+      </div>
       {st === "running" && block.summary && !open ? (
         <div className="subagent-live">{block.summary}</div>
       ) : null}

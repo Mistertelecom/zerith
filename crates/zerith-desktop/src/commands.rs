@@ -246,6 +246,13 @@ pub async fn background_job_stop(id: String) -> Cmd<String> {
         .map_err(|e| e.to_string())
 }
 
+/// Stops a running subagent (and its own children) by id: what it already
+/// produced goes back to the turn that started it.
+#[tauri::command]
+pub fn subagent_stop(id: String) -> bool {
+    zerith_runtime::subagent::stop(&id)
+}
+
 /// A copy of a conversation up to `upto_message_id` (all when `None`), in the
 /// same folder; the original is untouched (edit a prompt, branch an answer).
 #[tauri::command]

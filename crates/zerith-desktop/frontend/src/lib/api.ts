@@ -927,6 +927,8 @@ export const jobsApi = {
   list: () => invoke<BackgroundJob[]>("background_jobs"),
   stop: (id: string) => invoke<string>("background_job_stop", { id }),
   tail: (id: string) => invoke<string>("background_job_tail", { id }),
+  /** Stops a running subagent; false when it already ended. */
+  stopSubagent: (id: string) => invoke<boolean>("subagent_stop", { id }),
 };
 
 export interface TerminalSnapshot {

@@ -9,7 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -122,10 +122,16 @@ fn post_json(
     method: &str,
     body: &Value,
 ) -> std::result::Result<Value, String> {
-    let resp = agent
-        .post(&api_url(token, method))
-        .send_json(body.clone())
-        .map_err(|e| format!("Telegram {method} falhou: {}", sanitize_err(token, e)))?;
+    let resp = agent.post(&api_url(token, method)).send_json(body.clone());
+    parse_reply(token, method, resp)
+}
+
+fn parse_reply(
+    token: &str,
+    method: &str,
+    resp: std::result::Result<ureq::Response, ureq::Error>,
+) -> std::result::Result<Value, String> {
+    let resp = resp.map_err(|e| format!("Telegram {method} falhou: {}", sanitize_err(token, e)))?;
     let val: Value = resp.into_json().map_err(|e| {
         format!(
             "Telegram {method} JSON inválido: {}",
@@ -161,6 +167,214 @@ fn send_message(
         )?;
     }
     Ok(())
+}
+
+// Envio de arquivos. Ideia do gateway do Hermes (MIT): a resposta traz linhas
+// `MEDIA:<caminho>` que o gateway tira do texto e entrega como anexo nativo
+// (`gateway/platforms/base.py::extract_media`, `gateway/media_policy.py`).
+
+/// Limite da Bot API para upload (sendDocument/sendVideo).
+const TELEGRAM_MAX_UPLOAD: u64 = 50 * 1024 * 1024;
+/// sendPhoto recusa acima disso; a imagem vai como documento.
+const TELEGRAM_MAX_PHOTO: u64 = 10 * 1024 * 1024;
+
+/// Lembrete do turno (não entra no prompt de sistema global).
+const TELEGRAM_MEDIA_HINT: &str = "Você está respondendo pelo Telegram. Para mandar um arquivo ao \
+usuário, escreva numa linha própria MEDIA:<caminho> (absoluto ou relativo ao workspace); a linha \
+some do texto e o arquivo chega como anexo.";
+
+/// Tira as linhas `MEDIA:<caminho>` da resposta. Devolve os caminhos (sem
+/// repetição, na ordem) e o texto restante. Linhas dentro de bloco de código
+/// cercado são exemplos e ficam no texto.
+pub fn extract_media(text: &str) -> (Vec<String>, String) {
+    let mut paths: Vec<String> = Vec::new();
+    let mut kept = Vec::new();
+    let mut in_fence = false;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with("```") {
+            in_fence = !in_fence;
+        }
+        let raw = if in_fence {
+            None
+        } else {
+            t.strip_prefix("MEDIA:")
+        }
+        .map(|p| p.trim().trim_matches(|c| "`\"'<>".contains(c)).trim())
+        .filter(|p| !p.is_empty());
+        match raw {
+            Some(p) => {
+                if !paths.iter().any(|x| x == p) {
+                    paths.push(p.to_string());
+                }
+            }
+            None => kept.push(line),
+        }
+    }
+    (paths, kept.join("\n").trim().to_string())
+}
+
+/// Arquivos que nunca saem, mesmo dentro do workspace: segredos e chaves.
+fn is_sensitive(path: &Path) -> bool {
+    let in_ssh = path
+        .components()
+        .any(|c| c.as_os_str().to_string_lossy().eq_ignore_ascii_case(".ssh"));
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    in_ssh
+        || name == ".env"
+        || name.starts_with(".env.")
+        || ["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"]
+            .iter()
+            .any(|k| name.starts_with(k))
+        || name.ends_with(".pem")
+        || name.ends_with(".key")
+}
+
+/// Valida um caminho de `MEDIA:`: o destino real (links simbólicos
+/// resolvidos) tem que ser um arquivo dentro do workspace ou da pasta de mídia
+/// gerada, não sensível e até 50 MB. Devolve o caminho canônico e o tamanho.
+fn resolve_media_path(
+    raw: &str,
+    workspace: &Path,
+    media_root: &Path,
+) -> std::result::Result<(PathBuf, u64), String> {
+    let given = Path::new(raw);
+    let joined = if given.is_absolute() {
+        given.to_path_buf()
+    } else {
+        workspace.join(given)
+    };
+    if is_sensitive(&joined) {
+        return Err("arquivo sensível, não envio".into());
+    }
+    let real = joined
+        .canonicalize()
+        .map_err(|e| format!("não encontrei o arquivo ({e})"))?;
+    let inside = [workspace, media_root]
+        .iter()
+        .filter_map(|r| r.canonicalize().ok())
+        .any(|r| real.starts_with(r));
+    if !inside {
+        return Err("fora do workspace e da pasta de mídia".into());
+    }
+    if is_sensitive(&real) {
+        return Err("arquivo sensível, não envio".into());
+    }
+    let meta = real.metadata().map_err(|e| e.to_string())?;
+    if !meta.is_file() {
+        return Err("não é um arquivo".into());
+    }
+    if meta.len() > TELEGRAM_MAX_UPLOAD {
+        return Err(format!(
+            "{} MB passa do limite de 50 MB do Telegram",
+            meta.len().div_ceil(1024 * 1024)
+        ));
+    }
+    Ok((real, meta.len()))
+}
+
+/// Método e campo da Bot API para o arquivo, pela extensão e tamanho.
+fn upload_method(path: &Path, size: u64) -> (&'static str, &'static str) {
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "png" | "jpg" | "jpeg" | "gif" | "webp" if size <= TELEGRAM_MAX_PHOTO => {
+            ("sendPhoto", "photo")
+        }
+        "mp4" | "mov" | "webm" => ("sendVideo", "video"),
+        _ => ("sendDocument", "document"),
+    }
+}
+
+/// Caminhos de `Arquivo: <caminho> (<tipo>, <n> KB)` no resultado de
+/// generate_image/generate_video (`zerith_tools::media::report`).
+fn generated_files(tool_output: &str) -> Vec<String> {
+    tool_output
+        .lines()
+        .filter_map(|l| l.strip_prefix("Arquivo: "))
+        .filter_map(|l| l.rsplit_once(" (").map(|(p, _)| p.trim().to_string()))
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
+/// multipart/form-data à mão (ureq 2 não tem): `chat_id` e o arquivo.
+fn send_file(
+    agent: &ureq::Agent,
+    token: &str,
+    chat_id: i64,
+    path: &Path,
+    size: u64,
+) -> std::result::Result<(), String> {
+    let (method, field) = upload_method(path, size);
+    let bytes = std::fs::read(path).map_err(|e| format!("não consegui ler: {e}"))?;
+    let name: String = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "arquivo".into())
+        .chars()
+        .map(|c| if "\"\r\n\\".contains(c) { '_' } else { c })
+        .collect();
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut boundary = format!("zerith-{seed:x}");
+    while bytes
+        .windows(boundary.len())
+        .any(|w| w == boundary.as_bytes())
+    {
+        boundary.push('x');
+    }
+    let mut body = Vec::with_capacity(bytes.len() + 512);
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{chat_id}\r\n\
+             --{boundary}\r\nContent-Disposition: form-data; name=\"{field}\"; filename=\"{name}\"\r\n\
+             Content-Type: application/octet-stream\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(&bytes);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    let resp = agent
+        .post(&api_url(token, method))
+        .set(
+            "Content-Type",
+            &format!("multipart/form-data; boundary={boundary}"),
+        )
+        .send_bytes(&body);
+    parse_reply(token, method, resp).map(|_| ())
+}
+
+/// Manda cada arquivo; o que falhar vira uma mensagem curta com o motivo.
+fn deliver_media(token: &str, chat_id: i64, paths: &[String], workspace: &Path, media_root: &Path) {
+    if paths.is_empty() {
+        return;
+    }
+    // Upload de até 50 MB não cabe no prazo de 15 s do agente de mensagens.
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(300))
+        .build();
+    let mut sent: Vec<PathBuf> = Vec::new();
+    for raw in paths {
+        let res = resolve_media_path(raw, workspace, media_root).and_then(|(real, size)| {
+            if sent.contains(&real) {
+                return Ok(());
+            }
+            send_file(&agent, token, chat_id, &real, size)?;
+            sent.push(real);
+            Ok(())
+        });
+        if let Err(e) = res {
+            let msg = format!("Não enviei {raw}: {}", sanitize_err(token, e));
+            let _ = send_message(&agent, token, chat_id, &msg);
+        }
+    }
 }
 
 fn send_approval_prompt(
@@ -701,8 +915,10 @@ fn run_telegram_turn(t: TelegramTurnArgs<'_>) -> std::result::Result<(), String>
         approvals: Some(&gate),
         middleware: vec![Box::new(guards)],
         spill_dir: Some(t.paths.root().join("spill")),
+        dynamic_context: Some(TELEGRAM_MEDIA_HINT.to_string()),
         ..AgentOptions::for_profile(zerith_runtime::active_profile())
     };
+    let mut generated: Vec<String> = Vec::new();
     let _ = zerith_runtime::compact::auto_compact_routed(
         &store,
         t.settings,
@@ -732,6 +948,17 @@ fn run_telegram_turn(t: TelegramTurnArgs<'_>) -> std::result::Result<(), String>
         t.prompt,
         t.cancel,
         |e| {
+            if let RunEvent::ToolResult {
+                name,
+                ok: true,
+                output_preview,
+                ..
+            } = &e
+            {
+                if name == "generate_image" || name == "generate_video" {
+                    generated.extend(generated_files(output_preview));
+                }
+            }
             if let RunEvent::ApprovalNeeded { id, tool, summary } = e {
                 if let Ok(mut map) = t.approvals.lock() {
                     map.insert((t.chat_id, id), approver.clone());
@@ -754,7 +981,14 @@ fn run_telegram_turn(t: TelegramTurnArgs<'_>) -> std::result::Result<(), String>
     }
 
     let report = res.map_err(|e| sanitize_err(t.token, e))?;
-    send_message(t.agent, t.token, t.chat_id, &report.text)
+    let (mut files, text) = extract_media(&report.text);
+    if !text.is_empty() || files.is_empty() {
+        send_message(t.agent, t.token, t.chat_id, &text)?;
+    }
+    files.extend(generated);
+    let media_root = t.settings.media.resolve_output_dir(t.paths);
+    deliver_media(t.token, t.chat_id, &files, t.workspace, &media_root);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -812,6 +1046,89 @@ mod tests {
         );
         assert!(!cleaned.contains("ABC-SecretToken"), "{cleaned}");
         assert!(cleaned.contains("<redacted>"), "{cleaned}");
+    }
+
+    #[test]
+    fn extract_media_strips_lines_dedupes_and_skips_code_fences() {
+        let text = "Pronto, segue:\nMEDIA:/tmp/a.png\n  MEDIA: `rel/b.pdf`  \nMEDIA:/tmp/a.png\n\
+                    ```\nMEDIA:/exemplo.png\n```\nfim MEDIA:/no/meio.txt\nMEDIA:";
+        let (paths, rest) = extract_media(text);
+        assert_eq!(paths, vec!["/tmp/a.png", "rel/b.pdf"]);
+        assert!(rest.starts_with("Pronto, segue:"), "{rest}");
+        assert!(rest.contains("MEDIA:/exemplo.png"), "{rest}");
+        assert!(rest.contains("fim MEDIA:/no/meio.txt"), "{rest}");
+        assert!(!rest.contains("a.png"), "{rest}");
+        assert_eq!(extract_media("só texto").0, Vec::<String>::new());
+    }
+
+    #[test]
+    fn media_path_validation_enforces_roots_secrets_and_size() {
+        let base = std::env::temp_dir().join(format!("zerith-tg-media-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        struct Tmp(PathBuf);
+        impl Tmp {
+            fn path(&self) -> &Path {
+                &self.0
+            }
+        }
+        let mk = |n: &str| {
+            let d = base.join(n);
+            std::fs::create_dir_all(&d).unwrap();
+            Tmp(d)
+        };
+        let (ws, media, outside) = (mk("ws"), mk("media"), mk("fora"));
+        std::fs::write(ws.path().join("relatorio.pdf"), b"pdf").unwrap();
+        std::fs::write(ws.path().join(".env"), b"SECRET=1").unwrap();
+        std::fs::write(ws.path().join("server.pem"), b"k").unwrap();
+        std::fs::write(ws.path().join("id_rsa.pub"), b"k").unwrap();
+        std::fs::create_dir(ws.path().join(".ssh")).unwrap();
+        std::fs::write(ws.path().join(".ssh").join("config"), b"k").unwrap();
+        std::fs::write(media.path().join("gato.png"), b"png").unwrap();
+        std::fs::write(outside.path().join("fora.txt"), b"x").unwrap();
+
+        let (p, size) = resolve_media_path("relatorio.pdf", ws.path(), media.path()).unwrap();
+        assert_eq!(size, 3);
+        assert!(p.ends_with("relatorio.pdf"));
+        let img = media.path().join("gato.png");
+        assert!(resolve_media_path(img.to_str().unwrap(), ws.path(), media.path()).is_ok());
+
+        let fora = outside.path().join("fora.txt");
+        let err = resolve_media_path(fora.to_str().unwrap(), ws.path(), media.path()).unwrap_err();
+        assert!(err.contains("fora do workspace"), "{err}");
+        let err = resolve_media_path("../fora/fora.txt", ws.path(), media.path()).unwrap_err();
+        assert!(!err.is_empty());
+        for s in [".env", "server.pem", "id_rsa.pub", ".ssh/config"] {
+            let err = resolve_media_path(s, ws.path(), media.path()).unwrap_err();
+            assert!(err.contains("sensível"), "{s}: {err}");
+        }
+        assert!(resolve_media_path("sumiu.txt", ws.path(), media.path()).is_err());
+        assert!(resolve_media_path(".", ws.path(), media.path()).is_err());
+
+        let big = std::fs::File::create(ws.path().join("big.bin")).unwrap();
+        big.set_len(TELEGRAM_MAX_UPLOAD + 1).unwrap();
+        let err = resolve_media_path("big.bin", ws.path(), media.path()).unwrap_err();
+        assert!(err.contains("50 MB"), "{err}");
+
+        // Link simbólico de dentro para fora é recusado pelo destino real.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&fora, ws.path().join("link.txt")).unwrap();
+            assert!(resolve_media_path("link.txt", ws.path(), media.path()).is_err());
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn upload_method_and_generated_files() {
+        assert_eq!(upload_method(Path::new("a.PNG"), 10).0, "sendPhoto");
+        assert_eq!(
+            upload_method(Path::new("a.png"), TELEGRAM_MAX_PHOTO + 1).0,
+            "sendDocument"
+        );
+        assert_eq!(upload_method(Path::new("v.mp4"), 10).0, "sendVideo");
+        assert_eq!(upload_method(Path::new("r.pdf"), 10).0, "sendDocument");
+        let out = "Imagem gerada com x.\nCusto: US$ 0.01\nArquivo: C:\\m dia\\gato-1.png (image/png, 12 KB)\n![g](x)";
+        assert_eq!(generated_files(out), vec!["C:\\m dia\\gato-1.png"]);
     }
 
     #[test]

@@ -1065,3 +1065,50 @@ fn the_profile_sets_the_step_limit() {
         assert_eq!(AgentOptions::for_profile(p).max_steps, p.limits().max_steps);
     }
 }
+
+/// The budget line rides as synthetic context (`tool_context`), never as a
+/// message from the person, and the model sees it on the next request.
+#[test]
+fn the_step_budget_is_told_to_the_model_as_synthetic_context() {
+    let dir = workspace();
+    std::fs::write(dir.path().join("a.txt"), "A").unwrap();
+    let fake = serve(vec![
+        calls(&[("c", "read_file", json!({"path": "a.txt"}))]),
+        text("pronto"),
+    ]);
+    let store = Store::open_in_memory().unwrap();
+    let sid = session(&store);
+    let policy = Policy::new(
+        preset("workspace-write").unwrap(),
+        Mode::Default,
+        dir.path(),
+    );
+    let reg = Registry::new();
+    run_agent_turn(
+        &store,
+        &client(&fake.url, Protocol::OpenAi),
+        TurnContext::default(),
+        AgentOptions {
+            tools: Some(&reg),
+            policy: Some(&policy),
+            max_steps: 2,
+            ..Default::default()
+        },
+        &sid,
+        "m",
+        "faça",
+        &Cancel::default(),
+        |_| {},
+    )
+    .unwrap();
+    let row = store
+        .messages(&sid, 100, 0)
+        .unwrap()
+        .into_iter()
+        .find(|m| m.content.starts_with("[orçamento: passo 1 de 2"))
+        .expect("budget line stored");
+    assert_eq!(row.role, Role::User);
+    assert_eq!(row.raw.unwrap()["tool_context"], true);
+    let second = fake.seen.lock().unwrap()[1].1.to_string();
+    assert!(second.contains("[orçamento: passo 1 de 2"), "{second}");
+}

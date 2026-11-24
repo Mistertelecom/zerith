@@ -787,6 +787,8 @@ fn turn_body(
     let mut reason = "done";
     // Repetições, falhas idênticas, ciclos e texto repetido: avisa o modelo.
     let mut stuck = crate::stuck::Stuck::default();
+    // Passos e contexto gastos, ditos ao modelo a 50/75/90%.
+    let mut turn_budget = crate::budget::Budget::default();
     // Text answers the output cap cut that the turn resumed: a long plan or
     // file pasted as text would otherwise end the task mid-sentence.
     let mut cut_resumes = 0u8;
@@ -1346,6 +1348,9 @@ fn turn_body(
         if let Some(r) = agent.tools {
             context.extend(monitor_report(r.host().monitor_notices()));
         }
+        // Steps and window spent, told once per threshold; the schemas ride
+        // on every request, so they count as used.
+        context.extend(turn_budget.note(step, max_steps, hist.tokens() + schema_tokens, window));
         // One request left: ask for a wrap-up instead of stopping mid-sentence.
         if step + 1 == max_steps && max_steps > 1 {
             context.push(format!(

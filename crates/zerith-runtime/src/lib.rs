@@ -15,6 +15,7 @@
 
 pub mod agent;
 pub mod bili;
+mod budget;
 mod code_exec;
 pub mod compact;
 pub mod events;

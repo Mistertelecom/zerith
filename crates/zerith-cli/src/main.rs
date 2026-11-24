@@ -1014,6 +1014,7 @@ enum ReplSlash<'a> {
     Effort(Option<&'a str>),
     Rewind(Option<i64>),
     Goal(Option<&'a str>),
+    Btw(Option<&'a str>),
     Unknown(&'a str),
 }
 
@@ -1036,6 +1037,7 @@ fn parse_repl_slash(line: &str) -> Option<ReplSlash<'_>> {
         "/effort" => ReplSlash::Effort(rest),
         "/rewind" => ReplSlash::Rewind(rest.and_then(|s| s.parse().ok())),
         "/goal" => ReplSlash::Goal(rest),
+        "/btw" => ReplSlash::Btw(rest),
         other => ReplSlash::Unknown(other),
     })
 }
@@ -1160,7 +1162,7 @@ fn repl(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>
                 ReplSlash::Help => eprintln!(
                     "/help  /model <id>  /mode <default|acceptEdits|plan|bypass>  \
                      /effort <off|low|medium|high|xhigh|max>  /compact  /rewind [N]  \
-                     /sessions [id]  /goal <objetivo>  /clear  /exit"
+                     /sessions [id]  /goal <objetivo>  /btw <pergunta>  /clear  /exit"
                 ),
                 ReplSlash::Exit => break,
                 ReplSlash::Clear => {
@@ -1278,6 +1280,33 @@ fn repl(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>
                 },
                 ReplSlash::Goal(None) => eprintln!("zerith: uso: /goal <objetivo>"),
                 ReplSlash::Goal(Some(objective)) => goal = Some(objective.to_string()),
+                ReplSlash::Btw(None) => eprintln!("zerith: uso: /btw <pergunta>"),
+                ReplSlash::Btw(Some(question)) => {
+                    let Some(sid) = session_id.as_deref() else {
+                        eprintln!("zerith: /btw precisa de uma conversa ativa.");
+                        continue;
+                    };
+                    // Nada vai para o histórico: a resposta só aparece aqui.
+                    match zerith_runtime::btw::ask(
+                        &store,
+                        &client,
+                        TurnContext {
+                            skills: skills.as_ref(),
+                            settings: Some(&settings),
+                            project_dir: Some(&workspace),
+                            ..TurnContext::default()
+                        },
+                        Some(&tools),
+                        zerith_runtime::active_profile().limits().history_window,
+                        sid,
+                        &model,
+                        question,
+                        &Cancel::default(),
+                    ) {
+                        Ok(a) => println!("\n[pergunta paralela] {}\n", a.text),
+                        Err(e) => eprintln!("zerith: /btw falhou: {}", redact(&e.to_string())),
+                    }
+                }
                 ReplSlash::Unknown(other) => {
                     eprintln!("zerith: comando desconhecido {other} (tente /help)");
                 }
@@ -1844,6 +1873,10 @@ mod tests {
             Some(ReplSlash::Goal(Some("A01-A09 passarem")))
         );
         assert_eq!(parse_repl_slash("/goal"), Some(ReplSlash::Goal(None)));
+        assert_eq!(
+            parse_repl_slash("/btw route-map?"),
+            Some(ReplSlash::Btw(Some("route-map?")))
+        );
         assert_eq!(parse_repl_slash("/clear"), Some(ReplSlash::Clear));
         assert_eq!(parse_repl_slash("oi tudo bem"), None);
     }

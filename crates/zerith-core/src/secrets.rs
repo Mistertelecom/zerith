@@ -4,10 +4,16 @@
 //! `keyring` crate's native backends). There is no plaintext fallback: when
 //! the store is unavailable the caller gets an error saying so, never a key
 //! silently written to disk.
+//!
+//! Servers (systemd, no login session) can opt into [`file::FileStore`]; the
+//! choice is made in one place, [`choose_with`], and only when asked for.
 
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{OnceLock, RwLock};
+
+pub mod file;
+pub use file::FileStore;
 
 pub const SERVICE: &str = "zerith";
 
@@ -26,12 +32,13 @@ impl fmt::Display for SecretError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SecretError::NotFound(n) => {
-                write!(f, "segredo '{n}' não encontrado no cofre do sistema")
+                write!(f, "segredo '{n}' não encontrado no cofre")
             }
             SecretError::Unavailable(why) => write!(
                 f,
-                "cofre de credenciais do sistema indisponível ({why}); \
-                 defina {API_KEY_ENV} ou habilite o cofre — nada foi gravado em texto puro"
+                "cofre de credenciais indisponível ({why}); \
+                 defina {API_KEY_ENV}, habilite o cofre ou, num servidor, {BACKEND_ENV}=file \
+                 — nada foi gravado em texto puro"
             ),
         }
     }
@@ -44,6 +51,12 @@ pub trait SecretStore {
     fn get(&self, name: &str) -> Result<String, SecretError>;
     fn set(&self, name: &str, value: &str) -> Result<(), SecretError>;
     fn delete(&self, name: &str) -> Result<(), SecretError>;
+    /// Names only, never values. The OS vaults cannot enumerate one service.
+    fn list(&self) -> Result<Vec<String>, SecretError> {
+        Err(SecretError::Unavailable(
+            "o cofre do sistema não lista nomes".into(),
+        ))
+    }
 }
 
 pub struct OsKeyring;
@@ -187,16 +200,164 @@ impl SecretStore for OsKeyring {
     }
 }
 
+/// `os` (default) or `file`; wins over `secrets.backend` in `settings.toml`.
+pub const BACKEND_ENV: &str = "ZERITH_SECRETS_BACKEND";
+/// Set by systemd for a unit with `LoadCredential*=`.
+pub const CREDENTIALS_ENV: &str = "CREDENTIALS_DIRECTORY";
+
+/// Which store the process uses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Backend {
+    Os,
+    File(FileStore),
+    /// A backend name nobody knows: every call fails, nothing falls back.
+    Invalid(String),
+}
+
+/// The backend and why it was picked (`zerith secret backend`, doctor).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Choice {
+    pub backend: Backend,
+    pub reason: String,
+}
+
+impl Backend {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Backend::Os => "os",
+            Backend::File(_) => "file",
+            Backend::Invalid(_) => "inválido",
+        }
+    }
+
+    fn inner(&self) -> Result<&dyn SecretStore, SecretError> {
+        match self {
+            Backend::Os => Ok(&OsKeyring),
+            Backend::File(f) => Ok(f),
+            Backend::Invalid(why) => Err(SecretError::Unavailable(why.clone())),
+        }
+    }
+}
+
+impl SecretStore for Backend {
+    fn get(&self, name: &str) -> Result<String, SecretError> {
+        self.inner()?.get(name)
+    }
+    fn set(&self, name: &str, value: &str) -> Result<(), SecretError> {
+        self.inner()?.set(name, value)
+    }
+    fn delete(&self, name: &str) -> Result<(), SecretError> {
+        self.inner()?.delete(name)
+    }
+    fn list(&self) -> Result<Vec<String>, SecretError> {
+        self.inner()?.list()
+    }
+}
+
+/// The one place the backend is decided. Explicit beats automatic: env
+/// `ZERITH_SECRETS_BACKEND`, then `secrets.backend` (user layer), then
+/// `$CREDENTIALS_DIRECTORY` only where `auto_ok` (Linux/BSD: Windows and macOS
+/// have a vault that works for services). Nothing asked: the OS vault, never
+/// a file.
+pub fn choose_with(
+    env: impl Fn(&str) -> Option<String>,
+    setting: Option<&str>,
+    root: &std::path::Path,
+    auto_ok: bool,
+) -> Choice {
+    let nonempty = |v: Option<String>| v.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    let creds = nonempty(env(CREDENTIALS_ENV)).map(std::path::PathBuf::from);
+    let file = || Backend::File(FileStore::new(root.join("secrets"), creds.clone()));
+    let pick = |raw: &str, from: &str| match raw.to_ascii_lowercase().as_str() {
+        "file" => Choice {
+            backend: file(),
+            reason: format!("{from} = file"),
+        },
+        "os" => Choice {
+            backend: Backend::Os,
+            reason: format!("{from} = os"),
+        },
+        other => Choice {
+            backend: Backend::Invalid(format!(
+                "{from} = '{other}' não é um backend de segredos (use os ou file)"
+            )),
+            reason: format!("{from} = '{other}'"),
+        },
+    };
+    if let Some(v) = nonempty(env(BACKEND_ENV)) {
+        return pick(&v, BACKEND_ENV);
+    }
+    if let Some(v) = setting.map(str::trim).filter(|v| !v.is_empty()) {
+        return pick(v, "secrets.backend");
+    }
+    match &creds {
+        Some(_) if auto_ok => Choice {
+            backend: file(),
+            reason: format!("{CREDENTIALS_ENV} definido (serviço systemd)"),
+        },
+        Some(_) => Choice {
+            backend: Backend::Os,
+            reason: format!(
+                "padrão; {CREDENTIALS_ENV} ignorado neste SO (peça {BACKEND_ENV}=file)"
+            ),
+        },
+        None => Choice {
+            backend: Backend::Os,
+            reason: "padrão (cofre do sistema)".into(),
+        },
+    }
+}
+
+/// [`choose_with`] for this process: real env, the user's `settings.toml`.
+pub fn choose(paths: &crate::Paths) -> Choice {
+    let loaded = crate::Settings::load(paths, None);
+    choose_with(
+        |k| std::env::var(k).ok(),
+        loaded.settings.secrets.backend.as_deref(),
+        paths.root(),
+        cfg!(all(unix, not(target_os = "macos"))),
+    )
+}
+
+/// The process-wide choice, decided once.
+pub fn active() -> &'static Choice {
+    static ACTIVE: OnceLock<Choice> = OnceLock::new();
+    ACTIVE.get_or_init(|| choose(&crate::Paths::resolve()))
+}
+
+/// The configured store (see [`active`]): use it wherever `OsKeyring` was the
+/// default, so a server on the file backend reads the same place everywhere.
+pub struct Configured;
+
+impl SecretStore for Configured {
+    fn get(&self, name: &str) -> Result<String, SecretError> {
+        active().backend.get(name)
+    }
+    fn set(&self, name: &str, value: &str) -> Result<(), SecretError> {
+        active().backend.set(name, value)
+    }
+    fn delete(&self, name: &str) -> Result<(), SecretError> {
+        active().backend.delete(name)
+    }
+    fn list(&self) -> Result<Vec<String>, SecretError> {
+        active().backend.list()
+    }
+}
+
 pub fn set_secret(name: &str, value: &str) -> Result<(), SecretError> {
-    OsKeyring.set(name, value)
+    Configured.set(name, value)
 }
 
 pub fn get_secret(name: &str) -> Result<String, SecretError> {
-    OsKeyring.get(name)
+    Configured.get(name)
 }
 
 pub fn delete_secret(name: &str) -> Result<(), SecretError> {
-    OsKeyring.delete(name)
+    Configured.delete(name)
+}
+
+pub fn list_secrets() -> Result<Vec<String>, SecretError> {
+    Configured.list()
 }
 
 /// `<account>.oauth`: the cofre entry that holds an OAuth credential header.
@@ -320,7 +481,7 @@ pub fn resolve_api_key(
     provider: &str,
     key_ref: Option<&str>,
 ) -> Result<Option<String>, SecretError> {
-    resolve_api_key_with(&OsKeyring, |k| std::env::var(k).ok(), provider, key_ref)
+    resolve_api_key_with(&Configured, |k| std::env::var(k).ok(), provider, key_ref)
 }
 
 pub fn resolve_api_key_with(
@@ -348,7 +509,7 @@ pub const OPENROUTER_ENTRY: &str = "openrouter";
 /// `OPENROUTER_API_KEY`, then the keyring entry `openrouter`. `Ok(None)`: no
 /// key anywhere. `Err`: the keyring failed and the env var was not set.
 pub fn resolve_openrouter_key() -> Result<Option<String>, SecretError> {
-    resolve_openrouter_key_with(&OsKeyring, |k| std::env::var(k).ok())
+    resolve_openrouter_key_with(&Configured, |k| std::env::var(k).ok())
 }
 
 pub fn resolve_openrouter_key_with(
@@ -637,6 +798,48 @@ mod tests {
         let broken = Mem(RefCell::default(), true);
         assert!(resolve_openrouter_key_with(&broken, none).is_err());
         assert!(resolve_openrouter_key_with(&broken, env).is_ok());
+    }
+
+    #[test]
+    fn backend_choice_env_then_setting_then_systemd_never_silent() {
+        let root = std::path::Path::new("/r");
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                pairs
+                    .iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        let file = |c: Option<&str>| {
+            Backend::File(FileStore::new(root.join("secrets"), c.map(Into::into)))
+        };
+        // Nada pedido: cofre do sistema.
+        assert_eq!(choose_with(env(&[]), None, root, true).backend, Backend::Os);
+        // Setting liga o arquivo, em qualquer SO.
+        let c = choose_with(env(&[]), Some("file"), root, false);
+        assert_eq!(c.backend, file(None));
+        assert!(c.reason.contains("secrets.backend"));
+        // Env vence o setting.
+        let c = choose_with(env(&[(BACKEND_ENV, "os")]), Some("file"), root, true);
+        assert_eq!(c.backend, Backend::Os);
+        assert!(c.reason.contains(BACKEND_ENV));
+        let c = choose_with(env(&[(BACKEND_ENV, "FILE")]), None, root, false);
+        assert_eq!(c.backend, file(None));
+        // systemd: automático só onde é permitido, e as credenciais vão junto.
+        let sd = env(&[(CREDENTIALS_ENV, "/run/credentials/z.service")]);
+        let c = choose_with(sd, None, root, true);
+        assert_eq!(c.backend, file(Some("/run/credentials/z.service")));
+        assert!(c.reason.contains(CREDENTIALS_ENV));
+        assert_eq!(choose_with(sd, None, root, false).backend, Backend::Os);
+        // Pedido explícito de os vence o systemd.
+        let both = env(&[(CREDENTIALS_ENV, "/c"), (BACKEND_ENV, "os")]);
+        assert_eq!(choose_with(both, None, root, true).backend, Backend::Os);
+        // Nome desconhecido: erro, nunca cai em outro backend.
+        let c = choose_with(env(&[(BACKEND_ENV, "plain")]), None, root, true);
+        assert!(matches!(c.backend, Backend::Invalid(_)));
+        assert!(c.backend.get("x").is_err());
+        assert!(c.backend.set("x", "v").is_err());
     }
 
     #[test]

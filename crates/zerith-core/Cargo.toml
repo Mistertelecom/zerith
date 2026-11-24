@@ -10,6 +10,9 @@ serde_json.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 keyring.workspace = true
+# Cifra opcional do backend de arquivo (ChaCha20-Poly1305); já está na árvore
+# pelo TLS do ureq.
+ring = "0.17"
 # `OAuthCredential` lives with the providers: the cofre stores it, it does not
 # define it.
 zerith-providers = { path = "../zerith-providers" }

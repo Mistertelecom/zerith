@@ -5208,6 +5208,7 @@ name = "zerith-core"
 version = "0.4.7"
 dependencies = [
  "keyring",
+ "ring",
  "serde",
  "serde_json",
  "tempfile",

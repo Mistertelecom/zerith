@@ -60,6 +60,24 @@ pub struct Settings {
     pub remote: RemoteSettings,
     #[serde(default, skip_serializing_if = "BrowserSettings::is_default")]
     pub browser: BrowserSettings,
+    #[serde(default, skip_serializing_if = "SecretsSettings::is_default")]
+    pub secrets: SecretsSettings,
+}
+
+/// `[secrets]`: where secrets live (see `secrets::choose_with`). User layer
+/// only: a repo must not move someone's keys to a file.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SecretsSettings {
+    /// `os` (default) or `file` (servers; `<root>/secrets/`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+}
+
+impl SecretsSettings {
+    pub fn is_default(&self) -> bool {
+        self.backend.is_none()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1117,6 +1135,7 @@ fn tighten_only(t: &mut Table) -> Option<String> {
         "accounts",
         "gateway",
         "remote",
+        "secrets",
     ] {
         if t.remove(k).is_some() {
             removed.push(k);

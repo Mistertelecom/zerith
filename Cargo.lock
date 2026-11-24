@@ -5248,6 +5248,7 @@ dependencies = [
 name = "zerith-importers"
 version = "0.4.6"
 dependencies = [
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",
@@ -5256,8 +5257,11 @@ dependencies = [
  "thiserror 2.0.21",
  "zerith-core",
  "zerith-mcp",
+ "zerith-memory",
+ "zerith-security",
  "zerith-sessions",
  "zerith-skills",
+ "zerith-tools",
 ]
 
 [[package]]

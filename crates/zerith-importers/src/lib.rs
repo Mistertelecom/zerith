@@ -14,6 +14,7 @@
 
 mod hermes;
 mod hermes_jsonl;
+pub mod hermes_migrate;
 pub mod hermes_setup;
 pub mod plan;
 

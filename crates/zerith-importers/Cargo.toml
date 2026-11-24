@@ -9,12 +9,18 @@ zerith-core = { path = "../zerith-core" }
 zerith-sessions = { path = "../zerith-sessions" }
 zerith-skills = { path = "../zerith-skills" }
 zerith-mcp = { path = "../zerith-mcp" }
+# Migração completa: memória, `mentions_secret` e inventário de rede.
+zerith-memory = { path = "../zerith-memory" }
+zerith-security = { path = "../zerith-security" }
+zerith-tools = { path = "../zerith-tools" }
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 # Já no Cargo.lock (por outras crates): hash do ledger de importação.
 sha2 = "0.10"
+# Já no Cargo.lock: valores secretos dentro de texto livre.
+regex = "1"
 
 [dev-dependencies]
 tempfile.workspace = true

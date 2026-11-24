@@ -99,7 +99,7 @@ usage:
         [--session ID | --resume [id|name] | --continue] [--fork]
         [--max-turns N] [--effort <off|low|medium|high|xhigh|max>]
         [--orchestrator] [--agent <nome>]
-        [--max-budget-usd X --price-in P --price-out P]
+        [--max-budget-usd X [--price-in P --price-out P]]  (sem preço: catálogo do OpenRouter)
         [--allowed-tools a,b] [--disallowed-tools a,b] [--permission-mode MODE]
         [--json-schema <json|file>] [--no-tools] [--remote <uri|alias>]
   zerith schedule add <nome> --cron <expr> (--command <cmd> --no-agent | --prompt <p>) [--workspace dir] [--model M]

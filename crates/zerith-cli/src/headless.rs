@@ -11,9 +11,10 @@ use std::cell::Cell;
 use std::fmt;
 
 use zerith_core::settings::{ProviderEntry, WireProtocol};
-use zerith_core::{secrets, AccountEntry, Paths, Settings};
+use zerith_core::{secrets, AccountEntry, MediaSettings, Paths, Settings};
 use zerith_mcp::McpRegistry;
 use zerith_memory::{MemoryBackend, Scope, SqliteMemory};
+use zerith_providers::pricing::{self, Price, PriceTable, Tokens};
 use zerith_providers::{Cancel, Client, Protocol, ProviderConfig, ProviderError, ProviderKind};
 use zerith_runtime::{run_agent_turn, AgentOptions, RunError, RunEvent, TurnContext, TurnReport};
 use zerith_security::{Mode, Policy, Rule, RuleKind};
@@ -311,31 +312,55 @@ fn price(flag: Option<f64>, var: &str) -> Option<f64> {
     flag.or_else(|| std::env::var(var).ok()?.trim().parse().ok())
 }
 
-/// Dollars for `input`/`output` tokens at USD-per-million prices.
-pub fn cost_usd(input: u64, output: u64, price_in: f64, price_out: f64) -> f64 {
-    (input as f64 * price_in + output as f64 * price_out) / 1e6
+/// Preço do orçamento: o informado (por milhão) vence; senão o catálogo
+/// público do OpenRouter. Um combo usa o modelo mais caro dele, já que o
+/// failover pode cair em qualquer um.
+fn budget_price(
+    manual: (Option<f64>, Option<f64>),
+    model: &str,
+    settings: &Settings,
+    table: impl FnOnce() -> PriceTable,
+) -> Result<Price, String> {
+    match manual {
+        (Some(i), Some(o)) => {
+            return Ok(Price {
+                input: i / 1e6,
+                output: o / 1e6,
+                cache_read: None,
+                cache_write: None,
+            })
+        }
+        (None, None) => {}
+        _ => return Err("--price-in e --price-out vão juntos".into()),
+    }
+    let table = table();
+    let combo = settings.routing.combos.iter().find(|c| c.name == model);
+    let names: Vec<&str> = match combo {
+        Some(c) => c.models.iter().map(String::as_str).collect(),
+        None => vec![model],
+    };
+    let mut found: Vec<Price> = Vec::new();
+    for n in &names {
+        match table.lookup(n) {
+            Some((_, p)) => found.push(p),
+            None => {
+                return Err(format!(
+                    "--max-budget-usd: sem preço para {n} no catálogo do OpenRouter \
+                     (sem rede e sem cópia, ou modelo fora do catálogo). Informe \
+                     --price-in/--price-out (ou ZERITH_PRICE_IN/ZERITH_PRICE_OUT)."
+                ))
+            }
+        }
+    }
+    found
+        .into_iter()
+        .max_by(|a, b| (a.input + a.output).total_cmp(&(b.input + b.output)))
+        .ok_or_else(|| format!("--max-budget-usd: combo {model} sem modelos"))
 }
 
 pub fn run(paths: &Paths, args: &[String]) -> Result<(), Boxed> {
     let h = parse_headless(args)?;
     let schema = h.json_schema.as_deref().map(schema::load).transpose()?;
-    let prices = match h.max_budget_usd {
-        Some(_) => {
-            let pi = price(h.price_in, "ZERITH_PRICE_IN");
-            let po = price(h.price_out, "ZERITH_PRICE_OUT");
-            match (pi, po) {
-                (Some(i), Some(o)) => Some((i, o)),
-                _ => {
-                    return Err("--max-budget-usd precisa dos preços por milhão de tokens: \
-                                --price-in/--price-out (ou ZERITH_PRICE_IN/ZERITH_PRICE_OUT). \
-                                O Zerith não tem tabela de preços própria."
-                        .into())
-                }
-            }
-        }
-        None => None,
-    };
-
     let mut settings = load_settings(paths);
     let contrib = zerith_plugins::Library::open(&paths.root().join("plugins"))
         .and_then(|l| l.contributions())
@@ -348,6 +373,18 @@ pub fn run(paths: &Paths, args: &[String]) -> Result<(), Boxed> {
     let cfg = provider_config(&settings)?;
     let model = resolve_model(h.model.clone(), &settings, &cfg)
         .ok_or("sem modelo: use --model, routing.main_model ou ZERITH_MODEL")?;
+    let prices = match h.max_budget_usd {
+        Some(_) => Some(budget_price(
+            (
+                price(h.price_in, "ZERITH_PRICE_IN"),
+                price(h.price_out, "ZERITH_PRICE_OUT"),
+            ),
+            &model,
+            &settings,
+            || pricing::load(&MediaSettings::catalog_dir(paths)),
+        )?),
+        None => None,
+    };
     let client = Client::new(cfg)?;
     paths.ensure()?;
     let store = Store::open(paths.db())?;
@@ -490,10 +527,27 @@ pub fn run(paths: &Paths, args: &[String]) -> Result<(), Boxed> {
             &cancel,
             |e| {
                 sink(&e);
-                if let (RunEvent::Usage { input, output, .. }, Some((pi, po)), Some(max)) =
-                    (&e, prices, h.max_budget_usd)
+                if let (
+                    RunEvent::Usage {
+                        input,
+                        output,
+                        cache_read,
+                        cache_write,
+                        ..
+                    },
+                    Some(p),
+                    Some(max),
+                ) = (&e, prices, h.max_budget_usd)
                 {
-                    spent.set(spent.get() + cost_usd(*input, *output, pi, po));
+                    spent.set(
+                        spent.get()
+                            + p.cost(&Tokens {
+                                prompt: *input,
+                                completion: *output,
+                                cache_read: *cache_read,
+                                cache_write: *cache_write,
+                            }),
+                    );
                     // Checked after each model request: the request that crosses
                     // the line has already been paid for.
                     if spent.get() >= max {
@@ -591,8 +645,14 @@ pub fn run(paths: &Paths, args: &[String]) -> Result<(), Boxed> {
                 None => Err(vec!["a resposta não contém JSON".to_string()]),
             });
         let usage = build_usage_json(&report);
-        let cost =
-            prices.map(|(i, o)| cost_usd(report.prompt_tokens, report.completion_tokens, i, o));
+        let cost = prices.map(|p| {
+            p.cost(&Tokens {
+                prompt: report.prompt_tokens,
+                completion: report.completion_tokens,
+                cache_read: report.cache_read_tokens,
+                cache_write: report.cache_write_tokens,
+            })
+        });
         let mut obj = serde_json::json!({
             "session_id": report.session_id,
             "result": report.text,
@@ -957,9 +1017,29 @@ mod tests {
     }
 
     #[test]
-    fn cost_uses_prices_per_million_tokens() {
-        assert!((cost_usd(1_000_000, 500_000, 2.0, 8.0) - 6.0).abs() < 1e-9);
-        assert_eq!(cost_usd(0, 0, 2.0, 8.0), 0.0);
+    fn budget_price_prefers_flags_then_catalog_and_takes_the_dearest_combo_model() {
+        let table = || {
+            PriceTable::from_json(&serde_json::json!({"data": [
+                {"id": "anthropic/claude-opus-5.5", "pricing": {"prompt": "0.000004", "completion": "0.00002"}},
+                {"id": "deepseek/deepseek-chat", "pricing": {"prompt": "0.0000003", "completion": "0.0000012"}}
+            ]}))
+        };
+        let mut s = Settings::default();
+        let manual = budget_price((Some(2.0), Some(8.0)), "x", &s, || unreachable!()).unwrap();
+        assert_eq!((manual.input, manual.output), (2e-6, 8e-6));
+        assert!(budget_price((Some(2.0), None), "x", &s, table).is_err());
+        let p = budget_price((None, None), "claude-opus-5-5", &s, table).unwrap();
+        assert_eq!(p.output, 0.00002);
+        let err = budget_price((None, None), "modelo-local", &s, table).unwrap_err();
+        assert!(err.contains("--price-in"), "{err}");
+        assert!(budget_price((None, None), "deepseek-chat", &s, PriceTable::default).is_err());
+        s.routing.combos.push(zerith_core::ComboEntry {
+            name: "rapido".into(),
+            models: vec!["deepseek-chat".into(), "conta:claude-opus-5-5".into()],
+            ..Default::default()
+        });
+        let c = budget_price((None, None), "rapido", &s, table).unwrap();
+        assert_eq!(c.input, 0.000004);
     }
 
     #[test]

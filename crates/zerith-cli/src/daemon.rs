@@ -9,6 +9,10 @@
 //! the step limit and jobs longer than [`LONG_JOB`] dispatch a short Telegram
 //! summary (name, status, duration, first lines) when `gateway.telegram` is
 //! configured. Ideia: notificação de fim de tarefa do Claude Code e `notify` do Codex.
+//!
+//! O daemon também executa os workflows de `<raiz>/workflows.db` (cron dos
+//! gatilhos), com o agendador compartilhado com o app desktop; veja
+//! [`crate::daemon_workflows`].
 
 use std::collections::HashSet;
 use std::fs::OpenOptions;
@@ -386,6 +390,13 @@ pub fn daemon_cmd(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::err
         None
     };
     let store = Store::open(paths.db())?;
+    let workflows = match crate::daemon_workflows::WorkflowDaemon::open(paths) {
+        Ok(w) => Some(w),
+        Err(e) => {
+            eprintln!("zerith: workflows desativados (workflows.db): {e}");
+            None
+        }
+    };
     let cancel = Cancel::default();
     signals::install(cancel.clone());
 
@@ -457,6 +468,11 @@ pub fn daemon_cmd(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::err
                 }
             }
             Err(e) => eprintln!("zerith: erro ao listar agendamentos: {e}"),
+        }
+        if let Some(w) = &workflows {
+            if !cancel.is_cancelled() {
+                handles.extend(w.cycle(now_secs));
+            }
         }
         handles.retain(|h| !h.is_finished());
         maybe_curate_memory(paths, &store);

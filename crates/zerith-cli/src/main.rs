@@ -6,6 +6,7 @@
 mod args;
 mod cmds;
 mod daemon;
+mod daemon_workflows;
 mod headless;
 mod media_cmd;
 mod schema;

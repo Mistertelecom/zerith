@@ -5,6 +5,7 @@ pub mod model;
 pub mod remote;
 pub mod runner;
 pub mod schedule;
+pub mod scheduler;
 pub mod store;
 
 pub use model::{

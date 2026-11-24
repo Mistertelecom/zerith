@@ -1,7 +1,6 @@
-use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -16,8 +15,9 @@ use zerith_security::{Mode, ModeHandle, Policy};
 use zerith_sessions::{NewMessage, Role, SessionSource, Store as SessionStore};
 use zerith_tools::Registry;
 use zerith_workflows::{
-    channels, execute_workflow, local_offset_minutes, now_ms, starter_templates, test_single_node,
-    unix_secs, AiExecutor, ChannelConfig, CronSchedule, LocalDateTime, NodeEvent, NodeKind,
+    channels, execute_workflow, local_offset_minutes, now_ms,
+    scheduler::{self, RunHooks, SchedulerState, TickOptions},
+    starter_templates, test_single_node, unix_secs, AiExecutor, ChannelConfig, NodeEvent, NodeKind,
     RunOptions, Store, Workflow, WorkflowEdge, WorkflowError, WorkflowNode, WorkflowRun,
 };
 
@@ -376,28 +376,6 @@ pub fn disable_bot_workflows(root: &Path, bot_name: &str) -> Result<usize, Strin
     Ok(n)
 }
 
-/// Workflow ids with a scheduled run in progress. The guard removes its id on
-/// drop, which also runs when the run thread panics.
-static IN_FLIGHT: Mutex<Option<HashSet<String>>> = Mutex::new(None);
-
-struct InFlight(String);
-
-impl Drop for InFlight {
-    fn drop(&mut self) {
-        let mut g = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(set) = g.as_mut() {
-            set.remove(&self.0);
-        }
-    }
-}
-
-fn try_begin_run(id: &str) -> Option<InFlight> {
-    let mut g = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
-    g.get_or_insert_with(HashSet::new)
-        .insert(id.to_string())
-        .then(|| InFlight(id.to_string()))
-}
-
 /// Runs a periodic background cron scheduler inside the desktop app and binds
 /// runtime AI/event hooks for native `workflow_*` chat tools plus local webhooks.
 pub fn spawn_scheduler(app: AppHandle, root: PathBuf) {
@@ -406,8 +384,7 @@ pub fn spawn_scheduler(app: AppHandle, root: PathBuf) {
         let _ = hook_app.emit("workflows:changed", ());
     }));
     zerith_tools::set_workflow_ai_executor(Arc::new(DesktopAiExecutor { root: root.clone() }));
-    let last_fired: Arc<Mutex<HashMap<String, i64>>> = Arc::new(Mutex::new(HashMap::new()));
-    let last_checked_utc_min: Arc<Mutex<Option<i64>>> = Arc::new(Mutex::new(None));
+    let state = Arc::new(SchedulerState::default());
 
     let wh_app = app.clone();
     let wh_root = root.clone();
@@ -421,10 +398,9 @@ pub fn spawn_scheduler(app: AppHandle, root: PathBuf) {
         loop {
             let app_tick = app.clone();
             let root_tick = root.clone();
-            let fired_ref = Arc::clone(&last_fired);
-            let checked_ref = Arc::clone(&last_checked_utc_min);
+            let state_ref = Arc::clone(&state);
             let _ = tauri::async_runtime::spawn_blocking(move || {
-                tick_due_workflows(&app_tick, &root_tick, &fired_ref, &checked_ref);
+                tick_due_workflows(&app_tick, &root_tick, &state_ref);
             })
             .await;
             tokio::time::sleep(Duration::from_secs(30)).await;
@@ -932,123 +908,40 @@ async fn process_webhook_conn<F>(
     write_http_response(&mut stream, 202, "Accepted", &ok_json).await;
 }
 
-fn collect_due_workflows(
-    wfs: &[Workflow],
-    now_secs: i64,
-    last_fired: &Mutex<HashMap<String, i64>>,
-    last_checked_utc_min: &Mutex<Option<i64>>,
-) -> Vec<(Workflow, Option<i32>)> {
-    let now_utc_min = now_secs.div_euclid(60);
-    let start_min = {
-        let mut checked = last_checked_utc_min
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let start = match *checked {
-            Some(prev) if prev < now_utc_min => (prev + 1).max(now_utc_min.saturating_sub(5)),
-            _ => now_utc_min,
-        };
-        *checked = Some(now_utc_min);
-        start
-    };
-
-    // Catch-up collapses: each workflow fires at most once per tick even when
-    // several missed minutes match.
-    let mut due = Vec::new();
-    let mut due_ids: HashSet<String> = HashSet::new();
-    for utc_min in start_min..=now_utc_min {
-        let check_secs = utc_min * 60;
-        for wf in wfs {
-            if !wf.enabled || due_ids.contains(&wf.id) {
-                continue;
-            }
-            let mut matched_tz: Option<Option<i32>> = None;
-            for node in &wf.nodes {
-                if node.kind != NodeKind::TriggerCron {
-                    continue;
-                }
-                let expr = node
-                    .config
-                    .get("cron")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("0 8 * * *");
-                // No stored offset: follow the OS local offset at that minute (DST-aware).
-                let explicit_tz = node
-                    .config
-                    .get("tz_offset_minutes")
-                    .and_then(|v| v.as_i64())
-                    .map(|v| v as i32);
-                let tz = explicit_tz.unwrap_or_else(|| local_offset_minutes(check_secs));
-                if let Ok(sched) = CronSchedule::parse(expr) {
-                    let dt = LocalDateTime::from_unix_secs(check_secs, tz);
-                    if sched.matches_dt(&dt) {
-                        let mut m = last_fired.lock().unwrap_or_else(|e| e.into_inner());
-                        if m.get(&wf.id) == Some(&utc_min) {
-                            break;
-                        }
-                        m.insert(wf.id.clone(), utc_min);
-                        matched_tz = Some(explicit_tz);
-                        break;
-                    }
-                }
-            }
-
-            if let Some(tz) = matched_tz {
-                due_ids.insert(wf.id.clone());
-                due.push((wf.clone(), tz));
-            }
-        }
-    }
-    due
+/// Eventos Tauri e relatório no chat do bot para execuções agendadas.
+struct DesktopHooks {
+    app: AppHandle,
+    root: PathBuf,
 }
 
-fn tick_due_workflows(
-    app: &AppHandle,
-    root: &Path,
-    last_fired: &Arc<Mutex<HashMap<String, i64>>>,
-    last_checked_utc_min: &Arc<Mutex<Option<i64>>>,
-) {
+impl RunHooks for DesktopHooks {
+    fn on_event(&self, ev: &NodeEvent) {
+        let _ = self.app.emit("workflow:event", ev);
+    }
+    fn on_done(&self, wf: &Workflow, run: &WorkflowRun) {
+        notify_bot_chat(&self.app, &self.root, wf, run);
+        let _ = self.app.emit("workflow:done", run);
+    }
+}
+
+fn tick_due_workflows(app: &AppHandle, root: &Path, state: &SchedulerState) {
     let Ok(store) = open_store(root) else {
         return;
     };
-    let Ok(wfs) = store.list_workflows() else {
-        return;
+    let ai: Arc<dyn AiExecutor> = Arc::new(DesktopAiExecutor {
+        root: root.to_path_buf(),
+    });
+    let opts = TickOptions {
+        data_root: root.to_path_buf(),
+        now_secs: unix_secs(),
+        // Desktop: horário local do sistema quando o gatilho não grava fuso.
+        tz_offset_minutes: None,
+        hooks: Arc::new(DesktopHooks {
+            app: app.clone(),
+            root: root.to_path_buf(),
+        }),
     };
-    let now_secs = unix_secs();
-
-    for (wf, tz) in collect_due_workflows(&wfs, now_secs, last_fired, last_checked_utc_min) {
-        // Still running from an earlier tick: skip instead of overlapping.
-        let Some(in_flight) = try_begin_run(&wf.id) else {
-            continue;
-        };
-        let tz = tz.unwrap_or_else(|| local_offset_minutes(now_secs));
-        let app_bg = app.clone();
-        let root_bg = root.to_path_buf();
-        std::thread::spawn(move || {
-            let _in_flight = in_flight;
-            let Ok(st) = open_store(&root_bg) else {
-                return;
-            };
-            let ai = DesktopAiExecutor {
-                root: root_bg.clone(),
-            };
-            let mut emit = |ev: NodeEvent| {
-                let _ = app_bg.emit("workflow:event", &ev);
-            };
-            let mut opts = RunOptions {
-                store: &st,
-                data_root: &root_bg,
-                ai: &ai,
-                trigger_source: "cron",
-                tz_offset_minutes: tz,
-                initial_input: None,
-                on_event: &mut emit,
-            };
-            if let Ok(run) = execute_workflow(&wf, &mut opts) {
-                notify_bot_chat(&app_bg, &root_bg, &wf, &run);
-                let _ = app_bg.emit("workflow:done", &run);
-            }
-        });
-    }
+    let _ = scheduler::tick(&Arc::new(store), &ai, &opts, state);
 }
 
 #[tauri::command]
@@ -1414,6 +1307,7 @@ pub async fn workflow_test_node(
 #[cfg(test)]
 mod webhook_tests {
     use super::*;
+    use std::sync::Mutex;
 
     fn webhook_node(id: &str, slug: &str, secret: &str) -> WorkflowNode {
         WorkflowNode {
@@ -1623,94 +1517,6 @@ mod webhook_tests {
         }
     }
 
-    fn cron_node(id: &str, cron: &str, tz_offset_minutes: i32) -> WorkflowNode {
-        WorkflowNode {
-            id: id.into(),
-            kind: NodeKind::TriggerCron,
-            label: id.into(),
-            x: 0.0,
-            y: 0.0,
-            config: json!({
-                "cron": cron,
-                "tz_offset_minutes": tz_offset_minutes
-            }),
-        }
-    }
-
-    #[test]
-    fn scheduler_multi_timezone_cron_does_not_double_fire_in_same_minute() {
-        let wf = cron_wf(
-            "wf-tz",
-            vec![
-                cron_node("c1", "* * * * *", -180),
-                cron_node("c2", "* * * * *", 0),
-            ],
-        );
-        let wfs = vec![wf];
-        let last_fired = Mutex::new(HashMap::new());
-        let last_checked = Mutex::new(None);
-
-        // 1_700_000_000 is 2023-11-14 22:13:20 UTC; +30s stays in the same UTC minute.
-        let t1 = 1_700_000_000i64;
-        let first = collect_due_workflows(&wfs, t1, &last_fired, &last_checked);
-        assert_eq!(first.len(), 1);
-
-        let second = collect_due_workflows(&wfs, t1 + 30, &last_fired, &last_checked);
-        assert!(
-            second.is_empty(),
-            "expected no duplicate fire in same UTC minute"
-        );
-
-        // Next UTC minute fires again once.
-        let third = collect_due_workflows(&wfs, t1 + 60, &last_fired, &last_checked);
-        assert_eq!(third.len(), 1);
-    }
-
-    #[test]
-    fn scheduler_catch_up_covers_skipped_minute_and_caps_at_5_minutes() {
-        // Align to an exact UTC minute boundary where minute == 4.
-        let base_min = 28_333_320i64; // divisible by 60? check modulo
-        let aligned_utc_min = (1_700_000_000i64 / 60 / 60) * 60 + 4; // :04 of that hour
-        let _ = base_min;
-        let wf_five = cron_wf("wf-min5", vec![cron_node("c1", "5 * * * *", 0)]);
-        let last_fired = Mutex::new(HashMap::new());
-        let last_checked = Mutex::new(None);
-
-        // Tick at :04 -> does not match "5 * * * *".
-        let r1 = collect_due_workflows(
-            std::slice::from_ref(&wf_five),
-            aligned_utc_min * 60 + 10,
-            &last_fired,
-            &last_checked,
-        );
-        assert!(r1.is_empty());
-
-        // Tick drifts past :05 and lands at :06 -> catches up :05 without duplicating.
-        let r2 = collect_due_workflows(
-            std::slice::from_ref(&wf_five),
-            (aligned_utc_min + 2) * 60 + 10,
-            &last_fired,
-            &last_checked,
-        );
-        assert_eq!(r2.len(), 1);
-
-        // Another tick within :06 does not re-fire :05 or :06.
-        let r3 = collect_due_workflows(
-            &[wf_five],
-            (aligned_utc_min + 2) * 60 + 40,
-            &last_fired,
-            &last_checked,
-        );
-        assert!(r3.is_empty());
-
-        // Large drift (10 minutes) is capped at 5 minutes back and collapsed.
-        let wf_every = cron_wf("wf-every", vec![cron_node("c1", "* * * * *", 0)]);
-        let fired2 = Mutex::new(HashMap::new());
-        let checked2 = Mutex::new(Some(1000));
-        let r4 = collect_due_workflows(&[wf_every], 1010 * 60 + 5, &fired2, &checked2);
-        assert_eq!(r4.len(), 1, "catch-up collapses to one run per workflow");
-    }
-
     #[test]
     fn disabling_a_bot_disables_only_its_workflows() {
         let dir = tempfile::tempdir().unwrap();
@@ -1728,7 +1534,7 @@ mod webhook_tests {
     }
 
     #[test]
-    fn auth_host_and_in_flight_helpers() {
+    fn auth_and_host_helpers() {
         assert!(ct_eq("abc", "abc") && !ct_eq("abc", "abd") && !ct_eq("abc", "ab"));
         assert!(!webhook_authorized("", "", ""));
         assert!(webhook_authorized("s3", "s3", ""));
@@ -1739,20 +1545,6 @@ mod webhook_tests {
         for bad in ["evil.example", "127.0.0.1.evil:80", "", "localhost.evil"] {
             assert!(!is_loopback_host(bad), "{bad}");
         }
-        let g = try_begin_run("wf-x").unwrap();
-        assert!(try_begin_run("wf-x").is_none());
-        drop(g);
-        assert!(try_begin_run("wf-x").is_some());
-        // Stored offset is passed through; absent offset defers to OS local time.
-        let wf = cron_wf(
-            "wf-local",
-            vec![WorkflowNode {
-                config: json!({"cron": "* * * * *"}),
-                ..cron_node("c", "* * * * *", 0)
-            }],
-        );
-        let due = collect_due_workflows(&[wf], 1_700_000_000, &Mutex::default(), &Mutex::default());
-        assert_eq!(due[0].1, None);
     }
 
     #[test]

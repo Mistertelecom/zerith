@@ -73,6 +73,8 @@ usage:
   zerith memory export [scope]
   zerith memory import <file.jsonl>
   zerith memory pause|resume|status
+  zerith memory curate [--yes]
+  zerith memory unarchive <id>
   zerith skills list|installed|catalog [--refresh]
   zerith skills install <dir> | remove <name> | enable|disable <name>
   zerith skills update <name> <dir> | rollback <name>
@@ -631,6 +633,50 @@ fn memory(paths: &Paths, args: &[String], sub: &str) -> Result<(), Box<dyn std::
             let text = args.get(3).cloned().ok_or("memory edit needs text")?;
             mem.update(id, &text)?;
             println!("{id} atualizado");
+        }
+        "curate" => {
+            // Mostra o plano; só aplica com --yes ou com "s" na confirmação.
+            let plan = zerith_memory::curate::plan(&mem, zerith_sessions::migrations::now_ms())?;
+            if plan.is_empty() {
+                println!("memória em ordem: nada para fundir ou arquivar");
+                return Ok(());
+            }
+            println!("Plano de curadoria da memória:");
+            for l in plan.lines() {
+                println!("  {l}");
+            }
+            let yes = args.iter().any(|a| a == "--yes" || a == "-y");
+            if !yes {
+                use std::io::Write;
+                if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                    println!("nada aplicado (use --yes para aplicar sem perguntar)");
+                    return Ok(());
+                }
+                eprint!("Aplicar? Arquivar é reversível (zerith memory unarchive <id>). [s/N] ");
+                let _ = std::io::stderr().flush();
+                let mut ans = String::new();
+                std::io::stdin().read_line(&mut ans)?;
+                if !matches!(
+                    ans.trim().to_lowercase().as_str(),
+                    "s" | "sim" | "y" | "yes"
+                ) {
+                    println!("nada aplicado");
+                    return Ok(());
+                }
+            }
+            let done = zerith_memory::curate::apply(&mem, &plan)?;
+            println!("{} fusão(ões), {} arquivado(s)", done.merged, done.archived);
+        }
+        "unarchive" => {
+            let id: i64 = args
+                .get(2)
+                .ok_or("memory unarchive precisa de um id")?
+                .parse()?;
+            if mem.unarchive(id)? {
+                println!("{id} de volta à memória");
+            } else {
+                println!("{id} não estava arquivado");
+            }
         }
         "export" => {
             let scope = Scope(args.get(2).cloned().ok_or("memory export needs a scope")?);

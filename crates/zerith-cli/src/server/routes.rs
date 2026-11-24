@@ -42,6 +42,10 @@ pub fn route(ctx: &Arc<Ctx>, req: &Request) -> Resp {
         return (404, json!({ "error": "rota não encontrada" }));
     };
     let segs: Vec<&str> = rest.split('/').collect();
+    // `/v1/workflows/` ou `//`: id vazio nunca é válido.
+    if segs.iter().any(|s| s.is_empty()) {
+        return (404, json!({ "error": "rota não encontrada" }));
+    }
     let res = match (req.method.as_str(), segs.as_slice()) {
         ("GET", ["ping"]) => Ok((
             200,
@@ -346,7 +350,13 @@ fn put_secret(ctx: &Ctx, name: &str, req: &Request) -> Result<Resp, Resp> {
             json!({ "error": "nome: letras, números, '-', '_' e '.' (até 128)" }),
         ));
     }
-    let b: Body = body_json(req)?;
+    // Erro genérico: a mensagem do serde poderia citar trecho do valor.
+    let b: Body = serde_json::from_slice(&req.body).map_err(|_| {
+        (
+            400,
+            json!({ "error": "corpo deve ser {\"value\": \"...\"}" }),
+        )
+    })?;
     if b.value.is_empty() {
         return Err((400, json!({ "error": "valor vazio" })));
     }

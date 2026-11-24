@@ -109,6 +109,9 @@ usage:
   zerith schedule add <nome> --cron <expr> (--command <cmd> --no-agent | --prompt <p>) [--workspace dir] [--model M]
   zerith schedule list|remove <id|nome>|toggle <id|nome> <on|off>|run <id|nome>
   zerith daemon [--once] [--poll-secs N]
+  zerith server init [--name N] [--bind ip:porta] [--url U] [--device D] [--allow-public]
+  zerith server token add <dispositivo> | list | revoke <dispositivo>
+  zerith server serve                            (API de workflows para o desktop; docs/servidor.md)
   zerith gateway telegram setup --token <tok|-> --chats <id1,id2> [--model M] [--workspace dir]
   zerith gateway telegram run [--poll-secs N]
   zerith remote list|add <alias> <ssh://...|docker://...>|exec <alvo> [--] <cmd...>

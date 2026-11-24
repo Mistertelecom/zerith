@@ -16,10 +16,13 @@ use serde_json::{json, Value};
 const KEEP: usize = 500;
 pub const STATUS_EVERY: Duration = Duration::from_secs(30);
 
+/// (id, tipo, dados).
+pub type Event = (u64, &'static str, Value);
+
 #[derive(Default)]
 pub struct EventBus {
-    /// (próximo id, eventos (id, tipo, dados)).
-    log: Mutex<(u64, VecDeque<(u64, &'static str, Value)>)>,
+    /// (último id, eventos guardados).
+    log: Mutex<(u64, VecDeque<Event>)>,
     cv: Condvar,
 }
 
@@ -41,7 +44,7 @@ impl EventBus {
     }
 
     /// Eventos com id > `after`; espera até `timeout` se não houver nenhum.
-    pub fn wait_after(&self, after: u64, timeout: Duration) -> Vec<(u64, &'static str, Value)> {
+    pub fn wait_after(&self, after: u64, timeout: Duration) -> Vec<Event> {
         let Ok(g) = self.log.lock() else {
             return Vec::new();
         };

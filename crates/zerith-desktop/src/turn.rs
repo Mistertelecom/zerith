@@ -75,6 +75,12 @@ pub enum TurnEvent {
         id: u64,
         tool: String,
         summary: String,
+        /// The rule "sempre neste projeto" saves; absent: not offered.
+        always: Option<String>,
+    },
+    /// A line for the person: an allow rule was saved, and where.
+    Notice {
+        text: String,
     },
     Usage {
         input: u64,
@@ -169,7 +175,18 @@ fn shape(ev: RunEvent) -> Option<TurnEvent> {
             ok,
             preview: output_preview,
         },
-        RunEvent::ApprovalNeeded { id, tool, summary } => TurnEvent::Approval { id, tool, summary },
+        RunEvent::ApprovalNeeded {
+            id,
+            tool,
+            summary,
+            always,
+        } => TurnEvent::Approval {
+            id,
+            tool,
+            summary,
+            always,
+        },
+        RunEvent::Notice { text } => TurnEvent::Notice { text },
         RunEvent::Usage {
             input,
             output,

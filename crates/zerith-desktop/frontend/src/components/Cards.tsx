@@ -6,7 +6,9 @@ import { toolIcon } from "./Transcript";
 export function ApprovalCard(props: {
   tool: string;
   summary: string;
-  onAnswer: (d: "once" | "session" | "deny") => void | Promise<unknown>;
+  /** The allow rule "Sempre neste projeto" saves; absent: not offered. */
+  always?: string | null;
+  onAnswer: (d: "once" | "session" | "project" | "deny") => void | Promise<unknown>;
 }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -17,7 +19,7 @@ export function ApprovalCard(props: {
     deny.current?.focus();
   }, []);
 
-  const submit = async (d: "once" | "session" | "deny") => {
+  const submit = async (d: "once" | "session" | "project" | "deny") => {
     if (busy) return;
     setBusy(true);
     setErr(null);
@@ -46,6 +48,11 @@ export function ApprovalCard(props: {
         </span>
       </div>
       <pre className="ask-body">{props.summary}</pre>
+      {props.always ? (
+        <p className="ask-rule">
+          "Sempre neste projeto" grava a regra <code>{props.always}</code> nas suas permissões deste projeto.
+        </p>
+      ) : null}
       {err ? (
         <div className="toast bad" role="alert">
           <CircleAlert size={15} strokeWidth={1.75} />
@@ -57,6 +64,16 @@ export function ApprovalCard(props: {
           Negar
         </button>
         <span className="spacer" />
+        {props.always ? (
+          <button
+            className="btn"
+            disabled={busy}
+            title={`Grava a regra ${props.always} para este projeto`}
+            onClick={() => void submit("project")}
+          >
+            Sempre neste projeto
+          </button>
+        ) : null}
         <button className="btn" disabled={busy} onClick={() => void submit("session")}>
           Permitir nesta conversa
         </button>

@@ -103,7 +103,7 @@ async function drive() {
   await turn({ type: "saved", tool: "bash", before: 9_000, after: 1_200 });
 
   if (scene === "approval") {
-    await turn({ type: "approval", id: 7, tool: "bash", summary: "cargo test -p zerith-providers --all-features" });
+    await turn({ type: "approval", id: 7, tool: "bash", summary: "cargo test -p zerith-providers --all-features", always: "shell(cargo test *)" });
   }
   // The turn ended with a monitor still running; it prints, and the app
   // starts a turn on its own (`turn:wake`) that answers the notice.

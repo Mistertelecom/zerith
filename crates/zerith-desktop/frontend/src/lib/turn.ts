@@ -45,7 +45,7 @@ export interface ToolRow {
 export interface TurnState {
   blocks: Block[];
   tasks: Todo[];
-  approvals: { id: number; tool: string; summary: string }[];
+  approvals: { id: number; tool: string; summary: string; always?: string | null }[];
   question: { id: number; questions: Question[] } | null;
   usage: {
     input: number;
@@ -183,6 +183,9 @@ export function applyEvent(prev: TurnState, ev: TurnEvent): TurnState {
       ];
       return state;
     }
+    case "notice":
+      state.blocks = [...state.blocks, { kind: "note", text: ev.text }];
+      return state;
     case "steered":
       state.blocks = [...state.blocks, { kind: "note", text: `Direcionado: ${ev.text}` }];
       return state;
@@ -190,7 +193,7 @@ export function applyEvent(prev: TurnState, ev: TurnEvent): TurnState {
       if (prev.approvals.some((a) => a.id === ev.id)) return prev;
       state.approvals = [
         ...prev.approvals,
-        { id: ev.id, tool: ev.tool, summary: ev.summary },
+        { id: ev.id, tool: ev.tool, summary: ev.summary, always: ev.always ?? null },
       ];
       return state;
     case "question":

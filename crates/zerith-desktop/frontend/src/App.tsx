@@ -1455,6 +1455,7 @@ export default function App() {
           key={pendingApproval.id}
           tool={pendingApproval.tool}
           summary={pendingApproval.summary}
+          always={pendingApproval.always}
           onAnswer={(d) => {
             if (!selected) return;
             const sid = selected;

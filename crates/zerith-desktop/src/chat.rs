@@ -372,6 +372,7 @@ pub fn answer_approval(
     let approval = match decision {
         Decision::Once => Approval::AllowOnce,
         Decision::Session => Approval::AllowSession,
+        Decision::Project => Approval::AllowProject,
         Decision::Deny => Approval::Deny,
     };
     turns

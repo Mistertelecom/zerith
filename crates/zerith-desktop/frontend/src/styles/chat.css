@@ -643,8 +643,19 @@
   max-height: 200px;
   overflow: auto;
 }
+.ask-rule {
+  margin: 0;
+  font-size: var(--fs-small);
+  color: var(--label-secondary);
+  overflow-wrap: anywhere;
+}
+.ask-rule code {
+  font-family: var(--mono);
+  color: var(--label-primary);
+}
 .ask-actions {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
 }

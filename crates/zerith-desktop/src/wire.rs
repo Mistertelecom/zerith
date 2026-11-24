@@ -575,6 +575,7 @@ pub fn answer_approval(sender: Option<&ApprovalSender>, a: &Approval, d: Decisio
         match d {
             Decision::Once => RtApproval::AllowOnce,
             Decision::Session => RtApproval::AllowSession,
+            Decision::Project => RtApproval::AllowProject,
             Decision::Deny => RtApproval::Deny,
         },
     );

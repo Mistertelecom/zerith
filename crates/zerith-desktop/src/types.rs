@@ -75,6 +75,8 @@ pub struct Approval {
 pub enum Decision {
     Once,
     Session,
+    /// Session, and save the offered allow rule for the project.
+    Project,
     Deny,
 }
 

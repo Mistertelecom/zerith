@@ -96,7 +96,8 @@ export type TurnEvent =
   | { type: "toolProgress"; tool: string; chunk: string }
   | { type: "steered"; text: string }
   | { type: "skillsLoaded"; names: string[] }
-  | { type: "approval"; id: number; tool: string; summary: string }
+  | { type: "approval"; id: number; tool: string; summary: string; always?: string | null }
+  | { type: "notice"; text: string }
   | {
       type: "usage";
       input: number;
@@ -786,7 +787,7 @@ export const api = {
   answerApproval: (
     sessionId: string,
     id: number,
-    decision: "once" | "session" | "deny",
+    decision: "once" | "session" | "project" | "deny",
   ) => invoke<boolean>("answer_approval", { sessionId, id, decision }),
   answerQuestion: (sessionId: string, id: number, answers: string[]) =>
     invoke<boolean>("answer_question", { sessionId, id, answers }),

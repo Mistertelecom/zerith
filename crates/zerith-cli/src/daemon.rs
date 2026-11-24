@@ -400,6 +400,20 @@ pub fn daemon_cmd(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::err
     let cancel = Cancel::default();
     signals::install(cancel.clone());
 
+    // Com `zerith server init` feito, a API do servidor sobe junto do daemon
+    // (o desktop envia e acompanha os workflows por ela). Sem config, só agenda.
+    let _server = if !once && paths.root().join("server").join("config.toml").is_file() {
+        match crate::server::spawn(paths) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                eprintln!("zerith: API do servidor não subiu: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     if !once {
         eprintln!(
             "zerith: daemon de agendamentos iniciado (poll={}s, timeout={}s)",

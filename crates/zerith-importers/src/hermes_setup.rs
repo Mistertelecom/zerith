@@ -10,9 +10,9 @@ use zerith_mcp::config::{add_server, load_servers, set_enabled, set_extra};
 use zerith_mcp::{Extra, Origin, ServerConfig};
 use zerith_skills::Library;
 
-/// The Hermes home: `HERMES_HOME`, `~/.hermes`, then `%LOCALAPPDATA%\hermes`
-/// (the Windows installer). The first that has `config.yaml` or `skills/`.
-pub fn hermes_home() -> Option<PathBuf> {
+/// Where a Hermes home may be, in order: `HERMES_HOME`, `~/.hermes`, then
+/// `%LOCALAPPDATA%\hermes` (the Windows installer). Existence not checked.
+pub fn home_candidates() -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = Vec::new();
     if let Some(d) = std::env::var_os("HERMES_HOME") {
         v.push(d.into());
@@ -23,8 +23,16 @@ pub fn hermes_home() -> Option<PathBuf> {
     if let Some(l) = std::env::var_os("LOCALAPPDATA") {
         v.push(PathBuf::from(l).join("hermes"));
     }
-    v.into_iter()
-        .find(|d| d.join("config.yaml").is_file() || d.join("skills").is_dir())
+    v.dedup();
+    v
+}
+
+/// The Hermes home: the first of [`home_candidates`] that has `config.yaml`,
+/// `skills/` or `state.db`.
+pub fn hermes_home() -> Option<PathBuf> {
+    home_candidates().into_iter().find(|d| {
+        d.join("config.yaml").is_file() || d.join("skills").is_dir() || d.join("state.db").is_file()
+    })
 }
 
 // ------------------------------------------------------------------ skills

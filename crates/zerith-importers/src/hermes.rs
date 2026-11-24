@@ -101,24 +101,28 @@ pub fn detect() -> Vec<SourceLayout> {
     out
 }
 
+/// Every home of [`crate::hermes_setup::home_candidates`] (so `HERMES_HOME`,
+/// `~/.hermes` and `%LOCALAPPDATA%\hermes` are all seen), its
+/// `profiles/<nome>/` folders, and the older `<home>/<nome>/` layout. Paths
+/// already seen through another candidate are listed once.
 fn candidates() -> Vec<PathBuf> {
-    let mut v = Vec::new();
-    if let Some(dir) = std::env::var_os("HERMES_HOME") {
-        v.push(PathBuf::from(dir));
-    }
-    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
-        let home = PathBuf::from(home);
-        v.push(home.join(".hermes"));
-        // Profiles: ~/.hermes/<profile>/state.db
-        let root = home.join(".hermes");
-        if let Ok(entries) = std::fs::read_dir(&root) {
-            for e in entries.flatten() {
-                if e.path().is_dir() {
-                    v.push(e.path());
-                }
+    let mut v: Vec<PathBuf> = Vec::new();
+    for home in crate::hermes_setup::home_candidates() {
+        v.push(home.clone());
+        for sub in [home.join("profiles"), home.clone()] {
+            if let Ok(entries) = std::fs::read_dir(&sub) {
+                let mut dirs: Vec<PathBuf> = entries
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.is_dir() && p.join("state.db").is_file())
+                    .collect();
+                dirs.sort();
+                v.extend(dirs);
             }
         }
     }
+    let mut seen = HashSet::new();
+    v.retain(|p| seen.insert(p.canonicalize().unwrap_or_else(|_| p.clone())));
     v
 }
 
@@ -134,13 +138,25 @@ fn inspect(path: &Path) -> Result<SourceLayout> {
     })
 }
 
-/// `.../.hermes/state.db` is the default profile; `.../.hermes/work/state.db`
-/// is the profile named `work`.
-fn profile_of(path: &Path) -> String {
-    let dir = path.parent().and_then(|p| p.file_name());
-    match dir.and_then(|d| d.to_str()) {
-        Some(".hermes") | Some("hermes") | None => "default".to_string(),
-        Some(other) => other.to_string(),
+/// `<home>/state.db` is the default profile; `<home>/profiles/work/state.db`
+/// (and the older `<home>/work/state.db`) is the profile named `work`.
+pub(crate) fn profile_of(path: &Path) -> String {
+    let dir = path.parent();
+    let name = dir.and_then(|p| p.file_name()).and_then(|d| d.to_str());
+    let grand = dir
+        .and_then(|p| p.parent())
+        .and_then(|p| p.file_name())
+        .and_then(|d| d.to_str());
+    let is_home = dir.is_some_and(|d| {
+        crate::hermes_setup::home_candidates()
+            .iter()
+            .any(|h| h == d)
+    });
+    match (name, grand) {
+        (Some(n), Some("profiles")) => n.to_string(),
+        _ if is_home => "default".to_string(),
+        (Some(".hermes") | Some("hermes") | None, _) => "default".to_string(),
+        (Some(other), _) => other.to_string(),
     }
 }
 
@@ -485,4 +501,18 @@ pub(crate) fn to_ms(secs: f64) -> i64 {
         return 0;
     }
     (secs * 1000.0) as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profiles_come_from_the_folder_layout() {
+        let p = |s: &str| profile_of(Path::new(s));
+        assert_eq!(p("/x/.hermes/state.db"), "default");
+        assert_eq!(p("/x/AppData/Local/hermes/state.db"), "default");
+        assert_eq!(p("/x/hermes/profiles/netops-beta/state.db"), "netops-beta");
+        assert_eq!(p("/x/.hermes/work/state.db"), "work");
+    }
 }

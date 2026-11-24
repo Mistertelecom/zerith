@@ -273,6 +273,7 @@ pub fn run() {
             providers::routing,
             providers::routing_save,
             providers::usage,
+            providers::usage_cost,
             providers::clear_cooldown,
             memory::memory_facts,
             memory::memory_search,

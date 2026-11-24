@@ -448,6 +448,89 @@ pub async fn usage(state: tauri::State<'_, AppState>, hours: Option<u32>) -> Cmd
     wire::usage_summary(&db, hours.unwrap_or(5))
 }
 
+/// Custo em US$ (preços públicos do OpenRouter). `billed` é o que se paga
+/// por token; `subscription` é o equivalente na API do uso por assinatura,
+/// não cobrado. `priced` falso = nenhum preço conhecido (sem catálogo ou só
+/// modelos fora dele).
+#[derive(Serialize, Default)]
+pub struct CostView {
+    pub billed: f64,
+    pub subscription: f64,
+    pub priced: bool,
+    pub unpriced: Vec<String>,
+    pub by_model: Vec<CostLine>,
+    pub by_day: Vec<CostLine>,
+}
+
+#[derive(Serialize)]
+pub struct CostLine {
+    pub key: String,
+    pub billed: f64,
+    pub subscription: f64,
+    pub priced: bool,
+}
+
+fn cost_view(
+    table: &zerith_providers::pricing::PriceTable,
+    settings: &zerith_core::Settings,
+    rows: &[zerith_sessions::UsageCostRow],
+) -> CostView {
+    use std::collections::BTreeMap;
+    use zerith_runtime::cost::{self, Cost};
+    let mut by_model: BTreeMap<String, Cost> = BTreeMap::new();
+    let mut by_day: BTreeMap<String, Cost> = BTreeMap::new();
+    for r in rows {
+        let c = cost::row_cost(table, settings, r);
+        by_model.entry(r.model.clone()).or_default().add(&c);
+        by_day.entry(r.day.clone()).or_default().add(&c);
+    }
+    let line = |(key, c): (String, Cost)| CostLine {
+        key,
+        billed: c.billed_usd,
+        subscription: c.subscription_usd,
+        priced: !c.is_unknown(),
+    };
+    let total = cost::total(table, settings, rows);
+    let mut by_model: Vec<CostLine> = by_model.into_iter().map(line).collect();
+    by_model.sort_by(|a, b| (b.billed + b.subscription).total_cmp(&(a.billed + a.subscription)));
+    CostView {
+        billed: total.billed_usd,
+        subscription: total.subscription_usd,
+        priced: !table.is_empty() && !total.is_unknown(),
+        unpriced: cost::unpriced_models(table, rows),
+        by_model,
+        by_day: by_day.into_iter().map(line).collect(),
+    }
+}
+
+/// Custo de uma conversa (com os subagentes dela) ou, sem `session_id`, do
+/// período de `hours` horas (`0` = tudo). A primeira chamada do dia pode ir
+/// à rede buscar o catálogo; fora isso lê a cópia em disco.
+#[tauri::command]
+pub async fn usage_cost(
+    state: tauri::State<'_, AppState>,
+    session_id: Option<String>,
+    hours: Option<u32>,
+) -> Cmd<CostView> {
+    let root = state.root().to_path_buf();
+    let db = state.db();
+    tauri::async_runtime::spawn_blocking(move || {
+        let paths = zerith_core::Paths::with_root(&root);
+        let rows = zerith_sessions::Store::open(&db)
+            .and_then(|s| s.usage_cost_rows(hours.unwrap_or(0), session_id.as_deref()))
+            .map_err(|e| e.to_string())?;
+        if rows.is_empty() {
+            return Ok(CostView::default());
+        }
+        let settings = wire::load(&root);
+        let table =
+            zerith_providers::pricing::load(&zerith_core::MediaSettings::catalog_dir(&paths));
+        Ok(cost_view(&table, &settings, &rows))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 pub async fn clear_cooldown(state: tauri::State<'_, AppState>, account_id: String) -> Cmd<()> {
     let db = state.db();

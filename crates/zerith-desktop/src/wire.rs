@@ -17,7 +17,7 @@ use zerith_sessions::{Store, UsageSummary};
 use crate::types::{Approval, Decision};
 use crate::types::{Profile, Theme};
 
-fn load(root: &Path) -> Settings {
+pub(crate) fn load(root: &Path) -> Settings {
     let paths = Paths::with_root(root);
     // The project layer of the folder conversations use, not the launch dir.
     let dir = crate::turn::last_workspace(&paths.db());

@@ -21,6 +21,8 @@
 mod claude;
 pub mod market;
 
+pub use claude::translate_hook_matcher;
+
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 

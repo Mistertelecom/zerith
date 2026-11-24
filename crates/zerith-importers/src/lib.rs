@@ -12,6 +12,7 @@
 //! Unknown columns are kept verbatim in `raw` rather than dropped: a Hermes
 //! upgrade must not lose data this crate has not learned about yet.
 
+pub mod claude_code;
 mod hermes;
 mod hermes_jsonl;
 pub mod hermes_migrate;

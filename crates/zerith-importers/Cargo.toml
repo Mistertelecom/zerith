@@ -15,6 +15,7 @@ zerith-security = { path = "../zerith-security" }
 zerith-tools = { path = "../zerith-tools" }
 # Fuso local (cron do Hermes é no fuso dele; o daemon do Zerith avalia em UTC).
 zerith-workflows = { path = "../zerith-workflows" }
+zerith-plugins = { path = "../zerith-plugins" }
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -25,6 +26,7 @@ sha2 = "0.10"
 regex = "1"
 # Já no Cargo.lock: o `.bundled_manifest` do Hermes guarda md5 por skill.
 md-5 = "0.10"
+toml.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

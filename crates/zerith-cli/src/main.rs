@@ -9,6 +9,7 @@ mod daemon;
 mod headless;
 mod media_cmd;
 mod schema;
+mod server;
 mod signals;
 mod telegram;
 
@@ -264,6 +265,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         ("plan", _) => plan(&paths, args)?,
         ("schedule", _) => daemon::schedule_cmd(&paths, args)?,
         ("daemon", _) => daemon::daemon_cmd(&paths, args)?,
+        ("server", _) => server::cmd(&paths, args)?,
         ("gateway", _) => telegram::cmd(&paths, args)?,
         ("remote", _) => remote_cmd(&paths, args)?,
         ("media", _) => media_cmd::run(&paths, args)?,

@@ -43,6 +43,11 @@ pub enum SessionSource {
     /// parent session id and `source_profile` the child's own id (the pair is
     /// unique, the parent alone would not be).
     Subagent,
+    /// Imported from Claude Code (`~/.claude/projects/*/*.jsonl`).
+    #[serde(rename = "claude-code")]
+    ClaudeCode,
+    /// Imported from Codex (`~/.codex/sessions/**/*.jsonl`).
+    Codex,
 }
 
 impl SessionSource {
@@ -51,6 +56,8 @@ impl SessionSource {
             SessionSource::Native => "native",
             SessionSource::Hermes => "hermes",
             SessionSource::Subagent => "subagent",
+            SessionSource::ClaudeCode => "claude-code",
+            SessionSource::Codex => "codex",
         }
     }
 
@@ -59,6 +66,8 @@ impl SessionSource {
             "native" => Some(SessionSource::Native),
             "hermes" => Some(SessionSource::Hermes),
             "subagent" => Some(SessionSource::Subagent),
+            "claude-code" => Some(SessionSource::ClaudeCode),
+            "codex" => Some(SessionSource::Codex),
             _ => None,
         }
     }

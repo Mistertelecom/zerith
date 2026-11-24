@@ -338,7 +338,11 @@ fn serve(
     let p = pipe.prepare(&call, on_event);
     let ran = pipe.run_group(std::slice::from_ref(&p), 1, on_event);
     let (outcome, _) = pipe.finish(p, ran.into_iter().next().flatten());
-    (outcome.ok, outcome.output)
+    // The script parses the page or the search JSON: it gets the bare text.
+    // ponytail: what the script prints back reaches the model unmarked; mark
+    // execute_code's output when a script read the web, if that shows up.
+    let output = crate::pipeline::strip_external(&outcome.output).to_string();
+    (outcome.ok, output)
 }
 
 fn accept_loop(

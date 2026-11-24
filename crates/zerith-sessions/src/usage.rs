@@ -1096,7 +1096,9 @@ mod tests {
             .any(|r| r.model == "m3" && r.session_id.is_none()));
 
         let mine = s.usage_cost_rows(24, Some(&sess.id)).unwrap();
-        let models: Vec<&str> = mine.iter().map(|r| r.model.as_str()).collect();
+        // A ordem segue o id da sessão (UUID aleatório): comparar ordenado.
+        let mut models: Vec<&str> = mine.iter().map(|r| r.model.as_str()).collect();
+        models.sort_unstable();
         assert_eq!(models, ["m1", "m2"]);
     }
 }

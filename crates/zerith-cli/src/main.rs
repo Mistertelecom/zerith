@@ -88,7 +88,7 @@ usage:
   zerith mcp tools <server> | call <server> <tool> [json-args]
   zerith mcp tools <command and args>            (raw server, no config)
   zerith providers [show|probe|models|chat <model> <prompt>]
-  zerith usage [--hours N]
+  zerith usage [--hours N]                       (tokens e custo em US$ por modelo, dia e sessão)
   zerith quota [--hours N]
   zerith accounts [list|add <id> <provider> ...|remove|enable|disable|reset-cooldown <id>]
   zerith routing [show|main|subagent|explore|plan|compact <model>|role <agent> <model>|combo <name> <m1,m2,...>]

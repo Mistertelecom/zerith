@@ -1,6 +1,10 @@
-//! `zerith usage`: per-account, per-model and token-saver report.
+//! `zerith usage`: per-account, per-model, token-saver and dollar-cost report.
 
 use super::*;
+use zerith_core::MediaSettings;
+use zerith_providers::pricing::{self, PriceTable};
+use zerith_runtime::cost::{self, Cost};
+use zerith_sessions::UsageCostRow;
 
 pub(super) fn parse_usage_hours(args: &[String]) -> Result<u32, String> {
     let mut hours = 24u32;
@@ -287,6 +291,102 @@ pub fn format_usage_report(
     out
 }
 
+/// `US$ 0.1234`, `(US$ x assin.)` para assinatura, `+?` se há uso sem preço.
+pub(super) fn fmt_cost(c: &Cost) -> String {
+    if c.is_unknown() {
+        return "desconhecido".into();
+    }
+    let mut out = String::new();
+    if c.billed_usd > 0.0 || c.subscription_usd == 0.0 {
+        out = format!("US$ {:.4}", c.billed_usd);
+    }
+    if c.subscription_usd > 0.0 {
+        if !out.is_empty() {
+            out.push_str(" + ");
+        }
+        out.push_str(&format!("(US$ {:.4} assin.)", c.subscription_usd));
+    }
+    if c.unknown_requests > 0 {
+        out.push_str(" +?");
+    }
+    out
+}
+
+/// Custo por modelo, por dia, por sessão e total, com os preços públicos do
+/// OpenRouter. Assinatura (OAuth) sai como equivalente na API, não cobrado.
+pub fn format_cost_report(
+    settings: &Settings,
+    table: &PriceTable,
+    rows: &[UsageCostRow],
+) -> String {
+    use std::collections::BTreeMap;
+    let mut out = String::from("Custo (preços públicos do OpenRouter, US$):\n");
+    if table.is_empty() {
+        out.push_str(
+            "  sem tabela de preços (sem rede e sem cópia em disco): custo desconhecido\n",
+        );
+        return out;
+    }
+    if rows.is_empty() {
+        out.push_str("  (nenhum uso nesta janela)\n");
+        return out;
+    }
+    let mut by_model: BTreeMap<&str, Cost> = BTreeMap::new();
+    let mut by_day: BTreeMap<&str, Cost> = BTreeMap::new();
+    let mut by_session: BTreeMap<&str, (String, Cost)> = BTreeMap::new();
+    for r in rows {
+        let c = cost::row_cost(table, settings, r);
+        by_model.entry(&r.model).or_default().add(&c);
+        by_day.entry(&r.day).or_default().add(&c);
+        let sid = r.session_id.as_deref().unwrap_or("-");
+        let title = r.session_title.clone().unwrap_or_default();
+        by_session
+            .entry(sid)
+            .or_insert((title, Cost::default()))
+            .1
+            .add(&c);
+    }
+    let usd = |c: &Cost| c.billed_usd + c.subscription_usd;
+
+    out.push_str("  por modelo:\n");
+    let mut models: Vec<_> = by_model.into_iter().collect();
+    models.sort_by(|a, b| usd(&b.1).total_cmp(&usd(&a.1)));
+    for (m, c) in &models {
+        let id = table
+            .lookup(m)
+            .map(|(id, _)| id)
+            .unwrap_or_else(|| "sem preço".into());
+        out.push_str(&format!("    {:<30} {:<32} {}\n", m, id, fmt_cost(c)));
+    }
+    out.push_str("  por dia:\n");
+    for (d, c) in &by_day {
+        out.push_str(&format!("    {d}  {}\n", fmt_cost(c)));
+    }
+    out.push_str("  por sessão (as 10 mais caras):\n");
+    let mut sessions: Vec<_> = by_session.into_iter().collect();
+    sessions.sort_by(|a, b| usd(&b.1 .1).total_cmp(&usd(&a.1 .1)));
+    for (sid, (title, c)) in sessions.iter().take(10) {
+        let short: String = sid.chars().take(8).collect();
+        let title: String = title.chars().take(36).collect();
+        out.push_str(&format!("    {short:<8}  {title:<36}  {}\n", fmt_cost(c)));
+    }
+    let total = cost::total(table, settings, rows);
+    out.push_str(&format!("  total do período: {}\n", fmt_cost(&total)));
+    if total.subscription_usd > 0.0 {
+        out.push_str(
+            "  assin. = equivalente na API do uso por assinatura: não é cobrado por token\n",
+        );
+    }
+    let missing = cost::unpriced_models(table, rows);
+    if !missing.is_empty() {
+        out.push_str(&format!(
+            "  +? = sem preço no catálogo, fora da soma: {}\n",
+            missing.join(", ")
+        ));
+    }
+    out
+}
+
 pub fn usage_cmd(paths: &Paths, args: &[String]) -> Res {
     let hours = parse_usage_hours(args)?;
     paths.ensure()?;
@@ -297,5 +397,64 @@ pub fn usage_cmd(paths: &Paths, args: &[String]) -> Res {
         "{}",
         format_usage_report(&settings, &summary, hours, now_ms())
     );
+    let table = pricing::load(&MediaSettings::catalog_dir(paths));
+    let rows = store.usage_cost_rows(hours, None)?;
+    println!("\n{}", format_cost_report(&settings, &table, &rows));
     Ok(())
+}
+
+#[cfg(test)]
+mod cost_tests {
+    use super::*;
+
+    #[test]
+    fn cost_report_splits_model_day_session_and_marks_subscription() {
+        let settings = Settings {
+            accounts: vec![AccountEntry {
+                id: "claude-assinatura".into(),
+                provider: "anthropic".into(),
+                auth: zerith_core::settings::AuthMode::Oauth,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let table = PriceTable::from_json(&serde_json::json!({"data": [
+            {"id": "anthropic/claude-opus-5.5", "pricing": {"prompt": "0.000004", "completion": "0.00002"}},
+            {"id": "deepseek/deepseek-chat", "pricing": {"prompt": "0.0000003", "completion": "0.0000012"}}
+        ]}));
+        let row = |acc: &str, model: &str, day: &str, sid: &str| UsageCostRow {
+            day: day.into(),
+            session_id: Some(sid.into()),
+            session_title: Some("título".into()),
+            account_id: acc.into(),
+            provider: "x".into(),
+            model: model.into(),
+            prompt_tokens: 1_000_000,
+            completion_tokens: 0,
+            requests: 1,
+            ..UsageCostRow::default()
+        };
+        let rows = [
+            row(
+                "claude-assinatura",
+                "claude-opus-5-5",
+                "2026-11-23",
+                "aaaaaaaa1",
+            ),
+            row("deepseek", "deepseek-chat", "2026-11-24", "bbbbbbbb2"),
+            row("ollama", "llama-local", "2026-11-24", "bbbbbbbb2"),
+        ];
+        let r = format_cost_report(&settings, &table, &rows);
+        assert!(r.contains("anthropic/claude-opus-5.5"), "{r}");
+        assert!(r.contains("(US$ 4.0000 assin.)"), "{r}");
+        assert!(r.contains("2026-11-24  US$ 0.3000 +?"), "{r}");
+        assert!(
+            r.contains("total do período: US$ 0.3000 + (US$ 4.0000 assin.) +?"),
+            "{r}"
+        );
+        assert!(r.contains("llama-local"), "{r}");
+        assert!(r.contains("não é cobrado"), "{r}");
+        let empty = format_cost_report(&settings, &PriceTable::default(), &rows);
+        assert!(empty.contains("custo desconhecido"), "{empty}");
+    }
 }

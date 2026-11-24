@@ -98,7 +98,8 @@ impl Checker {
                 &f,
             ]),
             Checker::Bash => c.args(["-n", &f]),
-            Checker::ShellCheck => c.args(["-f", "gcc", "-S", "error", &f]),
+            // SC2148 (sem shebang) é estilo, não erro: não acusar todo script sem `#!`.
+            Checker::ShellCheck => c.args(["-f", "gcc", "-S", "error", "-e", "SC2148", &f]),
             Checker::Node => c.args(["--check", &f]),
             Checker::Pwsh => c.args([
                 "-NoProfile",
@@ -441,7 +442,8 @@ mod tests {
             let out = run(Some(broken), other);
             assert!(out.contains("linha 2"), "{name}: {out}");
             // Arquivo limpo: silêncio.
-            assert_eq!(run(Some(broken), "echo = 1\n"), "", "{name}");
+            // Arquivo limpo em Python e em shell (`echo = 1` é SC2283 no shellcheck).
+            assert_eq!(run(Some(broken), "# ok\n"), "", "{name}");
         }
     }
 }

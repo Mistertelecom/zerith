@@ -2342,6 +2342,104 @@ CORPO-{name}
         VPS: ajuste o firewall da VPS e /ip firewall filter e nat da Masterlink (concentrador MK \
         Masterlink, MikroTik) para a porta UDP 5514";
 
+    /// The 12 skills the old top-12 listed for [`SYSLOG_DUDE_PROMPT`] plus the
+    /// three it left out, names, categories and descriptions as in the user's
+    /// library (2026-11-25).
+    const SYSLOG_DUDE_LIBRARY: &[(&str, &str, &str)] = &[
+        ("mikrotik-routeros-cli", "networking", "Use when accessing a MikroTik RouterOS device via SSH."),
+        ("mikrotik-ssh-mkcli", "networking", "Consultar/validar MikroTik via SSH com a tool Go mkcli."),
+        ("network-device-automation", "networking", "Automate read-only SSH/telnet to ISP gear; plan CGNAT."),
+        ("remote-access-behind-cgnat", "networking", "Use when exposing a service behind CGNAT (no public IP)."),
+        ("netflow-syslog-telemetry", "devops", "Análise de tráfego NetFlow v9, IPFIX, sFlow (Akvorado, Elastiflow, nfdump), detecção de ataques DDoS volumétricos, mitigação BGP FlowSpec/RTBH e consultas PromQL/LogQL."),
+        ("linux-vps-remote-admin", "devops", "Use when configuring a remote Linux VPS via SSH/su/ufw."),
+        ("netdesk-rdp-and-tasks", "devops", "Use when changing, deploying or testing the NetDesk panel."),
+        ("ynoc-ai-filter", "devops", "Use when touching Y-NOC's AI false-positive filter."),
+        ("windows-pc-troubleshooting", "devops", "Windows PC: console flashes, low FPS, CPU turbo stuck."),
+        ("netdesk-panel-dev", "", "Use when changing, deploying or testing the NetDesk panel."),
+        ("network-consulting", "", "Workflows profissionais de consultoria em redes (BGP, OSPF, MPLS, VRF, VLAN, firewall) usando inventário, SSH via cofre e lotes seguros."),
+        ("windows-scheduled-task-hidden-console", "", "Use when a console window keeps popping up on Windows and the culprit is a scheduled task running a .cmd/.bat script."),
+        ("zerith-harness", "software-development", "Use when working in the Zerith Rust agent harness."),
+        ("minecraft-server-hosting", "gaming", "Use when hosting a Minecraft Java server on Linux."),
+        ("game-server-hosting", "gaming", "Use when hosting a dedicated game server on Windows."),
+        ("mudanca-segura", "zerith-infra", "Use antes de alterar configuração de roteador, switch, OLT, servidor Linux ou Proxmox, em produção, laboratório ou troubleshooting (corrigir defeito também é mudança)."),
+    ];
+
+    /// Regression for the 2026-11-25 miss: with the old top-12 list the
+    /// MikroTik skill was not in the prompt and the model got RouterOS wrong.
+    #[test]
+    fn eval_syslog_dude_request_finds_the_mikrotik_skill() {
+        use zerith_tools::network::{DeviceEntry, Vendor};
+        let tmp = tempfile::tempdir_in(scratch()).unwrap();
+        let lib = zerith_skills::Library::open(tmp.path().join("skills")).unwrap();
+        for (name, cat, desc) in SYSLOG_DUDE_LIBRARY {
+            let src = tmp.path().join("src").join(name);
+            std::fs::create_dir_all(&src).unwrap();
+            let cat = if cat.is_empty() {
+                String::new()
+            } else {
+                format!("category: {cat}\n")
+            };
+            std::fs::write(
+                src.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: \"{desc}\"\n{cat}---\n\n# {name}\n"),
+            )
+            .unwrap();
+            lib.install(&src, "t").unwrap();
+        }
+        let built = build_prompt_context(
+            "t",
+            TurnContext {
+                skills: Some(&lib),
+                no_project_instructions: true,
+                ..TurnContext::default()
+            },
+            true,
+            "s",
+            SYSLOG_DUDE_PROMPT,
+        );
+        for (name, _, _) in SYSLOG_DUDE_LIBRARY {
+            assert!(
+                built.static_system.contains(&format!("- {name}: ")),
+                "{name}"
+            );
+        }
+        assert!(
+            built.static_system.contains("## networking\n"),
+            "{}",
+            built.static_system
+        );
+        let rem = built.dynamic_reminder.unwrap_or_default();
+        let line = rem
+            .lines()
+            .find(|l| l.starts_with("Skills mais prováveis para este pedido: "))
+            .unwrap_or_else(|| panic!("{rem}"));
+        assert!(line.contains("mikrotik-routeros-cli"), "{line}");
+        // The inventory names the device the request calls "concentrador".
+        let inv = [DeviceEntry {
+            name: "concentrador".into(),
+            client: Some("facilnet".into()),
+            host: "10.50.40.1".into(),
+            vendor: Vendor::MikrotikRouterOs,
+            ..DeviceEntry::default()
+        }];
+        for devices in [&inv[..], &[]] {
+            let top = likely_skills(&lib, SYSLOG_DUDE_PROMPT, devices);
+            // With the device's vendor it leads; without, it is listed.
+            let at = top.iter().position(|n| n == "mikrotik-routeros-cli");
+            if devices.is_empty() {
+                assert!(at.is_some(), "{top:?}");
+            } else {
+                assert_eq!(at, Some(0), "{top:?}");
+            }
+            assert!(top.len() <= LIKELY_SKILLS, "{top:?}");
+            assert!(
+                !top.iter()
+                    .any(|n| n.contains("minecraft") || n.contains("game")),
+                "{top:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_skill_is_named_only_as_a_whole_word() {
         assert!(names_skill("use a skill ads agora", "ads"));

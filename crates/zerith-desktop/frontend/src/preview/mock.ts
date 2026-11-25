@@ -1191,7 +1191,7 @@ export function installMock(theme: string) {
         case "server_test":
           return serverStatus.find((s) => s.id === a.id);
         case "workflow_list":
-          return workflows;
+          return [...workflows, ...wfMock.workflows];
         case "server_workflows":
           return workflows.filter((w) => w.run_on === a.serverId).map((w) => ({ ...w, run_on: undefined }));
         case "server_workflow_runs":
@@ -1206,14 +1206,8 @@ export function installMock(theme: string) {
           state.jobs = state.jobs.filter((j) => j.id !== a.id);
           return `${a.id} encerrado`;
         // Automações: um workflow com alerta e dois canais (cena `channels`).
-        case "workflow_list":
-          return wfMock.workflows;
         case "workflow_save":
           return a.workflow;
-        case "workflow_runs":
-          return [];
-        case "workflow_webhook_base_url":
-          return "http://127.0.0.1:47891/webhook/";
         case "channel_list":
           return wfMock.channels;
         case "channel_save":

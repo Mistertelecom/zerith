@@ -170,11 +170,35 @@ zerith-pair:<base64url sem padding do JSON {"v":1,"name":"...","url":"http(s)://
 ```
 
 O código contém o token: trate como senha. Ele não é mostrado de novo — o
-servidor só guarda `sha256(token)`. No desktop: Workflows > Servidores >
+servidor só guarda `sha256(token)`. No desktop: Ajustes > Servidores >
 Adicionar servidor > colar. O desktop chama `GET /v1/ping` (sem token) e
-depois `GET /v1/health` (com token).
+depois `GET /v1/health` (com token); só grava se os dois responderem.
 
 Outro dispositivo: `zerith server token add <dispositivo>` (novo código).
+
+### No desktop
+
+- Cadastro em `<raiz>/servers.json` (id, nome, url, criado em, último
+  contato); o token vai para o cofre configurado como `server-token-<id>`.
+  Parear de novo o mesmo endereço troca o token e mantém o id.
+- Bolinha: **verde** = `health.daemon.last_cycle_ms` há menos de 2 min;
+  **amarelo** = a API responde mas o daemon está parado/atrasado; **vermelho**
+  = sem resposta.
+- Editor: "Executar em: Este PC | <servidor>" (campo `run_on` do workflow,
+  só na cópia local; o envio vai sem ele). Salvar com servidor faz
+  `PUT /workflows/:id` com o `updated_at_ms` local como base (a cópia local
+  passa a ter a versão do servidor); 409 abre *Recarregar do servidor* /
+  *Sobrescrever*. O agendador e o webhook local do desktop pulam workflows
+  com `run_on`; o daemon ignora o campo.
+- Saúde: um thread por servidor segue `GET /events` (SSE, com
+  `Last-Event-ID`) e reemite `server:event`/`server:status`; caiu, confere o
+  health e reconecta com espera dobrando até 30 s (atrás de proxy que
+  bufferiza o SSE, isso vira polling do health a cada 30 s). Notificação do
+  Windows quando um servidor cai ou um workflow remoto passa a falhar, uma
+  vez por mudança de estado.
+- Segredos: em workflow remoto, o inspetor mostra só os nomes (`secret_ref`
+  dos nós e os de `GET /secrets`) e "Definir no servidor" (`PUT
+  /secrets/:nome`).
 
 ## Revogação
 

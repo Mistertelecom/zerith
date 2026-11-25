@@ -1298,6 +1298,7 @@ mod tests {
 
         let wf = Workflow {
             alert: Default::default(),
+            run_on: None,
             id: "test-wf".into(),
             name: "Test Pipeline".into(),
             description: "".into(),
@@ -1479,6 +1480,7 @@ mod tests {
         };
         let wf = Workflow {
             alert: Default::default(),
+            run_on: None,
             id: "hook-wf".into(),
             name: "Hook + Loop + Mock + Bot".into(),
             description: "".into(),
@@ -1635,6 +1637,7 @@ mod tests {
     fn wf_of(nodes: Vec<WorkflowNode>, edges: Vec<WorkflowEdge>) -> Workflow {
         Workflow {
             alert: Default::default(),
+            run_on: None,
             id: "wf".into(),
             name: "wf".into(),
             description: String::new(),
@@ -1829,6 +1832,7 @@ mod tests {
         // Trigger -> A -> B -> A cycle
         let wf_cycle = Workflow {
             alert: Default::default(),
+            run_on: None,
             id: "cycle-wf".into(),
             name: "Cycle".into(),
             description: "".into(),

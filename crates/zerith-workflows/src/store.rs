@@ -48,7 +48,8 @@ impl Store {
                 last_run_at_ms INTEGER,
                 last_status TEXT,
                 bot_name TEXT,
-                alert_json TEXT
+                alert_json TEXT,
+                run_on TEXT
             );
 
             CREATE TABLE IF NOT EXISTS channels (
@@ -90,6 +91,7 @@ impl Store {
         // Idempotent migration for existing databases created prior to v0.3.3.
         let _ = conn.execute("ALTER TABLE workflows ADD COLUMN bot_name TEXT", []);
         let _ = conn.execute("ALTER TABLE workflows ADD COLUMN alert_json TEXT", []);
+        let _ = conn.execute("ALTER TABLE workflows ADD COLUMN run_on TEXT", []);
         Ok(())
     }
 
@@ -126,7 +128,7 @@ impl Store {
         let conn = self.conn.lock().map_err(|_| WorkflowError::Lock)?;
         let mut stmt = conn.prepare(
             "SELECT id, name, description, icon, enabled, nodes_json, edges_json,
-                    created_at_ms, updated_at_ms, last_run_at_ms, last_status, bot_name, alert_json
+                    created_at_ms, updated_at_ms, last_run_at_ms, last_status, bot_name, alert_json, run_on
              FROM workflows
              ORDER BY updated_at_ms DESC, name ASC",
         )?;
@@ -148,7 +150,7 @@ impl Store {
         let conn = self.conn.lock().map_err(|_| WorkflowError::Lock)?;
         conn.query_row(
             "SELECT id, name, description, icon, enabled, nodes_json, edges_json,
-                    created_at_ms, updated_at_ms, last_run_at_ms, last_status, bot_name, alert_json
+                    created_at_ms, updated_at_ms, last_run_at_ms, last_status, bot_name, alert_json, run_on
              FROM workflows WHERE id = ?1",
             params![id],
             row_to_workflow,
@@ -468,8 +470,8 @@ fn upsert_workflow(conn: &Connection, wf: &Workflow) -> Result<()> {
     conn.execute(
         "INSERT INTO workflows (
             id, name, description, icon, enabled, nodes_json, edges_json,
-            created_at_ms, updated_at_ms, last_run_at_ms, last_status, bot_name, alert_json
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            created_at_ms, updated_at_ms, last_run_at_ms, last_status, bot_name, alert_json, run_on
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
          ON CONFLICT(id) DO UPDATE SET
             name = excluded.name,
             description = excluded.description,
@@ -479,7 +481,8 @@ fn upsert_workflow(conn: &Connection, wf: &Workflow) -> Result<()> {
             edges_json = excluded.edges_json,
             updated_at_ms = excluded.updated_at_ms,
             bot_name = excluded.bot_name,
-            alert_json = excluded.alert_json",
+            alert_json = excluded.alert_json,
+            run_on = excluded.run_on",
         params![
             wf.id,
             wf.name,
@@ -493,7 +496,8 @@ fn upsert_workflow(conn: &Connection, wf: &Workflow) -> Result<()> {
             wf.last_run_at_ms,
             wf.last_status,
             bot_name,
-            alert_json
+            alert_json,
+            wf.run_on.as_deref().filter(|s| !s.is_empty())
         ],
     )?;
     Ok(())
@@ -528,6 +532,7 @@ fn row_to_workflow(row: &rusqlite::Row<'_>) -> rusqlite::Result<Workflow> {
         last_run_at_ms: row.get(9)?,
         last_status: row.get(10)?,
         bot_name: row.get(11)?,
+        run_on: row.get(13)?,
     })
 }
 
@@ -568,6 +573,7 @@ pub fn starter_templates() -> Vec<Workflow> {
     let mut base = default_templates(now);
     base.push(Workflow {
         alert: Default::default(),
+        run_on: None,
         id: "linux-proxmox-health".into(),
         name: "Server / Proxmox SSH Health".into(),
         description: "Runs SSH health checks (uptime, disk, RAM) on a Linux or Proxmox host and notifies you if usage is critical.".into(),
@@ -643,6 +649,7 @@ pub fn starter_templates() -> Vec<Workflow> {
     });
     base.push(Workflow {
         alert: Default::default(),
+        run_on: None,
         id: "api-ai-executive-brief".into(),
         name: "API Data → Transform → AI Brief".into(),
         description: "Fetches JSON from any external API or ERP, extracts the key field without spending AI tokens, summarizes via AI, and notifies your channel.".into(),
@@ -727,6 +734,7 @@ fn default_templates(now: i64) -> Vec<Workflow> {
     vec![
         Workflow {
             alert: Default::default(),
+            run_on: None,
             id: "noc-daily-report".into(),
             name: "Daily NOC Offline Report".into(),
             description: "Checks hosts/equipment every day at 08:00, summarizes incidents with AI, and alerts your WhatsApp if anything is offline.".into(),
@@ -799,6 +807,7 @@ fn default_templates(now: i64) -> Vec<Workflow> {
         },
         Workflow {
             alert: Default::default(),
+            run_on: None,
             id: "api-health-monitor".into(),
             name: "Global HTTP Healthcheck".into(),
             description: "Polls an HTTP endpoint every 15 minutes and triggers an alert if it stops responding.".into(),
@@ -861,6 +870,7 @@ fn default_templates(now: i64) -> Vec<Workflow> {
         },
         Workflow {
             alert: Default::default(),
+            run_on: None,
             id: "daily-workspace-digest".into(),
             name: "Daily Git & System Digest".into(),
             description: "Collects local system info, summarizes it with your AI model, and saves a daily Markdown log.".into(),
@@ -991,6 +1001,7 @@ mod tests {
         let store = Store::open(&dir.path().join("legacy.db")).unwrap();
         let custom = Workflow {
             alert: Default::default(),
+            run_on: None,
             id: "custom-1".into(),
             name: "Custom".into(),
             description: String::new(),

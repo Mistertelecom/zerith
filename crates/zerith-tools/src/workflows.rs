@@ -361,6 +361,8 @@ fn workflow_create_or_update(args: &Value, _: &CallCtx<'_>, _: &Exec<'_>) -> Res
         bot_name: opt_str(args, "bot_name")
             .map(str::to_string)
             .or_else(|| existing.as_ref().and_then(|e| e.bot_name.clone())),
+        // Editar pelo chat não muda onde o workflow roda.
+        run_on: existing.as_ref().and_then(|e| e.run_on.clone()),
     };
 
     let saved = store
@@ -591,6 +593,7 @@ mod tests {
 
         let shell_wf = Workflow {
             alert: Default::default(),
+            run_on: None,
             id: "wf-1".into(),
             name: "sh".into(),
             description: String::new(),
@@ -626,6 +629,7 @@ mod tests {
 
         let save_wf = Workflow {
             alert: Default::default(),
+            run_on: None,
             id: "wf-2".into(),
             name: "save".into(),
             description: String::new(),

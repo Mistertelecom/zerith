@@ -173,6 +173,7 @@ mod tests {
             last_status: None,
             bot_name: None,
             alert: Default::default(),
+            run_on: None,
         }
     }
 

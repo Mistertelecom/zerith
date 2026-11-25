@@ -271,6 +271,15 @@ pub struct TickOptions {
     pub hooks: Arc<dyn RunHooks>,
     /// Aviso de falha/recuperação ([`crate::alert`]); `None` desliga.
     pub alerts: Option<Arc<dyn AlertSink>>,
+    /// Desktop: pula workflows com `run_on` (rodam num servidor cadastrado).
+    /// O daemon deixa `false`: lá todo workflow é local.
+    pub skip_remote: bool,
+}
+
+/// Workflows que o agendador deste processo dispara (ver
+/// [`TickOptions::skip_remote`]).
+pub fn runs_here(wf: &Workflow, skip_remote: bool) -> bool {
+    !skip_remote || wf.run_on.is_none()
 }
 
 /// Um ciclo do agendador: dispara cada workflow vencido numa thread própria
@@ -282,7 +291,8 @@ pub fn tick(
     opts: &TickOptions,
     state: &SchedulerState,
 ) -> crate::Result<Vec<JoinHandle<()>>> {
-    let wfs = store.list_workflows()?;
+    let mut wfs = store.list_workflows()?;
+    wfs.retain(|w| runs_here(w, opts.skip_remote));
     let due = {
         let mut log = state.fires.lock().unwrap_or_else(|e| e.into_inner());
         due_workflows(&wfs, opts.now_secs, opts.tz_offset_minutes, &mut log)
@@ -335,6 +345,7 @@ mod tests {
     pub(crate) fn cron_wf(id: &str, nodes: Vec<WorkflowNode>) -> Workflow {
         Workflow {
             alert: Default::default(),
+            run_on: None,
             id: id.into(),
             name: id.into(),
             description: String::new(),
@@ -502,6 +513,7 @@ mod tests {
             tz_offset_minutes: None,
             hooks: Arc::new(NoHooks),
             alerts: None,
+            skip_remote: true,
         };
 
         // Rodando: o minuto seguinte não sobrepõe.
@@ -516,6 +528,36 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].trigger_source, "cron");
         assert_eq!(consecutive_failures(&store, "t").unwrap(), 0);
+    }
+
+    #[test]
+    fn desktop_skips_workflows_that_run_on_a_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(&dir.path().join("w.db")).unwrap());
+        let mut wf = cron_wf("r", vec![cron_node("c", "* * * * *", Some(0))]);
+        wf.run_on = Some("srv-1".into());
+        store.save_workflow(&wf).unwrap();
+        assert_eq!(
+            store.get_workflow("r").unwrap().unwrap().run_on.as_deref(),
+            Some("srv-1")
+        );
+        let ai: Arc<dyn AiExecutor> = Arc::new(crate::NoopAiExecutor);
+        let opts = |skip_remote| TickOptions {
+            data_root: dir.path().to_path_buf(),
+            now_secs: T,
+            tz_offset_minutes: None,
+            hooks: Arc::new(NoHooks),
+            alerts: None,
+            skip_remote,
+        };
+        assert!(tick(&store, &ai, &opts(true), &SchedulerState::default())
+            .unwrap()
+            .is_empty());
+        // O daemon (skip_remote = false) ignora o campo.
+        let hs = tick(&store, &ai, &opts(false), &SchedulerState::default()).unwrap();
+        assert_eq!(hs.len(), 1);
+        hs.into_iter().for_each(|h| h.join().unwrap());
+        assert!(runs_here(&cron_wf("l", vec![]), true));
     }
 
     #[test]

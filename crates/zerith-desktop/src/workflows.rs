@@ -25,7 +25,7 @@ use crate::state::AppState;
 
 static WEBHOOK_PORT: AtomicU16 = AtomicU16::new(47891);
 
-fn open_store(root: &Path) -> Result<Store, String> {
+pub(crate) fn open_store(root: &Path) -> Result<Store, String> {
     let st = Store::open(&root.join("workflows.db")).map_err(|e| e.to_string())?;
     st.seed_defaults().map_err(|e| e.to_string())?;
     Ok(st)
@@ -473,7 +473,7 @@ fn percent_decode(s: &str) -> String {
 
 fn find_webhook_match(wfs: Vec<Workflow>, slug_lookup: &str) -> Option<(Workflow, String)> {
     for w in wfs {
-        if !w.enabled {
+        if !w.enabled || w.run_on.is_some() {
             continue;
         }
         let matched_node = w
@@ -943,6 +943,8 @@ fn tick_due_workflows(app: &AppHandle, root: &Path, state: &SchedulerState) {
         // ponytail: aviso de falha só no daemon; ligar aqui quando o desktop
         // tiver onde configurar canais de aviso.
         alerts: None,
+        // "Executar em: <servidor>": quem agenda é o daemon de lá.
+        skip_remote: true,
     };
     let _ = scheduler::tick(&Arc::new(store), &ai, &opts, state);
 }
@@ -1149,6 +1151,7 @@ Layout rules:
 
         let wf = Workflow {
             alert: Default::default(),
+            run_on: None,
             id: format!("wf-{now}"),
             name: parsed
                 .get("name")
@@ -1372,6 +1375,7 @@ mod webhook_tests {
     fn slug_lookup_uses_matched_webhook_nodes_secret() {
         let wf = Workflow {
             alert: Default::default(),
+            run_on: None,
             id: "wf-multi".into(),
             name: "multi".into(),
             description: String::new(),
@@ -1418,6 +1422,7 @@ mod webhook_tests {
         store
             .save_workflow(&Workflow {
                 alert: Default::default(),
+                run_on: None,
                 id: "wf-hook".into(),
                 name: "hook".into(),
                 description: String::new(),
@@ -1548,6 +1553,7 @@ mod webhook_tests {
     fn cron_wf(id: &str, nodes: Vec<WorkflowNode>) -> Workflow {
         Workflow {
             alert: Default::default(),
+            run_on: None,
             id: id.into(),
             name: id.into(),
             description: String::new(),

@@ -99,6 +99,7 @@ impl WorkflowDaemon {
             tz_offset_minutes: tz,
             hooks: Arc::new(NoHooks),
             alerts: Some(Arc::new(ChannelAlerts)),
+            skip_remote: false,
         };
         let handles =
             scheduler::tick(&self.store, &self.ai, &opts, &self.state).unwrap_or_else(|e| {
@@ -162,6 +163,7 @@ mod tests {
     fn every_minute_wf(id: &str, second: WorkflowNode) -> Workflow {
         Workflow {
             alert: Default::default(),
+            run_on: None,
             id: id.into(),
             name: id.into(),
             description: String::new(),

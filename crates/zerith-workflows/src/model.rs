@@ -94,6 +94,11 @@ pub struct Workflow {
     /// Aviso de falha das execuções agendadas (campos `alert_*` no JSON).
     #[serde(flatten, default)]
     pub alert: WorkflowAlert,
+    /// Onde roda: `None` = nesta máquina; `Some(id)` = servidor cadastrado no
+    /// desktop (`servers.json`). O agendador do desktop pula esses; a cópia
+    /// enviada ao servidor vai sem o campo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_on: Option<String>,
 }
 
 /// Aviso quando o workflow falha N vezes seguidas e quando volta a funcionar.

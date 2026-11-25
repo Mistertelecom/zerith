@@ -299,6 +299,8 @@ pub async fn delete_session(
     turns.with(&id, |r| r.cancel.cancel());
     turns.remove_grants(&id);
     turns.cancel_precompact(&id);
+    // Its device sessions outlive turns, not the conversation.
+    zerith_tools::close_session_terminals(&id);
     state.with_store(|st| st.delete_session(&id).map_err(|e| e.to_string()))?;
     let _ = zerith_sessions::checkpoints::delete_all(state.root(), &id);
     Ok(())

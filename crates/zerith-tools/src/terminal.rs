@@ -1364,9 +1364,15 @@ fn without_echo(text: &str, cmd: Option<&str>) -> String {
             || l.match_indices(['>', '#', '$', '%', ']'])
                 .any(|(i, _)| shares(l[i + 1..].trim_start()))
     };
+    // RouterOS reads the `q` that stopped the previous command as a typed
+    // line and answers `no such item (4)` before the next echo (seen on a
+    // CCR1036); it is the stop's leftover, not this command's output.
+    let leftover = |l: &str| l.trim().starts_with("no such item (");
     let lines: Vec<&str> = text.lines().collect();
     let mut skip = 0;
-    while skip < lines.len().min(3) && (lines[skip].trim().is_empty() || is_echo(lines[skip])) {
+    while skip < lines.len().min(4)
+        && (lines[skip].trim().is_empty() || is_echo(lines[skip]) || leftover(lines[skip]))
+    {
         skip += 1;
     }
     lines[skip..].join("\n")
@@ -2122,6 +2128,15 @@ mod tests {
                 m
             ),
             "0 chain=prerouting"
+        );
+        // The previous command's stop left `no such item (4)` on top (real
+        // CCR1036 output).
+        assert_eq!(
+            cut(
+                "no such item (4)\n\n[joao72991@Masterlink] >/ip firewall connection print count-only where dst-address~\"179.108.156.6[joao72991@Masterlink] > /ip firewall connection print count-only where dst-address~\"179.108.156.6\"\n1",
+                c
+            ),
+            "1"
         );
         // Output that only looks like the command stays.
         assert_eq!(

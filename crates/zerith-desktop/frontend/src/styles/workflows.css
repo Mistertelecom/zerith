@@ -1030,7 +1030,9 @@
 .wf-secret-row > .mono {
   flex: 1;
   min-width: 0;
-  overflow-wrap: anywhere;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .wf-secret-row input {
   flex: 1;

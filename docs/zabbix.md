@@ -125,3 +125,31 @@ volumes:
 Os testes automáticos (`cargo test -p zerith-workflows zabbix`) usam um
 servidor JSON-RPC falso com respostas no formato do 7.0; nunca falam com um
 Zabbix de verdade.
+
+## Gatilho por webhook vindo do Zabbix
+
+Dá para o Zabbix chamar o Zerith na hora do problema (media type **Webhook**)
+em vez de esperar o horário — mas hoje só no **desktop**:
+
+- O desktop tem servidor de webhook (`trigger_webhook`), ouvindo só em
+  `127.0.0.1` (porta 47891 ou a mostrada no nó), com token obrigatório
+  (`Authorization: Bearer <secret>` ou `?token=`). Serve se o Zabbix rodar na
+  mesma máquina ou com um túnel/proxy até ela.
+- No **servidor** (`zerith daemon`/`zerith server`) webhooks **ainda não
+  rodam**: a API `/v1` não recebe gatilhos externos. Use o modelo agendado.
+
+Configuração no Zabbix (desktop alcançável):
+
+1. Alertas > Tipos de mídia > Criar: tipo **Webhook**, parâmetros
+   `host = {HOST.NAME}`, `ip = {HOST.IP}`, `problema = {EVENT.NAME}`,
+   `severidade = {EVENT.SEVERITY}`, `status = {EVENT.STATUS}`, e o script:
+   ```javascript
+   var p = JSON.parse(value), req = new HttpRequest();
+   req.addHeader('Content-Type: application/json');
+   req.addHeader('Authorization: Bearer SEU_SECRET_DO_NO');
+   req.post('http://127.0.0.1:47891/webhook/SEU_SLUG', JSON.stringify(p));
+   if (req.getStatus() >= 300) throw 'Zerith respondeu ' + req.getStatus();
+   return 'OK';
+   ```
+2. Associe a mídia a um usuário e crie uma ação de trigger que a use.
+3. No workflow, `trigger_webhook` recebe o JSON em `{{prev}}`.

@@ -426,7 +426,49 @@ fn web_fetch_blocks_loopback_unless_private_is_allowed() {
     )
     .unwrap();
     assert!(out.starts_with("[pedido: ache o título]"), "{out}");
-    assert!(out.contains("Oi\nmundo & mais"), "{out}");
+    assert!(out.contains("# Oi\n\nmundo & mais"), "{out}");
+}
+
+/// Manual técnico grande com tabelas: markdown, e com `prompt` só índice +
+/// trechos, com a página inteira gravada ao lado dos spills da sessão.
+#[test]
+fn web_fetch_turns_a_big_manual_into_excerpts_and_saves_the_whole_page() {
+    let dir = scratch();
+    std::env::set_var("ZERITH_HOME", dir.path().join("home"));
+    let p = policy(dir.path());
+    let r = bound("s-web");
+    let manual = include_str!("fixtures/manual.html");
+    let url = serve_once(manual, "text/html; charset=utf-8");
+    let whole = call(
+        &r,
+        &p,
+        "web_fetch",
+        json!({"url": url, "allow_private": true}),
+    )
+    .unwrap();
+    assert!(whole.contains("| `bgp <as>` | Inicia o BGP no AS local | global | `bgp 65000` |"));
+    assert!(!whole.contains("Portal do cliente"));
+
+    let url = serve_once(manual, "text/html; charset=utf-8");
+    let prompt = "limite de prefixos recebidos do vizinho BGP";
+    let out = call(
+        &r,
+        &p,
+        "web_fetch",
+        json!({"url": url, "allow_private": true, "prompt": prompt}),
+    )
+    .unwrap();
+    println!("{out}");
+    assert!(out.starts_with(&format!("[pedido: {prompt}]")), "{out}");
+    assert!(out.contains("route-limit 1000 80") && !out.contains("traffic classifier"));
+    let saved = out
+        .lines()
+        .find_map(|l| l.strip_prefix("[página completa: "))
+        .and_then(|l| l.split(" (leia").next())
+        .expect("caminho da página");
+    assert!(saved.contains("s-web"), "{saved}");
+    let disk = std::fs::read_to_string(saved).unwrap();
+    assert!(disk.contains("## NTP") && disk.contains("traffic classifier"));
 }
 
 #[test]

@@ -21,6 +21,12 @@ use zerith_security::Action;
 use crate::fntool::{make_with, opt_str, str_arg};
 use crate::{CallCtx, Exec, Permission, Result, Tool, ToolError, ToolSpec};
 
+mod page;
+pub use page::html_to_markdown;
+
+/// Acima disto, com `prompt`, a página volta como índice + trechos.
+const EXTRACT_ABOVE: usize = crate::OUTPUT_CAP_CHARS;
+
 /// Largest body read, in bytes.
 pub const MAX_BODY: usize = 1 << 20;
 const TIMEOUT: Duration = Duration::from_secs(20);
@@ -32,13 +38,13 @@ pub const SEARCH_ENV: &str = "ZERITH_SEARCH_URL";
 pub(crate) fn all() -> Vec<Box<dyn Tool>> {
     let mut v = vec![make_with(
         "web_fetch",
-        "Baixa uma página http(s) e devolve o texto (HTML sem marcação). Endereços locais e privados são bloqueados, salvo allow_private. Limite de 1 MB e 20 s.",
+        "Baixa uma página http(s) e devolve o conteúdo em markdown (títulos, listas, tabelas, links, código), sem menu, cabeçalho, rodapé e scripts. Página grande com `prompt`: devolve o índice de títulos, só os trechos que casam com o pedido e o arquivo com a página inteira. Endereços locais e privados são bloqueados, salvo allow_private. Limite de 1 MB e 20 s.",
         json!({"type": "object", "properties": {
             "url": {"type": "string"},
-            "prompt": {"type": "string", "description": "o que procurar na página; é repetido no topo do resultado, nenhum modelo resume a página"},
+            "prompt": {"type": "string", "description": "o que procurar na página; numa página grande escolhe os trechos devolvidos"},
             "allow_private": {"type": "boolean", "description": "permite localhost e redes privadas (padrão false)"}
         }, "required": ["url"]}),
-        "o texto da página, truncado em 1 MB",
+        "a página em markdown, ou índice + trechos + caminho da página inteira",
         Permission::Network,
         30,
         true,
@@ -207,17 +213,55 @@ fn fetch(args: &Value, _: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
     body.truncate(MAX_BODY);
     let raw = String::from_utf8_lossy(&body).into_owned();
     let mut text = if ctype.contains("html") || raw.trim_start().starts_with('<') {
-        html_to_text(&raw)
+        html_to_markdown(&raw, url)
     } else {
         raw
     };
     if cut {
         text.push_str("\n[página cortada em 1 MB]");
     }
-    Ok(match opt_str(args, "prompt") {
-        Some(p) => format!("[pedido: {p}]\n{text}"),
-        None => text,
-    })
+    let Some(p) = opt_str(args, "prompt") else {
+        return Ok(text);
+    };
+    if text.chars().count() <= EXTRACT_ABOVE {
+        return Ok(format!("[pedido: {p}]\n{text}"));
+    }
+    let full = save_page(&text, exec);
+    Ok(format!(
+        "[pedido: {p}]\n{}",
+        page::extract(&text, p, full.as_deref())
+    ))
+}
+
+/// A página inteira ao lado dos spills da sessão (`<raiz>/spill/<sessão>/`),
+/// onde ler não pede aprovação. `None`: não deu para gravar.
+fn save_page(text: &str, exec: &Exec<'_>) -> Option<std::path::PathBuf> {
+    // O mesmo nome seguro que `zerith_runtime::spill` usa para a pasta.
+    let session: String = exec
+        .host
+        .session()
+        .unwrap_or_else(|| "web".into())
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(80)
+        .collect();
+    let dir = zerith_core::Paths::resolve()
+        .root()
+        .join("spill")
+        .join(session);
+    std::fs::create_dir_all(&dir).ok()?;
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    let path = dir.join(format!("web_fetch-{ms}.md"));
+    std::fs::write(&path, text).ok()?;
+    Some(path)
 }
 
 /// A tag stripper, not a parser: drops `<script>`/`<style>` bodies, tags and

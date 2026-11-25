@@ -1,0 +1,575 @@
+<!DOCTYPE html>
+<html lang="pt-BR"><head><meta charset="utf-8"><title>Manual XR-9000</title>
+<style>body{font-family:sans-serif} table{border:1px solid #ccc}</style>
+<script>window.analytics = {track: function(a){ if (a < 3) { console.log("<nav>menu</nav>"); } }};</script>
+</head><body>
+<header><div class="logo">XR Networks</div><p>Portal do cliente | Entrar</p></header>
+<nav><ul><li><a href="#interface">Interfaces</a></li><li><a href="#vlan">VLAN</a></li><li><a href="#ospf">OSPF</a></li><li><a href="#bgp">BGP</a></li><li><a href="#mpls">MPLS</a></li><li><a href="#qos">QoS</a></li><li><a href="#nat">NAT</a></li><li><a href="#firewall">Firewall</a></li><li><a href="#snmp">SNMP</a></li><li><a href="#ntp">NTP</a></li><li><a href="#syslog">Syslog</a></li><li><a href="#aaa">AAA</a></li><li><a href="#vrrp">VRRP</a></li><li><a href="#lacp">LACP</a></li><li><a href="#pppoe">PPPoE</a></li><li><a href="#dhcp">DHCP</a></li><li><a href="#ipv6">IPv6</a></li><li><a href="#multicast">Multicast</a></li><li><a href="#acl">ACL</a></li><li><a href="#backup">Backup</a></li></ul></nav>
+<main><article>
+<h1>Manual de referência do roteador XR-9000</h1>
+<p>Guia de configuração por linha de comando. Veja também a <a href="/docs/xr9000/release-notes.html">nota de versão</a> e o <a href="https://example.com/suporte">portal de suporte</a>.</p>
+<section id="interface">
+<h2>Interfaces</h2>
+<p>Configura interfaces físicas e lógicas, MTU, velocidade e descrição. Esta seção descreve o recurso Interfaces do equipamento em detalhes para a equipe de operação. Antes de aplicar qualquer mudança de interface, confira a configuração atual, abra uma janela de manutenção e mantenha um acesso de console disponível. Os exemplos usam a sintaxe da versão 8 do sistema; versões anteriores podem exigir parâmetros diferentes. Valores padrão de interface são conservadores e servem para a maioria das redes de provedores regionais, mas ambientes com muitos assinantes devem revisar limites e temporizadores. </p>
+<h3>Comandos de Interfaces</h3>
+<table>
+<thead><tr><th>Comando</th><th>Função</th><th>Modo</th><th>Exemplo</th></tr></thead>
+<tbody>
+<tr><td><code>interface &lt;nome&gt;</code></td><td>Entra no modo da interface</td><td>global</td><td><code>interface GigabitEthernet0/0/1</code></td></tr>
+<tr><td><code>mtu &lt;bytes&gt;</code></td><td>Define o MTU da interface</td><td>interface</td><td><code>mtu 9000</code></td></tr>
+<tr><td><code>speed &lt;10|100|1000&gt;</code></td><td>Força a velocidade</td><td>interface</td><td><code>speed 1000</code></td></tr>
+<tr><td><code>shutdown</code></td><td>Desliga a interface</td><td>interface</td><td><code>shutdown</code></td></tr>
+</tbody></table>
+<h3>Exemplo completo de Interfaces</h3>
+<pre><code>system-view
+ interface GigabitEthernet0/0/1
+ mtu 9000
+ speed 1000
+ shutdown
+return
+</code></pre>
+<h3>Boas práticas de Interfaces</h3>
+<ul>
+<li>Documente cada mudança de interface no sistema de chamados.</li>
+<li>Valide com <code>display interface</code> depois de aplicar.</li>
+<li>Mantenha o rollback de interface pronto antes de começar:<ol><li>salve a configuração</li><li>anote o estado atual</li></ol></li>
+</ul>
+<p>Esta seção descreve o recurso Interfaces do equipamento em detalhes para a equipe de operação. Antes de aplicar qualquer mudança de interface, confira a configuração atual, abra uma janela de manutenção e mantenha um acesso de console disponível. Os exemplos usam a sintaxe da versão 8 do sistema; versões anteriores podem exigir parâmetros diferentes. Valores padrão de interface são conservadores e servem para a maioria das redes de provedores regionais, mas ambientes com muitos assinantes devem revisar limites e temporizadores. </p>
+</section>
+<section id="vlan">
+<h2>VLAN</h2>
+<p>Cria VLANs 802.1Q, portas trunk e access e a VLAN nativa. Esta seção descreve o recurso VLAN do equipamento em detalhes para a equipe de operação. Antes de aplicar qualquer mudança de vlan, confira a configuração atual, abra uma janela de manutenção e mantenha um acesso de console disponível. Os exemplos usam a sintaxe da versão 8 do sistema; versões anteriores podem exigir parâmetros diferentes. Valores padrão de vlan são conservadores e servem para a maioria das redes de provedores regionais, mas ambientes com muitos assinantes devem revisar limites e temporizadores. </p>
+<h3>Comandos de VLAN</h3>
+<table>
+<thead><tr><th>Comando</th><th>Função</th><th>Modo</th><th>Exemplo</th></tr></thead>
+<tbody>
+<tr><td><code>vlan &lt;id&gt;</code></td><td>Cria a VLAN</td><td>global</td><td><code>vlan 100</code></td></tr>
+<tr><td><code>port link-type trunk</code></td><td>Porta tronco</td><td>interface</td><td><code>port link-type trunk</code></td></tr>
+<tr><td><code>port trunk allow-pass vlan &lt;ids&gt;</code></td><td>VLANs permitidas no tronco</td><td>interface</td><td><code>port trunk allow-pass vlan 100 200</code></td></tr>
+<tr><td><code>port default vlan &lt;id&gt;</code></td><td>VLAN de acesso</td><td>interface</td><td><code>port default vlan 100</code></td></tr>
+</tbody></table>
+<h3>Exemplo completo de VLAN</h3>
+<pre><code>system-view
+ vlan 100
+ port link-type trunk
+ port trunk allow-pass vlan 100 200
+ port default vlan 100
+return
+</code></pre>
+<h3>Boas práticas de VLAN</h3>
+<ul>
+<li>Documente cada mudança de vlan no sistema de chamados.</li>
+<li>Valide com <code>display vlan</code> depois de aplicar.</li>
+<li>Mantenha o rollback de vlan pronto antes de começar:<ol><li>salve a configuração</li><li>anote o estado atual</li></ol></li>
+</ul>
+<p>Esta seção descreve o recurso VLAN do equipamento em detalhes para a equipe de operação. Antes de aplicar qualquer mudança de vlan, confira a configuração atual, abra uma janela de manutenção e mantenha um acesso de console disponível. Os exemplos usam a sintaxe da versão 8 do sistema; versões anteriores podem exigir parâmetros diferentes. Valores padrão de vlan são conservadores e servem para a maioria das redes de provedores regionais, mas ambientes com muitos assinantes devem revisar limites e temporizadores. </p>
+</section>
+<section id="ospf">
+<h2>OSPF</h2>
+<p>Roteamento OSPFv2 por área, custo de interface e redistribuição. Esta seção descreve o recurso OSPF do equipamento em detalhes para a equipe de operação. Antes de aplicar qualquer mudança de ospf, confira a configuração atual, abra uma janela de manutenção e mantenha um acesso de console disponível. Os exemplos usam a sintaxe da versão 8 do sistema; versões anteriores podem exigir parâmetros diferentes. Valores padrão de ospf são conservadores e servem para a maioria das redes de provedores regionais, mas ambientes com muitos assinantes devem revisar limites e temporizadores. </p>
+<h3>Comandos de OSPF</h3>
+<table>
+<thead><tr><th>Comando</th><th>Função</th><th>Modo</th><th>Exemplo</th></tr></thead>
+<tbody>
+<tr><td><code>ospf &lt;processo&gt;</code></td><td>Inicia o processo OSPF</td><td>global</td><td><code>ospf 1 router-id 10.0.0.1</code></td></tr>
+<tr><td><code>area &lt;id&gt;</code></td><td>Entra na área</td><td>ospf</td><td><code>area 0</code></td></tr>
+<tr><td><code>network &lt;rede&gt; &lt;wildcard&gt;</code></td><td>Anuncia a rede na área</td><td>área</td><td><code>network 10.0.0.0 0.0.0.255</code></td></tr>
+<tr><td><code>ospf cost &lt;valor&gt;</code></td><td>Custo da interface</td><td>interface</td><td><code>ospf cost 10</code></td></tr>
+</tbody></table>
+<h3>Exemplo completo de OSPF</h3>
+<pre><code>system-view
+ ospf 1 router-id 10.0.0.1
+ area 0
+ network 10.0.0.0 0.0.0.255
+ ospf cost 10
+return
+</code></pre>
+<h3>Boas práticas de OSPF</h3>
+<ul>
+<li>Documente cada mudança de ospf no sistema de chamados.</li>
+<li>Valide com <code>display ospf</code> depois de aplicar.</li>
+<li>Mantenha o rollback de ospf pronto antes de começar:<ol><li>salve a configuração</li><li>anote o estado atual</li></ol></li>
+</ul>
+<p>Esta seção descreve o recurso OSPF do equipamento em detalhes para a equipe de operação. Antes de aplicar qualquer mudança de ospf, confira a configuração atual, abra uma janela de manutenção e mantenha um acesso de console disponível. Os exemplos usam a sintaxe da versão 8 do sistema; versões anteriores podem exigir parâmetros diferentes. Valores padrão de ospf são conservadores e servem para a maioria das redes de provedores regionais, mas ambientes com muitos assinantes devem revisar limites e temporizadores. </p>
+</section>
+<section id="bgp">
+<h2>BGP</h2>
+<p>Sessões eBGP e iBGP, políticas de rota e proteção de vizinhos. Esta seção descreve o recurso BGP do equipamento em detalhes para a equipe de operação. Antes de aplicar qualquer mudança de bgp, confira a configuração atual, abra uma janela de manutenção e mantenha um acesso de console disponível. Os exemplos usam a sintaxe da versão 8 do sistema; versões anteriores podem exigir parâmetros diferentes. Valores padrão de bgp são conservadores e servem para a maioria das redes de provedores regionais, mas ambientes com muitos assinantes devem revisar limites e temporizadores. </p>
+<h3>Comandos de BGP</h3>
+<table>
+<thead><tr><th>Comando</th><th>Função</th><th>Modo</th><th>Exemplo</th></tr></thead>
+<tbody>
+<tr><td><code>bgp &lt;as&gt;</code></td><td>Inicia o BGP no AS local</td><td>global</td><td><code>bgp 65000</code></td></tr>
+<tr><td><code>peer &lt;ip&gt; as-number &lt;as&gt;</code></td><td>Declara o vizinho</td><td>bgp</td><td><code>peer 192.0.2.1 as-number 65001</code></td></tr>
+<tr><td><code>peer &lt;ip&gt; route-limit &lt;n&gt; &lt;pct&gt;</code></td><td>maximum-prefix: limita os prefixos recebidos do vizinho e avisa ao atingir o percentual</td><td>bgp</td><td><code>peer 192.0.2.1 route-limit 1000 80</code></td></tr>
+<tr><td><code>peer &lt;ip&gt; password cipher &lt;senha&gt;</code></td><td>Autenticação MD5 da sessão</td><td>bgp</td><td><code>peer 192.0.2.1 password cipher Segredo</code></td></tr>
+</tbody></table>
+<h3>Exemplo completo de BGP</h3>
+<pre><code>system-view
+ bgp 65000
+ peer 192.0.2.1 as-number 65001
+ peer 192.0.2.1 route-limit 1000 80
+ peer 192.0.2.1 password cipher Segredo
+return
+</code></pre>
+<h3>Boas práticas de BGP</h3>
+<ul>
+<li>Documente cada mudança de bgp no sistema de chamados.</li>
+<li>Valide com <code>display bgp</code> depois de aplicar.</li>
+<li>Mantenha o rollback de bgp pronto antes de começar:<ol><li>salve a configuração</li><li>anote o estado atual</li></ol></li>
+</ul>
+<p>Esta seção descreve o recurso BGP do equipamento em detalhes para a equipe de operação. Antes de aplicar qualquer mudança de bgp, confira a configuração atual, abra uma janela de manutenção e mantenha um acesso de console disponível. Os exemplos usam a sintaxe da versão 8 do sistema; versões anteriores podem exigir parâmetros diferentes. Valores padrão de bgp são conservadores e servem para a maioria das redes de provedores regionais, mas ambientes com muitos assinantes devem revisar limites e temporizadores. </p>
+</section>
+<section id="mpls">
+<h2>MPLS</h2>
+<p>LDP, rótulos e túneis MPLS para transporte de VPNs. Esta seção descreve o recurso MPLS do equipamento em detalhes para a equipe de operação. Antes de aplicar qualquer mudança de mpls, confira a configuração atual, abra uma janela de manutenção e mantenha um acesso de console disponível. Os exemplos usam a sintaxe da versão 8 do sistema; versões anteriores podem exigir parâmetros diferentes. Valores padrão de mpls são conservadores e servem para a maioria das redes de provedores regionais, mas ambientes com muitos assinantes devem revisar limites e temporizadores. </p>
+<h3>Comandos de MPLS</h3>
+<table>
+<thead><tr><th>Comando</th><th>Função</th><th>Modo</th><th>Exemplo</th></tr></thead>
+<tbody>
+<tr><td><code>mpls lsr-id &lt;ip&gt;</code></td><td>Identificador LSR</td><td>global</td><td><code>mpls lsr-id 10.0.0.1</code></td></tr>
+<tr><td><code>mpls ldp</code></td><td>Liga o LDP</td><td>global</td><td><code>mpls ldp</code></td></tr>
+<tr><td><code>mpls</code></td><td>Liga MPLS na interface</td><td>interface</td><td><code>mpls</code></td></tr>
+<tr><td><code>display mpls ldp session</code></td><td>Mostra as sessões LDP</td><td>qualquer</td><td><code>display mpls ldp session</code></td></tr>
+</tbody></table>
+<h3>Exemplo completo de MPLS</h3>
+<pre><code>system-view
+ mpls lsr-id 10.0.0.1
+ mpls ldp
+ mpls
+ display mpls ldp session
+return
+</code></pre>
+<h3>Boas práticas de MPLS</h3>
+<ul>
+<li>Documente cada mudança de mpls no sistema de chamados.</li>
+<li>Valide com <code>display mpls</code> depois de aplicar.</li>
+<li>Mantenha o rollback de mpls pronto antes de começar:<ol><li>salve a configuração</li><li>anote o estado atual</li></ol></li>
+</ul>
+<p>Esta seção descreve o recurso MPLS do equipamento em detalhes para a equipe de operação. Antes de aplicar qualquer mudança de mpls, confira a configuração atual, abra uma janela de manutenção e mantenha um acesso de console disponível. Os exemplos usam a sintaxe da versão 8 do sistema; versões anteriores podem exigir parâmetros diferentes. Valores padrão de mpls são conservadores e servem para a maioria das redes de provedores regionais, mas ambientes com muitos assinantes devem revisar limites e temporizadores. </p>
+</section>
+<section id="qos">
+<h2>QoS</h2>
+<p>Classificação, marcação DSCP, filas e limitação de banda. Esta seção descreve o recurso QoS do equipamento em detalhes para a equipe de operação. Antes de aplicar qualquer mudança de qos, confira a configuração atual, abra uma janela de manutenção e mantenha um acesso de console disponível. Os exemplos usam a sintaxe da versão 8 do sistema; versões anteriores podem exigir parâmetros diferentes. Valores padrão de qos são conservadores e servem para a maioria das redes de provedores regionais, mas ambientes com muitos assinantes devem revisar limites e temporizadores. </p>
+<h3>Comandos de QoS</h3>
+<table>
+<thead><tr><th>Comando</th><th>Função</th><th>Modo</th><th>Exemplo</th></tr></thead>
+<tbody>
+<tr><td><code>traffic classifier &lt;nome&gt;</code></td><td>Cria o classificador</td><td>global</td><td><code>traffic classifier VOZ</code></td></tr>
+<tr><td><code>if-match dscp &lt;valor&gt;</code></td><td>Casa por DSCP</td><td>classificador</td><td><code>if-match dscp ef</code></td></tr>
+<tr><td><code>traffic behavior &lt;nome&gt;</code></td><td>Cria o comportamento</td><td>global</td><td><code>traffic behavior PRIORIDADE</code></td></tr>
+<tr><td><code>car cir &lt;kbps&gt;</code></td><td>Limita a taxa</td><td>comportamento</td><td><code>car cir 10000</code></td></tr>
+</tbody></table>
+<h3>Exemplo completo de QoS</h3>
+<pre><code>system-view
+ traffic classifier VOZ
+ if-match dscp ef
+ traffic behavior PRIORIDADE
+ car cir 10000
+return
+</code></pre>
+<h3>Boas práticas de QoS</h3>
+<ul>
+<li>Documente cada mudança de qos no sistema de chamados.</li>
+<li>Valide com <code>display qos</code> depois de aplicar.</li>
+<li>Mantenha o rollback de qos pronto antes de começar:<ol><li>salve a configuração</li><li>anote o estado atual</li></ol></li>
+</ul>
+<p>Esta seção descreve o recurso QoS do equipamento em detalhes para a equipe de operação. Antes de aplicar qualquer mudança de qos, confira a configuração atual, abra uma janela de manutenção e mantenha um acesso de console disponível. Os exemplos usam a sintaxe da versão 8 do sistema; versões anteriores podem exigir parâmetros diferentes. Valores padrão de qos são conservadores e servem para a maioria das redes de provedores regionais, mas ambientes com muitos assinantes devem revisar limites e temporizadores. </p>
+</section>
+<section id="nat">
+<h2>NAT</h2>
+<p>NAT de origem, CGNAT com blocos de portas e NAT estático. Esta seção descreve o recurso NAT do equipamento em detalhes para a equipe de operação. Antes de aplicar qualquer mudança de nat, confira a configuração atual, abra uma janela de manutenção e mantenha um acesso de console disponível. Os exemplos usam a sintaxe da versão 8 do sistema; versões anteriores podem exigir parâmetros diferentes. Valores padrão de nat são conservadores e servem para a maioria das redes de provedores regionais, mas ambientes com muitos assinantes devem revisar limites e temporizadores. </p>
+<h3>Comandos de NAT</h3>
+<table>
+<thead><tr><th>Comando</th><th>Função</th><th>Modo</th><th>Exemplo</th></tr></thead>
+<tbody>
+<tr><td><code>nat address-group &lt;n&gt; &lt;ini&gt; &lt;fim&gt;</code></td><td>Pool de endereços públicos</td><td>global</td><td><code>nat address-group 1 203.0.113.10 203.0.113.20</code></td></tr>
+<tr><td><code>nat outbound &lt;acl&gt; address-group &lt;n&gt;</code></td><td>NAT de saída</td><td>interface</td><td><code>nat outbound 2000 address-group 1</code></td></tr>
+<tr><td><code>nat server global &lt;ip&gt; inside &lt;ip&gt;</code></td><td>NAT estático</td><td>interface</td><td><code>nat server global 203.0.113.5 inside 10.0.0.5</code></td></tr>
+<tr><td><code>display nat session all</code></td><td>Sessões de NAT</td><td>qualquer</td><td><code>display nat session all</code></td></tr>
+</tbody></table>
+<h3>Exemplo completo de NAT</h3>
+<pre><code>system-view
+ nat address-group 1 203.0.113.10 203.0.113.20
+ nat outbound 2000 address-group 1
+ nat server global 203.0.113.5 inside 10.0.0.5
+ display nat session all
+return
+</code></pre>
+<h3>Boas práticas de NAT</h3>
+<ul>
+<li>Documente cada mudança de nat no sistema de chamados.</li>
+<li>Valide com <code>display nat</code> depois de aplicar.</li>
+<li>Mantenha o rollback de nat pronto antes de começar:<ol><li>salve a configuração</li><li>anote o estado atual</li></ol></li>
+</ul>
+<p>Esta seção descreve o recurso NAT do equipamento em detalhes para a equipe de operação. Antes de aplicar qualquer mudança de nat, confira a configuração atual, abra uma janela de manutenção e mantenha um acesso de console disponível. Os exemplos usam a sintaxe da versão 8 do sistema; versões anteriores podem exigir parâmetros diferentes. Valores padrão de nat são conservadores e servem para a maioria das redes de provedores regionais, mas ambientes com muitos assinantes devem revisar limites e temporizadores. </p>
+</section>
+<section id="firewall">
+<h2>Firewall</h2>
+<p>Zonas de segurança, políticas entre zonas e proteção contra ataques. Esta seção descreve o recurso Firewall do equipamento em detalhes para a equipe de operação. Antes de aplicar qualquer mudança de firewall, confira a configuração atual, abra uma janela de manutenção e mantenha um acesso de console disponível. Os exemplos usam a sintaxe da versão 8 do sistema; versões anteriores podem exigir parâmetros diferentes. Valores padrão de firewall são conservadores e servem para a maioria das redes de provedores regionais, mas ambientes com muitos assinantes devem revisar limites e temporizadores. </p>
+<h3>Comandos de Firewall</h3>
+<table>
+<thead><tr><th>Comando</th><th>Função</th><th>Modo</th><th>Exemplo</th></tr></thead>
+<tbody>
+<tr><td><code>firewall zone &lt;nome&gt;</code></td><td>Cria a zona</td><td>global</td><td><code>firewall zone trust</code></td></tr>
+<tr><td><code>add interface &lt;if&gt;</code></td><td>Põe a interface na zona</td><td>zona</td><td><code>add interface GigabitEthernet0/0/2</code></td></tr>
+<tr><td><code>security-policy</code></td><td>Entra nas políticas</td><td>global</td><td><code>security-policy</code></td></tr>
+<tr><td><code>rule name &lt;nome&gt;</code></td><td>Cria a regra</td><td>políticas</td><td><code>rule name LIBERA-WEB</code></td></tr>
+</tbody></table>
+<h3>Exemplo completo de Firewall</h3>
+<pre><code>system-view
+ firewall zone trust
+ add interface GigabitEthernet0/0/2
+ security-policy
+ rule name LIBERA-WEB
+return
+</code></pre>
+<h3>Boas práticas de Firewall</h3>
+<ul>
+<li>Documente cada mudança de firewall no sistema de chamados.</li>
+<li>Valide com <code>display firewall</code> depois de aplicar.</li>
+<li>Mantenha o rollback de firewall pronto antes de começar:<ol><li>salve a configuração</li><li>anote o estado atual</li></ol></li>
+</ul>
+<p>Esta seção descreve o recurso Firewall do equipamento em detalhes para a equipe de operação. Antes de aplicar qualquer mudança de firewall, confira a configuração atual, abra uma janela de manutenção e mantenha um acesso de console disponível. Os exemplos usam a sintaxe da versão 8 do sistema; versões anteriores podem exigir parâmetros diferentes. Valores padrão de firewall são conservadores e servem para a maioria das redes de provedores regionais, mas ambientes com muitos assinantes devem revisar limites e temporizadores. </p>
+</section>
+<section id="snmp">
+<h2>SNMP</h2>
+<p>Agente SNMP v2c e v3, comunidades, traps e visões MIB. Esta seção descreve o recurso SNMP do equipamento em detalhes para a equipe de operação. Antes de aplicar qualquer mudança de snmp, confira a configuração atual, abra uma janela de manutenção e mantenha um acesso de console disponível. Os exemplos usam a sintaxe da versão 8 do sistema; versões anteriores podem exigir parâmetros diferentes. Valores padrão de snmp são conservadores e servem para a maioria das redes de provedores regionais, mas ambientes com muitos assinantes devem revisar limites e temporizadores. </p>
+<h3>Comandos de SNMP</h3>
+<table>
+<thead><tr><th>Comando</th><th>Função</th><th>Modo</th><th>Exemplo</th></tr></thead>
+<tbody>
+<tr><td><code>snmp-agent</code></td><td>Liga o agente</td><td>global</td><td><code>snmp-agent</code></td></tr>
+<tr><td><code>snmp-agent sys-info version v3</code></td><td>Só SNMPv3</td><td>global</td><td><code>snmp-agent sys-info version v3</code></td></tr>
+<tr><td><code>snmp-agent usm-user v3 &lt;usuário&gt;</code></td><td>Usuário v3</td><td>global</td><td><code>snmp-agent usm-user v3 monitor</code></td></tr>
+<tr><td><code>snmp-agent target-host trap address udp-domain &lt;ip&gt;</code></td><td>Destino de traps</td><td>global</td><td><code>snmp-agent target-host trap address udp-domain 10.9.9.9</code></td></tr>
+</tbody></table>
+<h3>Exemplo completo de SNMP</h3>
+<pre><code>system-view
+ snmp-agent
+ snmp-agent sys-info version v3
+ snmp-agent usm-user v3 monitor
+ snmp-agent target-host trap address udp-domain 10.9.9.9
+return
+</code></pre>
+<h3>Boas práticas de SNMP</h3>
+<ul>
+<li>Documente cada mudança de snmp no sistema de chamados.</li>
+<li>Valide com <code>display snmp</code> depois de aplicar.</li>
+<li>Mantenha o rollback de snmp pronto antes de começar:<ol><li>salve a configuração</li><li>anote o estado atual</li></ol></li>
+</ul>
+<p>Esta seção descreve o recurso SNMP do equipamento em detalhes para a equipe de operação. Antes de aplicar qualquer mudança de snmp, confira a configuração atual, abra uma janela de manutenção e mantenha um acesso de console disponível. Os exemplos usam a sintaxe da versão 8 do sistema; versões anteriores podem exigir parâmetros diferentes. Valores padrão de snmp são conservadores e servem para a maioria das redes de provedores regionais, mas ambientes com muitos assinantes devem revisar limites e temporizadores. </p>
+</section>
+<section id="ntp">
+<h2>NTP</h2>
+<p>Sincronização de relógio com servidores NTP e autenticação. Esta seção descreve o recurso NTP do equipamento em detalhes para a equipe de operação. Antes de aplicar qualquer mudança de ntp, confira a configuração atual, abra uma janela de manutenção e mantenha um acesso de console disponível. Os exemplos usam a sintaxe da versão 8 do sistema; versões anteriores podem exigir parâmetros diferentes. Valores padrão de ntp são conservadores e servem para a maioria das redes de provedores regionais, mas ambientes com muitos assinantes devem revisar limites e temporizadores. </p>
+<h3>Comandos de NTP</h3>
+<table>
+<thead><tr><th>Comando</th><th>Função</th><th>Modo</th><th>Exemplo</th></tr></thead>
+<tbody>
+<tr><td><code>ntp-service unicast-server &lt;ip&gt;</code></td><td>Servidor NTP</td><td>global</td><td><code>ntp-service unicast-server 200.160.7.186</code></td></tr>
+<tr><td><code>ntp-service authentication enable</code></td><td>Liga autenticação</td><td>global</td><td><code>ntp-service authentication enable</code></td></tr>
+<tr><td><code>clock timezone &lt;nome&gt; minus &lt;hh:mm&gt;</code></td><td>Fuso horário</td><td>usuário</td><td><code>clock timezone BRT minus 03:00</code></td></tr>
+<tr><td><code>display ntp-service status</code></td><td>Estado do NTP</td><td>qualquer</td><td><code>display ntp-service status</code></td></tr>
+</tbody></table>
+<h3>Exemplo completo de NTP</h3>
+<pre><code>system-view
+ ntp-service unicast-server 200.160.7.186
+ ntp-service authentication enable
+ clock timezone BRT minus 03:00
+ display ntp-service status
+return
+</code></pre>
+<h3>Boas práticas de NTP</h3>
+<ul>
+<li>Documente cada mudança de ntp no sistema de chamados.</li>
+<li>Valide com <code>display ntp</code> depois de aplicar.</li>
+<li>Mantenha o rollback de ntp pronto antes de começar:<ol><li>salve a configuração</li><li>anote o estado atual</li></ol></li>
+</ul>
+<p>Esta seção descreve o recurso NTP do equipamento em detalhes para a equipe de operação. Antes de aplicar qualquer mudança de ntp, confira a configuração atual, abra uma janela de manutenção e mantenha um acesso de console disponível. Os exemplos usam a sintaxe da versão 8 do sistema; versões anteriores podem exigir parâmetros diferentes. Valores padrão de ntp são conservadores e servem para a maioria das redes de provedores regionais, mas ambientes com muitos assinantes devem revisar limites e temporizadores. </p>
+</section>
+<section id="syslog">
+<h2>Syslog</h2>
+<p>Envio de logs para servidores remotos, níveis e filtros. Esta seção descreve o recurso Syslog do equipamento em detalhes para a equipe de operação. Antes de aplicar qualquer mudança de syslog, confira a configuração atual, abra uma janela de manutenção e mantenha um acesso de console disponível. Os exemplos usam a sintaxe da versão 8 do sistema; versões anteriores podem exigir parâmetros diferentes. Valores padrão de syslog são conservadores e servem para a maioria das redes de provedores regionais, mas ambientes com muitos assinantes devem revisar limites e temporizadores. </p>
+<h3>Comandos de Syslog</h3>
+<table>
+<thead><tr><th>Comando</th><th>Função</th><th>Modo</th><th>Exemplo</th></tr></thead>
+<tbody>
+<tr><td><code>info-center enable</code></td><td>Liga o centro de informações</td><td>global</td><td><code>info-center enable</code></td></tr>
+<tr><td><code>info-center loghost &lt;ip&gt;</code></td><td>Servidor de log</td><td>global</td><td><code>info-center loghost 10.9.9.10</code></td></tr>
+<tr><td><code>info-center source default channel loghost log level &lt;nível&gt;</code></td><td>Nível mínimo</td><td>global</td><td><code>info-center source default channel loghost log level warning</code></td></tr>
+<tr><td><code>display logbuffer</code></td><td>Logs locais</td><td>qualquer</td><td><code>display logbuffer</code></td></tr>
+</tbody></table>
+<h3>Exemplo completo de Syslog</h3>
+<pre><code>system-view
+ info-center enable
+ info-center loghost 10.9.9.10
+ info-center source default channel loghost log level warning
+ display logbuffer
+return
+</code></pre>
+<h3>Boas práticas de Syslog</h3>
+<ul>
+<li>Documente cada mudança de syslog no sistema de chamados.</li>
+<li>Valide com <code>display syslog</code> depois de aplicar.</li>
+<li>Mantenha o rollback de syslog pronto antes de começar:<ol><li>salve a configuração</li><li>anote o estado atual</li></ol></li>
+</ul>
+<p>Esta seção descreve o recurso Syslog do equipamento em detalhes para a equipe de operação. Antes de aplicar qualquer mudança de syslog, confira a configuração atual, abra uma janela de manutenção e mantenha um acesso de console disponível. Os exemplos usam a sintaxe da versão 8 do sistema; versões anteriores podem exigir parâmetros diferentes. Valores padrão de syslog são conservadores e servem para a maioria das redes de provedores regionais, mas ambientes com muitos assinantes devem revisar limites e temporizadores. </p>
+</section>
+<section id="aaa">
+<h2>AAA</h2>
+<p>Autenticação local, RADIUS e TACACS+ para acesso administrativo. Esta seção descreve o recurso AAA do equipamento em detalhes para a equipe de operação. Antes de aplicar qualquer mudança de aaa, confira a configuração atual, abra uma janela de manutenção e mantenha um acesso de console disponível. Os exemplos usam a sintaxe da versão 8 do sistema; versões anteriores podem exigir parâmetros diferentes. Valores padrão de aaa são conservadores e servem para a maioria das redes de provedores regionais, mas ambientes com muitos assinantes devem revisar limites e temporizadores. </p>
+<h3>Comandos de AAA</h3>
+<table>
+<thead><tr><th>Comando</th><th>Função</th><th>Modo</th><th>Exemplo</th></tr></thead>
+<tbody>
+<tr><td><code>aaa</code></td><td>Entra no modo AAA</td><td>global</td><td><code>aaa</code></td></tr>
+<tr><td><code>local-user &lt;nome&gt; password irreversible-cipher &lt;senha&gt;</code></td><td>Usuário local</td><td>aaa</td><td><code>local-user admin password irreversible-cipher Segredo</code></td></tr>
+<tr><td><code>radius-server template &lt;nome&gt;</code></td><td>Modelo RADIUS</td><td>global</td><td><code>radius-server template NOC</code></td></tr>
+<tr><td><code>hwtacacs-server template &lt;nome&gt;</code></td><td>Modelo TACACS+</td><td>global</td><td><code>hwtacacs-server template NOC</code></td></tr>
+</tbody></table>
+<h3>Exemplo completo de AAA</h3>
+<pre><code>system-view
+ aaa
+ local-user admin password irreversible-cipher Segredo
+ radius-server template NOC
+ hwtacacs-server template NOC
+return
+</code></pre>
+<h3>Boas práticas de AAA</h3>
+<ul>
+<li>Documente cada mudança de aaa no sistema de chamados.</li>
+<li>Valide com <code>display aaa</code> depois de aplicar.</li>
+<li>Mantenha o rollback de aaa pronto antes de começar:<ol><li>salve a configuração</li><li>anote o estado atual</li></ol></li>
+</ul>
+<p>Esta seção descreve o recurso AAA do equipamento em detalhes para a equipe de operação. Antes de aplicar qualquer mudança de aaa, confira a configuração atual, abra uma janela de manutenção e mantenha um acesso de console disponível. Os exemplos usam a sintaxe da versão 8 do sistema; versões anteriores podem exigir parâmetros diferentes. Valores padrão de aaa são conservadores e servem para a maioria das redes de provedores regionais, mas ambientes com muitos assinantes devem revisar limites e temporizadores. </p>
+</section>
+<section id="vrrp">
+<h2>VRRP</h2>
+<p>Redundância de gateway com VRRP, prioridade e preempção. Esta seção descreve o recurso VRRP do equipamento em detalhes para a equipe de operação. Antes de aplicar qualquer mudança de vrrp, confira a configuração atual, abra uma janela de manutenção e mantenha um acesso de console disponível. Os exemplos usam a sintaxe da versão 8 do sistema; versões anteriores podem exigir parâmetros diferentes. Valores padrão de vrrp são conservadores e servem para a maioria das redes de provedores regionais, mas ambientes com muitos assinantes devem revisar limites e temporizadores. </p>
+<h3>Comandos de VRRP</h3>
+<table>
+<thead><tr><th>Comando</th><th>Função</th><th>Modo</th><th>Exemplo</th></tr></thead>
+<tbody>
+<tr><td><code>vrrp vrid &lt;n&gt; virtual-ip &lt;ip&gt;</code></td><td>IP virtual</td><td>interface</td><td><code>vrrp vrid 1 virtual-ip 10.0.0.254</code></td></tr>
+<tr><td><code>vrrp vrid &lt;n&gt; priority &lt;p&gt;</code></td><td>Prioridade</td><td>interface</td><td><code>vrrp vrid 1 priority 120</code></td></tr>
+<tr><td><code>vrrp vrid &lt;n&gt; preempt-mode timer delay &lt;s&gt;</code></td><td>Atraso de preempção</td><td>interface</td><td><code>vrrp vrid 1 preempt-mode timer delay 20</code></td></tr>
+<tr><td><code>display vrrp brief</code></td><td>Resumo VRRP</td><td>qualquer</td><td><code>display vrrp brief</code></td></tr>
+</tbody></table>
+<h3>Exemplo completo de VRRP</h3>
+<pre><code>system-view
+ vrrp vrid 1 virtual-ip 10.0.0.254
+ vrrp vrid 1 priority 120
+ vrrp vrid 1 preempt-mode timer delay 20
+ display vrrp brief
+return
+</code></pre>
+<h3>Boas práticas de VRRP</h3>
+<ul>
+<li>Documente cada mudança de vrrp no sistema de chamados.</li>
+<li>Valide com <code>display vrrp</code> depois de aplicar.</li>
+<li>Mantenha o rollback de vrrp pronto antes de começar:<ol><li>salve a configuração</li><li>anote o estado atual</li></ol></li>
+</ul>
+<p>Esta seção descreve o recurso VRRP do equipamento em detalhes para a equipe de operação. Antes de aplicar qualquer mudança de vrrp, confira a configuração atual, abra uma janela de manutenção e mantenha um acesso de console disponível. Os exemplos usam a sintaxe da versão 8 do sistema; versões anteriores podem exigir parâmetros diferentes. Valores padrão de vrrp são conservadores e servem para a maioria das redes de provedores regionais, mas ambientes com muitos assinantes devem revisar limites e temporizadores. </p>
+</section>
+<section id="lacp">
+<h2>LACP</h2>
+<p>Agregação de enlaces Eth-Trunk com LACP e balanceamento. Esta seção descreve o recurso LACP do equipamento em detalhes para a equipe de operação. Antes de aplicar qualquer mudança de lacp, confira a configuração atual, abra uma janela de manutenção e mantenha um acesso de console disponível. Os exemplos usam a sintaxe da versão 8 do sistema; versões anteriores podem exigir parâmetros diferentes. Valores padrão de lacp são conservadores e servem para a maioria das redes de provedores regionais, mas ambientes com muitos assinantes devem revisar limites e temporizadores. </p>
+<h3>Comandos de LACP</h3>
+<table>
+<thead><tr><th>Comando</th><th>Função</th><th>Modo</th><th>Exemplo</th></tr></thead>
+<tbody>
+<tr><td><code>interface Eth-Trunk &lt;n&gt;</code></td><td>Cria o agregado</td><td>global</td><td><code>interface Eth-Trunk 1</code></td></tr>
+<tr><td><code>mode lacp</code></td><td>Modo LACP</td><td>eth-trunk</td><td><code>mode lacp</code></td></tr>
+<tr><td><code>trunkport &lt;ifs&gt;</code></td><td>Membros</td><td>eth-trunk</td><td><code>trunkport GigabitEthernet 0/0/1 to 0/0/2</code></td></tr>
+<tr><td><code>load-balance src-dst-ip</code></td><td>Balanceamento</td><td>eth-trunk</td><td><code>load-balance src-dst-ip</code></td></tr>
+</tbody></table>
+<h3>Exemplo completo de LACP</h3>
+<pre><code>system-view
+ interface Eth-Trunk 1
+ mode lacp
+ trunkport GigabitEthernet 0/0/1 to 0/0/2
+ load-balance src-dst-ip
+return
+</code></pre>
+<h3>Boas práticas de LACP</h3>
+<ul>
+<li>Documente cada mudança de lacp no sistema de chamados.</li>
+<li>Valide com <code>display lacp</code> depois de aplicar.</li>
+<li>Mantenha o rollback de lacp pronto antes de começar:<ol><li>salve a configuração</li><li>anote o estado atual</li></ol></li>
+</ul>
+<p>Esta seção descreve o recurso LACP do equipamento em detalhes para a equipe de operação. Antes de aplicar qualquer mudança de lacp, confira a configuração atual, abra uma janela de manutenção e mantenha um acesso de console disponível. Os exemplos usam a sintaxe da versão 8 do sistema; versões anteriores podem exigir parâmetros diferentes. Valores padrão de lacp são conservadores e servem para a maioria das redes de provedores regionais, mas ambientes com muitos assinantes devem revisar limites e temporizadores. </p>
+</section>
+<section id="pppoe">
+<h2>PPPoE</h2>
+<p>Servidor PPPoE para assinantes, pools e autenticação RADIUS. Esta seção descreve o recurso PPPoE do equipamento em detalhes para a equipe de operação. Antes de aplicar qualquer mudança de pppoe, confira a configuração atual, abra uma janela de manutenção e mantenha um acesso de console disponível. Os exemplos usam a sintaxe da versão 8 do sistema; versões anteriores podem exigir parâmetros diferentes. Valores padrão de pppoe são conservadores e servem para a maioria das redes de provedores regionais, mas ambientes com muitos assinantes devem revisar limites e temporizadores. </p>
+<h3>Comandos de PPPoE</h3>
+<table>
+<thead><tr><th>Comando</th><th>Função</th><th>Modo</th><th>Exemplo</th></tr></thead>
+<tbody>
+<tr><td><code>interface Virtual-Template &lt;n&gt;</code></td><td>Modelo de sessão</td><td>global</td><td><code>interface Virtual-Template 1</code></td></tr>
+<tr><td><code>ppp authentication-mode chap</code></td><td>Autenticação CHAP</td><td>virtual-template</td><td><code>ppp authentication-mode chap</code></td></tr>
+<tr><td><code>pppoe-server bind virtual-template &lt;n&gt;</code></td><td>Liga o servidor na interface</td><td>interface</td><td><code>pppoe-server bind virtual-template 1</code></td></tr>
+<tr><td><code>display access-user</code></td><td>Assinantes conectados</td><td>qualquer</td><td><code>display access-user</code></td></tr>
+</tbody></table>
+<h3>Exemplo completo de PPPoE</h3>
+<pre><code>system-view
+ interface Virtual-Template 1
+ ppp authentication-mode chap
+ pppoe-server bind virtual-template 1
+ display access-user
+return
+</code></pre>
+<h3>Boas práticas de PPPoE</h3>
+<ul>
+<li>Documente cada mudança de pppoe no sistema de chamados.</li>
+<li>Valide com <code>display pppoe</code> depois de aplicar.</li>
+<li>Mantenha o rollback de pppoe pronto antes de começar:<ol><li>salve a configuração</li><li>anote o estado atual</li></ol></li>
+</ul>
+<p>Esta seção descreve o recurso PPPoE do equipamento em detalhes para a equipe de operação. Antes de aplicar qualquer mudança de pppoe, confira a configuração atual, abra uma janela de manutenção e mantenha um acesso de console disponível. Os exemplos usam a sintaxe da versão 8 do sistema; versões anteriores podem exigir parâmetros diferentes. Valores padrão de pppoe são conservadores e servem para a maioria das redes de provedores regionais, mas ambientes com muitos assinantes devem revisar limites e temporizadores. </p>
+</section>
+<section id="dhcp">
+<h2>DHCP</h2>
+<p>Servidor e relay DHCP, pools, opções e reservas. Esta seção descreve o recurso DHCP do equipamento em detalhes para a equipe de operação. Antes de aplicar qualquer mudança de dhcp, confira a configuração atual, abra uma janela de manutenção e mantenha um acesso de console disponível. Os exemplos usam a sintaxe da versão 8 do sistema; versões anteriores podem exigir parâmetros diferentes. Valores padrão de dhcp são conservadores e servem para a maioria das redes de provedores regionais, mas ambientes com muitos assinantes devem revisar limites e temporizadores. </p>
+<h3>Comandos de DHCP</h3>
+<table>
+<thead><tr><th>Comando</th><th>Função</th><th>Modo</th><th>Exemplo</th></tr></thead>
+<tbody>
+<tr><td><code>dhcp enable</code></td><td>Liga o DHCP</td><td>global</td><td><code>dhcp enable</code></td></tr>
+<tr><td><code>ip pool &lt;nome&gt;</code></td><td>Cria o pool</td><td>global</td><td><code>ip pool LAN</code></td></tr>
+<tr><td><code>gateway-list &lt;ip&gt;</code></td><td>Gateway do pool</td><td>pool</td><td><code>gateway-list 10.0.0.1</code></td></tr>
+<tr><td><code>dhcp select relay</code></td><td>Relay na interface</td><td>interface</td><td><code>dhcp select relay</code></td></tr>
+</tbody></table>
+<h3>Exemplo completo de DHCP</h3>
+<pre><code>system-view
+ dhcp enable
+ ip pool LAN
+ gateway-list 10.0.0.1
+ dhcp select relay
+return
+</code></pre>
+<h3>Boas práticas de DHCP</h3>
+<ul>
+<li>Documente cada mudança de dhcp no sistema de chamados.</li>
+<li>Valide com <code>display dhcp</code> depois de aplicar.</li>
+<li>Mantenha o rollback de dhcp pronto antes de começar:<ol><li>salve a configuração</li><li>anote o estado atual</li></ol></li>
+</ul>
+<p>Esta seção descreve o recurso DHCP do equipamento em detalhes para a equipe de operação. Antes de aplicar qualquer mudança de dhcp, confira a configuração atual, abra uma janela de manutenção e mantenha um acesso de console disponível. Os exemplos usam a sintaxe da versão 8 do sistema; versões anteriores podem exigir parâmetros diferentes. Valores padrão de dhcp são conservadores e servem para a maioria das redes de provedores regionais, mas ambientes com muitos assinantes devem revisar limites e temporizadores. </p>
+</section>
+<section id="ipv6">
+<h2>IPv6</h2>
+<p>Endereçamento IPv6, SLAAC, DHCPv6-PD e roteamento. Esta seção descreve o recurso IPv6 do equipamento em detalhes para a equipe de operação. Antes de aplicar qualquer mudança de ipv6, confira a configuração atual, abra uma janela de manutenção e mantenha um acesso de console disponível. Os exemplos usam a sintaxe da versão 8 do sistema; versões anteriores podem exigir parâmetros diferentes. Valores padrão de ipv6 são conservadores e servem para a maioria das redes de provedores regionais, mas ambientes com muitos assinantes devem revisar limites e temporizadores. </p>
+<h3>Comandos de IPv6</h3>
+<table>
+<thead><tr><th>Comando</th><th>Função</th><th>Modo</th><th>Exemplo</th></tr></thead>
+<tbody>
+<tr><td><code>ipv6</code></td><td>Liga IPv6 no equipamento</td><td>global</td><td><code>ipv6</code></td></tr>
+<tr><td><code>ipv6 address &lt;prefixo&gt;</code></td><td>Endereço da interface</td><td>interface</td><td><code>ipv6 address 2001:db8::1/64</code></td></tr>
+<tr><td><code>ipv6 nd ra halt</code></td><td>Para os anúncios RA</td><td>interface</td><td><code>undo ipv6 nd ra halt</code></td></tr>
+<tr><td><code>display ipv6 routing-table</code></td><td>Tabela IPv6</td><td>qualquer</td><td><code>display ipv6 routing-table</code></td></tr>
+</tbody></table>
+<h3>Exemplo completo de IPv6</h3>
+<pre><code>system-view
+ ipv6
+ ipv6 address 2001:db8::1/64
+ undo ipv6 nd ra halt
+ display ipv6 routing-table
+return
+</code></pre>
+<h3>Boas práticas de IPv6</h3>
+<ul>
+<li>Documente cada mudança de ipv6 no sistema de chamados.</li>
+<li>Valide com <code>display ipv6</code> depois de aplicar.</li>
+<li>Mantenha o rollback de ipv6 pronto antes de começar:<ol><li>salve a configuração</li><li>anote o estado atual</li></ol></li>
+</ul>
+<p>Esta seção descreve o recurso IPv6 do equipamento em detalhes para a equipe de operação. Antes de aplicar qualquer mudança de ipv6, confira a configuração atual, abra uma janela de manutenção e mantenha um acesso de console disponível. Os exemplos usam a sintaxe da versão 8 do sistema; versões anteriores podem exigir parâmetros diferentes. Valores padrão de ipv6 são conservadores e servem para a maioria das redes de provedores regionais, mas ambientes com muitos assinantes devem revisar limites e temporizadores. </p>
+</section>
+<section id="multicast">
+<h2>Multicast</h2>
+<p>PIM-SM, IGMP e rendezvous point para IPTV. Esta seção descreve o recurso Multicast do equipamento em detalhes para a equipe de operação. Antes de aplicar qualquer mudança de multicast, confira a configuração atual, abra uma janela de manutenção e mantenha um acesso de console disponível. Os exemplos usam a sintaxe da versão 8 do sistema; versões anteriores podem exigir parâmetros diferentes. Valores padrão de multicast são conservadores e servem para a maioria das redes de provedores regionais, mas ambientes com muitos assinantes devem revisar limites e temporizadores. </p>
+<h3>Comandos de Multicast</h3>
+<table>
+<thead><tr><th>Comando</th><th>Função</th><th>Modo</th><th>Exemplo</th></tr></thead>
+<tbody>
+<tr><td><code>multicast routing-enable</code></td><td>Liga multicast</td><td>global</td><td><code>multicast routing-enable</code></td></tr>
+<tr><td><code>pim sm</code></td><td>PIM esparso na interface</td><td>interface</td><td><code>pim sm</code></td></tr>
+<tr><td><code>igmp enable</code></td><td>IGMP na interface</td><td>interface</td><td><code>igmp enable</code></td></tr>
+<tr><td><code>static-rp &lt;ip&gt;</code></td><td>RP estático</td><td>pim</td><td><code>static-rp 10.0.0.9</code></td></tr>
+</tbody></table>
+<h3>Exemplo completo de Multicast</h3>
+<pre><code>system-view
+ multicast routing-enable
+ pim sm
+ igmp enable
+ static-rp 10.0.0.9
+return
+</code></pre>
+<h3>Boas práticas de Multicast</h3>
+<ul>
+<li>Documente cada mudança de multicast no sistema de chamados.</li>
+<li>Valide com <code>display multicast</code> depois de aplicar.</li>
+<li>Mantenha o rollback de multicast pronto antes de começar:<ol><li>salve a configuração</li><li>anote o estado atual</li></ol></li>
+</ul>
+<p>Esta seção descreve o recurso Multicast do equipamento em detalhes para a equipe de operação. Antes de aplicar qualquer mudança de multicast, confira a configuração atual, abra uma janela de manutenção e mantenha um acesso de console disponível. Os exemplos usam a sintaxe da versão 8 do sistema; versões anteriores podem exigir parâmetros diferentes. Valores padrão de multicast são conservadores e servem para a maioria das redes de provedores regionais, mas ambientes com muitos assinantes devem revisar limites e temporizadores. </p>
+</section>
+<section id="acl">
+<h2>ACL</h2>
+<p>Listas de acesso básicas e avançadas para filtrar tráfego. Esta seção descreve o recurso ACL do equipamento em detalhes para a equipe de operação. Antes de aplicar qualquer mudança de acl, confira a configuração atual, abra uma janela de manutenção e mantenha um acesso de console disponível. Os exemplos usam a sintaxe da versão 8 do sistema; versões anteriores podem exigir parâmetros diferentes. Valores padrão de acl são conservadores e servem para a maioria das redes de provedores regionais, mas ambientes com muitos assinantes devem revisar limites e temporizadores. </p>
+<h3>Comandos de ACL</h3>
+<table>
+<thead><tr><th>Comando</th><th>Função</th><th>Modo</th><th>Exemplo</th></tr></thead>
+<tbody>
+<tr><td><code>acl number &lt;n&gt;</code></td><td>Cria a ACL</td><td>global</td><td><code>acl number 3000</code></td></tr>
+<tr><td><code>rule permit tcp destination-port eq &lt;p&gt;</code></td><td>Permite porta TCP</td><td>acl</td><td><code>rule permit tcp destination-port eq 443</code></td></tr>
+<tr><td><code>rule deny ip</code></td><td>Nega o resto</td><td>acl</td><td><code>rule deny ip</code></td></tr>
+<tr><td><code>traffic-filter inbound acl &lt;n&gt;</code></td><td>Aplica na interface</td><td>interface</td><td><code>traffic-filter inbound acl 3000</code></td></tr>
+</tbody></table>
+<h3>Exemplo completo de ACL</h3>
+<pre><code>system-view
+ acl number 3000
+ rule permit tcp destination-port eq 443
+ rule deny ip
+ traffic-filter inbound acl 3000
+return
+</code></pre>
+<h3>Boas práticas de ACL</h3>
+<ul>
+<li>Documente cada mudança de acl no sistema de chamados.</li>
+<li>Valide com <code>display acl</code> depois de aplicar.</li>
+<li>Mantenha o rollback de acl pronto antes de começar:<ol><li>salve a configuração</li><li>anote o estado atual</li></ol></li>
+</ul>
+<p>Esta seção descreve o recurso ACL do equipamento em detalhes para a equipe de operação. Antes de aplicar qualquer mudança de acl, confira a configuração atual, abra uma janela de manutenção e mantenha um acesso de console disponível. Os exemplos usam a sintaxe da versão 8 do sistema; versões anteriores podem exigir parâmetros diferentes. Valores padrão de acl são conservadores e servem para a maioria das redes de provedores regionais, mas ambientes com muitos assinantes devem revisar limites e temporizadores. </p>
+</section>
+<section id="backup">
+<h2>Backup</h2>
+<p>Cópia da configuração por FTP, SFTP e agendamento. Esta seção descreve o recurso Backup do equipamento em detalhes para a equipe de operação. Antes de aplicar qualquer mudança de backup, confira a configuração atual, abra uma janela de manutenção e mantenha um acesso de console disponível. Os exemplos usam a sintaxe da versão 8 do sistema; versões anteriores podem exigir parâmetros diferentes. Valores padrão de backup são conservadores e servem para a maioria das redes de provedores regionais, mas ambientes com muitos assinantes devem revisar limites e temporizadores. </p>
+<h3>Comandos de Backup</h3>
+<table>
+<thead><tr><th>Comando</th><th>Função</th><th>Modo</th><th>Exemplo</th></tr></thead>
+<tbody>
+<tr><td><code>save</code></td><td>Grava a configuração</td><td>usuário</td><td><code>save</code></td></tr>
+<tr><td><code>display current-configuration</code></td><td>Configuração em uso</td><td>qualquer</td><td><code>display current-configuration</code></td></tr>
+<tr><td><code>sftp &lt;ip&gt;</code></td><td>Copia por SFTP</td><td>usuário</td><td><code>sftp 10.9.9.11</code></td></tr>
+<tr><td><code>set save-configuration interval &lt;min&gt;</code></td><td>Gravação periódica</td><td>global</td><td><code>set save-configuration interval 60</code></td></tr>
+</tbody></table>
+<h3>Exemplo completo de Backup</h3>
+<pre><code>system-view
+ save
+ display current-configuration
+ sftp 10.9.9.11
+ set save-configuration interval 60
+return
+</code></pre>
+<h3>Boas práticas de Backup</h3>
+<ul>
+<li>Documente cada mudança de backup no sistema de chamados.</li>
+<li>Valide com <code>display backup</code> depois de aplicar.</li>
+<li>Mantenha o rollback de backup pronto antes de começar:<ol><li>salve a configuração</li><li>anote o estado atual</li></ol></li>
+</ul>
+<p>Esta seção descreve o recurso Backup do equipamento em detalhes para a equipe de operação. Antes de aplicar qualquer mudança de backup, confira a configuração atual, abra uma janela de manutenção e mantenha um acesso de console disponível. Os exemplos usam a sintaxe da versão 8 do sistema; versões anteriores podem exigir parâmetros diferentes. Valores padrão de backup são conservadores e servem para a maioria das redes de provedores regionais, mas ambientes com muitos assinantes devem revisar limites e temporizadores. </p>
+</section>
+</article></main>
+<aside><h4>Produtos relacionados</h4><p>XR-7000, XR-5000</p></aside>
+<footer><p>&copy; 2026 XR Networks. Todos os direitos reservados. Política de privacidade.</p></footer>
+<script src="/js/app.js"></script>
+</body></html>

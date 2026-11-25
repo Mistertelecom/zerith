@@ -492,7 +492,9 @@ fn explore_cannot_write_even_when_the_policy_would_allow_it() {
     let kid = &e.store.subagent_sessions(&e.sid).unwrap()[0];
     let last = e.store.messages(&kid.id, 100, 0).unwrap().pop().unwrap();
     assert!(
-        last.content.contains("no such tool: write_file"),
+        last.content.contains(
+            "ferramenta `write_file` não existe; disponíveis: glob, grep, list_dir, read_file"
+        ),
         "{}",
         last.content
     );

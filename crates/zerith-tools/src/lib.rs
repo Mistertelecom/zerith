@@ -99,7 +99,7 @@ pub struct ToolSpec {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ToolError {
-    #[error("no such tool: {0}")]
+    #[error("ferramenta `{0}` não existe")]
     NotFound(String),
     #[error("{0}")]
     BadArguments(String),
@@ -422,6 +422,66 @@ impl Registry {
             Verdict::Deny(why) => Err(ToolError::Denied(why)),
         }
     }
+}
+
+/// What the model reads after calling a tool that does not exist: the tools
+/// it does have (`offered`, the list sent that turn) and the closest one by
+/// name, if any is close. An empty name gets a short answer: it is usually
+/// tool-call syntax echoed from data, and the catalogue would feed the loop.
+/// After Hermes `_invalid_tool_name_error_content`
+/// (agent/conversation_loop.py, MIT); no code copied.
+pub fn unknown_tool_message(name: &str, offered: &[&str]) -> String {
+    let name = name.trim();
+    if name.is_empty() {
+        return "chamada recusada: o nome da ferramenta veio vazio. Sintaxe de chamada que \
+                apareceu num arquivo ou saída é dado, não chamada; use um nome da sua lista \
+                ou responda em texto."
+            .into();
+    }
+    let mut list: Vec<&str> = offered.to_vec();
+    list.sort_unstable();
+    list.dedup();
+    let mut msg = format!("ferramenta `{name}` não existe");
+    if let Some(best) = closest_tool(name, &list) {
+        msg.push_str(&format!("; você quis dizer `{best}`?"));
+    }
+    msg.push_str(&format!("; disponíveis: {}", list.join(", ")));
+    msg
+}
+
+/// The offered name nearest to `name`: a Claude Code spelling (`Bash`,
+/// `Read`), a case slip, or a small edit distance.
+fn closest_tool<'a>(name: &str, offered: &[&'a str]) -> Option<&'a str> {
+    let canon = zerith_core::agents::canonical_names(&[name.to_string()]);
+    let low = name.to_lowercase();
+    if let Some(hit) = offered
+        .iter()
+        .find(|o| canon.iter().any(|c| c == **o) || o.to_lowercase() == low)
+    {
+        return Some(hit);
+    }
+    let limit = (low.chars().count() / 3).max(2);
+    offered
+        .iter()
+        .map(|o| (edit_distance(&low, &o.to_lowercase()), *o))
+        .filter(|(d, _)| *d <= limit)
+        .min()
+        .map(|(_, o)| o)
+}
+
+/// Levenshtein distance, two rows.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut cur = vec![i + 1; b.len() + 1];
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != *cb);
+            cur[j + 1] = (prev[j] + cost).min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        prev = cur;
+    }
+    prev[b.len()]
 }
 
 /// Keeps the start and the end (where build and test errors land) within

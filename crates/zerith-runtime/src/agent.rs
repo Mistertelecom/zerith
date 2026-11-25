@@ -831,6 +831,7 @@ fn turn_body(
     let default_summarizer = ClientSummarizer { client, model };
     let summarizer: &dyn Summarizer = agent.summarizer.unwrap_or(&default_summarizer);
     let mut summary_failed = false;
+    let offered: Vec<String> = defs.iter().map(|d| d.name.clone()).collect();
 
     let pipe = Pipeline {
         core: agent.tools.zip(agent.policy),
@@ -844,6 +845,7 @@ fn turn_body(
         session_id,
         cancel,
         orchestrator_root: is_root_orchestrator,
+        offered: &offered,
     };
 
     let (mut prompt_tokens, mut completion_tokens) = (0u64, 0u64);

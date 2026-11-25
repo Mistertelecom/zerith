@@ -119,6 +119,9 @@ pub(crate) struct Pipeline<'a> {
     pub session_id: &'a str,
     pub cancel: &'a Cancel,
     pub orchestrator_root: bool,
+    /// Tool names sent to the model this turn: what an unknown name is
+    /// answered with. Empty: every tool of the registry that is listed.
+    pub offered: &'a [String],
 }
 
 impl Pipeline<'_> {
@@ -135,6 +138,26 @@ impl Pipeline<'_> {
             memory: self.memory,
             scope: self.scope,
         }
+    }
+
+    /// The answer to a call naming a tool that does not exist: the tools this
+    /// turn offered (or, without that list, the registry's listed ones) and
+    /// the closest name.
+    fn unknown_tool(&self, tools: &Registry, name: &str) -> String {
+        let listed: Vec<&str> = if self.offered.is_empty() {
+            tools
+                .specs()
+                .into_iter()
+                .filter(|s| {
+                    !s.source.starts_with(zerith_tools::DEFERRED_SOURCE)
+                        && !s.source.starts_with(zerith_tools::ALIAS_SOURCE)
+                })
+                .map(|s| s.name.as_str())
+                .collect()
+        } else {
+            self.offered.iter().map(String::as_str).collect()
+        };
+        zerith_tools::unknown_tool_message(name, &listed)
     }
 
     /// May this raw call join a parallel group? Judged on the model's own
@@ -232,6 +255,10 @@ impl Pipeline<'_> {
         let cctx = self.ctx(policy);
         let (verdict, action) = match tools.authorize(&inv.name, &inv.args, &cctx) {
             Ok(v) => v,
+            Err(zerith_tools::ToolError::NotFound(n)) => {
+                let text = format!("erro: {}", self.unknown_tool(tools, &n));
+                return settle(inv, false, text);
+            }
             Err(e) => return settle(inv, false, format!("erro: {e}")),
         };
         let mut policy_ask = match verdict {
@@ -1419,6 +1446,7 @@ mod parallel_panic_tests {
             session_id: "s1",
             cancel: &cancel,
             orchestrator_root: false,
+            offered: &[],
         };
         let calls = [
             ToolCall {
@@ -1440,6 +1468,27 @@ mod parallel_panic_tests {
         assert_eq!(pipe.run_group(&prepared, 2, &mut |_| {}), expected);
         // Serial path too: a panic fails the call, it never unwinds the turn.
         assert_eq!(pipe.run_group(&prepared, 1, &mut |_| {}), expected);
+
+        // An unknown name is answered with this turn's offered tools only.
+        let offered = vec!["healthy".to_string()];
+        let pipe = Pipeline {
+            offered: &offered,
+            ..pipe
+        };
+        let p = pipe.prepare(
+            &ToolCall {
+                id: "3".into(),
+                name: "healty".into(),
+                arguments: "{}".into(),
+            },
+            &mut |_| {},
+        );
+        assert_eq!(
+            p.settled.map(|o| o.output).as_deref(),
+            Some(
+                "erro: ferramenta `healty` não existe; você quis dizer `healthy`?; disponíveis: healthy"
+            )
+        );
     }
 
     #[test]
@@ -1581,6 +1630,7 @@ mod parallel_panic_tests {
             session_id: "s-always",
             cancel: &cancel,
             orchestrator_root: false,
+            offered: &[],
         };
         let offered = |name: &str, args: Value| {
             let mut got = None;
@@ -1670,6 +1720,7 @@ mod parallel_panic_tests {
             session_id: "s-bound",
             cancel: &cancel,
             orchestrator_root: false,
+            offered: &[],
         };
         let in_ws_call = ToolCall {
             id: "w1".into(),
@@ -1796,6 +1847,7 @@ mod parallel_panic_tests {
                     session_id: "s-serial",
                     cancel: cancel_ref,
                     orchestrator_root: false,
+                    offered: &[],
                 };
                 let c1 = ToolCall {
                     id: "w1".into(),
@@ -1827,6 +1879,7 @@ mod parallel_panic_tests {
                     session_id: "s-serial",
                     cancel: cancel_ref,
                     orchestrator_root: false,
+                    offered: &[],
                 };
                 let _ = second_entered_tx.send(());
                 let c2 = ToolCall {
@@ -1871,6 +1924,7 @@ mod parallel_panic_tests {
             session_id: "s-serial",
             cancel: &cancel,
             orchestrator_root: false,
+            offered: &[],
         };
         let mut forced_prompted = false;
         let res = p_forced.approve(
@@ -1948,6 +2002,7 @@ mod parallel_panic_tests {
             session_id: "s-orch",
             cancel: &cancel,
             orchestrator_root: true,
+            offered: &[],
         };
 
         for blocked in ["shell", "write_file", "edit_file"] {
@@ -2036,6 +2091,7 @@ mod external_tests {
             session_id: "s-ext",
             cancel: &cancel,
             orchestrator_root: false,
+            offered: &[],
         };
         let call = ToolCall {
             id: "c1".into(),

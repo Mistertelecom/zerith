@@ -294,6 +294,27 @@ fn an_unknown_tool_names_itself_in_the_error() {
 }
 
 #[test]
+fn an_unknown_tool_lists_the_offered_ones_and_suggests_the_closest() {
+    use crate::unknown_tool_message;
+    let offered = ["shell", "read_file", "grep", "process", "edit_file"];
+    let m = unknown_tool_message("read_fil", &offered);
+    assert_eq!(
+        m,
+        "ferramenta `read_fil` não existe; você quis dizer `read_file`?; disponíveis: edit_file, grep, process, read_file, shell"
+    );
+    // Claude Code spellings and case slips.
+    assert!(unknown_tool_message("Bash", &offered).contains("quis dizer `shell`"));
+    assert!(unknown_tool_message("GREP", &offered).contains("quis dizer `grep`"));
+    // Nothing close: the list only.
+    let far = unknown_tool_message("deploy_kubernetes", &offered);
+    assert!(!far.contains("quis dizer"), "{far}");
+    assert!(far.ends_with("disponíveis: edit_file, grep, process, read_file, shell"));
+    // An empty name gets no catalogue.
+    let empty = unknown_tool_message("  ", &offered);
+    assert!(empty.contains("vazio") && !empty.contains("disponíveis"));
+}
+
+#[test]
 fn only_read_only_tools_are_concurrency_safe() {
     let r = Registry::new();
     for name in ["read_file", "list_dir", "glob", "grep", "memory_recall"] {

@@ -1426,9 +1426,9 @@ pub(crate) fn tool_guidance(tools: &zerith_tools::Registry) -> String {
             "\n\n# Perguntas\nSe falta uma decisão que só o usuário pode tomar, use `ask_user` em vez de adivinhar.",
         );
     }
-    if has("memory_save") {
+    if has("memory") {
         out.push_str(
-            "\n\n# Memória\nQuando o usuário revelar uma preferência, instrução, entidade (nome, empresa, cliente, servidor, IP, ASN), decisão ou fato durável, salve com `memory_save` na hora, sem pedir (usando `kind`: `instruction`, `preference`, `entity`, `decision`, `project` ou `fact`). Use `memory_recall` para listar/buscar fatos salvos, `memory_update` para atualizar um fato que mudou e `memory_forget` para apagar um fato obsoleto. Não salve progresso de tarefa nem segredos.",
+            "\n\n# Memória\nQuando o usuário revelar uma preferência, instrução, entidade (nome, empresa, cliente, servidor, IP, ASN), decisão ou fato durável, salve com `memory` `action: save` na hora, sem pedir (usando `kind`: `instruction`, `preference`, `entity`, `decision`, `project` ou `fact`). Use `recall` para listar/buscar fatos salvos, `update` para atualizar um fato que mudou e `forget` para apagar um fato obsoleto. Não salve progresso de tarefa nem segredos.",
         );
     }
     if has("edit_file") {

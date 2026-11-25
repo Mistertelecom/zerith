@@ -274,21 +274,20 @@ impl Guards {
     /// skills, plugins). `Ok(Some(why))`: ask; `Err`: the refusal.
     fn external_rules(&self, call: &ToolInvocation) -> Result<Option<String>, Flow> {
         let builtin = self.policy.action_for(&call.name, &call.args).is_some();
-        if builtin || INTERNAL.contains(&call.name.as_str()) {
+        // `memory` com action=recall responde também por memory_recall: uma
+        // regra no nome antigo vale para o novo e vice-versa.
+        let mut names = zerith_core::tool_alias::names(&call.name, &call.args);
+        // `process` (ex-shell_output/shell_kill) tem o próprio mapa.
+        for n in rule_names(&call.name, &call.args) {
+            if !names.contains(&n) {
+                names.push(n);
+            }
+        }
+        if builtin || names.iter().any(|n| INTERNAL.contains(n)) {
             return Ok(None);
         }
         let subject = tool_subject(&call.name, &call.args);
-        // A rule written for an old name (`shell_kill`) still binds
-        // `process` doing the same, and one for `process` binds the old name.
-        let verdicts: Vec<Verdict> = rule_names(&call.name, &call.args)
-            .into_iter()
-            .filter_map(|n| self.policy.check_rules(n, subject.as_deref()))
-            .collect();
-        let pick = |want: fn(&Verdict) -> bool| verdicts.iter().find(|v| want(v)).cloned();
-        let verdict = pick(|v| matches!(v, Verdict::Deny(_)))
-            .or_else(|| pick(|v| matches!(v, Verdict::Ask(_))))
-            .or_else(|| pick(|v| matches!(v, Verdict::Allow)));
-        match verdict {
+        match self.policy.check_rules_any(&names, subject.as_deref()) {
             Some(Verdict::Deny(why)) => Err(Flow::Deny(why)),
             Some(Verdict::Ask(why)) => Ok(Some(why)),
             Some(Verdict::Allow) => Ok(None),

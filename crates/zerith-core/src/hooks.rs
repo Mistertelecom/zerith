@@ -254,9 +254,14 @@ pub fn run_hooks(event: HookEvent, payload: &HookPayload, settings: &Settings) -
     let mut out = HookOutcome::default();
     let tool = payload.tool_name.as_deref().unwrap_or("");
     let subject = payload.subject.as_deref();
+    // Um matcher no nome antigo (`memory_save`) pega `memory` action=save.
+    let null = Value::Null;
+    let names = crate::tool_alias::names(tool, payload.tool_input.as_ref().unwrap_or(&null));
     for spec in event.specs(settings) {
         let hit = if event.is_tool_event() {
-            matcher_hits(spec.matcher.as_deref(), tool, subject)
+            names
+                .iter()
+                .any(|t| matcher_hits(spec.matcher.as_deref(), t, subject))
         } else if event.has_kind() {
             subject.is_none_or(|kind| matcher_hits(spec.matcher.as_deref(), kind, None))
         } else {

@@ -2490,6 +2490,7 @@ pub(crate) fn is_orchestrator_root_tool(name: &str) -> bool {
             | "ask_user"
             | "skill"
             | "skill_search"
+            | "memory"
             | "memory_save"
             | "memory_recall"
             | "memory_update"

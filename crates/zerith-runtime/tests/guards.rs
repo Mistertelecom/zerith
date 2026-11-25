@@ -164,6 +164,28 @@ deny = ["mcp__gh__push"]
     assert_eq!(g.before(&mut c), Flow::Continue);
 }
 
+/// `memory_save` virou `memory` com `action: "save"`: a regra antiga vale
+/// para a chamada nova, só na ação equivalente, e um hook no nome antigo
+/// também dispara.
+#[test]
+fn a_rule_or_hook_on_an_old_tool_name_covers_the_new_action() {
+    let dir = scratch();
+    let text = "[permissions]\ndefault_mode = \"default\"\ndeny = [\"memory_save\"]\n";
+    let (g, _) = guards(dir.path(), text);
+    let mut c = call(dir.path(), "memory", json!({"action": "save", "text": "x"}));
+    assert!(matches!(g.before(&mut c), Flow::Deny(_)));
+    let mut c = call(dir.path(), "memory_save", json!({"text": "x"}));
+    assert!(matches!(g.before(&mut c), Flow::Deny(_)));
+    let mut c = call(dir.path(), "memory", json!({"action": "recall"}));
+    assert_eq!(g.before(&mut c), Flow::Continue);
+
+    let (g, _) = guards(dir.path(), &hook("PreToolUse", "memory_save", DENY_JSON));
+    let mut c = call(dir.path(), "memory", json!({"action": "save", "text": "x"}));
+    assert_eq!(g.before(&mut c), Flow::Deny("nao".into()));
+    let mut c = call(dir.path(), "memory", json!({"action": "recall"}));
+    assert_eq!(g.before(&mut c), Flow::Continue);
+}
+
 #[test]
 fn the_plan_gate_asks_with_the_plan_and_switches_the_mode() {
     let dir = scratch();

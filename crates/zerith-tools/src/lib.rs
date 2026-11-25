@@ -32,6 +32,7 @@ mod terminal;
 mod web;
 mod workflows;
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -328,11 +329,32 @@ impl Registry {
         }
     }
 
+    /// The tool by its name or, when none has it, by an old name that became
+    /// an action of another (`zerith_core::tool_alias`).
     fn find(&self, name: &str) -> Option<&dyn Tool> {
-        self.tools
-            .iter()
-            .find(|t| t.spec().name == name)
-            .map(|t| t.as_ref())
+        let exact = |n: &str| {
+            self.tools
+                .iter()
+                .find(|t| t.spec().name == n)
+                .map(|t| t.as_ref())
+        };
+        exact(name).or_else(|| exact(zerith_core::tool_alias::resolve(name)?.0))
+    }
+
+    /// The tool and the arguments it runs with: an old name carries its
+    /// `action` into the arguments of the tool it became.
+    fn find_call<'v>(&self, name: &str, args: &'v Value) -> Option<(&dyn Tool, Cow<'v, Value>)> {
+        let tool = self.find(name)?;
+        if tool.spec().name == name {
+            return Some((tool, Cow::Borrowed(args)));
+        }
+        let (_, action) = zerith_core::tool_alias::resolve(name)?;
+        let mut args = args.clone();
+        if !args.is_object() {
+            args = Value::Object(Default::default());
+        }
+        args["action"] = action.into();
+        Some((tool, Cow::Owned(args)))
     }
 
     /// The prompt catalogue: one line per tool, name and description only.
@@ -353,12 +375,14 @@ impl Registry {
         args: &Value,
         ctx: &CallCtx<'_>,
     ) -> Result<(Verdict, Option<Action>)> {
-        let tool = self
-            .find(name)
+        let (tool, args) = self
+            .find_call(name, args)
             .ok_or_else(|| ToolError::NotFound(name.into()))?;
-        let action = tool.action(args, ctx)?;
+        let action = tool.action(&args, ctx)?;
+        // A rule on the old name (`lsp_symbols(src/**)`) still speaks.
+        let names = zerith_core::tool_alias::names(&tool.spec().name, &args);
         let verdict = match &action {
-            Some(a) => ctx.policy.check_tool(name, a),
+            Some(a) => ctx.policy.check_tool_any(&names, a),
             None => Verdict::Allow,
         };
         Ok((verdict, action))
@@ -388,8 +412,8 @@ impl Registry {
         ctx: &CallCtx<'_>,
         cancel: &Cancel,
     ) -> Result<String> {
-        let tool = self
-            .find(name)
+        let (tool, args) = self
+            .find_call(name, args)
             .ok_or_else(|| ToolError::NotFound(name.into()))?;
         let timeout = tool.spec().timeout;
         let exec = Exec {
@@ -401,13 +425,14 @@ impl Registry {
         exec.check()?;
         // A vault value a tool typed (browser `fill_secret`) never comes back
         // in any output, whatever the page or the command echoes.
-        tool.run(args, ctx, &exec)
+        tool.run(&args, ctx, &exec)
             .map(|out| self.host.scrub_secrets(&out))
     }
 
     /// Whether this exact call may run beside other safe calls. Unknown tool: no.
     pub fn concurrency_safe(&self, name: &str, args: &Value) -> bool {
-        self.find(name).is_some_and(|t| t.concurrency_safe(args))
+        self.find_call(name, args)
+            .is_some_and(|(t, a)| t.concurrency_safe(&a))
     }
 
     /// Whether the tool reads `CallCtx::memory` (see [`Tool::uses_memory`]).

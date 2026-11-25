@@ -320,10 +320,12 @@ fn only_read_only_tools_are_concurrency_safe() {
     for name in ["read_file", "list_dir", "glob", "grep", "memory_recall"] {
         assert!(r.concurrency_safe(name, &json!({})), "{name}");
     }
-    for name in ["write_file", "edit_file", "shell", "nope"] {
+    assert!(r.concurrency_safe("memory", &json!({"action": "recall"})));
+    for name in ["write_file", "edit_file", "shell", "nope", "memory_save"] {
         assert!(!r.concurrency_safe(name, &json!({})), "{name}");
     }
-    assert!(r.uses_memory("memory_recall") && !r.uses_memory("grep"));
+    assert!(!r.concurrency_safe("memory", &json!({"action": "save"})));
+    assert!(r.uses_memory("memory_recall") && r.uses_memory("memory") && !r.uses_memory("grep"));
 }
 
 #[test]
@@ -414,6 +416,68 @@ fn memory_save_writes_once_and_respects_the_pause() {
     let paused = r.call("memory_save", &json!({"text": "outro fato"}), &c);
     assert!(matches!(paused, Err(ToolError::Denied(_))), "{paused:?}");
     assert_eq!(mem.list(&scope, 10).unwrap().len(), 1);
+}
+
+/// `memory` com `action` e os nomes antigos levam ao mesmo lugar.
+#[test]
+fn memory_actions_answer_by_the_new_and_the_old_names() {
+    use zerith_memory::{MemoryBackend, Scope, SqliteMemory};
+    let dir = scratch();
+    let p = policy(dir.path(), Mode::Default);
+    let mem = SqliteMemory::open(dir.path().join("m.db")).unwrap();
+    let scope = Scope::user("t");
+    let c = CallCtx {
+        memory: Some(&mem),
+        scope: Some(&scope),
+        ..ctx(&p)
+    };
+    let r = Registry::new();
+    let out = r
+        .call(
+            "memory",
+            &json!({"action": "save", "text": "O usuário usa Helix"}),
+            &c,
+        )
+        .unwrap();
+    assert!(out.starts_with("salvo"), "{out}");
+    let id = mem.list(&scope, 10).unwrap()[0].id;
+    let found = r
+        .call("memory", &json!({"action": "recall", "query": "Helix"}), &c)
+        .unwrap();
+    assert!(found.contains("Helix"), "{found}");
+    assert_eq!(
+        r.call("memory_recall", &json!({"query": "Helix"}), &c)
+            .unwrap(),
+        found
+    );
+    r.call(
+        "memory_update",
+        &json!({"id": id, "text": "O usuário usa Neovim"}),
+        &c,
+    )
+    .unwrap();
+    let after = r
+        .call("memory", &json!({"action": "recall", "query": "*"}), &c)
+        .unwrap();
+    assert!(after.contains("Neovim"), "{after}");
+    r.call("memory", &json!({"action": "forget", "id": id}), &c)
+        .unwrap();
+    assert!(r.call("memory", &json!({"action": "voa"}), &c).is_err());
+    // O nome antigo traz a ação dele e não deixa o modelo trocá-la.
+    let forced = r.call("memory_recall", &json!({"action": "forget", "id": id}), &c);
+    assert!(forced.is_ok_and(|o| !o.contains("removido")));
+}
+
+/// O anúncio só tem os nomes novos; os antigos seguem despachando.
+#[test]
+fn old_tool_names_dispatch_but_are_not_announced() {
+    let r = Registry::new();
+    let names: Vec<&str> = r.specs().iter().map(|s| s.name.as_str()).collect();
+    for (old, new, _) in zerith_core::tool_alias::LEGACY {
+        assert!(!names.contains(old), "{old} ainda anunciado");
+        assert!(names.contains(new), "{new} faltando");
+        assert_eq!(r.get(old).map(|s| s.name.as_str()), Some(*new), "{old}");
+    }
 }
 
 /// `cmd` never understood the `\"` that Rust wrote through `.arg`: every path
@@ -781,4 +845,17 @@ fn an_edit_that_breaks_json_is_refused_and_the_file_stays_whole() {
     let patch = "*** Begin Patch\n*** Add File: b.toml\n+x = \n*** End Patch\n";
     assert!(r.call("apply_patch", &json!({"patch": patch}), &c).is_err());
     assert!(!dir.path().join("b.toml").exists());
+}
+
+/// Tamanho do que vai ao modelo: ferramentas anunciadas e caracteres de
+/// descrição + parâmetros JSON (`--nocapture` mostra os números).
+#[test]
+fn announced_schema_size() {
+    let r = Registry::new();
+    let specs = r.specs();
+    let chars: usize = specs
+        .iter()
+        .map(|s| s.description.chars().count() + s.parameters.to_string().chars().count())
+        .sum();
+    println!("ferramentas: {} · schema: {chars} caracteres", specs.len());
 }

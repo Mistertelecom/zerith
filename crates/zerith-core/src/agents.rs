@@ -143,7 +143,9 @@ fn canonical(t: &str) -> String {
         "Glob" => "glob",
         "Grep" => "grep",
         "LS" => "list_dir",
-        other => other,
+        // Nome antigo que virou ação de outra ferramenta: `memory_recall`
+        // dá ao agente a ferramenta `memory` inteira.
+        other => crate::tool_alias::resolve(other).map_or(other, |(new, _)| new),
     }
     .to_string()
 }
@@ -539,6 +541,13 @@ mod tests {
         assert_eq!(plain.isolation, Isolation::None);
         // A bad `name` falls back to the file name.
         assert_eq!(def("---\nname: a b/c\n---\nx").name, "x");
+    }
+
+    #[test]
+    fn an_old_tool_name_in_tools_grants_the_tool_it_became() {
+        let all = ["read_file", "memory", "lsp"];
+        let a = def("---\ntools: read_file, memory_recall, memory_save\n---\nx");
+        assert_eq!(a.effective_tools(&all), ["read_file", "memory"]);
     }
 
     #[test]

@@ -1005,6 +1005,7 @@ function toolActionLabel(name: string): string {
     case "skill":
     case "skill_load":
       return "Loaded skill";
+    case "memory":
     case "memory_save":
     case "memory_update":
     case "memory_forget":

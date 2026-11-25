@@ -36,23 +36,16 @@ impl Tool for Builtin {
         (self.run)(args, ctx, exec)
     }
     // Read-only and stateless: safe to run side by side.
-    fn concurrency_safe(&self, _: &Value) -> bool {
-        matches!(
-            self.spec.name.as_str(),
-            "read_file"
-                | "list_dir"
-                | "glob"
-                | "grep"
-                | "repo_map"
-                | "memory_recall"
-                | "session_search"
-        )
+    fn concurrency_safe(&self, args: &Value) -> bool {
+        match self.spec.name.as_str() {
+            "read_file" | "list_dir" | "glob" | "grep" | "repo_map" | "session_search" => true,
+            // Só a leitura da memória: save/update/forget escrevem.
+            "memory" => args["action"] == "recall",
+            _ => false,
+        }
     }
     fn uses_memory(&self) -> bool {
-        matches!(
-            self.spec.name.as_str(),
-            "memory_recall" | "memory_save" | "memory_update" | "memory_forget"
-        )
+        self.spec.name == "memory"
     }
 }
 
@@ -232,53 +225,23 @@ pub(crate) fn all() -> Vec<Box<dyn crate::Tool>> {
             shell_action,
             shell,
         ),
+        // Uma ferramenta com `action` no lugar de memory_save/recall/update/
+        // forget, que seguem aceitos como apelido (zerith_core::tool_alias).
         tool(
-            "memory_recall",
-            "Consulta ou lista fatos duráveis da memória do usuário (retorna [#id], tipo, confiança e texto). Se query for vazio ou \"*\", lista os fatos ativos.",
-            json!({"type": "object", "properties": {"query": {"type": "string", "description": "termos para buscar ou \"*\" para listar todos os fatos recentes"}}}),
-            "linhas \"[#id] [confirmed|inferred] (kind) texto\"",
-            Permission::Read,
-            5,
-            |_, _| Ok(None),
-            memory_recall,
-        ),
-        tool(
-            "memory_save",
-            "Guarda na memória durável um fato, preferência, entidade (cliente, servidor, IP, ASN, pessoa), decisão, projeto ou instrução que o usuário disse ou confirmou e que vale para conversas futuras. Use por conta própria, sem pedir, assim que o usuário revelar algo assim. Uma frase curta e autossuficiente, na terceira pessoa (\"O usuário prefere respostas curtas\"). Não salve progresso de tarefa, resultados temporários nem segredos (senhas, chaves, tokens).",
+            "memory",
+            "Memória durável do usuário entre conversas. save: guarda um fato, preferência, entidade (cliente, servidor, IP, ASN, pessoa), decisão, projeto ou instrução que o usuário disse ou confirmou; use por conta própria, sem pedir, numa frase curta na terceira pessoa (\"O usuário prefere respostas curtas\"); nunca progresso de tarefa, resultado temporário ou segredo. recall: busca por `query` (vazio ou \"*\" lista os fatos ativos). update: troca o texto do fato `id`. forget: apaga o fato `id`.",
             json!({"type": "object", "properties": {
-                "text": {"type": "string", "description": "o fato, em uma frase autossuficiente"},
-                "kind": {"type": "string", "enum": ["instruction", "preference", "fact", "entity", "decision", "project"], "description": "instruction: regra; preference: gosto; entity: pessoa/cliente/equipamento/IP; decision: decisão; project: projeto atual; fact: informação geral (padrão)"}
-            }, "required": ["text"]}),
-            "confirmação do que foi salvo com seu [#id], ou que já estava na memória",
+                "action": {"type": "string", "enum": ["save", "recall", "update", "forget"]},
+                "text": {"type": "string", "description": "save/update: o fato, em uma frase autossuficiente"},
+                "kind": {"type": "string", "enum": ["instruction", "preference", "fact", "entity", "decision", "project"], "description": "save: instruction regra; preference gosto; entity pessoa/cliente/equipamento/IP; decision; project projeto atual; fact (padrão)"},
+                "query": {"type": "string", "description": "recall: termos ou \"*\""},
+                "id": {"type": "integer", "description": "update/forget: o [#id] devolvido por recall"}
+            }, "required": ["action"]}),
+            "save: o [#id] salvo ou que já existia; recall: linhas \"[#id] [confirmed|inferred] (kind) texto\"; update/forget: confirmação",
             Permission::Read,
             5,
             |_, _| Ok(None),
-            memory_save,
-        ),
-        tool(
-            "memory_update",
-            "Atualiza o texto de um fato existente na memória pelo seu id numérico (obtido via memory_recall).",
-            json!({"type": "object", "properties": {
-                "id": {"type": "integer", "description": "id numérico do fato na memória"},
-                "text": {"type": "string", "description": "novo texto atualizado do fato"}
-            }, "required": ["id", "text"]}),
-            "confirmação da atualização do fato",
-            Permission::Read,
-            5,
-            |_, _| Ok(None),
-            memory_update,
-        ),
-        tool(
-            "memory_forget",
-            "Remove permanentemente um fato obsoleto ou incorreto da memória pelo seu id numérico (obtido via memory_recall).",
-            json!({"type": "object", "properties": {
-                "id": {"type": "integer", "description": "id numérico do fato a remover"}
-            }, "required": ["id"]}),
-            "confirmação da remoção do fato",
-            Permission::Read,
-            5,
-            |_, _| Ok(None),
-            memory_forget,
+            memory,
         ),
         tool(
             "session_search",
@@ -1030,7 +993,19 @@ fn root_hint(cmd: &str, output: &str) -> Option<String> {
     Some(format!("{base}\ncomando pronto: {ready}"))
 }
 
-fn memory_recall(args: &Value, ctx: &CallCtx<'_>, _: &Exec<'_>) -> Result<String> {
+fn memory(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
+    match args["action"].as_str().unwrap_or("") {
+        "save" => memory_save(args, ctx, exec),
+        "recall" => memory_recall(args, ctx),
+        "update" => memory_update(args, ctx),
+        "forget" => memory_forget(args, ctx),
+        other => Err(ToolError::BadArguments(format!(
+            "action precisa ser save, recall, update ou forget, não {other:?}"
+        ))),
+    }
+}
+
+fn memory_recall(args: &Value, ctx: &CallCtx<'_>) -> Result<String> {
     let query = args["query"].as_str().unwrap_or("*").trim();
     let (Some(mem), Some(scope)) = (ctx.memory, ctx.scope) else {
         return Err(ToolError::Denied("nenhuma memória configurada".into()));
@@ -1125,7 +1100,7 @@ fn memory_save(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<Strin
     ))
 }
 
-fn memory_update(args: &Value, ctx: &CallCtx<'_>, _: &Exec<'_>) -> Result<String> {
+fn memory_update(args: &Value, ctx: &CallCtx<'_>) -> Result<String> {
     let id = args["id"]
         .as_i64()
         .ok_or_else(|| ToolError::BadArguments("id precisa ser um inteiro".into()))?;
@@ -1141,7 +1116,7 @@ fn memory_update(args: &Value, ctx: &CallCtx<'_>, _: &Exec<'_>) -> Result<String
     Ok(format!("fato [#{id}] atualizado na memória: {text}"))
 }
 
-fn memory_forget(args: &Value, ctx: &CallCtx<'_>, _: &Exec<'_>) -> Result<String> {
+fn memory_forget(args: &Value, ctx: &CallCtx<'_>) -> Result<String> {
     let id = args["id"]
         .as_i64()
         .ok_or_else(|| ToolError::BadArguments("id precisa ser um inteiro".into()))?;

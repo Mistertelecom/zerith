@@ -690,6 +690,13 @@ impl Policy {
     /// `dontAsk` turns every remaining ask into a deny. An allow rule can
     /// never lift a deny, and a `deny` rule beats every mode, `bypass` too.
     pub fn check_tool(&self, tool: &str, action: &Action) -> Verdict {
+        self.check_tool_any(&[tool], action)
+    }
+
+    /// [`Policy::check_tool`] for a call known by several names (a tool and
+    /// its old name, see `zerith_core::tool_alias`): a rule on any of them
+    /// applies.
+    pub fn check_tool_any(&self, tools: &[&str], action: &Action) -> Verdict {
         let base = self.check_base(action);
         if matches!(base, Verdict::Deny(_)) {
             return base;
@@ -699,7 +706,7 @@ impl Policy {
             Action::Shell(c) => Subject::Shell(c.clone()),
             Action::Network(c) => Subject::Text(c.clone()),
         };
-        let v = self.rule_verdict(tool, &subject).unwrap_or(base);
+        let v = self.rule_verdict(tools, &subject).unwrap_or(base);
         self.dont_ask(self.no_ask(v))
     }
 
@@ -707,17 +714,22 @@ impl Policy {
     /// plugins): `subject` is the text a specifier matches (a skill name, a
     /// URL, ...). `None`: no rule spoke, the caller's default stands.
     pub fn check_rules(&self, tool: &str, subject: Option<&str>) -> Option<Verdict> {
+        self.check_rules_any(&[tool], subject)
+    }
+
+    /// [`Policy::check_rules`] for a call known by several names.
+    pub fn check_rules_any(&self, tools: &[&str], subject: Option<&str>) -> Option<Verdict> {
         let s = Subject::Text(subject.unwrap_or("").to_string());
-        self.rule_verdict(tool, &s)
+        self.rule_verdict(tools, &s)
             .map(|v| self.dont_ask(self.no_ask(v)))
     }
 
     /// The first rule verdict, deny → ask → allow.
-    fn rule_verdict(&self, tool: &str, subject: &Subject) -> Option<Verdict> {
+    fn rule_verdict(&self, tools: &[&str], subject: &Subject) -> Option<Verdict> {
         let rules = |kind: RuleKind| {
             self.rules
                 .iter()
-                .filter(move |r| r.kind == kind && r.tool_matches(tool))
+                .filter(move |r| r.kind == kind && tools.iter().any(|t| r.tool_matches(t)))
         };
         let shell = match subject {
             Subject::Shell(c) => Some(shellparse::analyze(c)),

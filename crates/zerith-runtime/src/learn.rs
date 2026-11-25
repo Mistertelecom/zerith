@@ -45,7 +45,7 @@ const MAX_DESC_CHARS: usize = 160;
 /// Phrases that mark a correction, a preference, a rule or a personal fact.
 /// Matched on whole words of the lowercased message.
 // ponytail: a phrase list, not a classifier; a false hit costs one cheap
-// review that answers "nothing", a miss is covered by the `memory_save` tool.
+// review that answers "nothing", a miss is covered by the `memory` tool (action save).
 const USER_MARKERS: &[&str] = &[
     // pt
     "não faça",

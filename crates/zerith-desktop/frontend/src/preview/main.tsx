@@ -1,6 +1,7 @@
 // Dev-only entry for `/preview.html`: renders the real App over the fake core
 // and drives it to one scene, so a headless browser can photograph it.
-//   ?scene=empty|chat|approval|question|settings  &tab=Contas  &open=anthropic  &theme=light
+//   ?scene=empty|chat|approval|question|settings|workflows  &tab=Contas  &open=anthropic  &theme=light
+//   Servidores: ?scene=settings&tab=Servidores; editor remoto: ?scene=workflows[&runs=1|&node=n2]
 //   Mídia: ?scene=settings&tab=Mídia (imagem) or &tab=Mídia&click=Vídeo (vídeo)
 //   Canais/alerta: ?scene=channels (&alert=1)
 import { StrictMode } from "react";
@@ -72,6 +73,21 @@ async function drive() {
     if (body) {
       await wait(300);
       body.scrollTop = scroll === "bottom" ? body.scrollHeight : Number(scroll);
+    }
+    return;
+  }
+  // Automações com workflows em servidor: ?scene=workflows (editor com
+  // "Executar em", lista com saúde remota); &runs=1 abre as execuções do
+  // servidor; &node=n2 seleciona o nó SSH (segredos no servidor).
+  if (scene === "workflows") {
+    (await until(() => byText("Automações", ".side-foot")))?.click();
+    const card = await until(() => document.querySelector<HTMLElement>(".wf-roster-card"));
+    card?.click();
+    if (q.get("runs")) (await until(() => byText("Execuções", ".wf-insp-tabs")))?.click();
+    const node = q.get("node");
+    if (node) {
+      await wait(400);
+      document.querySelectorAll<HTMLElement>(".wf-node")[Number(node.replace(/\D/g, "")) - 1]?.click();
     }
     return;
   }

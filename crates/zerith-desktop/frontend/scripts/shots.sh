@@ -13,7 +13,8 @@ scenes=("$@")
 if [ ${#scenes[@]} -eq 0 ]; then
   scenes=(empty chat approval question
     settings:Geral settings:Provedor settings:Contas "settings:Delegação" settings:Uso
-    "settings:Memória" settings:Skills settings:Agentes "settings:Mídia" "settings:Histórico")
+    "settings:Memória" settings:Skills settings:Agentes "settings:Mídia" "settings:Histórico"
+    settings:Servidores workflows)
 fi
 for theme in ${THEMES:-dark light}; do
   for s in "${scenes[@]}"; do

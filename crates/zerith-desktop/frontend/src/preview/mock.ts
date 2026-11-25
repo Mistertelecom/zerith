@@ -670,6 +670,87 @@ const wfMock = {
     },
   ],
 };
+// Servidores: "vps" online (daemon recente, um workflow falhando) e "casa" fora do ar.
+const nowMs = now * 1000;
+const servers = [
+  { id: "srv-vps", name: "vps", url: "http://198.18.251.1:7878", created_at_ms: nowMs - 9 * 86400e3, last_contact_ms: nowMs - 20e3 },
+  { id: "srv-casa", name: "casa", url: "http://100.101.102.103:7878", created_at_ms: nowMs - 30 * 86400e3, last_contact_ms: nowMs - 5 * 3600e3 },
+];
+const serverStatus = [
+  {
+    id: "srv-vps",
+    color: "green",
+    version: "0.4.7",
+    health: { name: "zerith", version: "0.4.7", hostname: "vps", uptime_secs: 86400, workflows_total: 2, workflows_enabled: 2, failing_workflows: 1, runs_active: 0 },
+    daemon: {
+      version: "0.4.7",
+      started_at_ms: nowMs - 86400e3,
+      last_cycle_ms: nowMs - 25e3,
+      hostname: "vps",
+      active_workflows: 2,
+      next_run: { workflow_id: "wf-backup", at_ms: nowMs + 42 * 60e3 },
+      consecutive_failures: { "wf-olt": 3 },
+    },
+    error: null,
+    checked_at_ms: nowMs,
+    last_contact_ms: nowMs - 20e3,
+  },
+  { id: "srv-casa", color: "red", version: null, health: null, daemon: null, error: "sem conexão com o servidor: connection refused", checked_at_ms: nowMs, last_contact_ms: nowMs - 5 * 3600e3 },
+];
+const wfNode = (id: string, kind: string, label: string, x: number, config: Record<string, unknown>) => ({ id, kind, label, x, y: 140, config });
+const wfBase = { description: "", icon: "workflow", edges: [{ id: "e1", from: "n1", to: "n2", branch: null }], created_at_ms: nowMs - 86400e3, updated_at_ms: nowMs - 3600e3, bot_name: null };
+const workflows = [
+  {
+    ...wfBase,
+    id: "wf-olt",
+    name: "Checar OLT Huawei",
+    icon: "radar",
+    enabled: true,
+    run_on: "srv-vps",
+    last_run_at_ms: nowMs - 5 * 60e3,
+    last_status: "error",
+    nodes: [
+      wfNode("n1", "trigger_cron", "A cada 5 min", 60, { cron: "*/5 * * * *" }),
+      wfNode("n2", "ssh_command", "display ont info", 350, { host: "10.0.0.2", user: "noc", command: "display ont info 0 all", secret_ref: "olt-borda" }),
+    ],
+  },
+  {
+    ...wfBase,
+    id: "wf-backup",
+    name: "Backup do banco",
+    icon: "rocket",
+    enabled: true,
+    run_on: "srv-vps",
+    last_run_at_ms: nowMs - 23 * 3600e3,
+    last_status: "ok",
+    nodes: [wfNode("n1", "trigger_cron", "Todo dia 03:00", 60, { cron: "0 3 * * *" }), wfNode("n2", "shell", "pg_dump", 350, { command: "pg_dump app > /var/backups/app.sql" })],
+  },
+  {
+    ...wfBase,
+    id: "wf-local",
+    name: "Resumo da manhã",
+    enabled: false,
+    run_on: null,
+    last_run_at_ms: null,
+    last_status: null,
+    nodes: [wfNode("n1", "trigger_cron", "Todo dia 08:00", 60, { cron: "0 8 * * *" }), wfNode("n2", "notify_channel", "Avisar", 350, {})],
+  },
+];
+const remoteRuns = [
+  {
+    id: "run-3",
+    workflow_id: "wf-olt",
+    trigger_source: "cron",
+    status: "error",
+    started_at_ms: nowMs - 5 * 60e3,
+    finished_at_ms: nowMs - 5 * 60e3 + 10_400,
+    summary: "ssh: connect to host 10.0.0.2 port 22: Connection timed out",
+    node_logs: [
+      { node_id: "n1", label: "A cada 5 min", kind: "trigger_cron", status: "ok", output: "", duration_ms: 0 },
+      { node_id: "n2", label: "display ont info", kind: "ssh_command", status: "error", output: "ssh: connect to host 10.0.0.2 port 22: Connection timed out", duration_ms: 10_400 },
+    ],
+  },
+];
 
 let state = {
   theme: "dark",
@@ -1102,6 +1183,25 @@ export function installMock(theme: string) {
           };
         case "subagent_stop":
           return true;
+        case "servers_list":
+          return servers;
+        case "servers_status":
+          return serverStatus;
+        case "server_health":
+        case "server_test":
+          return serverStatus.find((s) => s.id === a.id);
+        case "workflow_list":
+          return workflows;
+        case "server_workflows":
+          return workflows.filter((w) => w.run_on === a.serverId).map((w) => ({ ...w, run_on: undefined }));
+        case "server_workflow_runs":
+          return remoteRuns.filter((r) => r.workflow_id === a.id);
+        case "workflow_runs":
+          return [];
+        case "server_secret_names":
+          return ["telegram-bot"];
+        case "workflow_webhook_base_url":
+          return "http://127.0.0.1:47891/webhook/";
         case "background_job_stop":
           state.jobs = state.jobs.filter((j) => j.id !== a.id);
           return `${a.id} encerrado`;

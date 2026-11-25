@@ -40,8 +40,10 @@ import {
   onWorkflowDone,
   onWorkflowEvent,
   onWorkflowsChanged,
+  serversApi,
   workflowsApi,
   type AgentView,
+  type ServerEntry,
   type ChannelConfig,
   type ChannelGroup,
   type ChannelKind,
@@ -372,6 +374,12 @@ export function WorkflowsStudio(props: {
   const [nodeTestInput, setNodeTestInput] = useState("");
   const [nodeTestOutput, setNodeTestOutput] = useState<string | null>(null);
   const [nodeTestBusy, setNodeTestBusy] = useState(false);
+  const [servers, setServers] = useState<ServerEntry[]>([]);
+  // 409 do servidor: a versão dele, para recarregar ou sobrescrever.
+  const [conflict, setConflict] = useState<Workflow | null>(null);
+  // Trocou "Executar em": servidor de onde remover depois de salvar, ou
+  // manter uma cópia local ao mandar para um servidor.
+  const moveRef = useRef<{ removeFrom?: string; keepLocal?: boolean }>({});
 
   const loadedIdRef = useRef<string | null>(null);
   const selectedIdRef = useRef(selectedId);
@@ -444,12 +452,14 @@ export function WorkflowsStudio(props: {
 
   const loadAll = useCallback(async (keepSelection = true) => {
     try {
-      const [wfs, chs, ags] = await Promise.all([
+      const [wfs, chs, ags, srvs] = await Promise.all([
         workflowsApi.list(),
         channelsApi.list(),
         api.agentsList().catch(() => [] as AgentView[]),
+        serversApi.list().catch(() => [] as ServerEntry[]),
       ]);
       setWorkflows(wfs);
+      setServers(srvs);
       setChannels(chs);
       setAgents(ags.filter((a) => !a.disabled));
       setSelectedId((prev) => {
@@ -727,19 +737,104 @@ export function WorkflowsStudio(props: {
     }
   };
 
-  const handleSave = async (): Promise<Workflow | null> => {
+  const serverName = (id?: string | null) =>
+    servers.find((s) => s.id === id)?.name ?? id ?? tr(lang, "este PC", "this PC");
+
+  /** Depois de gravar: tira do servidor antigo e/ou deixa a cópia local. */
+  const finishMove = async (saved: Workflow) => {
+    const move = moveRef.current;
+    moveRef.current = {};
+    if (move.removeFrom) {
+      await serversApi.deleteWorkflow(move.removeFrom, saved.id).catch((e) =>
+        setBanner({
+          text: `${tr(lang, "Não removi do servidor", "Not removed from server")}: ${String(e)}`,
+          tone: "err",
+        }),
+      );
+    }
+    if (move.keepLocal) {
+      const now = Date.now();
+      await workflowsApi.save({
+        ...structuredClone(saved),
+        id: `wf-${now}`,
+        name: `${saved.name} (${tr(lang, "este PC", "this PC")})`,
+        run_on: null,
+        created_at_ms: now,
+        updated_at_ms: now,
+      });
+    }
+  };
+
+  const afterSave = async (saved: Workflow) => {
+    await finishMove(saved);
+    setDirty(false);
+    setConflict(null);
+    setDraft(structuredClone(saved));
+    await loadAll(true);
+    setBanner({
+      text: saved.run_on
+        ? tr(lang, `Salvo e enviado para ${serverName(saved.run_on)}`, `Saved and sent to ${serverName(saved.run_on)}`)
+        : tr(lang, "Workflow salvo", "Workflow saved"),
+      tone: "ok",
+    });
+    return saved;
+  };
+
+  /** `base`: sobrescrever a versão do servidor depois de um 409. */
+  const handleSave = async (base?: number): Promise<Workflow | null> => {
     if (!draft) return null;
     try {
-      const saved = await workflowsApi.save(draft);
-      setDirty(false);
-      setDraft(structuredClone(saved));
-      await loadAll(true);
-      setBanner({ text: tr(lang, "Workflow salvo", "Workflow saved"), tone: "ok" });
-      return saved;
+      if (!draft.run_on) return await afterSave(await workflowsApi.save(draft));
+      const r = await serversApi.pushWorkflow(draft, base);
+      if (r.kind === "conflict") {
+        setConflict(r.workflow);
+        return null;
+      }
+      return await afterSave(r.workflow);
     } catch (e) {
       setBanner({ text: String(e), tone: "err" });
       return null;
     }
+  };
+
+  const reloadFromServer = async () => {
+    if (!draft?.run_on) return;
+    try {
+      const wf = await serversApi.pullWorkflow(draft.run_on, draft.id);
+      setConflict(null);
+      setDirty(false);
+      setDraft(structuredClone(wf));
+      await loadAll(true);
+      setBanner({ text: tr(lang, "Recarregado do servidor", "Reloaded from server"), tone: "ok" });
+    } catch (e) {
+      setBanner({ text: String(e), tone: "err" });
+    }
+  };
+
+  const changeRunOn = (next: string | null) => {
+    if (!draft || (draft.run_on ?? null) === next) return;
+    const from = draft.run_on ?? null;
+    // Só pergunta quando a origem já tem o workflow salvo.
+    const savedHere = workflows.find((w) => w.id === draft.id);
+    moveRef.current = {};
+    if (savedHere && (savedHere.run_on ?? null) === from) {
+      if (from) {
+        const msg = tr(
+          lang,
+          `Remover de ${serverName(from)} ao salvar? (Cancelar = deixa a cópia lá)`,
+          `Remove from ${serverName(from)} on save? (Cancel = leave it there)`,
+        );
+        if (window.confirm(msg)) moveRef.current.removeFrom = from;
+      } else {
+        const msg = tr(
+          lang,
+          "Parar de rodar neste PC ao salvar? (Cancelar = mantém uma cópia rodando aqui também)",
+          "Stop running it on this PC on save? (Cancel = keep a local copy too)",
+        );
+        if (!window.confirm(msg)) moveRef.current.keepLocal = true;
+      }
+    }
+    patchDraft((w) => ({ ...w, run_on: next }));
   };
 
   const handleRunNow = async () => {
@@ -1248,6 +1343,29 @@ export function WorkflowsStudio(props: {
                   </option>
                 ))}
               </select>
+              <select
+                className="wf-bot-select wf-run-on"
+                value={draft.run_on ?? ""}
+                onChange={(e) => changeRunOn(e.target.value || null)}
+                aria-label={tr(lang, "Executar em", "Run on")}
+                title={tr(
+                  lang,
+                  "Onde o workflow roda. Servidores: Ajustes > Servidores.",
+                  "Where the workflow runs. Servers: Settings > Servers.",
+                )}
+              >
+                <option value="">{tr(lang, "Executar em: Este PC", "Run on: This PC")}</option>
+                {servers.map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {tr(lang, "Executar em", "Run on")}: {s.name}
+                  </option>
+                ))}
+                {draft.run_on && !servers.some((s) => s.id === draft.run_on) ? (
+                  <option value={draft.run_on}>
+                    {tr(lang, "Servidor removido", "Removed server")} ({draft.run_on})
+                  </option>
+                ) : null}
+              </select>
               <div className="wf-add-pop-wrap">
                 <button
                   type="button"
@@ -1321,6 +1439,18 @@ export function WorkflowsStudio(props: {
                     return;
                   }
                   try {
+                    if (
+                      draft.run_on &&
+                      window.confirm(
+                        tr(
+                          lang,
+                          `Excluir também em ${serverName(draft.run_on)}?`,
+                          `Also delete on ${serverName(draft.run_on)}?`,
+                        ),
+                      )
+                    ) {
+                      await serversApi.deleteWorkflow(draft.run_on, draft.id);
+                    }
                     await workflowsApi.delete(draft.id);
                     setDirty(false);
                     await loadAll(false);
@@ -1958,6 +2088,36 @@ export function WorkflowsStudio(props: {
           {studio}
         </div>
       )}
+
+      {conflict && draft ? (
+        <div className="wf-modal-backdrop" onMouseDown={() => setConflict(null)}>
+          <div className="wf-conflict" role="alertdialog" onMouseDown={(e) => e.stopPropagation()}>
+            <strong>{tr(lang, "O servidor tem uma versão mais nova", "The server has a newer version")}</strong>
+            <p className="pn-hint">
+              {tr(
+                lang,
+                `Outro dispositivo salvou "${conflict.name}" em ${serverName(draft.run_on)} (${new Date(conflict.updated_at_ms).toLocaleString()}).`,
+                `Another device saved "${conflict.name}" on ${serverName(draft.run_on)} (${new Date(conflict.updated_at_ms).toLocaleString()}).`,
+              )}
+            </p>
+            <div className="pn-inline pn-end">
+              <button type="button" className="btn btn-sm btn-ghost" onClick={() => setConflict(null)}>
+                {tr(lang, "Cancelar", "Cancel")}
+              </button>
+              <button type="button" className="btn btn-sm" onClick={() => void reloadFromServer()}>
+                <RefreshCw size={13} /> {tr(lang, "Recarregar do servidor", "Reload from server")}
+              </button>
+              <button
+                type="button"
+                className="btn btn-sm btn-primary"
+                onClick={() => void handleSave(conflict.updated_at_ms)}
+              >
+                <Upload size={13} /> {tr(lang, "Sobrescrever", "Overwrite")}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       {channelsOpen ? (
         <ChannelsModal

@@ -12,8 +12,8 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use tauri::State;
 use zerith_core::secrets::{Configured, SecretStore};
-use zerith_workflows::remote::{Health, PairingCode, RemoteClient};
-use zerith_workflows::{now_ms, random_token, DaemonStatus};
+use zerith_workflows::remote::{Health, PairingCode, RemoteClient, RemoteError};
+use zerith_workflows::{now_ms, random_token, DaemonStatus, Store, Workflow};
 
 use crate::state::AppState;
 
@@ -146,7 +146,7 @@ pub fn status_of(id: &str, health: Result<Health, String>, last: Option<i64>) ->
 pub fn add(root: &Path, vault: &dyn SecretStore, pair_code: &str) -> Result<ServerEntry, String> {
     let pc = PairingCode::decode(pair_code)?;
     let c = RemoteClient::from_pairing(&pc);
-    let unreachable = |e: zerith_workflows::remote::RemoteError| {
+    let unreachable = |e: RemoteError| {
         format!(
             "não alcancei {} ({e}). Confira se o servidor está ligado e se este PC está na \
              mesma VPN/rede.",
@@ -284,6 +284,136 @@ pub async fn server_test(state: State<'_, AppState>, id: String) -> Result<Serve
 pub async fn server_health(state: State<'_, AppState>, id: String) -> Result<ServerStatus, String> {
     let root = state.root().to_path_buf();
     blocking(move || Ok(health(&root, &Configured, &id))).await
+}
+
+// ------------------------------------------------------------ workflows remotos
+
+/// Resultado de enviar um workflow ao servidor.
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", content = "workflow", rename_all = "lowercase")]
+pub enum Pushed {
+    /// Gravado lá e aqui (versão local = versão do servidor).
+    Saved(Workflow),
+    /// 409: o servidor tem outra versão (vem a dele, para recarregar ou
+    /// sobrescrever com a base nova).
+    Conflict(Workflow),
+}
+
+/// Grava o workflow aqui (cópia de edição, com `run_on`) e manda ao servidor
+/// sem o campo. Base da concorrência otimista: `base`, senão o `updated_at_ms`
+/// local, que depois de cada envio passa a ser o do servidor. Workflow que
+/// nunca foi ao servidor vai com base `None` (criar).
+pub fn push(
+    root: &Path,
+    vault: &dyn SecretStore,
+    store: &Store,
+    wf: &Workflow,
+    base: Option<i64>,
+) -> Result<Pushed, String> {
+    let server = wf
+        .run_on
+        .clone()
+        .ok_or("workflow sem servidor em 'Executar em'")?;
+    let c = client(root, vault, &server)?;
+    let sent_before = store
+        .get_workflow(&wf.id)
+        .map_err(|e| e.to_string())?
+        .is_some_and(|w| w.run_on.as_deref() == Some(server.as_str()) && w.updated_at_ms > 0);
+    let base = base.or(sent_before.then_some(wf.updated_at_ms));
+    let remote = Workflow {
+        run_on: None,
+        ..wf.clone()
+    };
+    match c.put(&remote, base) {
+        Ok(saved) => {
+            let local = Workflow {
+                run_on: Some(server),
+                ..saved
+            };
+            store
+                .save_workflow(&local)
+                .map(Pushed::Saved)
+                .map_err(|e| e.to_string())
+        }
+        Err(RemoteError::Conflict(cur)) => Ok(Pushed::Conflict(*cur)),
+        Err(e) => {
+            // O servidor não aceitou: guarda a edição aqui para não perdê-la.
+            store.save_workflow(wf).map_err(|e| e.to_string())?;
+            Err(format!("salvo neste PC, mas não no servidor: {e}"))
+        }
+    }
+}
+
+/// Troca a cópia local pela do servidor ("Recarregar do servidor").
+pub fn pull(
+    root: &Path,
+    vault: &dyn SecretStore,
+    store: &Store,
+    server: &str,
+    id: &str,
+) -> Result<Workflow, String> {
+    let wf = client(root, vault, server)?
+        .get(id)
+        .map_err(|e| e.to_string())?;
+    store
+        .save_workflow(&Workflow {
+            run_on: Some(server.to_string()),
+            ..wf
+        })
+        .map_err(|e| e.to_string())
+}
+
+fn with_store<T: Send + 'static>(
+    root: PathBuf,
+    job: impl FnOnce(&Path, &Store) -> Result<T, String> + Send + 'static,
+) -> impl FnOnce() -> Result<T, String> + Send + 'static {
+    move || {
+        let store = crate::workflows::open_store(&root)?;
+        job(&root, &store)
+    }
+}
+
+#[tauri::command]
+pub async fn server_workflow_push(
+    state: State<'_, AppState>,
+    workflow: Workflow,
+    base_updated_at_ms: Option<i64>,
+) -> Result<Pushed, String> {
+    let root = state.root().to_path_buf();
+    blocking(with_store(root, move |r, s| {
+        push(r, &Configured, s, &workflow, base_updated_at_ms)
+    }))
+    .await
+}
+
+#[tauri::command]
+pub async fn server_workflow_pull(
+    state: State<'_, AppState>,
+    server_id: String,
+    id: String,
+) -> Result<Workflow, String> {
+    let root = state.root().to_path_buf();
+    blocking(with_store(root, move |r, s| {
+        pull(r, &Configured, s, &server_id, &id)
+    }))
+    .await
+}
+
+/// Apaga o workflow (e as execuções) no servidor; 404 conta como feito.
+#[tauri::command]
+pub async fn server_workflow_delete(
+    state: State<'_, AppState>,
+    server_id: String,
+    id: String,
+) -> Result<(), String> {
+    let root = state.root().to_path_buf();
+    blocking(
+        move || match client(&root, &Configured, &server_id)?.delete(&id) {
+            Ok(()) | Err(RemoteError::Status(404, _)) => Ok(()),
+            Err(e) => Err(e.to_string()),
+        },
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -459,6 +589,90 @@ pub(crate) mod tests {
         assert!(add(dir.path(), &vault, "lixo").is_err());
         assert!(load(dir.path()).is_empty());
         assert!(vault.0.lock().unwrap().is_empty());
+    }
+
+    /// Cadastra um servidor falso com PUT de verdade (concorrência otimista
+    /// como a do `zerith server`) e devolve (raiz, cofre, id).
+    fn paired_with_put() -> (tempfile::TempDir, MapVault, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = MapVault::default();
+        let held: Arc<Mutex<Option<serde_json::Value>>> = Arc::default();
+        let url = fake_server("zt_bom", move |m, p, body| {
+            let mut cur = held.lock().unwrap();
+            match (m, p) {
+                ("GET", "/v1/health") => (200, health_json(Some(now_ms()))),
+                ("PUT", _) => {
+                    let b: serde_json::Value = serde_json::from_str(body).unwrap();
+                    assert!(
+                        b["workflow"].get("run_on").is_none(),
+                        "run_on não vai ao servidor"
+                    );
+                    if let Some(c) = cur.as_ref() {
+                        if b["base_updated_at_ms"] != c["updated_at_ms"] {
+                            return (409, serde_json::json!({"error": "x", "current": c}));
+                        }
+                    }
+                    let mut wf = b["workflow"].clone();
+                    let next = cur
+                        .as_ref()
+                        .map_or(1000, |c| c["updated_at_ms"].as_i64().unwrap() + 1);
+                    wf["updated_at_ms"] = next.into();
+                    *cur = Some(wf.clone());
+                    (200, wf)
+                }
+                _ => (404, serde_json::json!({"error": "?"})),
+            }
+        });
+        let code = PairingCode {
+            v: 1,
+            name: "vps".into(),
+            url,
+            token: "zt_bom".into(),
+        }
+        .encode();
+        let id = add(dir.path(), &vault, &code).unwrap().id;
+        (dir, vault, id)
+    }
+
+    #[test]
+    fn enviar_workflow_cria_atualiza_e_avisa_conflito() {
+        let (dir, vault, srv) = paired_with_put();
+        let store = Store::open(&dir.path().join("workflows.db")).unwrap();
+        let mut wf: Workflow = serde_json::from_value(serde_json::json!({
+            "id": "w", "name": "w", "created_at_ms": 1, "updated_at_ms": 5
+        }))
+        .unwrap();
+        wf.run_on = Some(srv.clone());
+
+        let Pushed::Saved(v1) = push(dir.path(), &vault, &store, &wf, None).unwrap() else {
+            panic!("primeiro envio cria")
+        };
+        assert_eq!(
+            (v1.updated_at_ms, v1.run_on.as_deref()),
+            (1000, Some(srv.as_str()))
+        );
+        assert_eq!(
+            store.get_workflow("w").unwrap().unwrap().updated_at_ms,
+            1000
+        );
+
+        // Edição em cima da versão local: base = 1000.
+        let Pushed::Saved(v2) = push(dir.path(), &vault, &store, &v1, None).unwrap() else {
+            panic!("segunda edição grava")
+        };
+        assert_eq!(v2.updated_at_ms, 1001);
+
+        // Outro dispositivo já salvou: a base velha vira conflito com a versão dele.
+        let Pushed::Conflict(cur) = push(dir.path(), &vault, &store, &v1, Some(1000)).unwrap()
+        else {
+            panic!("base velha = 409")
+        };
+        assert_eq!(cur.updated_at_ms, 1001);
+        // "Sobrescrever": manda de novo com a base do servidor.
+        assert!(matches!(
+            push(dir.path(), &vault, &store, &v1, Some(cur.updated_at_ms)).unwrap(),
+            Pushed::Saved(_)
+        ));
     }
 
     #[test]

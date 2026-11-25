@@ -377,6 +377,9 @@ pub fn run() {
             servers::server_remove,
             servers::server_test,
             servers::server_health,
+            servers::server_workflow_push,
+            servers::server_workflow_pull,
+            servers::server_workflow_delete,
             update::update_check,
             update::update_install,
         ])

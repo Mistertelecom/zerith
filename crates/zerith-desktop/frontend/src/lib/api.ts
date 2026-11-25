@@ -1108,6 +1108,8 @@ export interface Workflow {
   alert_channels?: string[];
   /** Destino por id de canal; sem entrada usa o destino padrão do canal. */
   alert_target?: Record<string, string>;
+  /** Onde roda: ausente/null = este PC; senão o id de um servidor cadastrado. */
+  run_on?: string | null;
 }
 
 export interface ChannelConfig {
@@ -1296,4 +1298,15 @@ export const serversApi = {
   remove: (id: string) => invoke<void>("server_remove", { id }),
   test: (id: string) => invoke<ServerStatus>("server_test", { id }),
   health: (id: string) => invoke<ServerStatus>("server_health", { id }),
+  /** Grava aqui e envia ao servidor de `workflow.run_on`; 409 vem como `conflict`. */
+  pushWorkflow: (workflow: Workflow, baseUpdatedAtMs?: number) =>
+    invoke<Pushed>("server_workflow_push", { workflow, baseUpdatedAtMs: baseUpdatedAtMs ?? null }),
+  pullWorkflow: (serverId: string, id: string) =>
+    invoke<Workflow>("server_workflow_pull", { serverId, id }),
+  deleteWorkflow: (serverId: string, id: string) =>
+    invoke<void>("server_workflow_delete", { serverId, id }),
 };
+
+export type Pushed =
+  | { kind: "saved"; workflow: Workflow }
+  | { kind: "conflict"; workflow: Workflow };

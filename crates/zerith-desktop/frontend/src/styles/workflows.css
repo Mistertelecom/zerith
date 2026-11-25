@@ -1001,6 +1001,19 @@
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
 
+/* 409 do servidor: recarregar ou sobrescrever */
+.wf-conflict {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: min(460px, 92vw);
+  padding: 18px 20px;
+  background: var(--bg-base);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-xl);
+  box-shadow: var(--shadow-3);
+}
+
 .wf-mock-badge {
   margin-left: auto;
   padding: 1px 5px;

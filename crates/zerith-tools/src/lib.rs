@@ -58,7 +58,7 @@ pub use terminal::{
     terminal_open_for,
     terminal_program, terminal_tail, TerminalSnapshot,
 };
-pub use web::SearchTool;
+pub use web::{Provider as SearchProvider, SearchTool};
 pub use workflows::{set_workflow_ai_executor, set_workflow_change_hook};
 
 /// What a caller may be asked to allow.

@@ -602,6 +602,124 @@ fn search_tool_returns_the_endpoint_json() {
     assert!(out.contains("\"title\": \"x\""), "{out}");
 }
 
+/// Um servidor HTTP falso que responde `status` + `body` uma vez e devolve,
+/// pelo canal, a requisição que recebeu (linha, cabeçalhos e corpo).
+fn serve_capture(
+    status: &'static str,
+    body: &'static str,
+) -> (String, std::sync::mpsc::Receiver<String>) {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", l.local_addr().unwrap());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        if let Ok((mut s, _)) = l.accept() {
+            s.set_read_timeout(Some(Duration::from_millis(300))).ok();
+            let mut req = Vec::new();
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = s.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                req.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&req);
+                let Some(head_end) = text.find("\r\n\r\n") else {
+                    continue;
+                };
+                let len = text[..head_end]
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                    })
+                    .unwrap_or(0);
+                if req.len() >= head_end + 4 + len {
+                    break;
+                }
+            }
+            let _ = write!(
+                s,
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = tx.send(String::from_utf8_lossy(&req).into_owned());
+        }
+    });
+    (url, rx)
+}
+
+#[test]
+fn search_providers_send_their_key_and_read_their_answer() {
+    use zerith_tools::{SearchProvider, SearchTool};
+    let dir = scratch();
+    let p = policy(dir.path());
+    let run = |provider: SearchProvider| {
+        let mut r = Registry::empty();
+        r.register(Box::new(SearchTool::with(provider)));
+        call(&r, &p, "web_search", json!({"query": "olt huawei"}))
+    };
+
+    let (url, req) = serve_capture(
+        "200 OK",
+        r#"{"web":{"results":[{"title":"<strong>MA5800</strong> guia","url":"https://e.com/a","description":"configurar <strong>OLT</strong>"}]}}"#,
+    );
+    let out = run(SearchProvider::Brave {
+        url: format!("{url}/res"),
+        key: "bk".into(),
+    })
+    .unwrap();
+    assert_eq!(out, "1. MA5800 guia\n   https://e.com/a\n   configurar OLT");
+    let got = req.recv().unwrap().to_ascii_lowercase();
+    assert!(
+        got.starts_with("get /res?q=olt%20huawei&count=10 "),
+        "{got}"
+    );
+    assert!(got.contains("x-subscription-token: bk"), "{got}");
+
+    let (url, req) = serve_capture(
+        "200 OK",
+        r#"{"results":[{"title":"T","url":"https://t.com","content":"c"},{"title":"sem url","url":"","content":""}]}"#,
+    );
+    let out = run(SearchProvider::Tavily {
+        url: url.clone(),
+        key: "tk".into(),
+    })
+    .unwrap();
+    assert_eq!(out, "1. T\n   https://t.com\n   c");
+    let got = req.recv().unwrap();
+    assert!(got.starts_with("POST / "), "{got}");
+    assert!(
+        got.to_ascii_lowercase()
+            .contains("authorization: bearer tk"),
+        "{got}"
+    );
+    assert!(got.contains(r#""query":"olt huawei""#), "{got}");
+
+    let (url, req) = serve_capture(
+        "200 OK",
+        r#"{"results":[{"title":"S","url":"http://s.lan/x","content":"local"}]}"#,
+    );
+    let out = run(SearchProvider::Searxng { url }).unwrap();
+    assert!(out.starts_with("1. S\n   http://s.lan/x"), "{out}");
+    assert!(req
+        .recv()
+        .unwrap()
+        .starts_with("GET /search?q=olt%20huawei&format=json "));
+
+    // A recusa da API chega ao modelo com o motivo.
+    let (url, _req) = serve_capture("401 Unauthorized", r#"{"error":"chave inválida"}"#);
+    let e = run(SearchProvider::Brave {
+        url,
+        key: "x".into(),
+    })
+    .unwrap_err()
+    .to_string();
+    assert!(
+        e.contains("HTTP 401") && e.contains("chave inválida"),
+        "{e}"
+    );
+}
+
 // --- tools the runtime settles ---------------------------------------------
 
 #[test]

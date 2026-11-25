@@ -62,6 +62,36 @@ pub struct Settings {
     pub browser: BrowserSettings,
     #[serde(default, skip_serializing_if = "SecretsSettings::is_default")]
     pub secrets: SecretsSettings,
+    #[serde(default, skip_serializing_if = "WebSearchSettings::is_default")]
+    pub web_search: WebSearchSettings,
+}
+
+/// `[web_search]`: o provedor de `web_search`. Vazio: DuckDuckGo (sem conta).
+/// Só a camada do usuário: um repositório não troca para onde vão as buscas.
+///
+/// ```toml
+/// [web_search]
+/// provider = "brave"          # brave | tavily | searxng | duckduckgo
+/// # key_ref = "brave_search"  # entrada do cofre (padrão: nome do provedor)
+/// # url = "http://127.0.0.1:8080"  # searxng; ou outro endereço da API
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebSearchSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Endereço: obrigatório para searxng; troca a API dos outros.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Entrada do cofre com a chave (`zerith secret set <nome>`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_ref: Option<String>,
+}
+
+impl WebSearchSettings {
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
 }
 
 /// `[secrets]`: where secrets live (see `secrets::choose_with`). User layer
@@ -1149,6 +1179,7 @@ fn tighten_only(t: &mut Table) -> Option<String> {
         "gateway",
         "remote",
         "secrets",
+        "web_search",
     ] {
         if t.remove(k).is_some() {
             removed.push(k);

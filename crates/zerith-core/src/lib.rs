@@ -21,7 +21,7 @@ pub use instructions::{
 pub use paths::Paths;
 pub use settings::{
     AccountEntry, BrowserEngine, BrowserSettings, CavemanLevel, ComboEntry, MediaSettings,
-    MediaSlot, PonytailLevel, RoutingSettings, Settings, TokenSaverSettings,
+    MediaSlot, PonytailLevel, RoutingSettings, Settings, TokenSaverSettings, WebSearchSettings,
 };
 
 /// Product identity. One place, so a rename never means a grep.

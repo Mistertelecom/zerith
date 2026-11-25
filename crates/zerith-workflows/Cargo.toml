@@ -15,6 +15,10 @@ thiserror.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # Código de pareamento do `zerith server` (remote.rs); já na árvore via ureq.
 base64 = "0.22"
+# Segredos `{{secret:nome}}` no cofre configurado (arquivo no servidor).
+zerith-core = { path = "../zerith-core" }
+# `<raiz>/inventory.toml` para a opção `device` do nó SSH.
+toml.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

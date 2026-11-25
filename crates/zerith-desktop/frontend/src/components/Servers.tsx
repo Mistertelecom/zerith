@@ -67,15 +67,14 @@ export function useServerTrouble(): boolean {
   return serverTrouble(Object.values(all));
 }
 
-/** Nomes de segredo citados na config de um nó: `secret_ref` e `*_secret_ref`. */
+/** Nomes de segredo citados na config de um nó: `secret_ref`, `*_secret_ref`,
+ * `*_secret` (ex. `password_secret`) e `{{secret:nome}}` em qualquer texto. */
 export function secretRefs(config: Record<string, unknown>): string[] {
-  return [
-    ...new Set(
-      Object.entries(config)
-        .filter(([k, v]) => (k === "secret_ref" || k.endsWith("_secret_ref")) && typeof v === "string" && v.trim())
-        .map(([, v]) => (v as string).trim()),
-    ),
-  ];
+  const named = Object.entries(config)
+    .filter(([k, v]) => (k === "secret_ref" || k.endsWith("_secret_ref") || k.endsWith("_secret")) && typeof v === "string" && v.trim())
+    .map(([, v]) => (v as string).trim());
+  const inline = [...JSON.stringify(config).matchAll(/\{\{secret:([A-Za-z0-9._-]{1,128})\}\}/g)].map((m) => m[1]);
+  return [...new Set([...named, ...inline])];
 }
 
 const SECRET_NAME = /^[A-Za-z0-9._-]{1,128}$/;

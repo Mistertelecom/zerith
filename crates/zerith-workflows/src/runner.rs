@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -8,12 +9,12 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use crate::channels;
 use crate::model::{
     NodeEvent, NodeKind, NodeRunLog, Workflow, WorkflowEdge, WorkflowNode, WorkflowRun,
 };
 use crate::schedule::LocalDateTime;
 use crate::store::Store;
+use crate::{channels, ssh};
 use crate::{now_ms, unix_secs, Result, WorkflowError};
 
 pub trait AiExecutor: Send + Sync {
@@ -359,7 +360,7 @@ fn run_node_with_controls(
 
     let mut attempt = 0u64;
     loop {
-        match run_node(node, prev, outputs, now_dt, opts) {
+        match run_node_masked(node, prev, outputs, now_dt, opts) {
             Ok(ok) => return Ok(ok),
             Err(err) if attempt < retry_count => {
                 attempt += 1;
@@ -514,22 +515,7 @@ fn run_node(
             Ok((out, None))
         }
         NodeKind::SshCommand => {
-            let host = cfg_str(cfg, "host")
-                .ok_or_else(|| WorkflowError::Exec("host SSH obrigatório".into()))?;
-            if host.starts_with('-') {
-                return Err(WorkflowError::Exec("host SSH inválido".into()));
-            }
-            let user = cfg_str(cfg, "user");
-            if let Some(u) = user {
-                if u.starts_with('-') {
-                    return Err(WorkflowError::Exec("usuário SSH inválido".into()));
-                }
-            }
-            let port = cfg
-                .get("port")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(22)
-                .clamp(1, 65535);
+            let t = ssh::target(cfg, opts.data_root)?;
             let raw_cmd = cfg_str(cfg, "command")
                 .ok_or_else(|| WorkflowError::Exec("comando SSH vazio".into()))?;
             // The remote shell parses this string: dynamic values are POSIX-quoted.
@@ -539,29 +525,17 @@ fn run_node(
                 .and_then(|v| v.as_u64())
                 .unwrap_or(30)
                 .clamp(1, 300);
-            let dest = match user {
-                Some(u) => format!("{u}@{host}"),
-                None => host.to_string(),
+            let args = ssh::args(&t, &cmd);
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let timeout = Duration::from_secs(timeout);
+            let out = match t.password_secret.as_deref() {
+                Some(name) => {
+                    let pw = secret_value(name)?;
+                    let askpass = ssh::AskPass::create()?;
+                    run_direct_command("ssh", &args, &askpass.env(&pw), timeout)?
+                }
+                None => run_direct_command("ssh", &args, &[], timeout)?,
             };
-            let port_str = port.to_string();
-            let mut args = vec![
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "StrictHostKeyChecking=accept-new",
-                "-o",
-                "ConnectTimeout=10",
-                "-p",
-                &port_str,
-            ];
-            let key_path = cfg_str(cfg, "identity_file");
-            if let Some(kp) = key_path {
-                args.push("-i");
-                args.push(kp);
-            }
-            args.push(&dest);
-            args.push(&cmd);
-            let out = run_direct_command("ssh", &args, Duration::from_secs(timeout))?;
             Ok((out, None))
         }
         NodeKind::HttpRequest => {
@@ -817,6 +791,100 @@ fn run_node(
     }
 }
 
+// ---- Segredos `{{secret:nome}}` --------------------------------------------
+
+thread_local! {
+    /// Valores de segredo lidos durante o nó atual (para mascarar a saída) e o
+    /// primeiro `{{secret:x}}` que faltou no cofre.
+    static SECRETS_SEEN: RefCell<(Vec<String>, Option<String>)> =
+        const { RefCell::new((Vec::new(), None)) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Cofre de teste: os testes nunca tocam o cofre real.
+    static TEST_VAULT: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+}
+
+const SECRET_MASK: &str = "***";
+
+/// Lê `name` no cofre configurado (`zerith_core::secrets`; no servidor, o
+/// backend de arquivo) e guarda o valor para mascarar a saída do nó.
+pub(crate) fn secret_value(name: &str) -> Result<String> {
+    #[cfg(test)]
+    let got = TEST_VAULT.with(|v| {
+        v.borrow()
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("segredo '{name}' não encontrado no cofre"))
+    });
+    #[cfg(not(test))]
+    let got = zerith_core::secrets::get_secret(name).map_err(|e| e.to_string());
+    let v = got.map_err(|e| WorkflowError::Exec(format!("{e}{}", secret_hint(name))))?;
+    if !v.is_empty() {
+        SECRETS_SEEN.with(|s| s.borrow_mut().0.push(v.clone()));
+    }
+    Ok(v)
+}
+
+fn secret_hint(name: &str) -> String {
+    format!(" (grave no servidor: zerith secret set {name}, ou pela tela do desktop)")
+}
+
+/// `{{secret:nome}}` na interpolação: o valor, ou `None` (o token fica literal
+/// e o nó falha em [`run_node_masked`]).
+fn scoped_secret(name: &str) -> Option<String> {
+    let name = name.trim();
+    match secret_value(name) {
+        Ok(v) => Some(v),
+        Err(_) => {
+            SECRETS_SEEN.with(|s| {
+                s.borrow_mut().1.get_or_insert_with(|| name.to_string());
+            });
+            None
+        }
+    }
+}
+
+/// Troca cada valor de segredo por `***` (o mais longo primeiro).
+fn mask_secrets(text: &str, values: &[String]) -> String {
+    let mut vals: Vec<&String> = values.iter().filter(|v| !v.is_empty()).collect();
+    vals.sort_by_key(|v| std::cmp::Reverse(v.len()));
+    let mut out = text.to_string();
+    for v in vals {
+        out = out.replace(v.as_str(), SECRET_MASK);
+    }
+    out
+}
+
+/// [`run_node`] com os segredos lidos no nó mascarados na saída e no erro —
+/// é isso que vai para log, histórico, eventos e resumo.
+fn run_node_masked(
+    node: &WorkflowNode,
+    prev: &str,
+    outputs: &HashMap<String, String>,
+    now_dt: &LocalDateTime,
+    opts: &RunOptions<'_>,
+) -> Result<(String, Option<String>)> {
+    SECRETS_SEEN.with(|s| *s.borrow_mut() = (Vec::new(), None));
+    let res = run_node(node, prev, outputs, now_dt, opts);
+    let (seen, missing) = SECRETS_SEEN.with(|s| std::mem::take(&mut *s.borrow_mut()));
+    if let Some(name) = missing {
+        return Err(WorkflowError::Exec(format!(
+            "segredo '{name}' não encontrado no cofre{}",
+            secret_hint(&name)
+        )));
+    }
+    match res {
+        Ok((out, branch)) => Ok((mask_secrets(&out, &seen), branch)),
+        Err(e) if seen.is_empty() => Err(e),
+        Err(WorkflowError::Exec(m)) => Err(WorkflowError::Exec(mask_secrets(&m, &seen))),
+        Err(WorkflowError::Channel(m)) => Err(WorkflowError::Channel(mask_secrets(&m, &seen))),
+        Err(WorkflowError::Ai(m)) => Err(WorkflowError::Ai(mask_secrets(&m, &seen))),
+        Err(e) => Err(WorkflowError::Exec(mask_secrets(&e.to_string(), &seen))),
+    }
+}
+
 /// Início da saída do nó SaveFile; o resto é o caminho gravado (lido pelo
 /// anexo do NotifyChannel).
 const SAVED_PREFIX: &str = "Arquivo salvo em ";
@@ -868,7 +936,7 @@ pub fn test_single_node(
 ) -> Result<String> {
     let now_dt = LocalDateTime::from_unix_secs(unix_secs(), opts.tz_offset_minutes);
     let outputs = HashMap::new();
-    let (out, branch) = run_node(node, sample_input, &outputs, &now_dt, opts)?;
+    let (out, branch) = run_node_masked(node, sample_input, &outputs, &now_dt, opts)?;
     if let Some(scope) = dedup_scope(node, sample_input, &outputs, &now_dt) {
         let items: Vec<String> = out.lines().map(str::to_string).collect();
         opts.store.mark_items_seen(&scope, &items)?;
@@ -910,9 +978,15 @@ fn extract_json_path(raw: &str, path: &str) -> Result<String> {
     })
 }
 
-fn run_direct_command(bin: &str, args: &[&str], timeout: Duration) -> Result<String> {
+fn run_direct_command(
+    bin: &str,
+    args: &[&str],
+    env: &[(&str, String)],
+    timeout: Duration,
+) -> Result<String> {
     let mut c = Command::new(bin);
     c.args(args)
+        .envs(env.iter().map(|(k, v)| (k, v)))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -1138,6 +1212,8 @@ fn interpolate_inner(
                     .filter(|id| outputs.contains_key(*id))
                 {
                     out.push_str(&esc(&outputs[id]));
+                } else if let Some(v) = token.strip_prefix("secret:").and_then(scoped_secret) {
+                    out.push_str(&esc(&v));
                 } else {
                     out.push_str(&rest[start..start + 2 + end + 2]);
                 }
@@ -1651,6 +1727,76 @@ mod tests {
             last_run_at_ms: None,
             last_status: None,
         }
+    }
+
+    #[test]
+    fn segredo_resolvido_na_execucao_e_mascarado_no_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("w.db")).unwrap();
+        TEST_VAULT.with(|v| v.borrow_mut().insert("api_x".into(), "s3nh4-Sup3r".into()));
+        let echo = if cfg!(windows) {
+            "echo {{secret:api_x}}"
+        } else {
+            "printf '%s\\n' {{secret:api_x}}"
+        };
+        let wf = wf_of(
+            vec![
+                node(
+                    "t",
+                    NodeKind::Transform,
+                    json!({"template": "tok={{secret:api_x}}"}),
+                ),
+                node("s", NodeKind::Shell, json!({"command": echo})),
+                node(
+                    "d",
+                    NodeKind::Transform,
+                    json!({"template": "antes: {{node.t}}"}),
+                ),
+            ],
+            vec![edge("t", "s"), edge("s", "d")],
+        );
+        let events = Arc::new(Mutex::new(String::new()));
+        let sink = Arc::clone(&events);
+        let mut on_event = move |e: NodeEvent| sink.lock().unwrap().push_str(&e.output);
+        let mut opts = RunOptions {
+            store: &store,
+            data_root: dir.path(),
+            ai: &NoopAiExecutor,
+            trigger_source: "manual",
+            tz_offset_minutes: 0,
+            initial_input: None,
+            on_event: &mut on_event,
+        };
+        let run = execute_workflow(&wf, &mut opts).unwrap();
+        assert_eq!(run.status, "ok", "{:?}", run.node_logs);
+        assert_eq!(run.node_logs[0].output, "tok=***");
+        assert_eq!(run.node_logs[1].output.trim(), "***");
+        // O nó seguinte recebe o texto já mascarado.
+        assert_eq!(run.node_logs[2].output, "antes: tok=***");
+        let saved = serde_json::to_string(&store.list_runs("wf", 1).unwrap()).unwrap();
+        assert!(!saved.contains("s3nh4-Sup3r") && saved.contains("***"));
+        assert!(!run.summary.contains("s3nh4") && !events.lock().unwrap().contains("s3nh4"));
+
+        // Segredo que falta: o nó falha com o nome, sem rodar com o token cru.
+        let wf = wf_of(
+            vec![node(
+                "t",
+                NodeKind::Transform,
+                json!({"template": "{{secret:nada}}"}),
+            )],
+            vec![],
+        );
+        let run = execute_workflow(&wf, &mut opts).unwrap();
+        assert_eq!(run.status, "error");
+        assert!(run.summary.contains("segredo 'nada'"), "{}", run.summary);
+        assert!(!run.summary.contains("s3nh4"));
+    }
+
+    #[test]
+    fn mascara_troca_o_valor_mais_longo_primeiro() {
+        let vals = vec!["ab".to_string(), "abcd".to_string(), String::new()];
+        assert_eq!(mask_secrets("x abcd y ab", &vals), "x *** y ***");
+        assert_eq!(mask_secrets("nada", &[]), "nada");
     }
 
     #[test]

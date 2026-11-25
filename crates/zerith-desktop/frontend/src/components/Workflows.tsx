@@ -2540,6 +2540,30 @@ function NodeInspector(props: {
       {node.kind === "ssh_command" ? (
         <>
           <div className="wf-field">
+            <label>{tr(lang, "Equipamento do inventário (cliente/nome)", "Inventory device (client/name)")}</label>
+            <input
+              value={String(cfg.device ?? "")}
+              placeholder={tr(lang, "opcional: preenche host, porta, usuário e senha", "optional: fills host, port, user and password")}
+              onChange={(e) => setCfg({ device: e.target.value })}
+            />
+          </div>
+          <div className="wf-field">
+            <label>{tr(lang, "Segredo com a senha (sem chave)", "Password secret (no key)")}</label>
+            <input
+              value={String(cfg.password_secret ?? "")}
+              placeholder="ex. dude-senha"
+              onChange={(e) => setCfg({ password_secret: e.target.value })}
+            />
+          </div>
+          <label className="pn-inline">
+            <input
+              type="checkbox"
+              checked={Boolean(cfg.legacy_ssh)}
+              onChange={(e) => setCfg({ legacy_ssh: e.target.checked })}
+            />
+            <span>{tr(lang, "Algoritmos antigos (ssh-rsa, DH group14-sha1)", "Legacy algorithms (ssh-rsa, DH group14-sha1)")}</span>
+          </label>
+          <div className="wf-field">
             <label>Host / IP</label>
             <input
               value={String(cfg.host ?? "")}

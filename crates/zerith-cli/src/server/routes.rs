@@ -361,5 +361,6 @@ fn delete_secret(ctx: &Ctx, name: &str) -> Result<Resp, Resp> {
     Ok((200, json!({ "deleted": name })))
 }
 
-/// Cofre usado pelo servidor: o do SO em produção, um mapa nos testes.
+/// Cofre usado pelo servidor: o configurado (`secrets::Configured`) em
+/// produção, um mapa nos testes.
 pub type Secrets = Box<dyn SecretStore + Send + Sync>;

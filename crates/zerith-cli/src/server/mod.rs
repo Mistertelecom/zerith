@@ -49,12 +49,13 @@ pub(crate) struct Ctx {
 
 impl Ctx {
     /// `<raiz>/workflows.db` (o mesmo banco do desktop e do daemon) e o cofre
-    /// do sistema. Não semeia os modelos de exemplo: o servidor é gerenciado
+    /// configurado (`ZERITH_SECRETS_BACKEND`). Não semeia os modelos de exemplo: o servidor é gerenciado
     /// pelo desktop.
     pub(crate) fn open(paths: &Paths) -> Result<Self, Boxed> {
         Self::with(
             paths,
-            Box::new(zerith_core::secrets::OsKeyring),
+            // O mesmo cofre que o motor lê (`{{secret:x}}`): arquivo no servidor.
+            Box::new(zerith_core::secrets::Configured),
             Arc::new(CliAi {
                 paths: paths.clone(),
             }),

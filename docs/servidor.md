@@ -230,7 +230,7 @@ ausente/errado/revogado: 401. Mais de 10 falhas por minuto do mesmo IP: 429
 | `GET /workflows/:id/runs?limit=` | execuções recentes (1–200, padrão 20) |
 | `GET /runs/:run_id` | execução com logs por nó |
 | `GET /secrets` | só os nomes gravados por esta API |
-| `PUT /secrets/:nome` | `{value}`; grava no cofre do sistema |
+| `PUT /secrets/:nome` | `{value}`; grava no cofre configurado (arquivo no servidor) |
 | `DELETE /secrets/:nome` | apaga do cofre |
 | `GET /events` | Server-Sent Events: `run_started`, `node`, `run_finished` (com `id:`), e `daemon_status` a cada 30 s. Reconexão com `?since=<id>` ou `Last-Event-ID` (últimos 500 eventos em memória) |
 
@@ -256,6 +256,28 @@ essa linha; quando existir `Store::daemon_status()`, a leitura passa a usá-la.
 
 Atenção: os *workflows* em si (comandos, URLs, saídas dos nós) vão e voltam
 pela API — não coloque segredos direto no texto do workflow; guarde no cofre.
+
+## Segredos nos nós
+
+O servidor grava e o motor lê o **mesmo** cofre: o configurado
+(`ZERITH_SECRETS_BACKEND=file` no serviço → `<raiz>/secrets/`).
+
+- `{{secret:nome}}` em qualquer campo de texto (comando, URL, corpo,
+  cabeçalho, mensagem) vira o valor só na hora de executar. Na saída do nó, no
+  erro, no histórico, nos eventos e no resumo cada valor lido aparece como
+  `***`. Segredo que falta: o nó falha com o nome e a dica
+  `zerith secret set <nome>`.
+- `ssh_command`:
+  - `password_secret`: nome do segredo com a senha. Sem `identity_file`, o
+    nó autentica por senha (password/keyboard-interactive, uma tentativa) via
+    `SSH_ASKPASS` — a senha vai só no ambiente do `ssh` filho, nunca na linha de
+    comando nem em arquivo. Exige OpenSSH ≥ 8.4 (`SSH_ASKPASS_REQUIRE`).
+  - `legacy_ssh: true`: `KexAlgorithms=+diffie-hellman-group14-sha1,…`,
+    `HostKeyAlgorithms=+ssh-rsa`, `PubkeyAcceptedAlgorithms=+ssh-rsa`
+    (equipamentos antigos; os mesmos das ferramentas de rede).
+  - `device: "cliente/nome"`: pega host, porta, usuário, `secret_ref` (vira
+    `password_secret`) e `legacy_ssh` de `<raiz>/inventory.toml`. Campo
+    preenchido no nó vence o do inventário.
 
 ## Limites conhecidos
 

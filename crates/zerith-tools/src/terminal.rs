@@ -808,6 +808,16 @@ fn collect(
     let started = Instant::now();
     let watch_footer = !cmd.is_some_and(has_stop_param);
     let mut footer_at: Option<Instant> = None;
+    // A prompt only ends the read once the device echoed what was typed:
+    // RouterOS redraws the prompt in the middle of its own echo
+    // (`/ip fir[admin@MK] > /ip firewall filter print`), and stopping there
+    // handed each command the output of the one before, while the next
+    // command got typed into the pager. No echo seen: a prompt needs 600 ms
+    // of quiet. Idea from Hermes Agent's `terminal_tool.py` (MIT), which
+    // waits on a known prompt instead of a fixed sleep.
+    let echo = cmd.map(echo_tail).filter(|e| !e.is_empty());
+    let mut echo_seen = echo.is_none();
+    let strict = t.meta.vendor.as_deref().and_then(vendor_prompt);
     let note = loop {
         std::thread::sleep(Duration::from_millis(12));
         let now = len();
@@ -863,10 +873,33 @@ fn collect(
             }
         }
         let pager_waiting = auto_page && pages < MAX_AUTO_PAGES && looks_like_pager(&tail_clean);
-        let prompt_settle = if tail_clean.contains('\n') {
-            Duration::from_millis(80)
-        } else {
-            Duration::from_millis(120)
+        if !echo_seen {
+            let head: Vec<u8> = t
+                .buf
+                .lock()
+                .map(|b| b.range(..b.len().min(ECHO_SCAN_BYTES)).copied().collect())
+                .unwrap_or_default();
+            echo_seen = echo.as_deref().is_some_and(|e| clean(&head).contains(e));
+        }
+        // The vendor's own prompt alone on the last line, after the echo:
+        // the command is over, no need to wait for quiet (30 ms only so a
+        // line split by the network is not taken for one). The redrawn
+        // prompt inside an echo (`/ip fir[admin@MK] >`) is not alone.
+        let strict_hit = strict.map(|re| {
+            !tail_bytes.ends_with(b"\n")
+                && tail_clean.lines().last().is_some_and(|l| re.is_match(l))
+        });
+        let at_vendor_prompt =
+            echo_seen && strict_hit == Some(true) && quiet >= Duration::from_millis(30);
+        // Anything else that ends like a prompt waits a little for quiet;
+        // longer before the echo, or when it is not the vendor's shape.
+        let prompt_settle = match (
+            echo_seen && strict_hit != Some(false),
+            tail_clean.contains('\n'),
+        ) {
+            (false, _) => Duration::from_millis(600),
+            (true, true) => Duration::from_millis(80),
+            (true, false) => Duration::from_millis(120),
         };
         // A monitor footer keeps output flowing, so "quiet for 2 s" never
         // comes and the footer is not a prompt.
@@ -876,7 +909,8 @@ fn collect(
                 Some(re) => re.is_match(&tail_clean),
                 None => {
                     now > 0
-                        && (quiet >= Duration::from_secs(2) && monitor.is_none()
+                        && (at_vendor_prompt
+                            || quiet >= Duration::from_secs(2) && monitor.is_none()
                             || (quiet >= prompt_settle && looks_like_prompt(&tail_clean)))
                 }
             };
@@ -1132,6 +1166,48 @@ fn condense_continuous(text: &str) -> (String, usize) {
         return (s, longest);
     }
     (out.join("\n"), longest)
+}
+
+/// How far into a command's output its echo is looked for.
+const ECHO_SCAN_BYTES: usize = 4096;
+
+/// The part of a typed command its echo must show: the last 24 characters
+/// (a long line may wrap or scroll at the start, never at the end).
+fn echo_tail(cmd: &str) -> String {
+    let c: Vec<char> = cmd.trim().chars().collect();
+    c[c.len().saturating_sub(24)..].iter().collect()
+}
+
+/// A line that is exactly the vendor's prompt (after `clean`, trailing
+/// space gone): RouterOS `[admin@MK] >` / `[admin@MK] /ip/route>`, Cisco
+/// `R1#` / `R1(config-if)#`, Huawei `<HW>` / `[~HW-Gi0/0/1]`, Junos
+/// `user@mx>`, FortiOS `FGT60E #`, Linux `user@host:~$`. `None`: no
+/// known shape, the read waits for quiet.
+fn vendor_prompt(vendor: &str) -> Option<&'static Regex> {
+    static RES: OnceLock<Vec<(&'static str, Regex)>> = OnceLock::new();
+    let res = RES.get_or_init(|| {
+        [
+            // `<SAFE>` in safe mode.
+            (
+                "mikrotik_router_os",
+                r"^\[[^\[\]\s]+@[^\[\]]+\] ?(/\S*)?(>|<SAFE>)$",
+            ),
+            ("cisco_ios", r"^[\w.\-/:]+(\([\w.\-]+\))?[#>]$"),
+            ("cisco_nxos", r"^[\w.\-/:]+(\([\w.\-]+\))?[#>]$"),
+            ("cisco_xr", r"^(RP/\S+:)?[\w.\-/]+(\([\w.\-]+\))?[#>]$"),
+            ("huawei_vrp", r"^(<[\w.\-~]+>|\[~?\*?[\w.\-/:~]+\])$"),
+            (
+                "juniper_junos",
+                r"^(\{\w+(:\d+)?\}\s*)?[\w.\-]+@[\w.\-]+[>#%]$",
+            ),
+            ("fortinet_forti_os", r"^[\w.\-]+( \([\w.\-]+\))? [#$]$"),
+            ("linux", r"^[\w.\-]+@[\w.\-]+(:\S*)?\s?[$#]$"),
+        ]
+        .into_iter()
+        .map(|(v, p)| (v, Regex::new(p).expect("static regex")))
+        .collect()
+    });
+    res.iter().find(|(v, _)| *v == vendor).map(|(_, re)| re)
 }
 
 /// The last line ends like a prompt: `Router#`, `<Huawei>`, `[admin@MikroTik] >`,
@@ -1611,6 +1687,28 @@ mod tests {
         assert!(looks_like_pager("show bgp\n--More--"));
         assert!(looks_like_pager("---(more 42%)---"));
         assert!(!looks_like_pager("Router#"));
+    }
+
+    #[test]
+    fn vendor_prompts_are_told_from_an_echo_with_the_prompt_inside() {
+        let ok = |v: &str, l: &str| vendor_prompt(v).unwrap().is_match(l);
+        let mk = "mikrotik_router_os";
+        assert!(ok(mk, "[admin@MK] >"));
+        assert!(ok(mk, "[admin@Borda SP-01] /ip/route>"));
+        assert!(ok(mk, "[admin@MK] <SAFE>"));
+        assert!(!ok(mk, "/ip fir[admin@MK] >"));
+        assert!(!ok(mk, "[admin@MK] > /ip firewall filter print"));
+        assert!(ok("cisco_ios", "R1(config-if)#"));
+        assert!(!ok("cisco_ios", "R1#show run"));
+        assert!(ok("huawei_vrp", "<HW-CORE>"));
+        assert!(ok("huawei_vrp", "[~HW-CORE-GigabitEthernet0/0/1]"));
+        assert!(ok("juniper_junos", "netops@mx480>"));
+        assert!(ok("linux", "root@pve:~#"));
+        assert!(vendor_prompt("generic").is_none());
+        assert_eq!(
+            echo_tail("/ip firewall filter print terse"),
+            "ewall filter print terse"
+        );
     }
 
     #[test]

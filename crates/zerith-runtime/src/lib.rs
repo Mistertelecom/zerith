@@ -435,10 +435,10 @@ pub fn build_prompt_context(
         .project_dir
         .map(std::path::Path::to_path_buf)
         .or_else(|| std::env::current_dir().ok());
-    let mut static_system = match dir {
+    let mut static_system = match &dir {
         Some(cwd) if !ctx.no_project_instructions => {
             zerith_core::system_prompt_base_with_instructions(&zerith_core::load_instructions(
-                &paths, &cwd,
+                &paths, cwd,
             ))
         }
         _ => zerith_core::system_prompt_base(),
@@ -494,6 +494,19 @@ pub fn build_prompt_context(
                     static_system.push_str("\n\n");
                     static_system.push_str(header);
                     static_system.push_str(&full_catalog(lib));
+                    let devices = dir
+                        .as_deref()
+                        .and_then(|d| {
+                            zerith_tools::network::load_inventory(d, Some(paths.root())).ok()
+                        })
+                        .unwrap_or_default();
+                    let likely = likely_skills(lib, prompt, &devices);
+                    if !likely.is_empty() {
+                        dyn_parts.push(format!(
+                            "Skills mais prováveis para este pedido: {}",
+                            likely.join(", ")
+                        ));
+                    }
                     let inlined = auto_inline_skills(lib, &catalog, prompt, 3600);
                     if !inlined.is_empty() {
                         dyn_parts.push(inlined);
@@ -1679,6 +1692,82 @@ pub fn full_catalog(lib: &zerith_skills::Library) -> String {
     out
 }
 
+/// How many skills the per-turn highlight names.
+const LIKELY_SKILLS: usize = 5;
+
+/// Words that find a vendor's skills: what their names and descriptions say.
+/// Empty for `generic`/`linux` (any skill says "linux").
+pub fn vendor_terms(v: zerith_tools::network::Vendor) -> &'static [&'static str] {
+    use zerith_tools::network::Vendor::*;
+    match v {
+        MikrotikRouterOs => &["mikrotik", "routeros"],
+        CiscoIos => &["cisco", "ios"],
+        CiscoNxos => &["cisco", "nexus", "nxos"],
+        CiscoXr => &["cisco", "iosxr"],
+        HuaweiVrp => &["huawei", "vrp"],
+        JuniperJunos => &["juniper", "junos"],
+        FortinetFortiOs => &["fortinet", "fortigate", "fortios"],
+        Linux | Generic => &[],
+    }
+}
+
+/// Platform words implied by the inventory devices `prompt` names (by name or
+/// host as a whole word; when a client is named too, only that client's).
+/// "concentrador da Facilnet" → the device's vendor → `mikrotik routeros`.
+/// A `generic` device contributes the platform words in its name and tags
+/// (`olt-parks` → `olt parks`).
+fn device_terms(prompt: &str, devices: &[zerith_tools::network::DeviceEntry]) -> Vec<String> {
+    let named: Vec<_> = devices
+        .iter()
+        .filter(|d| names_skill(prompt, &d.name) || names_skill(prompt, &d.host))
+        .collect();
+    let of_client: Vec<_> = named
+        .iter()
+        .filter(|d| d.client.as_deref().is_some_and(|c| names_skill(prompt, c)))
+        .copied()
+        .collect();
+    let picked = if of_client.is_empty() {
+        named
+    } else {
+        of_client
+    };
+    let mut out: Vec<String> = Vec::new();
+    for d in picked {
+        let words: Vec<String> = match vendor_terms(d.vendor) {
+            [] => zerith_skills::search::tokens(&format!("{} {}", d.name, d.tags.join(" ")))
+                .into_iter()
+                .filter(|t| zerith_skills::search::PLATFORM.contains(&t.as_str()))
+                .collect(),
+            v => v.iter().map(|s| s.to_string()).collect(),
+        };
+        for w in words {
+            if !out.contains(&w) {
+                out.push(w);
+            }
+        }
+    }
+    out
+}
+
+/// The skills that best fit this request, for one line in the turn reminder
+/// (the full list is in the cached prompt). BM25 with platform words weighed
+/// up, the vendor of a named inventory device added, and the same floor as
+/// the ranked list.
+pub fn likely_skills(
+    lib: &zerith_skills::Library,
+    prompt: &str,
+    devices: &[zerith_tools::network::DeviceEntry],
+) -> Vec<String> {
+    let boost = device_terms(prompt, devices);
+    let boost: Vec<&str> = boost.iter().map(String::as_str).collect();
+    let hits = zerith_skills::search::search_boosted(lib, prompt, &boost, LIKELY_SKILLS);
+    let floor = hits.first().map_or(0.0, |h| h.score / 5.0);
+    hits.into_iter()
+        .filter(|h| h.score >= floor)
+        .map(|h| h.name)
+        .collect()
+}
+
 /// `text` cut to at most `max` chars at a word boundary, with `…` when cut.
 fn clip_words(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
@@ -2107,7 +2196,46 @@ CORPO-{name}
             cat.len() + SKILLS_HEADER.len(),
             (cat.len() + SKILLS_HEADER.len()) / 4
         );
+        let devices = zerith_tools::network::load_inventory(&root, Some(&root)).unwrap();
+        println!(
+            "destaques: {:?}",
+            likely_skills(&lib, SYSLOG_DUDE_PROMPT, &devices)
+        );
     }
+
+    /// A named device brings its vendor; a client narrows same-named ones;
+    /// a generic device brings the platform words of its name.
+    #[test]
+    fn a_named_inventory_device_brings_its_vendor_terms() {
+        use zerith_tools::network::{DeviceEntry, Vendor};
+        let dev = |name: &str, client: &str, vendor| DeviceEntry {
+            name: name.into(),
+            client: Some(client.into()),
+            host: "10.0.0.1".into(),
+            vendor,
+            ..DeviceEntry::default()
+        };
+        let inv = [
+            dev("concentrador", "facilnet", Vendor::MikrotikRouterOs),
+            dev("concentrador", "outro", Vendor::HuaweiVrp),
+            dev("olt-parks", "facilnet", Vendor::Generic),
+        ];
+        assert_eq!(
+            device_terms("nat no concentrador da Facilnet", &inv),
+            ["mikrotik", "routeros"]
+        );
+        assert_eq!(
+            device_terms("nat no concentrador", &inv),
+            ["mikrotik", "routeros", "huawei", "vrp"]
+        );
+        assert_eq!(device_terms("onu na olt-parks", &inv), ["olt", "parks"]);
+        assert!(device_terms("bolo de cenoura", &inv).is_empty());
+    }
+
+    /// The request that missed `mikrotik-routeros-cli` with the top-12 list.
+    const SYSLOG_DUDE_PROMPT: &str = "liberar o envio de syslog do The Dude da Facilnet para a \
+        VPS: ajuste o firewall da VPS e /ip firewall filter e nat da Masterlink (concentrador MK \
+        Masterlink, MikroTik) para a porta UDP 5514";
 
     #[test]
     fn a_skill_is_named_only_as_a_whole_word() {

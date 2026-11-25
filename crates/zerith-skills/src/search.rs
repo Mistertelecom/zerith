@@ -81,10 +81,119 @@ static CACHE: Mutex<Option<Cache>> = Mutex::new(None);
 /// The `limit` enabled skills that best match `query`, best first. Skills
 /// that match nothing are left out, so the result may be shorter or empty.
 pub fn search(lib: &Library, query: &str, limit: usize) -> Vec<Hit> {
+    search_boosted(lib, query, &[], limit)
+}
+
+/// [`search`] with extra strong terms the request implies but may not say,
+/// e.g. the vendor of an inventory device it names (`concentrador` →
+/// `mikrotik`, `routeros`). They count like platform words in the query.
+pub fn search_boosted(lib: &Library, query: &str, boost: &[&str], limit: usize) -> Vec<Hit> {
     let Some(index) = index(lib) else {
         return Vec::new();
     };
-    index.search(query, limit)
+    index.search(query, boost, limit)
+}
+
+/// Vendor and platform words: they say which skill fits far more than a
+/// generic "configurar" or "firewall" does, so they weigh this much more.
+const PLATFORM_WEIGHT: f64 = 2.5;
+pub const PLATFORM: &[&str] = &[
+    "mikrotik",
+    "routeros",
+    "winbox",
+    "huawei",
+    "vrp",
+    "cisco",
+    "ios",
+    "iosxe",
+    "iosxr",
+    "nxos",
+    "nexus",
+    "junos",
+    "juniper",
+    "datacom",
+    "dmos",
+    "fiberhome",
+    "parks",
+    "vsol",
+    "zte",
+    "nokia",
+    "ubiquiti",
+    "airos",
+    "fortigate",
+    "fortinet",
+    "fortios",
+    "zabbix",
+    "librenms",
+    "proxmox",
+    "pve",
+    "syslog",
+    "netflow",
+    "sflow",
+    "ipfix",
+    "bgp",
+    "ospf",
+    "isis",
+    "mpls",
+    "gpon",
+    "xgspon",
+    "olt",
+    "ont",
+    "pppoe",
+    "cgnat",
+    "bng",
+    "vyos",
+    "frr",
+    "wireguard",
+    "dude",
+];
+
+/// Words that make a request about networks, besides [`PLATFORM`]. In such a
+/// request a skill that matched none of them (it shared only "vps" or
+/// "servidor") is weak, and gaming / Windows desktop ones weaker still.
+const NETWORK: &[&str] = &[
+    "firewall",
+    "nat",
+    "vlan",
+    "router",
+    "roteador",
+    "switch",
+    "udp",
+    "tcp",
+    "porta",
+    "port",
+    "interface",
+    "rota",
+    "route",
+    "snmp",
+    "ssh",
+    "telnet",
+    "concentrador",
+    "dhcp",
+    "dns",
+    "network",
+    "rede",
+    "isp",
+    "provedor",
+    "mangle",
+    "filter",
+    "srcnat",
+    "dstnat",
+    "masquerade",
+];
+/// A skill that matched no network word in a network request.
+const OFF_NETWORK: f64 = 0.5;
+/// A gaming or Windows-desktop skill in a network request.
+const OFF_TOPIC: f64 = 0.3;
+
+/// Gaming category (Hermes `gaming/`) or a Windows desktop skill
+/// (`windows-*`, `devops/windows-*`): rarely what a network request needs.
+fn off_topic_for_network(d: &Doc) -> bool {
+    let c = d.category.to_lowercase();
+    let n = d.name.to_lowercase();
+    matches!(c.as_str(), "gaming" | "games" | "jogos")
+        || c.starts_with("windows")
+        || n.starts_with("windows-")
 }
 
 /// How many skills the index holds (the enabled ones).
@@ -204,16 +313,30 @@ impl Index {
         }
     }
 
-    fn search(&self, query: &str, limit: usize) -> Vec<Hit> {
+    fn search(&self, query: &str, boost: &[&str], limit: usize) -> Vec<Hit> {
         let n = self.docs.len() as f64;
         let idf = |t: &str| {
             let df = *self.df.get(t).unwrap_or(&0) as f64;
             (1.0 + (n - df + 0.5) / (df + 0.5)).ln()
         };
+        let mut words = query_words(query);
+        for b in boost.iter().flat_map(|b| tokens(b)) {
+            if !words.iter().flatten().any(|w| *w == b) {
+                words.push(vec![b]);
+            }
+        }
+        let platform = |alts: &[String]| alts.iter().any(|w| PLATFORM.contains(&w.as_str()));
+        let netty =
+            |alts: &[String]| platform(alts) || alts.iter().any(|w| NETWORK.contains(&w.as_str()));
+        let weights: Vec<(f64, bool)> = words
+            .iter()
+            .map(|a| (if platform(a) { PLATFORM_WEIGHT } else { 1.0 }, netty(a)))
+            .collect();
+        let network_request = weights.iter().filter(|w| w.1).count() >= 2;
         // One entry per query word, with its glossary twins: a concept scores
         // once (its best spelling), so a skill that says "subtitles" and
         // "legenda" is not counted twice for the same idea.
-        let concepts: Vec<Vec<(String, String)>> = query_words(query)
+        let concepts: Vec<Vec<(String, String)>> = words
             .into_iter()
             .map(|alts| {
                 alts.into_iter()
@@ -237,7 +360,8 @@ impl Index {
             };
             let mut score = 0.0;
             let mut matched = Vec::new();
-            for alts in &concepts {
+            let mut matched_net = false;
+            for (alts, &(weight, net)) in concepts.iter().zip(&weights) {
                 let best = alts
                     .iter()
                     .map(|(w, st)| {
@@ -254,8 +378,18 @@ impl Index {
                     })
                     .max_by(|a, b| a.0.total_cmp(&b.0));
                 if let Some((s, w)) = best.filter(|b| b.0 > 0.0) {
-                    score += s;
+                    score += s * weight;
+                    matched_net |= net;
                     matched.push(w.clone());
+                }
+            }
+            // A network request: what shares only "vps" or "servidor" with it
+            // is weak, and a game server or Windows desktop skill weaker.
+            if network_request {
+                if off_topic_for_network(d) {
+                    score *= OFF_TOPIC;
+                } else if !matched_net {
+                    score *= OFF_NETWORK;
                 }
             }
             if score > 0.0 {

@@ -1,5 +1,5 @@
 //! Lazy stdio Language Server Protocol (LSP) client for real code intelligence:
-//! `lsp_diagnostics`, `lsp_definition`, `lsp_references`, and `lsp_symbols`.
+//! `lsp` (`action`: diagnostics, definition, references, symbols).
 
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Write};
@@ -528,64 +528,38 @@ fn format_diagnostics(diags: &[Value]) -> String {
         .join("\n")
 }
 
+// Uma ferramenta com `action` no lugar de lsp_diagnostics/definition/
+// references/symbols, que seguem aceitos como apelido (zerith_core::tool_alias).
 pub(crate) fn all() -> Vec<Box<dyn Tool>> {
-    vec![
-        make_with(
-            "lsp_diagnostics",
-            "Consulta diagnósticos (erros/avisos de tipo e compilação) via Language Server para um arquivo.",
-            json!({"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}),
-            "lista de diagnósticos por linha/coluna",
-            Permission::Read,
-            15,
-            true,
-            lsp_read_action,
-            run_lsp_diagnostics,
-        ),
-        make_with(
-            "lsp_definition",
-            "Encontra a definição de um símbolo na posição (`line` 1-based, `character` 0-based) via LSP.",
-            json!({"type": "object", "properties": {
-                "path": {"type": "string"},
-                "line": {"type": "integer"},
-                "character": {"type": "integer"}
-            }, "required": ["path", "line", "character"]}),
-            "localizações URI:linha:coluna",
-            Permission::Read,
-            15,
-            true,
-            lsp_read_action,
-            run_lsp_definition,
-        ),
-        make_with(
-            "lsp_references",
-            "Encontra todas as referências de um símbolo na posição via LSP.",
-            json!({"type": "object", "properties": {
-                "path": {"type": "string"},
-                "line": {"type": "integer"},
-                "character": {"type": "integer"}
-            }, "required": ["path", "line", "character"]}),
-            "lista de referências URI:linha:coluna",
-            Permission::Read,
-            15,
-            true,
-            lsp_read_action,
-            run_lsp_references,
-        ),
-        make_with(
-            "lsp_symbols",
-            "Lista símbolos de um arquivo (`path`) ou busca símbolos no workspace (`query`, com `path` indicando a linguagem) via LSP.",
-            json!({"type": "object", "properties": {
-                "path": {"type": "string"},
-                "query": {"type": "string"}
-            }, "required": ["path"]}),
-            "lista de símbolos com tipo e linha",
-            Permission::Read,
-            15,
-            true,
-            lsp_read_action,
-            run_lsp_symbols,
-        ),
-    ]
+    vec![make_with(
+        "lsp",
+        "Consulta o Language Server de um arquivo. diagnostics: erros e avisos de tipo/compilação. definition: onde o símbolo na posição foi definido. references: todos os usos dele. symbols: símbolos do arquivo, ou do workspace com `query` (`path` indica a linguagem).",
+        json!({"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["diagnostics", "definition", "references", "symbols"]},
+            "path": {"type": "string"},
+            "line": {"type": "integer", "description": "definition/references: linha, 1-based"},
+            "character": {"type": "integer", "description": "definition/references: coluna, 0-based"},
+            "query": {"type": "string", "description": "symbols: busca no workspace"}
+        }, "required": ["action", "path"]}),
+        "diagnostics por linha/coluna, localizações URI:linha:coluna ou símbolos com linha",
+        Permission::Read,
+        15,
+        true,
+        lsp_read_action,
+        run_lsp,
+    )]
+}
+
+fn run_lsp(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
+    match args["action"].as_str().unwrap_or("") {
+        "diagnostics" => run_lsp_diagnostics(args, ctx, exec),
+        "definition" => run_lsp_definition(args, ctx, exec),
+        "references" => run_lsp_references(args, ctx, exec),
+        "symbols" => run_lsp_symbols(args, ctx, exec),
+        other => Err(ToolError::BadArguments(format!(
+            "action precisa ser diagnostics, definition, references ou symbols, não {other:?}"
+        ))),
+    }
 }
 
 fn lsp_read_action(args: &Value, ctx: &CallCtx<'_>) -> Result<Option<Action>> {

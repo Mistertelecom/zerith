@@ -1861,6 +1861,7 @@ fn track_verification(
         }
         // Diagnostics read the code itself: a check of its own.
         "lsp_diagnostics" | "diagnostics" if ok => unverified.clear(),
+        "lsp" if ok && args["action"] == "diagnostics" => unverified.clear(),
         _ => {}
     }
 }
@@ -2691,7 +2692,7 @@ pub(crate) fn should_include_tool_schema(name: &str, context_lower: &str) -> boo
         .iter()
         .any(|kw| context_lower.contains(kw));
     }
-    if name.starts_with("lsp_") {
+    if name == "lsp" || name.starts_with("lsp_") {
         return [
             "lsp",
             "definição",

@@ -18,6 +18,10 @@ pub const LEGACY: &[(&str, &str, &str)] = &[
     ("agent_list", "agent_manage", "list"),
     ("agent_send", "agent_manage", "send"),
     ("agent_stop", "agent_manage", "stop"),
+    ("lsp_diagnostics", "lsp", "diagnostics"),
+    ("lsp_definition", "lsp", "definition"),
+    ("lsp_references", "lsp", "references"),
+    ("lsp_symbols", "lsp", "symbols"),
 ];
 
 /// Nome antigo → (ferramenta nova, ação).

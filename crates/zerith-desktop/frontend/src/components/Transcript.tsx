@@ -964,6 +964,7 @@ const FILE_TOOLS = new Set([
   "multi_edit",
   "write_file",
   "diagnostics",
+  "lsp",
   "lsp_definition",
   "lsp_references",
   "lsp_hover",
@@ -974,6 +975,7 @@ function toolActionLabel(name: string): string {
   switch (name) {
     case "read_file":
     case "diagnostics":
+    case "lsp":
     case "lsp_definition":
     case "lsp_references":
     case "lsp_hover":

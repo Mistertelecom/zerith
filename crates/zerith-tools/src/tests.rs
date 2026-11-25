@@ -847,6 +847,44 @@ fn an_edit_that_breaks_json_is_refused_and_the_file_stays_whole() {
     assert!(!dir.path().join("b.toml").exists());
 }
 
+/// Uma regra no nome antigo vale para a ação equivalente da ferramenta nova
+/// (e uma regra no nome novo vale para o antigo).
+#[test]
+fn a_rule_on_an_old_name_applies_to_the_new_tool() {
+    let dir = scratch();
+    std::fs::write(
+        dir.path().join("a.rs"),
+        "fn main() {}
+",
+    )
+    .unwrap();
+    let mut p = policy(dir.path(), Mode::Bypass);
+    p.rules.push(
+        zerith_security::Rule::parse(zerith_security::RuleKind::Deny, "lsp_symbols").unwrap(),
+    );
+    let r = Registry::new();
+    let c = ctx(&p);
+    let symbols = json!({"action": "symbols", "path": "a.rs"});
+    let (v, _) = r.authorize("lsp", &symbols, &c).unwrap();
+    assert!(matches!(v, Verdict::Deny(_)), "{v:?}");
+    let (v, _) = r
+        .authorize("lsp_symbols", &json!({"path": "a.rs"}), &c)
+        .unwrap();
+    assert!(matches!(v, Verdict::Deny(_)), "{v:?}");
+    // Outra ação da mesma ferramenta não é atingida.
+    let diag = json!({"action": "diagnostics", "path": "a.rs"});
+    assert_eq!(r.authorize("lsp", &diag, &c).unwrap().0, Verdict::Allow);
+
+    let mut p = policy(dir.path(), Mode::Bypass);
+    p.rules
+        .push(zerith_security::Rule::parse(zerith_security::RuleKind::Deny, "lsp").unwrap());
+    let c = ctx(&p);
+    let (v, _) = r
+        .authorize("lsp_definition", &json!({"path": "a.rs"}), &c)
+        .unwrap();
+    assert!(matches!(v, Verdict::Deny(_)), "{v:?}");
+}
+
 /// Tamanho do que vai ao modelo: ferramentas anunciadas e caracteres de
 /// descrição + parâmetros JSON (`--nocapture` mostra os números).
 #[test]

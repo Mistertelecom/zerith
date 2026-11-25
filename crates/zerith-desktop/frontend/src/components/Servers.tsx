@@ -67,6 +67,128 @@ export function useServerTrouble(): boolean {
   return serverTrouble(Object.values(all));
 }
 
+/** Nomes de segredo citados na config de um nó: `secret_ref` e `*_secret_ref`. */
+export function secretRefs(config: Record<string, unknown>): string[] {
+  return [
+    ...new Set(
+      Object.entries(config)
+        .filter(([k, v]) => (k === "secret_ref" || k.endsWith("_secret_ref")) && typeof v === "string" && v.trim())
+        .map(([, v]) => (v as string).trim()),
+    ),
+  ];
+}
+
+const SECRET_NAME = /^[A-Za-z0-9._-]{1,128}$/;
+
+/** Inspetor de nó com workflow em servidor: segredos só por nome, gravados
+ * lá com `PUT /secrets/:nome` (nunca lidos de volta). */
+export function ServerSecrets({ serverId, refs }: { serverId: string; refs: string[] }) {
+  const [names, setNames] = useState<string[] | null>(null);
+  const [editing, setEditing] = useState<string | null>(null);
+  const [other, setOther] = useState("");
+  const [value, setValue] = useState("");
+  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(() => {
+    serversApi
+      .secretNames(serverId)
+      .then(setNames)
+      .catch((e) => {
+        setNames([]);
+        setMsg({ ok: false, text: String(e) });
+      });
+  }, [serverId]);
+  useEffect(load, [load]);
+
+  const save = async (name: string) => {
+    setBusy(true);
+    try {
+      await serversApi.setSecret(serverId, name, value);
+      setMsg({ ok: true, text: `“${name}” definido no servidor.` });
+      setEditing(null);
+      setOther("");
+      load();
+    } catch (e) {
+      setMsg({ ok: false, text: String(e) });
+    } finally {
+      setValue("");
+      setBusy(false);
+    }
+  };
+
+  const row = (name: string) => (
+    <div key={name} className="wf-secret-row" data-secret={name}>
+      <span className="mono">{name}</span>
+      <span className={"badge" + (names?.includes(name) ? " ok" : " warn")}>
+        {names === null ? "…" : names.includes(name) ? "definido" : "falta no servidor"}
+      </span>
+      <button type="button" className="btn btn-sm" onClick={() => setEditing(name)}>
+        Definir no servidor
+      </button>
+    </div>
+  );
+
+  const shown = [...new Set([...refs, ...(names ?? [])])];
+  return (
+    <div className="wf-pin-box wf-secrets">
+      <strong>Segredos no servidor</strong>
+      <p className="pn-hint">O valor vai direto para o cofre do servidor e nunca volta para esta tela.</p>
+      {shown.map(row)}
+      <div className="wf-secret-row">
+        <input
+          className="mono"
+          placeholder="nome-do-segredo"
+          value={other}
+          onChange={(e) => setOther(e.target.value)}
+          aria-label="Nome de outro segredo"
+        />
+        <button
+          type="button"
+          className="btn btn-sm"
+          disabled={!SECRET_NAME.test(other.trim())}
+          onClick={() => setEditing(other.trim())}
+        >
+          Definir no servidor
+        </button>
+      </div>
+      {editing ? (
+        <form
+          className="wf-secret-row"
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (value) void save(editing);
+          }}
+        >
+          <input
+            type="password"
+            autoComplete="new-password"
+            placeholder={`valor de ${editing}`}
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            aria-label={`Valor de ${editing}`}
+            autoFocus
+          />
+          <button type="submit" className="btn btn-sm btn-primary" disabled={busy || !value}>
+            Gravar
+          </button>
+          <button
+            type="button"
+            className="btn btn-sm btn-ghost"
+            onClick={() => {
+              setEditing(null);
+              setValue("");
+            }}
+          >
+            Cancelar
+          </button>
+        </form>
+      ) : null}
+      {msg ? <div className={"wf-banner-msg " + (msg.ok ? "ok" : "err")}>{msg.text}</div> : null}
+    </div>
+  );
+}
+
 export function ServersTab() {
   const [servers, setServers] = useState<ServerEntry[] | null>(null);
   const [status, setStatus] = useState<Record<string, ServerStatus>>({});

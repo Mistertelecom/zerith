@@ -479,6 +479,31 @@ pub async fn server_workflow_enabled(
     .await
 }
 
+/// Nomes de segredos gravados pela API no servidor (nunca os valores).
+#[tauri::command]
+pub async fn server_secret_names(
+    state: State<'_, AppState>,
+    server_id: String,
+) -> Result<Vec<String>, String> {
+    let root = state.root().to_path_buf();
+    blocking(remote_call(root, server_id, |c| c.secret_names())).await
+}
+
+/// Só escrita: o valor vai para o cofre do servidor e não volta.
+#[tauri::command]
+pub async fn server_secret_set(
+    state: State<'_, AppState>,
+    server_id: String,
+    name: String,
+    value: String,
+) -> Result<(), String> {
+    let root = state.root().to_path_buf();
+    blocking(remote_call(root, server_id, move |c| {
+        c.secret_set(&name, &value)
+    }))
+    .await
+}
+
 // ------------------------------------------------------------ monitor
 
 /// Evento SSE do servidor reemitido ao frontend como `server:event`.

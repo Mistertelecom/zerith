@@ -1311,6 +1311,10 @@ export const serversApi = {
   run: (serverId: string, id: string) => invoke<string>("server_workflow_run", { serverId, id }),
   setEnabled: (serverId: string, id: string, enabled: boolean) =>
     invoke<Workflow>("server_workflow_enabled", { serverId, id, enabled }),
+  /** Só nomes: o servidor nunca devolve valores. */
+  secretNames: (serverId: string) => invoke<string[]>("server_secret_names", { serverId }),
+  setSecret: (serverId: string, name: string, value: string) =>
+    invoke<void>("server_secret_set", { serverId, name, value }),
 };
 
 /** Evento SSE de um servidor (`run_started`, `node`, `run_finished`). */

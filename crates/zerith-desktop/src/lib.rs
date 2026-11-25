@@ -385,6 +385,8 @@ pub fn run() {
             servers::server_workflow_runs,
             servers::server_workflow_run,
             servers::server_workflow_enabled,
+            servers::server_secret_names,
+            servers::server_secret_set,
             update::update_check,
             update::update_install,
         ])

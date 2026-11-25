@@ -1015,6 +1015,28 @@
   color: var(--danger-text);
 }
 
+/* Segredos de um workflow em servidor: só nomes */
+.wf-secrets {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.wf-secret-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.wf-secret-row > .mono {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.wf-secret-row input {
+  flex: 1;
+  min-width: 120px;
+}
+
 /* 409 do servidor: recarregar ou sobrescrever */
 .wf-conflict {
   display: flex;

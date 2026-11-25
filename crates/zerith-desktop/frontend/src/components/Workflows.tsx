@@ -59,7 +59,7 @@ import {
 } from "../lib/api";
 import { tr, useLang, type Lang } from "../lib/i18n";
 import { BOT_EMBLEMS, BotEmblem } from "./BotEmblem";
-import { agoText, ServerDot } from "./Servers";
+import { agoText, secretRefs, ServerDot, ServerSecrets } from "./Servers";
 import "../styles/workflows.css";
 
 const NODE_W = 222;
@@ -2123,6 +2123,7 @@ export function WorkflowsStudio(props: {
               {selectedNode && draft ? (
                 <NodeInspector
                   node={selectedNode}
+                  runOn={draft.run_on}
                   workflowId={draft.id}
                   webhookBase={webhookBase}
                   allNodes={draft.nodes}
@@ -2327,6 +2328,8 @@ function NodeInspector(props: {
   testOutput: string | null;
   testBusy: boolean;
   onTest: () => void;
+  /** Servidor em "Executar em": segredos viram nomes + "definir no servidor". */
+  runOn?: string | null;
 }) {
   const { node, lang } = props;
   const cfg = node.config ?? {};
@@ -2845,6 +2848,10 @@ function NodeInspector(props: {
             <span>{tr(lang, "Acrescentar ao final (append)", "Append to file")}</span>
           </label>
         </>
+      ) : null}
+
+      {props.runOn && (secretRefs(cfg).length || node.kind === "ssh_command" || node.kind === "notify_channel") ? (
+        <ServerSecrets serverId={props.runOn} refs={secretRefs(cfg)} />
       ) : null}
 
       {supportsRetry ? (

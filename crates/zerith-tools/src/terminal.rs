@@ -22,8 +22,18 @@ use crate::fntool::{make_with, opt_str, str_arg};
 use crate::{CallCtx, Exec, Permission, Result, Tool, ToolError};
 
 const MAX_OPEN: usize = 24;
-const MAX_AUTO_PAGES: usize = 64;
+const MAX_AUTO_PAGES: usize = 200;
 const LOOP_TAIL_BYTES: usize = 4096;
+/// Output past this without a prompt is treated as never-ending (below
+/// `BUF_CAP`, so nothing is dropped before the interrupt).
+const MAX_CMD_BYTES: usize = 3 * 1024 * 1024;
+/// Same block of 1–6 lines this many times in a row, no prompt: a loop.
+const REPEAT_STOP: usize = 5;
+/// Lines handed back after a continuous command was cut (head + tail).
+const CUT_HEAD_LINES: usize = 120;
+const CUT_TAIL_LINES: usize = 30;
+/// Marks output that went through the pager (the batch then turns paging off).
+pub(crate) const PAGED_NOTE: &str = "[paginação automática:";
 const IDLE_REAP: Duration = Duration::from_secs(20 * 60);
 const BUF_CAP: usize = 4 * 1024 * 1024;
 const BUF_SHRINK_THRESHOLD: usize = 64 * 1024;
@@ -548,6 +558,8 @@ pub(crate) fn open_with_meta(
         spec.expect,
         deadline,
         spec.auto_page,
+        None,
+        false,
         exec,
     );
     term.meta.busy.store(false, Ordering::SeqCst);
@@ -612,6 +624,41 @@ pub(crate) fn send_session_command(
     auto_page: bool,
     exec: &Exec<'_>,
 ) -> Result<(String, bool)> {
+    send_session_command_with(
+        tool_name,
+        id,
+        input_str,
+        secret_val,
+        enter,
+        re,
+        timeout_dur,
+        auto_page,
+        false,
+        exec,
+    )
+}
+
+/// `send_session_command`, plus `interrupt_on_timeout`: at the deadline the
+/// running command gets `q`/Ctrl+C so the session is back at a prompt (the
+/// batch moves on to its next command instead of typing into a monitor).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn send_session_command_with(
+    tool_name: &str,
+    id: &str,
+    input_str: Option<&str>,
+    secret_val: Option<String>,
+    enter: bool,
+    re: Option<&Regex>,
+    timeout_dur: Duration,
+    auto_page: bool,
+    interrupt_on_timeout: bool,
+    exec: &Exec<'_>,
+) -> Result<(String, bool)> {
+    let typed_cmd = if secret_val.is_none() {
+        input_str
+    } else {
+        None
+    };
     let mut t = {
         let mut table = lock();
         let Some(t) = table.remove(id) else {
@@ -653,7 +700,16 @@ pub(crate) fn send_session_command(
         write_res?;
     }
     let deadline = exec.deadline.min(Instant::now() + timeout_dur);
-    let text = collect(tool_name, &t, re, deadline, auto_page, exec);
+    let text = collect(
+        tool_name,
+        &t,
+        re,
+        deadline,
+        auto_page,
+        typed_cmd,
+        interrupt_on_timeout,
+        exec,
+    );
     t.meta.busy.store(false, Ordering::SeqCst);
     if let Ok(mut u) = t.meta.last_used.lock() {
         *u = Instant::now();
@@ -713,18 +769,30 @@ fn close(args: &Value, _: &CallCtx<'_>, _: &Exec<'_>) -> Result<String> {
 /// Waits for the program to settle, then hands over (and drops) everything
 /// unread. Settled: the `expect` pattern showed up, or the output went quiet
 /// on what looks like a prompt, or quiet for 2 s.
+///
+/// Output that never settles (monitor footer, a block repeating, too many
+/// bytes, too many pages) is stopped with `q`/Ctrl+C and condensed. `cmd`
+/// is what was typed: a monitor footer on a command with `count=`,
+/// `duration=` or `once` is left to finish. `interrupt_on_timeout` (batch):
+/// at the deadline the command is stopped too, so the next one finds a prompt.
+#[allow(clippy::too_many_arguments)]
 fn collect(
     tool: &str,
     t: &Term,
     expect: Option<&Regex>,
     deadline: Instant,
     auto_page: bool,
+    cmd: Option<&str>,
+    interrupt_on_timeout: bool,
     exec: &Exec<'_>,
 ) -> String {
     let len = || t.buf.lock().map(|b| b.len()).unwrap_or(0);
     let (mut last, mut changed) = (len(), Instant::now());
     let (mut progress_at, mut last_emit) = (0usize, Instant::now());
     let (mut pages, mut page_at) = (0usize, 0usize);
+    let started = Instant::now();
+    let watch_footer = !cmd.is_some_and(has_stop_param);
+    let mut footer_at: Option<Instant> = None;
     let note = loop {
         std::thread::sleep(Duration::from_millis(12));
         let now = len();
@@ -785,27 +853,51 @@ fn collect(
         } else {
             Duration::from_millis(120)
         };
+        // A monitor footer keeps output flowing, so "quiet for 2 s" never
+        // comes and the footer is not a prompt.
+        let monitor = monitor_key(&tail_clean);
         let done = !pager_waiting
             && match expect {
                 Some(re) => re.is_match(&tail_clean),
                 None => {
                     now > 0
-                        && (quiet >= Duration::from_secs(2)
+                        && (quiet >= Duration::from_secs(2) && monitor.is_none()
                             || (quiet >= prompt_settle && looks_like_prompt(&tail_clean)))
                 }
             };
         if done {
             break None;
         }
+        // Never-ending output: stop the command instead of waiting for a
+        // prompt that won't come (RouterOS `/ip route check` filled 12k lines
+        // in 86 s). Footer: the first frame is drawn, give it 2 s to settle.
+        if monitor.is_some() && watch_footer {
+            let seen = *footer_at.get_or_insert_with(Instant::now);
+            if seen.elapsed() >= Duration::from_secs(2) {
+                break Some(Err(stop_continuous(t, monitor, Stop::Monitor)));
+            }
+        }
+        if !looks_like_prompt(&tail_clean) && repeating_tail(&tail_clean).is_some() {
+            break Some(Err(stop_continuous(t, monitor, Stop::Monitor)));
+        }
+        if now >= MAX_CMD_BYTES {
+            break Some(Err(stop_continuous(t, monitor, Stop::Bytes)));
+        }
+        if auto_page && pages >= MAX_AUTO_PAGES && looks_like_pager(&tail_clean) {
+            break Some(Err(stop_continuous(t, Some(b"q"), Stop::Pages)));
+        }
         if !t.proc.alive() || !t.meta.alive.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(200));
-            break Some("[o programa encerrou]".to_string());
+            break Some(Ok("[o programa encerrou]".to_string()));
         }
         if exec.cancel.is_cancelled() {
-            break Some("[cancelado; a sessão continua aberta]".into());
+            break Some(Ok("[cancelado; a sessão continua aberta]".into()));
         }
         if Instant::now() >= deadline {
-            break Some(match expect {
+            if interrupt_on_timeout && now > 0 {
+                break Some(Err(stop_continuous(t, monitor, Stop::Timeout(started))));
+            }
+            break Some(Ok(match expect {
                 Some(re) => format!(
                     "[tempo esgotado esperando /{}/; a sessão continua aberta]",
                     re.as_str()
@@ -816,7 +908,7 @@ fn collect(
                 None => {
                     "[ainda chegando saída; chame terminal_send sem input para ler o resto]".into()
                 }
-            });
+            }));
         }
     };
     let raw: Vec<u8> = {
@@ -831,11 +923,88 @@ fn collect(
     for s in &t.secrets {
         text = text.replace(s.as_str(), "[segredo]");
     }
+    let note = note.map(|n| match n {
+        Ok(n) => n,
+        Err(stop) => {
+            let (short, runs) = condense_continuous(&text);
+            text = short;
+            stop.note(runs)
+        }
+    });
+    if pages > 0 {
+        text.push_str(&format!("\n{PAGED_NOTE} {pages} páginas]"));
+    }
     match note {
         Some(n) if text.is_empty() => n,
         Some(n) => format!("{text}\n{n}"),
         None => text,
     }
+}
+
+/// Why `collect` cut a command short.
+enum Stop {
+    Monitor,
+    Bytes,
+    Pages,
+    Timeout(Instant),
+}
+
+impl Stop {
+    fn note(&self, runs: usize) -> String {
+        match self {
+            Self::Monitor => format!(
+                "[saída contínua interrompida pelo Zerith após {runs} repetições: o comando é um \
+                 monitor; use count=/duration=/once ou o equivalente]"
+            ),
+            Self::Bytes => format!(
+                "[saída contínua interrompida pelo Zerith após {} MB sem voltar o prompt; \
+                 filtre (where/include/| no-more) ou limite com count=/duration=/once]",
+                MAX_CMD_BYTES / (1024 * 1024)
+            ),
+            Self::Pages => format!(
+                "[paginação interrompida pelo Zerith após {MAX_AUTO_PAGES} páginas; desligue a \
+                 paginação (terminal length 0 / screen-length 0 temporary) ou filtre a saída]"
+            ),
+            Self::Timeout(t) => format!(
+                "[tempo esgotado após {}s: o Zerith interrompeu o comando (q/Ctrl+C) e seguiu; \
+                 aumente timeout_secs se ele é só lento]",
+                t.elapsed().as_secs()
+            ),
+        }
+    }
+}
+
+/// Stops a running command: `key` (RouterOS monitor footer → `q`), else
+/// Ctrl+C; then waits briefly for the prompt, with Ctrl+C as a second try.
+// Idea from Hermes (MIT), which sets PAGER=cat because a PTY makes pagers
+// wait for `q`; network CLIs have no env, so the key is sent instead.
+fn stop_continuous(t: &Term, key: Option<&'static [u8]>, why: Stop) -> Stop {
+    let send = |k: &[u8]| {
+        if let Ok(mut w) = t.input.lock() {
+            let _ = w.write_all(k).and_then(|_| w.flush());
+        }
+    };
+    let prompt_back = |wait: Duration| {
+        let until = Instant::now() + wait;
+        while Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(50));
+            let tail: Vec<u8> = t
+                .buf
+                .lock()
+                .map(|b| b.range(b.len().saturating_sub(512)..).copied().collect())
+                .unwrap_or_default();
+            if looks_like_prompt(&clean(&tail)) {
+                return true;
+            }
+        }
+        false
+    };
+    send(key.unwrap_or(b"\x03"));
+    if !prompt_back(Duration::from_secs(3)) && key != Some(b"\x03") {
+        send(b"\x03");
+        prompt_back(Duration::from_secs(2));
+    }
+    why
 }
 
 /// Detects CLI pagination prompts at the tail of terminal output.
@@ -856,16 +1025,111 @@ pub(crate) fn looks_like_pager(text: &str) -> bool {
         || tail.contains("--- more ---")
         || tail.contains("---(more")
         || tail.contains("press any key")
-        || tail.contains("-- [q quit")
+        // RouterOS pager on a long `print`: `-- [Q quit|D dump|down]`.
+        || (tail.contains("[q quit") && !is_monitor_line(&tail))
+}
+
+/// Footer of a command that never ends on its own. RouterOS monitors
+/// (`/ip route check`, `/ping` without count, `/tool torch`,
+/// `monitor-traffic`, `/interface ethernet monitor`) draw
+/// `-- [Q quit|D dump|C-z pause]`; `print follow` draws `-- Ctrl-C to quit`.
+fn is_monitor_line(line: &str) -> bool {
+    let l = line.to_ascii_lowercase();
+    (l.contains("[q quit") && l.contains("c-z pause")) || l.contains("ctrl-c to quit")
+}
+
+/// The key that stops the monitor whose footer is in `text`, if any.
+fn monitor_key(text: &str) -> Option<&'static [u8]> {
+    let line = text.lines().rev().find(|l| is_monitor_line(l))?;
+    Some(if line.to_ascii_lowercase().contains("q quit") {
+        b"q"
+    } else {
+        b"\x03"
+    })
+}
+
+/// `count=`, `duration=`, `once`: the command says when it stops, so a
+/// monitor footer on screen is not a reason to cut it.
+fn has_stop_param(cmd: &str) -> bool {
+    let l = cmd.to_ascii_lowercase();
+    l.contains("count=")
+        || l.contains("duration=")
+        || l.split_whitespace().any(|w| w == "once" || w == "once=yes")
+}
+
+/// Size of a block of 1–6 lines repeated `REPEAT_STOP` times in a row at
+/// the end of `text` (the last line, maybe half-written, left out). Blocks
+/// with under 6 visible characters (`!` separators) don't count.
+fn repeating_tail(text: &str) -> Option<usize> {
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let lines = &lines[..lines.len().saturating_sub(1)];
+    (1..=6).find(|&k| {
+        // One line alone repeats legitimately more often (`Request timed out.`).
+        let need = k * if k == 1 { 4 * REPEAT_STOP } else { REPEAT_STOP };
+        if lines.len() < need {
+            return false;
+        }
+        let tail = &lines[lines.len() - need..];
+        let visible: usize = tail[..k].iter().map(|l| l.trim().len()).sum();
+        visible >= 6 && tail.chunks(k).all(|c| c == &tail[..k])
+    })
+}
+
+/// Collapses each run of the same 1–6 line block (3+ copies in a row) to one
+/// copy, drops monitor footers, and keeps head + tail when still long.
+/// Returns the text and the longest run collapsed.
+fn condense_continuous(text: &str) -> (String, usize) {
+    let lines: Vec<&str> = text.lines().filter(|l| !is_monitor_line(l)).collect();
+    let (mut out, mut longest, mut i) = (Vec::new(), 1usize, 0usize);
+    while i < lines.len() {
+        let best = (1..=6)
+            .filter(|&k| i + 2 * k <= lines.len())
+            .map(|k| {
+                let block = &lines[i..i + k];
+                let runs = lines[i..]
+                    .chunks_exact(k)
+                    .take_while(|c| *c == block)
+                    .count();
+                (runs, k)
+            })
+            .filter(|&(runs, _)| runs >= 3)
+            .max_by_key(|&(runs, k)| (runs * k, std::cmp::Reverse(k)));
+        match best {
+            Some((runs, k)) => {
+                out.extend_from_slice(&lines[i..i + k]);
+                longest = longest.max(runs);
+                i += runs * k;
+            }
+            None => {
+                out.push(lines[i]);
+                i += 1;
+            }
+        }
+    }
+    if out.len() > CUT_HEAD_LINES + CUT_TAIL_LINES {
+        let cut = out.len() - CUT_HEAD_LINES - CUT_TAIL_LINES;
+        let tail = out.split_off(out.len() - CUT_TAIL_LINES);
+        out.truncate(CUT_HEAD_LINES);
+        out.push("");
+        let mut s = out.join("\n");
+        s.push_str(&format!("[… {cut} linhas omitidas …]\n"));
+        s.push_str(&tail.join("\n"));
+        return (s, longest);
+    }
+    (out.join("\n"), longest)
 }
 
 /// The last line ends like a prompt: `Router#`, `<Huawei>`, `[admin@MikroTik] >`,
-/// `$`, `Password:`, `(yes/no)?`.
+/// `$`, `Password:`, `(yes/no)?`. A pager or monitor footer is not one.
 fn looks_like_prompt(text: &str) -> bool {
     text.lines()
         .rev()
         .find(|l| !l.trim().is_empty())
-        .is_some_and(|l| l.trim_end().ends_with(['>', '#', '$', '%', ']', ':', '?']))
+        .is_some_and(|l| {
+            l.trim_end().ends_with(['>', '#', '$', '%', ']', ':', '?'])
+                && !is_monitor_line(l)
+                && !looks_like_pager(l)
+        })
 }
 
 /// Terminal output as text: escape sequences (colors, cursor moves, titles)
@@ -1332,6 +1596,34 @@ mod tests {
         assert!(looks_like_pager("show bgp\n--More--"));
         assert!(looks_like_pager("---(more 42%)---"));
         assert!(!looks_like_pager("Router#"));
+    }
+
+    #[test]
+    fn monitor_footer_pager_and_repeats_are_told_apart() {
+        let frame = "      status: ok\n   interface: sfp-sfpplus1\n     nexthop: 10.0.0.1\n";
+        let footer = "-- [Q quit|D dump|C-z pause]";
+        // RouterOS monitor: not a pager, not a prompt, stopped with `q`.
+        assert!(!looks_like_pager(footer));
+        assert!(!looks_like_prompt(&format!("{frame}{footer}")));
+        assert_eq!(monitor_key(&format!("{frame}{footer}")), Some(&b"q"[..]));
+        assert_eq!(monitor_key("x\n-- Ctrl-C to quit."), Some(&b"\x03"[..]));
+        // RouterOS pager on a long print still pages.
+        assert!(looks_like_pager("0 ether1\n-- [Q quit|D dump|down]"));
+        assert!(has_stop_param("/ping 8.8.8.8 count=4"));
+        assert!(has_stop_param("/interface monitor-traffic ether1 once"));
+        assert!(!has_stop_param("/ip route check 1.1.1.1"));
+        // Five copies of the 3-line frame, last line still being written.
+        let looped = format!("{}      sta", frame.repeat(5));
+        assert_eq!(repeating_tail(&looped), Some(3));
+        assert_eq!(repeating_tail(&frame.repeat(4)), None);
+        assert_eq!(repeating_tail("!\n!\n!\n!\n!\n!\n!\n"), None);
+        let (short, runs) = condense_continuous(&format!(
+            "[admin@MK] > /ip route check 1.1.1.1\n{}",
+            format!("{frame}{footer}\n").repeat(400)
+        ));
+        assert_eq!(runs, 400);
+        assert_eq!(short.matches("status: ok").count(), 1, "{short}");
+        assert!(!short.contains("Q quit"), "{short}");
     }
 
     fn exec_ctx(f: impl FnOnce(&CallCtx<'_>, &Exec<'_>)) {

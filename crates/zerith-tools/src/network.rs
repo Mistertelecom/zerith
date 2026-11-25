@@ -1026,13 +1026,21 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
         make_with(
             "terminal_batch",
             "Executa uma sequência de comandos em um terminal aberto (`terminal_open` ou `net_connect`), \
-             separando a saída por comando com detecção automática de paginação e de erros de CLI.",
+             separando a saída por comando com detecção automática de paginação e de erros de CLI. \
+             Comando contínuo (monitor, `print follow`, ping sem fim) ou que estoura o prazo é \
+             interrompido (q/Ctrl+C) e o lote segue para o próximo.",
             json!({"type": "object", "properties": {
                 "id": {"type": "string"},
-                "commands": {"type": "array", "items": {"type": "string"}},
+                "commands": {"type": "array", "description": "texto do comando, ou {\"cmd\": \"...\", \"timeout_secs\": N} para um prazo próprio", "items": {"anyOf": [
+                    {"type": "string"},
+                    {"type": "object", "properties": {
+                        "cmd": {"type": "string"},
+                        "timeout_secs": {"type": "integer"}
+                    }, "required": ["cmd"]}
+                ]}},
                 "stop_on_error": {"type": "boolean", "description": "padrão true"},
                 "auto_page": {"type": "boolean", "description": "padrão true"},
-                "timeout_secs": {"type": "integer", "description": "timeout por comando, padrão 20"}
+                "timeout_secs": {"type": "integer", "description": "prazo por comando, padrão 20, máximo 300"}
             }, "required": ["id", "commands"]}),
             "saída estruturada de cada comando",
             Permission::Shell,
@@ -1586,10 +1594,7 @@ fn connect_action(args: &Value, ctx: &CallCtx<'_>) -> Result<Option<Action>> {
 fn batch_action(args: &Value, _: &CallCtx<'_>) -> Result<Option<Action>> {
     let id = args["id"].as_str().unwrap_or("");
     let prog = terminal::terminal_program(id).unwrap_or_else(|| "terminal".into());
-    let cmds: Vec<&str> = args["commands"]
-        .as_array()
-        .map(|a| a.iter().filter_map(Value::as_str).collect())
-        .unwrap_or_default();
+    let cmds: Vec<String> = batch_items(args).into_iter().map(|(c, _)| c).collect();
     if cmds.is_empty() {
         return Ok(None);
     }
@@ -2238,30 +2243,47 @@ fn net_connect(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<Strin
     ))
 }
 
-fn terminal_batch(args: &Value, _: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
-    let id = str_arg(args, "id")?;
-    let cmds: Vec<String> = args["commands"]
+/// `commands` items: a string, or `{"cmd": "...", "timeout_secs": N}` for a
+/// command with its own deadline.
+fn batch_items(args: &Value) -> Vec<(String, Option<u64>)> {
+    args["commands"]
         .as_array()
         .map(|arr| {
             arr.iter()
-                .filter_map(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
+                .filter_map(|v| match v {
+                    Value::String(s) => Some((s.trim().to_string(), None)),
+                    _ => Some((
+                        v["cmd"].as_str()?.trim().to_string(),
+                        v["timeout_secs"].as_u64(),
+                    )),
+                })
+                .filter(|(s, _)| !s.is_empty())
                 .collect()
         })
-        .unwrap_or_default();
-    if cmds.is_empty() {
+        .unwrap_or_default()
+}
+
+fn terminal_batch(args: &Value, _: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
+    let id = str_arg(args, "id")?;
+    let items = batch_items(args);
+    if items.is_empty() {
         return Err(ToolError::BadArguments(
             "commands precisa ter ao menos um comando".into(),
         ));
     }
+    let cmds: Vec<&String> = items.iter().map(|(c, _)| c).collect();
     let stop_on_error = args["stop_on_error"].as_bool().unwrap_or(true);
     let auto_page = args["auto_page"].as_bool().unwrap_or(true);
     let per_cmd_secs = args["timeout_secs"].as_u64().unwrap_or(20).clamp(2, 300);
+    let vendor = terminal::terminal_meta(id)
+        .and_then(|(v, _, _)| v)
+        .and_then(|v| Vendor::parse(&v))
+        .unwrap_or_default();
+    let mut paging_off = false;
 
     let mut sections = Vec::with_capacity(cmds.len());
-    for (idx, cmd) in cmds.iter().enumerate() {
+    for (idx, (cmd, own_secs)) in items.iter().enumerate() {
+        let secs = own_secs.unwrap_or(per_cmd_secs).clamp(2, 300);
         if exec.cancel.is_cancelled() {
             sections.push(format!(
                 "### [{}/{}] {cmd}\n[cancelado]",
@@ -2270,21 +2292,42 @@ fn terminal_batch(args: &Value, _: &CallCtx<'_>, exec: &Exec<'_>) -> Result<Stri
             ));
             break;
         }
-        let (out, alive) = terminal::send_session_command(
+        let (out, alive) = terminal::send_session_command_with(
             "terminal_batch",
             id,
             Some(cmd),
             None,
             true,
             None,
-            Duration::from_secs(per_cmd_secs),
+            Duration::from_secs(secs),
             auto_page,
+            true,
             exec,
         )?;
         sections.push(format!("### {cmd}\n{out}"));
         if !alive {
             sections.push("[sessão encerrou durante o lote]".into());
             break;
+        }
+        // The pager showed up: paging was never turned off on this session
+        // (opened by terminal_open, or the login skipped it). Turn it off
+        // once so the rest of the batch comes in one piece.
+        if !paging_off && out.contains(terminal::PAGED_NOTE) {
+            if let Some(pg) = vendor.disable_paging_cmd() {
+                paging_off = true;
+                terminal::send_session_command(
+                    "terminal_batch",
+                    id,
+                    Some(pg),
+                    None,
+                    true,
+                    None,
+                    Duration::from_secs(8),
+                    true,
+                    exec,
+                )?;
+                sections.push(format!("[paginação desativada pelo Zerith: {pg}]"));
+            }
         }
         if let Some(err_kind) = has_cli_error(&out) {
             if stop_on_error {
@@ -4041,6 +4084,193 @@ router bgp 65001
         assert!(build_connect_command(&dev).is_err());
         dev.serial_port = Some("/dev/ttyUSB0;rm".into());
         assert!(build_connect_command(&dev).is_err());
+    }
+
+    /// A router on a local socket (telnet transport, no IAC): prompt, then
+    /// per command: `route check` loops a RouterOS monitor frame until `q`;
+    /// `/slow` prints changing lines until Ctrl+C; `show run` pages three
+    /// times on ` --More-- `; anything else answers `ok: <cmd>`.
+    fn fake_router(prompt: &'static str) -> u16 {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let Ok((mut s, _)) = l.accept() else { return };
+            s.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+            // Err: connection gone; Ok(None): nothing typed yet.
+            let key = |s: &mut std::net::TcpStream| -> std::result::Result<Option<u8>, ()> {
+                let mut b = [0u8; 1];
+                match s.read(&mut b) {
+                    Ok(0) => Err(()),
+                    Ok(_) => Ok(Some(b[0])),
+                    Err(_) => Ok(None),
+                }
+            };
+            let wait_for =
+                |s: &mut std::net::TcpStream,
+                 want: u8,
+                 tick: &mut dyn FnMut(&mut std::net::TcpStream)| {
+                    let until = std::time::Instant::now() + Duration::from_secs(30);
+                    while std::time::Instant::now() < until {
+                        match key(s) {
+                            Err(()) => return false,
+                            Ok(Some(b)) if b == want => return true,
+                            _ => tick(s),
+                        }
+                    }
+                    false
+                };
+            let _ = s.write_all(prompt.as_bytes());
+            let mut line = Vec::new();
+            loop {
+                let b = match key(&mut s) {
+                    Err(()) => return,
+                    Ok(None) => continue,
+                    Ok(Some(b)) => b,
+                };
+                if b != b'\r' && b != b'\n' {
+                    line.push(b);
+                    continue;
+                }
+                if line.is_empty() {
+                    continue;
+                }
+                let cmd = String::from_utf8_lossy(&std::mem::take(&mut line)).to_string();
+                let _ = s.write_all(format!("{cmd}\r\n").as_bytes());
+                if cmd.contains("route check") {
+                    let ok = wait_for(&mut s, b'q', &mut |s| {
+                        let _ = s.write_all(
+                            b"      status: ok\r\n   interface: sfp-sfpplus1\r\n     nexthop: 179.108.156.1\r\n-- [Q quit|D dump|C-z pause]\r\n",
+                        );
+                    });
+                    if !ok {
+                        return;
+                    }
+                } else if cmd == "/slow" {
+                    let mut n = 0;
+                    if !wait_for(&mut s, 3, &mut |s| {
+                        n += 1;
+                        let _ = s.write_all(format!("aguardando {n}\r\n").as_bytes());
+                        std::thread::sleep(Duration::from_millis(200));
+                    }) {
+                        return;
+                    }
+                    let _ = s.write_all(b"^C\r\n");
+                } else if cmd == "show run" {
+                    for page in 0..3 {
+                        let _ = s.write_all(
+                            format!("linha {page}a\r\nlinha {page}b\r\n --More-- ").as_bytes(),
+                        );
+                        if !wait_for(&mut s, b' ', &mut |_| {}) {
+                            return;
+                        }
+                    }
+                    let _ = s.write_all(b"\r\nend\r\n");
+                } else {
+                    let _ = s.write_all(format!("ok: {cmd}\r\n").as_bytes());
+                }
+                let _ = s.write_all(prompt.as_bytes());
+            }
+        });
+        port
+    }
+
+    fn with_fake_router(
+        prompt: &'static str,
+        vendor: &str,
+        f: impl FnOnce(&str, &CallCtx<'_>, &Exec<'_>),
+    ) {
+        let port = fake_router(prompt);
+        let ws = std::env::current_dir().unwrap();
+        let policy = zerith_security::Policy::new(
+            zerith_security::preset("workspace-write").unwrap(),
+            zerith_security::Mode::Bypass,
+            &ws,
+        );
+        let ctx = CallCtx {
+            workspace: &ws,
+            policy: &policy,
+            memory: None,
+            scope: None,
+        };
+        let cancel = zerith_providers::Cancel::default();
+        let host = crate::Host::default();
+        let exec = Exec {
+            cancel: &cancel,
+            deadline: std::time::Instant::now() + Duration::from_secs(60),
+            timeout: Duration::from_secs(60),
+            host: &host,
+        };
+        let target = format!("telnet://127.0.0.1:{port}");
+        let (id, _, alive) = terminal::open_with_meta(
+            OpenSpec {
+                command: &target,
+                cwd: &ws,
+                expect: None,
+                timeout_dur: Duration::from_secs(5),
+                auto_page: true,
+                secrets: Vec::new(),
+                vendor: Some(vendor.into()),
+                device: None,
+                host: None,
+                role: None,
+                client: None,
+                vpn: None,
+                transport: Some("telnet".into()),
+            },
+            &exec,
+        )
+        .unwrap();
+        assert!(alive);
+        f(&id, &ctx, &exec);
+        let _ = terminal::close_terminal(&id);
+    }
+
+    #[test]
+    fn batch_stops_routeros_monitor_and_slow_command_then_moves_on() {
+        with_fake_router("[admin@MK] > ", "mikrotik_router_os", |id, ctx, exec| {
+            let started = std::time::Instant::now();
+            let out = terminal_batch(
+                &json!({"id": id, "commands": [
+                    "/ip route check 179.108.156.6",
+                    {"cmd": "/slow", "timeout_secs": 2},
+                    "/system identity print"
+                ]}),
+                ctx,
+                exec,
+            )
+            .unwrap();
+            assert!(started.elapsed() < Duration::from_secs(15), "{out}");
+            let check = out.split("### /slow").next().unwrap();
+            assert_eq!(check.matches("status: ok").count(), 1, "{out}");
+            assert!(!check.contains("Q quit"), "{out}");
+            assert!(
+                check.contains("[saída contínua interrompida pelo Zerith após"),
+                "{out}"
+            );
+            assert!(out.contains("[tempo esgotado após 2s"), "{out}");
+            assert!(out.contains("aguardando 1"), "{out}");
+            assert!(out.contains("ok: /system identity print"), "{out}");
+        });
+    }
+
+    #[test]
+    fn batch_pages_cisco_more_and_turns_paging_off() {
+        with_fake_router("R1#", "cisco_ios", |id, ctx, exec| {
+            let out = terminal_batch(
+                &json!({"id": id, "commands": ["show run", "show clock"]}),
+                ctx,
+                exec,
+            )
+            .unwrap();
+            assert!(out.contains("linha 2b") && out.contains("end"), "{out}");
+            assert!(out.contains("[paginação automática: 3 páginas]"), "{out}");
+            assert!(
+                out.contains("[paginação desativada pelo Zerith: terminal length 0]"),
+                "{out}"
+            );
+            assert!(out.contains("ok: show clock"), "{out}");
+        });
     }
 
     #[test]

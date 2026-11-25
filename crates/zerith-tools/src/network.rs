@@ -1132,13 +1132,10 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
              interrompido (q/Ctrl+C) e o lote segue para o próximo.",
             json!({"type": "object", "properties": {
                 "id": {"type": "string"},
-                "commands": {"type": "array", "description": "texto do comando, ou {\"cmd\": \"...\", \"timeout_secs\": N} para um prazo próprio", "items": {"anyOf": [
-                    {"type": "string"},
-                    {"type": "object", "properties": {
-                        "cmd": {"type": "string"},
-                        "timeout_secs": {"type": "integer"}
-                    }, "required": ["cmd"]}
-                ]}},
+                // Só texto no schema: `anyOf` é recusado por parte dos provedores
+                // (Gemini, alguns compatíveis com OpenAI). `batch_items` ainda aceita
+                // `{"cmd", "timeout_secs"}` para quem mandar.
+                "commands": {"type": "array", "description": "um comando por item; para um prazo maior use timeout_secs", "items": {"type": "string"}},
                 "stop_on_error": {"type": "boolean", "description": "padrão true"},
                 "auto_page": {"type": "boolean", "description": "padrão true"},
                 "timeout_secs": {"type": "integer", "description": "prazo por comando, padrão 20, máximo 300"}

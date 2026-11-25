@@ -55,8 +55,7 @@ pub use tasks::{check as check_task_args, STATUSES as TASK_STATUSES};
 pub use terminal::{
     close_all_terminals, close_session_terminals, close_terminal, interrupt_terminal,
     list_active_terminals, send_terminal_input, set_terminal_change_hook, terminal_meta,
-    terminal_open_for,
-    terminal_program, terminal_tail, TerminalSnapshot,
+    terminal_open_for, terminal_program, terminal_tail, TerminalSnapshot,
 };
 pub use web::{Provider as SearchProvider, SearchTool};
 pub use workflows::{set_workflow_ai_executor, set_workflow_change_hook};

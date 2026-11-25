@@ -52,6 +52,55 @@ Por isso o bind é fechado por padrão:
 | `10/8`, `172.16/12`, `192.168/16`, `100.64/10` (Tailscale/CGNAT), `198.18/15` (RFC 2544, comum em WireGuard; nunca roteada na internet), `fd00::/8` | sem flag |
 | `0.0.0.0`, `::`, IP público | só com `--allow-public` (fica `allow_public = true` no config) e um aviso forte a cada início |
 
+## Instalação com o instalador (Linux, systemd)
+
+1. Copie o binário para o servidor (ex.: `scp zerith vps:/tmp/`).
+2. Veja o plano sem executar nada:
+   ```bash
+   /tmp/zerith server install --bind 100.101.102.103:7878 --dry-run
+   ```
+3. Instale (como root):
+   ```bash
+   sudo /tmp/zerith server install --bind 100.101.102.103:7878 --tz America/Sao_Paulo
+   ```
+   Opções: `--user zerith`, `--home /var/lib/zerith`, `--url <http://…>`
+   (obrigatório com bind `0.0.0.0`), `--allow-public`, `--force`.
+4. No fim aparece o **código de pareamento** (saída do `server init`); cole
+   no desktop (Workflows > Servidores > Adicionar servidor).
+5. Grave os segredos que os workflows usam (senha do SSH, token do Zabbix):
+   ```bash
+   sudo -u zerith env ZERITH_HOME=/var/lib/zerith ZERITH_SECRETS_BACKEND=file zerith secret set dude-senha
+   ```
+   ou pela tela do desktop (inspetor do nó > Definir no servidor).
+
+O que ele faz, na ordem (o `--dry-run` imprime exatamente isto):
+
+- confere: Linux, root (`id -u`), porta livre (`ss -ltn`), e que não existe
+  `/etc/systemd/system/zerith-daemon.service` nem `<home>/server/config.toml`
+  (senão recusa; `--force` regrava o serviço e mantém os dados e o pareamento);
+- `useradd --system --home <home> --shell /usr/sbin/nologin <user>` (se não existir);
+- `install -d -m 0700` da pasta `<home>`, dono o usuário do serviço;
+- copia o próprio binário para `/usr/local/bin/zerith` (se ainda não for ele);
+- grava `zerith-daemon.service`: `User=`, `ZERITH_HOME`, `TZ`,
+  `ZERITH_SECRETS_BACKEND=file`, `ExecStart=zerith daemon`, `Restart=always`,
+  `UMask=0077`, `NoNewPrivileges=yes`, `ProtectSystem=strict`,
+  `ReadWritePaths=<home>`, `PrivateTmp=yes`, `ProtectHome=yes`;
+- `zerith server init --bind …` como o usuário do serviço (pula se já configurado);
+- `systemctl daemon-reload` e `systemctl enable --now zerith-daemon`.
+
+O `zerith daemon` roda os workflows agendados e, com `server/config.toml`,
+sobe a API junto — um serviço só.
+
+```bash
+systemctl status zerith-daemon
+journalctl -u zerith-daemon -f
+sudo zerith server uninstall            # para e remove o serviço; dados ficam
+sudo zerith server uninstall --purge    # também apaga o usuário e <home>
+```
+
+No Windows/macOS o instalador explica e sai (só `--dry-run` imprime o plano);
+lá rode `zerith daemon` como tarefa/serviço do sistema.
+
 ## Instalação manual (Linux, systemd)
 
 ```bash

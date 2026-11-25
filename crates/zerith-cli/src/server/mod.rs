@@ -12,6 +12,7 @@
 mod auth;
 mod events;
 mod http;
+mod install;
 mod routes;
 
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -338,6 +339,13 @@ pub fn cmd(paths: &Paths, args: &[String]) -> Result<(), Boxed> {
             println!("token de '{device}' revogado (vale na hora, sem reiniciar o servidor)");
             Ok(())
         }
+        (Some("install"), _) => install::install(&install::parse(args)?),
+        (Some("uninstall"), _) => install::uninstall(
+            &flag("--user").unwrap_or_else(|| "zerith".into()),
+            &flag("--home").unwrap_or_else(|| "/var/lib/zerith".into()),
+            args.iter().any(|a| a == "--purge"),
+            args.iter().any(|a| a == "--dry-run"),
+        ),
         (Some("serve"), _) => {
             let h = spawn(paths)?;
             h.join()
@@ -348,7 +356,10 @@ pub fn cmd(paths: &Paths, args: &[String]) -> Result<(), Boxed> {
             "uso: zerith server init [--name <nome>] [--bind <ip:porta>] [--url <url>] \
                   [--device <nome>] [--allow-public]\n\
                   \x20     zerith server token add <dispositivo> | list | revoke <dispositivo>\n\
-                  \x20     zerith server serve"
+                  \x20     zerith server serve\n\
+                  \x20     zerith server install [--user zerith] [--home /var/lib/zerith] \
+                  [--bind <ip:porta>] [--url <url>] [--tz America/Sao_Paulo] [--dry-run] [--force]\n\
+                  \x20     zerith server uninstall [--purge] [--dry-run]"
                 .into(),
         ),
     }

@@ -1783,9 +1783,6 @@ pub fn likely_skills(
         .collect()
 }
 
-/// Body of a lone device skill appended to `net_connect`, at most this much.
-const DEVICE_SKILL_BODY_MAX: usize = 6 * 1024;
-
 /// Header of a device skill body in a tool result; [`device_skills_seen`]
 /// reads it back from the history so the body enters once per session.
 const DEVICE_SKILL_BODY_TAG: &str = "[corpo da skill do equipamento: ";
@@ -1799,11 +1796,113 @@ pub fn device_skills_seen(text: &str, seen: &mut std::collections::HashSet<Strin
     }
 }
 
+/// Words that make a skill the vendor's command-line one (`*-routeros-cli`,
+/// "Huawei VRP", "Cisco IOS"), not a topic skill that merely names it.
+const CLI_WORDS: &[&str] = &[
+    "cli", "routeros", "vrp", "ios", "iosxe", "iosxr", "nxos", "junos", "fortios",
+];
+
+/// Section titles of reference material: a lookup, not the how-to.
+const REFERENCE_SECTIONS: &[&str] = &[
+    "reference",
+    "references",
+    "referencia",
+    "referencias",
+    "support",
+    "apoio",
+    "links",
+    "anexo",
+    "anexos",
+    "appendix",
+];
+
+/// How much of a device skill's body rides on `net_connect`.
+const DEVICE_SKILL_BODY_MAX: usize = 8 * 1024;
+/// A section longer than this keeps only its start in the digest.
+const DEVICE_SKILL_SECTION_MAX: usize = 2_500;
+
+/// Rank of a vendor skill as the device's main CLI skill: CLI words and
+/// vendor words in the name count double, in the description once, and the
+/// `networking` category once. Ties go to the search score (the caller
+/// sorts stably).
+fn cli_rank(h: &zerith_skills::search::Hit, terms: &[&str]) -> usize {
+    let name = zerith_skills::search::tokens(&h.name);
+    let desc = zerith_skills::search::tokens(&h.description);
+    let has = |toks: &[String], set: &[&str]| toks.iter().any(|t| set.contains(&t.as_str()));
+    2 * has(&name, CLI_WORDS) as usize
+        + has(&desc, CLI_WORDS) as usize
+        + 2 * has(&name, terms) as usize
+        + h.category.eq_ignore_ascii_case("networking") as usize
+}
+
+/// `body` cut to about `max` bytes by section: reference sections go, long
+/// sections keep their start, and sections past the budget are named at the
+/// end so the model knows to load the rest with `skill`.
+fn skill_digest(body: &str, max: usize) -> String {
+    let clip = |s: &str, n: usize| {
+        let mut cut = s.len().min(n);
+        while !s.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        s[..cut].to_string()
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    let mut start = 0;
+    for (i, _) in body.match_indices("\n## ") {
+        parts.push(&body[start..=i]);
+        start = i + 1;
+    }
+    parts.push(&body[start..]);
+    let mut out = String::new();
+    let mut left_out: Vec<String> = Vec::new();
+    for part in parts {
+        let title = part
+            .strip_prefix("## ")
+            .and_then(|p| p.lines().next())
+            .unwrap_or("")
+            .trim();
+        // The first word says what the section is: "Support files" goes,
+        // "RouterOS pitfalls (deep dives in references/)" stays.
+        let first = zerith_skills::search::tokens(title).into_iter().next();
+        if first.is_some_and(|w| REFERENCE_SECTIONS.contains(&w.as_str())) {
+            left_out.push(title.to_string());
+            continue;
+        }
+        let text = if part.len() > DEVICE_SKILL_SECTION_MAX {
+            format!(
+                "{}\n[seção cortada; o resto com `skill`]\n",
+                clip(part, DEVICE_SKILL_SECTION_MAX).trim_end()
+            )
+        } else {
+            part.to_string()
+        };
+        if out.len() + text.len() > max {
+            if !title.is_empty() {
+                left_out.push(title.to_string());
+            }
+            continue;
+        }
+        out.push_str(&text);
+    }
+    let mut out = out.trim_end().to_string();
+    let mut once = std::collections::HashSet::new();
+    left_out.retain(|t| once.insert(t.clone()));
+    if !left_out.is_empty() {
+        out.push_str(&format!(
+            "\n[seções fora deste resumo: {}; leia com `skill` se precisar]",
+            left_out.join("; ")
+        ));
+    }
+    out
+}
+
 /// What `net_connect` output gains for a device of known vendor (`vendor=…`
-/// in its first line): the library's skills whose name or description names
-/// the vendor, to load before sending commands. With exactly one, its body
-/// (≤ 6 KB) comes along the first time in the session, like a subfolder
-/// `AGENTS.md` (`zerith_core::subdir_hints`).
+/// in its first line): the body of the vendor's main CLI skill (the
+/// candidate that names the vendor with the best [`cli_rank`], digest of at
+/// most 8 KB), the first time in the session, like a subfolder `AGENTS.md`
+/// (`zerith_core::subdir_hints`); then the other vendor skills, to load if
+/// needed. Measured on 2026-11-25: with only a list of four names here the
+/// model loaded none and got RouterOS commands wrong.
 pub fn device_skills_note(
     lib: &zerith_skills::Library,
     tool_output: &str,
@@ -1819,38 +1918,39 @@ pub fn device_skills_note(
     if terms.is_empty() {
         return None;
     }
-    let names: Vec<String> = zerith_skills::search::search_boosted(lib, "", terms, 8)
+    let mut hits: Vec<_> = zerith_skills::search::search_boosted(lib, "", terms, 8)
         .into_iter()
         .filter(|h| {
             zerith_skills::search::tokens(&format!("{} {}", h.name, h.description))
                 .iter()
                 .any(|t| terms.contains(&t.as_str()))
         })
-        .map(|h| h.name)
         .collect();
-    if names.is_empty() {
-        return None;
+    // Stable: equal ranks keep the search order.
+    hits.sort_by_key(|h| std::cmp::Reverse(cli_rank(h, terms)));
+    let (main, others) = hits.split_first()?;
+    let others: Vec<&str> = others.iter().map(|h| h.name.as_str()).collect();
+    let mut out = String::new();
+    let body = seen
+        .insert(main.name.clone())
+        .then(|| lib.skill_body(&main.name))
+        .flatten();
+    match body {
+        Some(body) => out.push_str(&format!(
+            "\n\n[skill principal deste equipamento, já carregada: siga antes de mandar comandos]\n{DEVICE_SKILL_BODY_TAG}{}]\n{}",
+            main.name,
+            skill_digest(&body, DEVICE_SKILL_BODY_MAX)
+        )),
+        None => out.push_str(&format!(
+            "\n\n[skill principal deste equipamento: {} (já carregada nesta sessão)]",
+            main.name
+        )),
     }
-    let mut out = format!(
-        "\n\n[skills deste equipamento: {} — carregue com `skill` antes de mandar comandos]",
-        names.join(", ")
-    );
-    if let [only] = names.as_slice() {
-        if seen.insert(only.clone()) {
-            if let Some(body) = lib.skill_body(only) {
-                let mut cut = body.len().min(DEVICE_SKILL_BODY_MAX);
-                while !body.is_char_boundary(cut) {
-                    cut -= 1;
-                }
-                out.push_str(&format!(
-                    "\n\n{DEVICE_SKILL_BODY_TAG}{only}]\n{}",
-                    &body[..cut]
-                ));
-                if cut < body.len() {
-                    out.push_str("\n[cortado em 6 KB; o resto com `skill`]");
-                }
-            }
-        }
+    if !others.is_empty() {
+        out.push_str(&format!(
+            "\n[outras skills deste equipamento: {} — carregue com `skill` se precisar]",
+            others.join(", ")
+        ));
     }
     Some(out)
 }
@@ -2305,8 +2405,17 @@ CORPO-{name}
         let mut seen = std::collections::HashSet::new();
         println!(
             "net_connect: {:?}",
-            device_skills_note(&lib, "t (h, vendor=mikrotik_router_os, role=x)", &mut seen)
-                .map(|n| n.lines().take(3).collect::<Vec<_>>().join(" | "))
+            device_skills_note(&lib, "t (h, vendor=mikrotik_router_os, role=x)", &mut seen).map(
+                |n| {
+                    let l: Vec<_> = n.lines().collect();
+                    format!(
+                        "{} bytes | {} | {}",
+                        n.len(),
+                        l[3],
+                        l[l.len() - 2..].join(" | ")
+                    )
+                }
+            )
         );
     }
 
@@ -2339,8 +2448,8 @@ CORPO-{name}
         assert!(device_terms("bolo de cenoura", &inv).is_empty());
     }
 
-    /// `net_connect` to a MikroTik names the MikroTik skills; with only one,
-    /// its body comes once per session; a generic device adds nothing.
+    /// `net_connect` to a MikroTik brings the MikroTik skill's body once per
+    /// session; a generic device adds nothing.
     #[test]
     fn net_connect_output_names_the_device_vendor_skills() {
         let tmp = tempfile::tempdir_in(scratch()).unwrap();
@@ -2348,18 +2457,17 @@ CORPO-{name}
         let out = "term-1 conectado via ssh a facilnet/concentrador (10.50.40.1, vendor=mikrotik_router_os, role=border)\n[admin@MK] >";
         let mut seen = std::collections::HashSet::new();
         let note = device_skills_note(&lib, out, &mut seen).unwrap();
-        assert!(
-            note.contains(
-                "[skills deste equipamento: mikrotik-routeros-cli — carregue com `skill`"
-            ),
-            "{note}"
-        );
         assert!(note.contains("CORPO-mikrotik-routeros-cli"), "{note}");
+        assert!(!note.contains("outras skills"), "{note}");
         // The history now carries the body: the next connect only names it.
         let mut again = std::collections::HashSet::new();
         device_skills_seen(&note, &mut again);
         let second = device_skills_note(&lib, out, &mut again).unwrap();
         assert!(!second.contains("CORPO-"), "{second}");
+        assert!(
+            second.contains("mikrotik-routeros-cli (já carregada nesta sessão)"),
+            "{second}"
+        );
         assert!(device_skills_note(
             &lib,
             "term-2 conectado (h, vendor=generic, role=lab)",
@@ -2473,6 +2581,63 @@ CORPO-{name}
                 "{top:?}"
             );
         }
+        // net_connect to the MikroTik: with four vendor skills (the
+        // 2026-11-25 list), the CLI one is the body, the rest a list.
+        for (name, desc) in [
+            ("bgp-ospf-mpls-tshoot", "Use quando o usuário pedir diagnóstico de BGP, OSPF, MPLS em roteadores Cisco IOS-XE/XR, Huawei VRP, Juniper Junos ou MikroTik RouterOS."),
+            ("mikrotik-bridge-vlan", "Use quando o assunto for VLAN em MikroTik RouterOS 7 com bridge."),
+        ] {
+            let src = tmp.path().join("src").join(name);
+            std::fs::create_dir_all(&src).unwrap();
+            std::fs::write(
+                src.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: \"{desc}\"\n---\n\n# {name}\n"),
+            )
+            .unwrap();
+            lib.install(&src, "t").unwrap();
+        }
+        let out = "term-1 conectado via ssh a facilnet/concentrador (10.50.40.1, vendor=mikrotik_router_os, role=border)";
+        let note = device_skills_note(&lib, out, &mut Default::default()).unwrap();
+        assert!(
+            note.contains(&format!(
+                "{DEVICE_SKILL_BODY_TAG}mikrotik-routeros-cli]\n# mikrotik-routeros-cli"
+            )),
+            "{note}"
+        );
+        let others = note
+            .lines()
+            .find(|l| l.starts_with("[outras skills deste equipamento: "))
+            .unwrap_or_else(|| panic!("{note}"));
+        for n in [
+            "mikrotik-ssh-mkcli",
+            "mikrotik-bridge-vlan",
+            "bgp-ospf-mpls-tshoot",
+        ] {
+            assert!(others.contains(n), "{others}");
+        }
+        assert!(!others.contains("mikrotik-routeros-cli"), "{others}");
+    }
+
+    /// The digest drops reference sections, keeps the start of a long one,
+    /// stays under the budget, and names what it left out.
+    #[test]
+    fn a_device_skill_digest_cuts_by_section() {
+        let long = "x ".repeat(3_000);
+        let body = format!(
+            "# T\nintro\n## Login\nssh admin@r\n## Pitfalls\n{long}\n## Support files\nreferences/a.md\n## Tail\n{}",
+            "y".repeat(7_000)
+        );
+        let d = skill_digest(&body, 4 * 1024);
+        assert!(d.starts_with("# T\nintro\n## Login\nssh admin@r"), "{d}");
+        assert!(d.contains("[seção cortada; o resto com `skill`]"), "{d}");
+        assert!(!d.contains("references/a.md"), "{d}");
+        assert!(
+            d.ends_with(
+                "[seções fora deste resumo: Support files; Tail; leia com `skill` se precisar]"
+            ),
+            "{d}"
+        );
+        assert!(d.len() < 4 * 1024 + 200, "{}", d.len());
     }
 
     #[test]

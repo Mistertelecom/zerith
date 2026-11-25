@@ -1768,6 +1768,78 @@ pub fn likely_skills(
         .collect()
 }
 
+/// Body of a lone device skill appended to `net_connect`, at most this much.
+const DEVICE_SKILL_BODY_MAX: usize = 6 * 1024;
+
+/// Header of a device skill body in a tool result; [`device_skills_seen`]
+/// reads it back from the history so the body enters once per session.
+const DEVICE_SKILL_BODY_TAG: &str = "[corpo da skill do equipamento: ";
+
+/// Skills whose bodies an earlier `net_connect` already appended.
+pub fn device_skills_seen(text: &str, seen: &mut std::collections::HashSet<String>) {
+    for rest in text.split(DEVICE_SKILL_BODY_TAG).skip(1) {
+        if let Some(name) = rest.split(']').next() {
+            seen.insert(name.trim().to_string());
+        }
+    }
+}
+
+/// What `net_connect` output gains for a device of known vendor (`vendor=…`
+/// in its first line): the library's skills whose name or description names
+/// the vendor, to load before sending commands. With exactly one, its body
+/// (≤ 6 KB) comes along the first time in the session, like a subfolder
+/// `AGENTS.md` (`zerith_core::subdir_hints`).
+pub fn device_skills_note(
+    lib: &zerith_skills::Library,
+    tool_output: &str,
+    seen: &mut std::collections::HashSet<String>,
+) -> Option<String> {
+    let head = tool_output.lines().find(|l| l.contains("vendor="))?;
+    let raw = head
+        .split("vendor=")
+        .nth(1)?
+        .split([',', ')', ' '])
+        .next()?;
+    let terms = vendor_terms(zerith_tools::network::Vendor::parse(raw)?);
+    if terms.is_empty() {
+        return None;
+    }
+    let names: Vec<String> = zerith_skills::search::search_boosted(lib, "", terms, 8)
+        .into_iter()
+        .filter(|h| {
+            zerith_skills::search::tokens(&format!("{} {}", h.name, h.description))
+                .iter()
+                .any(|t| terms.contains(&t.as_str()))
+        })
+        .map(|h| h.name)
+        .collect();
+    if names.is_empty() {
+        return None;
+    }
+    let mut out = format!(
+        "\n\n[skills deste equipamento: {} — carregue com `skill` antes de mandar comandos]",
+        names.join(", ")
+    );
+    if let [only] = names.as_slice() {
+        if seen.insert(only.clone()) {
+            if let Some(body) = lib.skill_body(only) {
+                let mut cut = body.len().min(DEVICE_SKILL_BODY_MAX);
+                while !body.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                out.push_str(&format!(
+                    "\n\n{DEVICE_SKILL_BODY_TAG}{only}]\n{}",
+                    &body[..cut]
+                ));
+                if cut < body.len() {
+                    out.push_str("\n[cortado em 6 KB; o resto com `skill`]");
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
 /// `text` cut to at most `max` chars at a word boundary, with `…` when cut.
 fn clip_words(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
@@ -2230,6 +2302,39 @@ CORPO-{name}
         );
         assert_eq!(device_terms("onu na olt-parks", &inv), ["olt", "parks"]);
         assert!(device_terms("bolo de cenoura", &inv).is_empty());
+    }
+
+    /// `net_connect` to a MikroTik names the MikroTik skills; with only one,
+    /// its body comes once per session; a generic device adds nothing.
+    #[test]
+    fn net_connect_output_names_the_device_vendor_skills() {
+        let tmp = tempfile::tempdir_in(scratch()).unwrap();
+        let lib = big_library(tmp.path());
+        let out = "term-1 conectado via ssh a facilnet/concentrador (10.50.40.1, vendor=mikrotik_router_os, role=border)\n[admin@MK] >";
+        let mut seen = std::collections::HashSet::new();
+        let note = device_skills_note(&lib, out, &mut seen).unwrap();
+        assert!(
+            note.contains(
+                "[skills deste equipamento: mikrotik-routeros-cli — carregue com `skill`"
+            ),
+            "{note}"
+        );
+        assert!(note.contains("CORPO-mikrotik-routeros-cli"), "{note}");
+        // The history now carries the body: the next connect only names it.
+        let mut again = std::collections::HashSet::new();
+        device_skills_seen(&note, &mut again);
+        let second = device_skills_note(&lib, out, &mut again).unwrap();
+        assert!(!second.contains("CORPO-"), "{second}");
+        assert!(device_skills_note(
+            &lib,
+            "term-2 conectado (h, vendor=generic, role=lab)",
+            &mut seen
+        )
+        .is_none());
+        assert!(
+            device_skills_note(&lib, "term-3 (h, vendor=huawei_vrp, role=lab)", &mut seen)
+                .is_none()
+        );
     }
 
     /// The request that missed `mikrotik-routeros-cli` with the top-12 list.

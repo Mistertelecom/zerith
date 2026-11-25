@@ -879,6 +879,11 @@ fn turn_body(
         }
         h
     });
+    // Skills cujo corpo um `net_connect` já anexou nesta sessão.
+    let mut device_skills = std::collections::HashSet::new();
+    for row in &rows {
+        crate::device_skills_seen(&row.content, &mut device_skills);
+    }
     // Code files the turn edited since its last check, and whether it was
     // already sent back once to verify them (verify-on-stop).
     let mut unverified: Vec<String> = Vec::new();
@@ -1368,6 +1373,14 @@ fn turn_body(
                     );
                     if let Some(text) = h.on_paths(&paths) {
                         outcome.output.push_str(&text);
+                    }
+                }
+                // Equipamento aberto: as skills do vendor dele, da biblioteca.
+                if outcome.ok && call.name == "net_connect" {
+                    if let Some(note) = ctx.skills.and_then(|lib| {
+                        crate::device_skills_note(lib, &outcome.output, &mut device_skills)
+                    }) {
+                        outcome.output.push_str(&note);
                     }
                 }
                 record(store, session_id, call, &outcome.output, &mut hist)?;

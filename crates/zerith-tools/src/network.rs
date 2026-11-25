@@ -2510,6 +2510,15 @@ fn terminal_batch(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<St
             sections.push("[sessão encerrou durante o lote]".into());
             break;
         }
+        // Output still pending: the next command would get it.
+        if out.contains(terminal::UNSYNCED_NOTE) {
+            sections.push(format!(
+                "[lote interrompido no comando {}/{}: a sessão não voltou ao prompt]",
+                idx + 1,
+                cmds.len()
+            ));
+            break;
+        }
         // The pager showed up: paging was never turned off on this session
         // (opened by terminal_open, or the login skipped it). Turn it off
         // once so the rest of the batch comes in one piece.
@@ -4391,6 +4400,11 @@ router bgp 65001
                         }
                     }
                     let _ = s.write_all(b"\r\nend\r\n");
+                } else if let Some(x) = cmd
+                    .strip_prefix(":put \"")
+                    .and_then(|r| r.strip_suffix('"'))
+                {
+                    let _ = s.write_all(format!("{x}\r\n").as_bytes());
                 } else {
                     let _ = s.write_all(format!("ok: {cmd}\r\n").as_bytes());
                 }
@@ -4484,6 +4498,14 @@ router bgp 65001
                 std::thread::sleep(Duration::from_millis(150));
                 let _ = s.write_all(format!("{cmd}\r\n").as_bytes());
                 std::thread::sleep(Duration::from_millis(30));
+                if let Some(x) = cmd
+                    .strip_prefix(":put \"")
+                    .and_then(|r| r.strip_suffix('"'))
+                {
+                    let _ = s.write_all(format!("{x}\r\n").as_bytes());
+                    let _ = s.write_all(PROMPT);
+                    continue;
+                }
                 let rows = if cmd.contains("route print") { 600 } else { 5 };
                 let paged = cmd.contains("print") && !cmd.contains("without-paging");
                 for i in 0..rows {
@@ -4581,7 +4603,10 @@ router bgp 65001
             assert_eq!(sec.matches("fim: ").count(), 1, "{cmd}: {sec}");
         }
         assert!(out.contains(" 599   dst-address=10.0.599.0/24"), "{out}");
-        assert!(took < Duration::from_secs(2), "{took:?}");
+        assert!(!out.contains("__ZB_END_"), "{out}");
+        // The end marker costs one more round trip per command (here the
+        // 150 ms redraw of its echo).
+        assert!(took < Duration::from_secs(3), "{took:?}");
     }
 
     /// RouterOS on a local socket as a real CCR (7.24) looks over ssh.
@@ -4740,6 +4765,80 @@ router bgp 65001
             let _ = terminal::close_terminal(&id);
             assert!(res.contains(&format!("ok: {cmd}")), "{res}");
             assert!(!res.contains("Masterlink] > /ip"), "{res}");
+        });
+    }
+
+    /// The batch measured on a CCR1036 (RouterOS 7.24.2, ssh without console
+    /// options): prompt redrawn inside the echo, echo cut at the terminal
+    /// width, and a conntrack count that answers after 8 s with a 5 s
+    /// deadline. Every section keeps its own answer.
+    #[test]
+    fn a_routeros_batch_with_a_slow_command_keeps_each_output_in_place() {
+        let port = fake_routeros_cli(None);
+        with_env(|ctx, exec| {
+            let target = format!("telnet://127.0.0.1:{port}");
+            let (id, _, _) = terminal::open_with_meta(
+                OpenSpec {
+                    command: &target,
+                    cwd: ctx.workspace,
+                    expect: None,
+                    timeout_dur: Duration::from_secs(5),
+                    auto_page: true,
+                    secrets: Vec::new(),
+                    vendor: Some("mikrotik_router_os".into()),
+                    device: None,
+                    host: None,
+                    role: None,
+                    client: None,
+                    vpn: None,
+                    transport: Some("telnet".into()),
+                },
+                exec,
+            )
+            .unwrap();
+            let slow =
+                r#"/ip firewall connection print count-only where dst-address~"179.108.156.6""#;
+            let cmds = [
+                "/system identity print without-paging",
+                "/ip route print without-paging terse where dst-address=45.232.65.248/30",
+                slow,
+                "/ip firewall address-list print without-paging terse where address=45.232.65.250",
+                "/ip firewall nat print without-paging terse where src-address=45.232.65.250",
+                "/ip firewall mangle print terse without-paging",
+                "/ip address print without-paging terse",
+                "/interface print without-paging terse where running",
+                "/ip firewall filter print without-paging terse where chain=forward",
+                "/system resource print without-paging",
+            ];
+            let items: Vec<Value> = cmds
+                .iter()
+                .map(|c| {
+                    if *c == slow {
+                        json!({"cmd": c, "timeout_secs": 5})
+                    } else {
+                        json!(c)
+                    }
+                })
+                .collect();
+            let started = std::time::Instant::now();
+            let out = terminal_batch(&json!({"id": id, "commands": items}), ctx, exec).unwrap();
+            let took = started.elapsed();
+            let _ = terminal::close_terminal(&id);
+            eprintln!("lote de 10 com um lento (8 s, prazo 5 s): {took:?}\n{out}");
+            let sections: Vec<&str> = out.split("### ").skip(1).collect();
+            assert_eq!(sections.len(), 10, "{out}");
+            for (sec, cmd) in sections.iter().zip(cmds) {
+                let (head, body) = sec.split_once('\n').unwrap();
+                assert_eq!(head, cmd, "{out}");
+                if cmd == slow {
+                    assert_eq!(body.lines().next(), Some("1"), "{sec}");
+                } else {
+                    assert_eq!(body.lines().next(), Some(&*format!("ok: {cmd}")), "{sec}");
+                }
+                assert!(!body.contains("Masterlink]"), "{sec}");
+                assert!(!body.contains("__ZB_END_"), "{sec}");
+            }
+            assert!(took < Duration::from_secs(20), "{took:?}");
         });
     }
 

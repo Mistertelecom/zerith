@@ -705,7 +705,7 @@ pub(crate) fn open_with_meta(
         secrets: spec.secrets,
     };
     let deadline = exec.deadline.min(Instant::now() + spec.timeout_dur);
-    let text = collect(
+    let (text, note) = collect(
         "terminal_open",
         &term,
         spec.expect,
@@ -715,6 +715,7 @@ pub(crate) fn open_with_meta(
         false,
         exec,
     );
+    let text = with_note(text, note);
     term.meta.busy.store(false, Ordering::SeqCst);
     if let Ok(mut u) = term.meta.last_used.lock() {
         *u = Instant::now();
@@ -791,9 +792,12 @@ pub(crate) fn send_session_command(
     )
 }
 
-/// `send_session_command`, plus `interrupt_on_timeout`: at the deadline the
-/// running command gets `q`/Ctrl+C so the session is back at a prompt (the
-/// batch moves on to its next command instead of typing into a monitor).
+/// `send_session_command`, plus `batch`: at the deadline the running command
+/// gets `q`/Ctrl+C so the session is back at a prompt (the batch moves on to
+/// its next command instead of typing into a monitor); an end marker is
+/// typed after it (`sync_end`), so late output stays with its command; the
+/// echo and the closing prompt are left out (the batch header has the
+/// command).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn send_session_command_with(
     tool_name: &str,
@@ -804,9 +808,10 @@ pub(crate) fn send_session_command_with(
     re: Option<&Regex>,
     timeout_dur: Duration,
     auto_page: bool,
-    interrupt_on_timeout: bool,
+    batch: bool,
     exec: &Exec<'_>,
 ) -> Result<(String, bool)> {
+    let started = Instant::now();
     let typed_cmd = if secret_val.is_none() {
         input_str
     } else {
@@ -851,16 +856,40 @@ pub(crate) fn send_session_command_with(
         write_res?;
     }
     let deadline = exec.deadline.min(Instant::now() + timeout_dur);
-    let text = collect(
-        tool_name,
-        &t,
-        re,
-        deadline,
-        auto_page,
-        typed_cmd,
-        interrupt_on_timeout,
-        exec,
+    let (mut text, mut note) = collect(
+        tool_name, &t, re, deadline, auto_page, typed_cmd, batch, exec,
     );
+    if batch {
+        let prompt = t.meta.vendor.as_deref().and_then(vendor_prompt);
+        text = without_echo(&without_prompt_tail(&text, prompt), typed_cmd);
+        // The program asks something (`Password:`, `[y/N]?`): no marker.
+        let asking = text
+            .lines()
+            .last()
+            .is_some_and(|l| l.trim_end().ends_with([':', '?']));
+        if let Some((late, synced)) = sync_end(&t, note.is_some(), asking, deadline, exec) {
+            let late = without_prompt_tail(&late, prompt);
+            if !late.is_empty() {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(&late);
+            }
+            match synced {
+                Synced::Clean => {}
+                Synced::AfterStop => {
+                    note.get_or_insert_with(|| Stop::Timeout(started).note(0));
+                }
+                Synced::Lost => {
+                    note = Some(match note {
+                        Some(n) => format!("{n}\n{UNSYNCED_NOTE}"),
+                        None => UNSYNCED_NOTE.into(),
+                    })
+                }
+            }
+        }
+    }
+    let text = with_note(text, note);
     t.meta.busy.store(false, Ordering::SeqCst);
     if let Ok(mut u) = t.meta.last_used.lock() {
         *u = Instant::now();
@@ -952,7 +981,7 @@ fn collect(
     cmd: Option<&str>,
     interrupt_on_timeout: bool,
     exec: &Exec<'_>,
-) -> String {
+) -> (String, Option<String>) {
     let len = || t.buf.lock().map(|b| b.len()).unwrap_or(0);
     let (mut last, mut changed) = (len(), Instant::now());
     let (mut progress_at, mut last_emit) = (0usize, Instant::now());
@@ -1132,14 +1161,225 @@ fn collect(
             stop.note(runs)
         }
     });
-    if pages > 0 {
-        text.push_str(&format!("\n{PAGED_NOTE} {pages} páginas]"));
-    }
+    let paged = (pages > 0).then(|| format!("{PAGED_NOTE} {pages} páginas]"));
+    let note = match (paged, note) {
+        (Some(p), Some(n)) => Some(format!("{p}\n{n}")),
+        (p, n) => p.or(n),
+    };
+    (text, note)
+}
+
+/// Output with the reader's note (`[tempo esgotado…]`) on its own last line.
+fn with_note(text: String, note: Option<String>) -> String {
     match note {
         Some(n) if text.is_empty() => n,
         Some(n) => format!("{text}\n{n}"),
         None => text,
     }
+}
+
+/// Batch command whose end marker never came back (the batch stops there).
+pub(crate) const UNSYNCED_NOTE: &str =
+    "[o equipamento não respondeu ao marcador de fim nem a q/Ctrl+C: a \
+                             saída deste comando pode continuar no próximo]";
+
+/// How the batch's end marker went (see [`sync_end`]).
+enum Synced {
+    /// Came back on the first try.
+    Clean,
+    /// Came back only after `q`/Ctrl+C.
+    AfterStop,
+    /// Never came back.
+    Lost,
+}
+
+/// End marker for one batch command: a cheap read-only command and the
+/// line it prints, which nothing else prints (the echo has the quotes or
+/// `echo`). RouterOS `:put` writes its argument to the console and changes
+/// no configuration (the `read` policy allows every console command that
+/// does not change it). Cisco/Huawei/Junos/FortiOS exec modes have no echo
+/// command: `None`, the prompt heuristic stays.
+fn end_marker(vendor: &str, n: u64) -> Option<(String, String)> {
+    let mark = format!("__ZB_END_{n}__");
+    let cmd = match vendor {
+        "mikrotik_router_os" => format!(":put \"{mark}\""),
+        "linux" => format!("echo {mark}"),
+        _ => return None,
+    };
+    Some((cmd, mark))
+}
+
+/// After a batch command: types an end marker and keeps reading until its
+/// line comes back, so whatever the command still prints (a slow
+/// `connection print` that answered after a 2 s silence or after the
+/// deadline) stays with it and the next command starts on a clean session.
+/// Waits until the command's `deadline` (3 s when it was already stopped),
+/// then `q` + Ctrl+C, a new marker and 5 s more. Vendors without a marker:
+/// after a stop only, waits up to 3 s for the prompt. Nothing is typed when
+/// the output ends on a question (`Password:`, `[y/N]?`): the marker would
+/// be the answer. Returns the late output (markers out) and how it went;
+/// `None` when there was nothing to wait for.
+// Idea from netmiko's `send_command` (MIT), which reads until a known
+// pattern instead of trusting the prompt, and from pexpect's sentinel.
+fn sync_end(
+    t: &Term,
+    stopped: bool,
+    asking: bool,
+    deadline: Instant,
+    exec: &Exec<'_>,
+) -> Option<(String, Synced)> {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let vendor = t.meta.vendor.as_deref()?;
+    let alive = || t.proc.alive() && t.meta.alive.load(Ordering::SeqCst);
+    if asking || exec.cancel.is_cancelled() || !alive() {
+        return None;
+    }
+    let send = |k: &[u8]| {
+        if let Ok(mut w) = t.input.lock() {
+            let _ = w.write_all(k).and_then(|_| w.flush());
+        }
+    };
+    let seen = || {
+        let raw: Vec<u8> = t
+            .buf
+            .lock()
+            .map(|b| b.iter().copied().collect())
+            .unwrap_or_default();
+        clean(&raw)
+    };
+    let take = |upto: Option<usize>| {
+        let raw: Vec<u8> = t
+            .buf
+            .lock()
+            .map(|mut b| b.drain(..).collect())
+            .unwrap_or_default();
+        let mut s = clean(&raw);
+        for x in &t.secrets {
+            s = s.replace(x.as_str(), "[segredo]");
+        }
+        s.lines()
+            .take(upto.unwrap_or(usize::MAX))
+            .filter(|l| !l.contains("__ZB_END_"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let prompt = vendor_prompt(vendor);
+    if end_marker(vendor, 0).is_none() {
+        if !stopped {
+            return None;
+        }
+        let until = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < until && alive() {
+            std::thread::sleep(Duration::from_millis(50));
+            let s = seen();
+            let last = s.lines().last().unwrap_or("");
+            if prompt.map_or(looks_like_prompt(&s), |re| re.is_match(last)) {
+                break;
+            }
+        }
+        return Some((take(None), Synced::Clean));
+    }
+    let first_wait = if stopped {
+        Instant::now() + Duration::from_secs(3)
+    } else {
+        deadline.max(Instant::now() + Duration::from_secs(2))
+    };
+    for round in 0..2 {
+        if round == 1 {
+            if !alive() {
+                break;
+            }
+            send(b"q");
+            std::thread::sleep(Duration::from_millis(100));
+            send(b"\x03");
+        }
+        let (cmd, mark) = end_marker(vendor, NEXT.fetch_add(1, Ordering::Relaxed))?;
+        send(format!("{cmd}\r").as_bytes());
+        let until = if round == 0 {
+            first_wait
+        } else {
+            Instant::now() + Duration::from_secs(5)
+        };
+        let (mut size, mut changed) = (0usize, Instant::now());
+        while Instant::now() < until && alive() && !exec.cancel.is_cancelled() {
+            std::thread::sleep(Duration::from_millis(12));
+            let s = seen();
+            if s.len() != size {
+                (size, changed) = (s.len(), Instant::now());
+            }
+            // Only the last marker typed: an earlier one may come back
+            // before what `q`/Ctrl+C left on the screen.
+            let lines: Vec<&str> = s.lines().collect();
+            let Some(at) = lines.iter().rposition(|l| l.trim() == mark) else {
+                // Echoed, answered and back at the prompt without the
+                // marker line (`:put` refused): it will not come.
+                let echoed = s.lines().any(|l| l.contains(&mark));
+                let last = s.lines().last().unwrap_or("");
+                let at_prompt = prompt.map_or(looks_like_prompt(&s), |re| re.is_match(last));
+                if echoed && at_prompt && changed.elapsed() >= Duration::from_secs(1) {
+                    return Some((take(None), Synced::Clean));
+                }
+                continue;
+            };
+            // The marker's own prompt follows; it is not the next command's.
+            let settle = Instant::now() + Duration::from_millis(500);
+            while Instant::now() < settle && seen().lines().count() <= at + 1 {
+                std::thread::sleep(Duration::from_millis(12));
+            }
+            let how = if round == 0 {
+                Synced::Clean
+            } else {
+                Synced::AfterStop
+            };
+            return Some((take(Some(at)), how));
+        }
+    }
+    let how = if alive() { Synced::Lost } else { Synced::Clean };
+    Some((take(None), how))
+}
+
+/// Batch output without the device's echo of `cmd` at the top: the plain
+/// echo, or the one RouterOS redraws with the prompt in the middle and cut
+/// at the terminal width (`/ip firewall connection [joao@MK] > /ip firewall
+/// connection print count-only where d6"`). An echo line starts with the
+/// command, maybe after a prompt, sharing the command's first 10 characters (all of
+/// a shorter one); only lines at the top, at most 3.
+fn without_echo(text: &str, cmd: Option<&str>) -> String {
+    let Some(cmd) = cmd.map(str::trim).filter(|c| !c.is_empty()) else {
+        return text.to_string();
+    };
+    let need = cmd.chars().count().min(10);
+    let shares = |l: &str| {
+        let n = l
+            .chars()
+            .zip(cmd.chars())
+            .take_while(|(a, b)| a == b)
+            .count();
+        n >= need
+    };
+    let is_echo = |l: &str| {
+        let l = l.trim();
+        // `[admin@MK] > /ip ...`, `R1#show run`: prompt then the command.
+        shares(l)
+            || l.match_indices(['>', '#', '$', '%', ']'])
+                .any(|(i, _)| shares(l[i + 1..].trim_start()))
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    let mut skip = 0;
+    while skip < lines.len().min(3) && (lines[skip].trim().is_empty() || is_echo(lines[skip])) {
+        skip += 1;
+    }
+    lines[skip..].join("\n")
+}
+
+/// Batch output without bare prompt lines (the one closing the command,
+/// those Ctrl+C left) and blank edges.
+fn without_prompt_tail(text: &str, prompt: Option<&Regex>) -> String {
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|l| !prompt.is_some_and(|re| re.is_match(l.trim())))
+        .collect();
+    lines.join("\n").trim_matches('\n').trim_end().to_string()
 }
 
 /// Why `collect` cut a command short.
@@ -1860,6 +2100,38 @@ mod tests {
         assert_eq!(
             echo_tail("/ip firewall filter print terse"),
             "ewall filter print terse"
+        );
+    }
+
+    /// Echo lines taken from a CCR1036 (RouterOS 7.24.2) batch.
+    #[test]
+    fn a_broken_echo_is_dropped_from_the_top_of_a_batch_section() {
+        let cut = |text: &str, cmd: &str| without_echo(text, Some(cmd));
+        let c = r#"/ip firewall connection print count-only where dst-address~"179.108.156.6""#;
+        assert_eq!(
+            cut(
+                &format!("{}[joao72991@Masterlink] > /ip firewall connection print count-only where dst-a\n1", &c[..60]),
+                c
+            ),
+            "1"
+        );
+        let m = "/ip firewall mangle print terse without-paging";
+        assert_eq!(
+            cut(
+                "/ip firewall mangle prin[joao72991@Masterlink] > /ip firewall mangle print terse without-pagingwithout-paging\n0 chain=prerouting",
+                m
+            ),
+            "0 chain=prerouting"
+        );
+        // Output that only looks like the command stays.
+        assert_eq!(
+            cut("ok\n/ip firewall", "/ip firewall nat print"),
+            "ok\n/ip firewall"
+        );
+        assert_eq!(cut("uptime: 1d", "/system resource print"), "uptime: 1d");
+        assert_eq!(
+            without_prompt_tail("1\n[joao@MK] >\n", vendor_prompt("mikrotik_router_os")),
+            "1"
         );
     }
 

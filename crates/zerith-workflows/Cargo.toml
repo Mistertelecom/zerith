@@ -19,6 +19,9 @@ base64 = "0.22"
 zerith-core = { path = "../zerith-core" }
 # `<raiz>/inventory.toml` para a opção `device` do nó SSH.
 toml.workspace = true
+# `insecure_tls` do nó zabbix (certificado próprio); mesma versão/feature que
+# o ureq já usa (sem crate nova na árvore).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 
 [dev-dependencies]
 tempfile.workspace = true

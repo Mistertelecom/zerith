@@ -10,6 +10,7 @@ pub mod schedule;
 pub mod scheduler;
 mod ssh;
 pub mod store;
+mod zabbix;
 
 pub use model::{
     ChannelConfig, ChannelKind, DaemonStatus, NextRun, NodeEvent, NodeKind, NodeRunLog, Workflow,

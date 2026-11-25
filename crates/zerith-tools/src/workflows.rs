@@ -464,6 +464,7 @@ fn authorize_workflow_nodes(wf: &Workflow, ctx: &CallCtx<'_>) -> Result<()> {
                     | NodeKind::SshCommand
                     | NodeKind::SaveFile
                     | NodeKind::HttpRequest
+                    | NodeKind::Zabbix
                     | NodeKind::Loop
             )
         })

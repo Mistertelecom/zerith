@@ -5415,6 +5415,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "rusqlite",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",

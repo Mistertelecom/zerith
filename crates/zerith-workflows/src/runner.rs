@@ -14,7 +14,7 @@ use crate::model::{
 };
 use crate::schedule::LocalDateTime;
 use crate::store::Store;
-use crate::{channels, report, ssh};
+use crate::{channels, report, ssh, zabbix};
 use crate::{now_ms, unix_secs, Result, WorkflowError};
 
 pub trait AiExecutor: Send + Sync {
@@ -563,6 +563,10 @@ fn run_node(
             })?;
             Ok((out, None))
         }
+        NodeKind::Zabbix => {
+            let out = zabbix::run(cfg, &|t| interpolate(t, prev, outputs, now_dt))?;
+            Ok((out, None))
+        }
         NodeKind::AiAgent => {
             let explicit_model = cfg_str(cfg, "model");
             let bot_name = cfg_str(cfg, "bot_name");
@@ -814,7 +818,7 @@ thread_local! {
 #[cfg(test)]
 thread_local! {
     /// Cofre de teste: os testes nunca tocam o cofre real.
-    static TEST_VAULT: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+    pub(crate) static TEST_VAULT: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
 }
 
 const SECRET_MASK: &str = "***";

@@ -1055,6 +1055,7 @@ export type NodeKind =
   | "shell"
   | "ssh_command"
   | "http_request"
+  | "zabbix"
   | "ai_agent"
   | "condition"
   | "transform"

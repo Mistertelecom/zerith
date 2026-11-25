@@ -7,6 +7,7 @@ import {
   Download,
   FileText,
   GitBranch,
+  Activity,
   Globe,
   Hourglass,
   LayoutGrid,
@@ -129,6 +130,22 @@ const NODE_META: Record<
       allow_error_status: true,
     }),
   },
+  zabbix: {
+    pt: "Zabbix",
+    en: "Zabbix",
+    cat: "collect",
+    color: "#d40000",
+    icon: Activity,
+    defaultCfg: () => ({
+      url: "https://",
+      token_secret: "",
+      auth_mode: "header",
+      operation: "hosts_unavailable",
+      groups: "",
+      timeout_secs: 30,
+      insecure_tls: false,
+    }),
+  },
   transform: {
     pt: "Transformar",
     en: "Transform",
@@ -194,7 +211,7 @@ const NODE_META: Record<
 
 const NODE_CATEGORIES: { cat: "trigger" | "collect" | "logic" | "deliver"; pt: string; en: string; kinds: NodeKind[] }[] = [
   { cat: "trigger", pt: "Gatilhos", en: "Triggers", kinds: ["trigger_cron", "trigger_manual", "trigger_webhook"] },
-  { cat: "collect", pt: "Coleta & Ação", en: "Collect & Act", kinds: ["shell", "ssh_command", "http_request"] },
+  { cat: "collect", pt: "Coleta & Ação", en: "Collect & Act", kinds: ["shell", "ssh_command", "http_request", "zabbix"] },
   { cat: "logic", pt: "IA & Lógica", en: "AI & Logic", kinds: ["ai_agent", "condition", "transform", "loop", "delay"] },
   { cat: "deliver", pt: "Entrega", en: "Delivery", kinds: ["notify_channel", "save_file"] },
 ];
@@ -206,6 +223,7 @@ const NODE_KINDS: NodeKind[] = [
   "shell",
   "ssh_command",
   "http_request",
+  "zabbix",
   "transform",
   "condition",
   "loop",
@@ -261,6 +279,8 @@ function nodeSubPreview(n: WorkflowNode, channels: ChannelConfig[]): string {
       return `${String(c.user ?? "root")}@${String(c.host ?? "host")}: ${String(c.command ?? "")}`;
     case "http_request":
       return `${String(c.method ?? "GET")} ${String(c.url ?? "")}`;
+    case "zabbix":
+      return `${String(c.operation ?? "problems")} · ${String(c.url ?? "")}`;
     case "transform":
       return `${String(c.mode ?? "template")} ${String(c.pattern ?? "")}`.trim();
     case "condition":
@@ -2341,6 +2361,7 @@ function NodeInspector(props: {
     "shell",
     "ssh_command",
     "http_request",
+    "zabbix",
     "ai_agent",
     "notify_channel",
     "loop",
@@ -2594,6 +2615,83 @@ function NodeInspector(props: {
             />
             {renderVarChips("command")}
           </div>
+        </>
+      ) : null}
+
+      {node.kind === "zabbix" ? (
+        <>
+          <div className="wf-field">
+            <label>{tr(lang, "URL do Zabbix", "Zabbix URL")}</label>
+            <input
+              value={String(cfg.url ?? "")}
+              placeholder="https://zabbix.exemplo/zabbix"
+              onChange={(e) => setCfg({ url: e.target.value })}
+            />
+          </div>
+          <div className="wf-field">
+            <label>{tr(lang, "Segredo com o token de API & envio", "API token secret & auth")}</label>
+            <div className="pn-inline">
+              <input
+                value={String(cfg.token_secret ?? "")}
+                placeholder="zabbix-token"
+                onChange={(e) => setCfg({ token_secret: e.target.value })}
+              />
+              <select
+                style={{ width: 150 }}
+                value={String(cfg.auth_mode ?? "header")}
+                onChange={(e) => setCfg({ auth_mode: e.target.value })}
+              >
+                <option value="header">Bearer (6.4+/7.x)</option>
+                <option value="auth_field">{tr(lang, "campo auth (antigo)", "auth field (old)")}</option>
+              </select>
+            </div>
+          </div>
+          <div className="wf-field">
+            <label>{tr(lang, "Consulta", "Query")}</label>
+            <select
+              value={String(cfg.operation ?? "problems")}
+              onChange={(e) => setCfg({ operation: e.target.value })}
+            >
+              <option value="hosts_unavailable">{tr(lang, "Hosts indisponíveis (ICMP/agente/SNMP)", "Unavailable hosts (ICMP/agent/SNMP)")}</option>
+              <option value="problems">{tr(lang, "Problemas ativos", "Active problems")}</option>
+              <option value="raw">{tr(lang, "Método livre (raw)", "Raw method")}</option>
+            </select>
+          </div>
+          {String(cfg.operation ?? "problems") === "raw" ? (
+            <>
+              <div className="wf-field">
+                <label>{tr(lang, "Método", "Method")}</label>
+                <input
+                  value={String(cfg.method ?? "")}
+                  placeholder="host.get"
+                  onChange={(e) => setCfg({ method: e.target.value })}
+                />
+              </div>
+              <div className="wf-field">
+                <label>Params (JSON)</label>
+                <textarea
+                  value={String(cfg.params ?? "{}")}
+                  onChange={(e) => setCfg({ params: e.target.value })}
+                />
+              </div>
+            </>
+          ) : (
+            <div className="wf-field">
+              <label>{tr(lang, "Grupos de hosts (vírgula, opcional)", "Host groups (comma, optional)")}</label>
+              <input
+                value={String(cfg.groups ?? "")}
+                onChange={(e) => setCfg({ groups: e.target.value })}
+              />
+            </div>
+          )}
+          <label className="pn-inline">
+            <input
+              type="checkbox"
+              checked={Boolean(cfg.insecure_tls)}
+              onChange={(e) => setCfg({ insecure_tls: e.target.checked })}
+            />
+            <span>{tr(lang, "Aceitar certificado próprio (inseguro)", "Accept self-signed certificate (insecure)")}</span>
+          </label>
         </>
       ) : null}
 

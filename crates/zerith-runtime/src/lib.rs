@@ -199,13 +199,19 @@ pub const SKILLS_TOP_K: usize = 12;
 
 /// What the model reads above the skill list. In the benchmarks the model
 /// called a skill once in 13 runs, never `security-audit` on a security
-/// review: a bare "to use one, call `skill`" reads as optional. Like Hermes,
-/// the rule is to load a matching skill before acting, but only a matching
-/// one: loading everything costs tokens and adds noise.
+/// review: a bare "to use one, call `skill`" reads as optional. On
+/// 2026-11-25 the softer "carregue" version still got no call in a whole
+/// MikroTik turn. Now in Hermes' words (agent/prompt_builder.py, `## Skills`
+/// section of `build_skills_system_prompt`, MIT): a matching skill, even
+/// partly, MUST be loaded, and "err on the side of loading — it is always
+/// better to have context you don't need than to miss critical steps,
+/// pitfalls"; Hermes users report it flows. Only a matching one: loading
+/// everything costs tokens and adds noise.
 const SKILLS_HEADER: &str = "# Skills disponíveis\nAntes de agir, confira a lista: se uma skill \
-corresponde ao pedido, mesmo em parte, carregue com a ferramenta `skill` e siga as instruções \
-dela, ainda que você saiba fazer sozinho, porque a skill traz o jeito certo de fazer aqui. Siga \
-sem skill só se nenhuma tiver relação.";
+corresponde ao pedido, mesmo em parte, você DEVE carregá-la com a ferramenta `skill` e seguir as \
+instruções dela, ainda que saiba fazer sozinho, porque a skill traz os comandos, as armadilhas e \
+o jeito certo de fazer aqui. Na dúvida, carregue: é melhor ter contexto sobrando do que errar um \
+passo, um comando ou uma armadilha conhecida. Siga sem skill só se nenhuma tiver relação.";
 
 /// A ranked line's description is cut here, so twelve fit in the budget.
 const SKILL_DESC_CHARS: usize = 160;
@@ -2158,6 +2164,7 @@ mod skills_tests {
         // not just how to (it treated "to use one, call skill" as optional).
         assert!(idx.contains("Antes de agir"), "{idx}");
         assert!(idx.contains("mesmo em parte"), "{idx}");
+        assert!(idx.contains("Na dúvida, carregue"), "{idx}");
     }
 
     #[test]

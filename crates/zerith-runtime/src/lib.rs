@@ -184,15 +184,13 @@ pub const MEMORY_BUDGET_CHARS: usize = 2000;
 /// dump; the budget trims what the ranking offered.
 pub const MEMORY_HITS: usize = 12;
 
-/// How much of the prompt skills may occupy. Metadata for many, bodies for
-/// the few the user named.
+/// How much of the per-turn ranked list may occupy, for libraries past
+/// [`SKILLS_FULL_MAX`] (and for [`skills_index`] / [`skills_block`] callers).
 ///
 /// ponytail: 4000 chars ≈ 1000 tokens at the same 4-chars-per-token rule as
-/// memory. Room for ~25 full descriptions; past that the section lists the
-/// [`SKILLS_TOP_K`] skills that match the request (~2.5k chars) and points to
-/// `skill_search`, so the cost stays flat as the library grows (Hermes' list of
-/// every name + 60-char description grows: ~23.7k chars ≈ 5.9k tokens for 307).
-/// Raise it only with a measured miss rate.
+/// memory. The ranked list was the default until a 127-skill library left the
+/// right MikroTik skill out of the top 12; now every skill is listed (10.7k
+/// chars ≈ 2.7k tokens for 116 active) and this only covers huge libraries.
 pub const SKILLS_BUDGET_CHARS: usize = 4000;
 
 /// How many skills a library too big for the budget shows: the ones the
@@ -211,6 +209,23 @@ sem skill só se nenhuma tiver relação.";
 
 /// A ranked line's description is cut here, so twelve fit in the budget.
 const SKILL_DESC_CHARS: usize = 160;
+
+/// Up to this many skills the static prompt lists every one (name + short
+/// description), like Hermes and Claude Code do. With 127 skills the top-K
+/// ranking left out `mikrotik-routeros-cli` on a MikroTik firewall request;
+/// the full list cannot. Past it the section falls back to top-K +
+/// `skill_search`.
+// ponytail: 400 × ~100 chars would pass the char target even at the shortest
+// width; raise only with a measured miss rate on a bigger library.
+pub const SKILLS_FULL_MAX: usize = 400;
+
+/// Target size of the full catalog. Over it, descriptions get shorter (see
+/// [`CATALOG_DESC_WIDTHS`]); no skill is dropped.
+pub const SKILLS_FULL_CHARS: usize = 12_000;
+
+/// Description widths tried in order until the catalog fits
+/// [`SKILLS_FULL_CHARS`]; the last one is used even if it does not.
+const CATALOG_DESC_WIDTHS: &[usize] = &[80, 70, 60, 50, 40];
 
 /// Everything a turn may consult besides the conversation itself.
 ///
@@ -467,26 +482,21 @@ pub fn build_prompt_context(
         if let Ok(mut catalog) = lib.catalog() {
             catalog.sort_by(|a, b| a.0.cmp(&b.0));
             if !catalog.is_empty() {
-                let full_len: usize = catalog.iter().map(|(n, d)| n.len() + d.len() + 5).sum();
                 let header = if skill_tool {
                     SKILLS_HEADER
                 } else {
                     "# Skills disponíveis"
                 };
-                if full_len + header.len() <= SKILLS_BUDGET_CHARS
-                    && (skill_tool || !catalog.iter().any(|(n, _)| names_skill(prompt, n)))
-                {
-                    let mut sec = String::from(header);
-                    for line in skill_lines(&catalog, false) {
-                        sec.push_str(&line);
-                    }
+                if catalog.len() <= SKILLS_FULL_MAX {
+                    // Every skill, in a fixed order: the section depends only
+                    // on the library, so it stays in the cached prefix. What
+                    // varies with the request goes in the reminder below.
                     static_system.push_str("\n\n");
-                    static_system.push_str(&sec);
-                    if skill_tool {
-                        let inlined = auto_inline_skills(lib, &catalog, prompt, 3600);
-                        if !inlined.is_empty() {
-                            dyn_parts.push(inlined);
-                        }
+                    static_system.push_str(header);
+                    static_system.push_str(&full_catalog(lib));
+                    let inlined = auto_inline_skills(lib, &catalog, prompt, 3600);
+                    if !inlined.is_empty() {
+                        dyn_parts.push(inlined);
                     }
                 } else if skill_tool {
                     // Static pointer stays in the cached system prompt; BM25
@@ -1628,6 +1638,63 @@ fn pick_skills(
     (picked, true)
 }
 
+/// Every enabled skill as `- name: description`, grouped under `## category`
+/// (frontmatter, Hermes folder or plugin; `geral` when none), categories and
+/// names in alphabetical order so the text is the same every turn. The
+/// descriptions get as short as needed to fit [`SKILLS_FULL_CHARS`].
+///
+/// Like Hermes' `<available_skills>` index (agent/prompt_builder.py,
+/// `_render_skills_index`, MIT) and the name + description list Claude Code and
+/// opencode (MIT) show for every skill.
+pub fn full_catalog(lib: &zerith_skills::Library) -> String {
+    let mut rows: Vec<(String, String, String)> = zerith_skills::search::entries(lib)
+        .into_iter()
+        .map(|(c, n, d)| {
+            let c = c.trim().to_lowercase();
+            let c = if c.is_empty() { "geral".to_string() } else { c };
+            (c, n, d.split_whitespace().collect::<Vec<_>>().join(" "))
+        })
+        .collect();
+    rows.sort();
+    let render = |width: usize| {
+        let mut out = String::new();
+        let mut last: Option<&str> = None;
+        for (c, n, d) in &rows {
+            if last != Some(c.as_str()) {
+                out.push_str("\n## ");
+                out.push_str(c);
+                last = Some(c);
+            }
+            out.push_str(&format!("\n- {n}: {}", clip_words(d, width)));
+        }
+        out
+    };
+    let mut out = String::new();
+    for &w in CATALOG_DESC_WIDTHS {
+        out = render(w);
+        if out.len() <= SKILLS_FULL_CHARS {
+            break;
+        }
+    }
+    out
+}
+
+/// `text` cut to at most `max` chars at a word boundary, with `…` when cut.
+fn clip_words(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let head: String = text.chars().take(max.saturating_sub(1)).collect();
+    let cut = match head.rfind(' ') {
+        Some(i) if i > max / 2 => &head[..i],
+        _ => head.as_str(),
+    };
+    format!(
+        "{}…",
+        cut.trim_end_matches([' ', ',', ';', ':', '.', '(', '-'])
+    )
+}
+
 fn skill_lines(picked: &[(String, String)], clip: bool) -> Vec<String> {
     picked
         .iter()
@@ -1894,10 +1961,12 @@ corpo
             "s1",
             "Como entro numa MikroTik RouterOS por SSH?",
         );
-        let rem = built
-            .dynamic_reminder
-            .expect("a lista curta vai no lembrete");
-        assert!(rem.contains("- mikrotik-routeros-cli:"), "{rem}");
+        assert!(
+            built.static_system.contains("- mikrotik-routeros-cli:"),
+            "{}",
+            built.static_system
+        );
+        let rem = built.dynamic_reminder.unwrap_or_default();
         assert!(
             !rem.contains("CORPO-mikrotik-routeros-cli"),
             "o modelo carrega com `skill`; palavra-chave não injeta o corpo: {rem}"
@@ -1980,6 +2049,64 @@ CORPO-{name}
             3600,
         );
         assert!(named.contains("CORPO-security-audit"), "{named}");
+    }
+
+    /// Every skill, grouped and sorted, cut at a word, same text every turn.
+    #[test]
+    fn the_full_catalog_lists_every_skill_in_a_stable_order() {
+        let tmp = tempfile::tempdir_in(scratch()).unwrap();
+        let lib = big_library(tmp.path());
+        let a = build_prompt_context(
+            "t",
+            TurnContext {
+                skills: Some(&lib),
+                no_project_instructions: true,
+                ..TurnContext::default()
+            },
+            true,
+            "s",
+            "legenda de vídeo",
+        );
+        let b = build_prompt_context(
+            "t",
+            TurnContext {
+                skills: Some(&lib),
+                no_project_instructions: true,
+                ..TurnContext::default()
+            },
+            true,
+            "s",
+            "mikrotik",
+        );
+        assert_eq!(a.static_system, b.static_system, "o prefixo não muda");
+        let cat = full_catalog(&lib);
+        assert_eq!(cat.matches("\n- ").count(), 42, "{cat}");
+        assert!(cat.starts_with("\n## geral\n- filler-00: "), "{cat}");
+        assert!(cat.contains("- video-subtitles: Use when generating subtitles for video files."));
+        let filler = cat.lines().nth(2).unwrap();
+        assert!(filler.ends_with('…') && filler.len() < 110, "{filler}");
+        assert_eq!(clip_words("abc def ghi", 9), "abc def…");
+        assert_eq!(clip_words("abc", 9), "abc");
+    }
+
+    /// Sizes with a real library: `ZERITH_SKILLS_ROOT=%APPDATA%\Zerith
+    /// cargo test -p zerith-runtime real_catalog -- --nocapture`. Read only.
+    #[test]
+    fn real_catalog_size_when_pointed_at_one() {
+        let Some(root) = std::env::var_os("ZERITH_SKILLS_ROOT").map(std::path::PathBuf::from)
+        else {
+            return;
+        };
+        let lib = zerith_skills::Library::open(root.join("skills"))
+            .unwrap()
+            .with_plugins(&root.join("plugins"));
+        let cat = full_catalog(&lib);
+        println!(
+            "{cat}\n\n{} skills, {} chars, ~{} tokens",
+            cat.matches("\n- ").count(),
+            cat.len() + SKILLS_HEADER.len(),
+            (cat.len() + SKILLS_HEADER.len()) / 4
+        );
     }
 
     #[test]

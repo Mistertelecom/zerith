@@ -92,6 +92,18 @@ pub fn count(lib: &Library) -> usize {
     index(lib).map_or(0, |i| i.docs.len())
 }
 
+/// Every enabled skill as `(category, name, description)`, in manifest order;
+/// the caller sorts. Read from the cached index, so the category (frontmatter,
+/// Hermes folder or plugin) is parsed once per library change.
+pub fn entries(lib: &Library) -> Vec<(String, String, String)> {
+    index(lib).map_or_else(Vec::new, |i| {
+        i.docs
+            .iter()
+            .map(|d| (d.category.clone(), d.name.clone(), d.description.clone()))
+            .collect()
+    })
+}
+
 fn index(lib: &Library) -> Option<Arc<Index>> {
     let rows = lib.enabled().ok()?;
     let mut h = DefaultHasher::new();
@@ -273,13 +285,20 @@ impl Field {
 }
 
 /// Hermes records where a skill came from (`.../skills/networking/<name>`);
-/// the parent folder is its category unless it is the skills root itself.
+/// the parent folder is its category unless it is the skills root itself. A
+/// plugin skill (`plugin:.../installed/<plugin>/skills/<name>`) without one
+/// falls under its plugin's name.
 fn folder_category(source: &str) -> String {
     let parts: Vec<&str> = source
         .split(['/', '\\'])
         .filter(|p| !p.is_empty())
         .collect();
-    match parts.len().checked_sub(2).map(|i| parts[i]) {
+    let at = |back: usize| parts.len().checked_sub(back).map(|i| parts[i]);
+    match at(2) {
+        Some("skills") if source.starts_with("plugin:") => at(3)
+            .filter(|p| !p.contains(':'))
+            .unwrap_or_default()
+            .to_string(),
         Some(p) if p != "skills" && !p.contains(':') => p.to_string(),
         _ => String::new(),
     }
@@ -782,6 +801,10 @@ mod tests {
         );
         assert_eq!(folder_category(r"hermes:C:\h\skills\ab-testing"), "");
         assert_eq!(folder_category("t"), "");
+        assert_eq!(
+            folder_category(r"plugin:C:\z\plugins\installed\zerith-infra\skills\mudanca-segura"),
+            "zerith-infra"
+        );
     }
 
     /// The imported 307-skill library, when this checkout has it (not in git).

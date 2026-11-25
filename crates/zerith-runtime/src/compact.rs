@@ -745,6 +745,18 @@ fn compact_with(
     cancel: &Cancel,
     trigger: &str,
 ) -> Result<Option<CompactReport>> {
+    compact_keep(store, session_id, summarizer, cancel, trigger, 0)
+}
+
+/// [`compact_with`] keeping the newest `keep` tokens out of the summary.
+fn compact_keep(
+    store: &Store,
+    session_id: &str,
+    summarizer: &dyn Summarizer,
+    cancel: &Cancel,
+    trigger: &str,
+    keep: usize,
+) -> Result<Option<CompactReport>> {
     store
         .session(session_id)?
         .ok_or_else(|| RunError::NoSession(session_id.to_string()))?;
@@ -752,7 +764,7 @@ fn compact_with(
     let mut hist = History::new(Vec::new(), replay_items(&rows));
     let log = TurnLog::outside_turn(store, session_id);
     summarize_into(
-        store, session_id, &mut hist, 0, summarizer, cancel, &log, trigger,
+        store, session_id, &mut hist, keep, summarizer, cancel, &log, trigger,
     )
     .map_err(|e| RunError::Provider(ProviderError::Transport(e)))
 }
@@ -943,12 +955,18 @@ pub fn auto_compact_routed_at(
         Some((cl, m)) => (cl, m.as_str()),
         None => (client, model),
     };
-    let r = auto_compact_at(
+    let imported_cap = if is_imported(store, session_id) {
+        settings.context.imported_compact_tokens
+    } else {
+        0
+    };
+    let r = auto_compact_capped(
         store,
         session_id,
         history,
         limit,
         threshold_pct,
+        imported_cap,
         &ClientSummarizer {
             client,
             model: sum_model,
@@ -1003,21 +1021,83 @@ pub fn auto_compact_at(
     summarizer: &dyn Summarizer,
     cancel: &Cancel,
 ) -> Result<Option<CompactReport>> {
+    auto_compact_capped(
+        store,
+        session_id,
+        history,
+        context_limit,
+        threshold_pct,
+        0,
+        summarizer,
+        cancel,
+    )
+}
+
+/// Whether `session_id` came from another harness (Hermes, Claude Code,
+/// Codex): its history was written for that one and is replayed as is.
+pub fn is_imported(store: &Store, session_id: &str) -> bool {
+    use zerith_sessions::SessionSource as S;
+    store
+        .session(session_id)
+        .ok()
+        .flatten()
+        .is_some_and(|s| matches!(s.source, S::Hermes | S::ClaudeCode | S::Codex))
+}
+
+/// [`auto_compact_at`] with a comfort cap for imported conversations: with
+/// `imported_cap > 0` the history is summarized past `imported_cap` tokens
+/// (not only past `threshold_pct` of a 1M window, which a chat never
+/// reaches), and on the first turn it continues in Zerith (no Zerith summary
+/// yet) as soon as it passes a quarter of the cap. The newest
+/// `imported_cap / 4` tokens stay verbatim.
+///
+/// Measured on 2026-11-25: a 326-row Hermes chat (YSERVICE) replayed ~25k
+/// tokens of history on every step of a MikroTik turn, a 34 KB Hermes
+/// compaction note and 155 assistant messages among them, with 75% of 1M
+/// never in sight. Hermes itself summarizes at 50% of the window
+/// (`compression.threshold`, agent/context_compressor.py) and its gateway
+/// "hygiene" pass at 85% or 400 messages (gateway/run_turn.py, MIT); this cap
+/// is lower on purpose: every step re-sends the history, so a smaller one is
+/// faster and cheaper. The price is one summary call and old detail only in
+/// the summary. `[context] imported_compact_tokens = 0` turns it off.
+#[allow(clippy::too_many_arguments)]
+pub fn auto_compact_capped(
+    store: &Store,
+    session_id: &str,
+    history: usize,
+    context_limit: Option<u32>,
+    threshold_pct: usize,
+    imported_cap: usize,
+    summarizer: &dyn Summarizer,
+    cancel: &Cancel,
+) -> Result<Option<CompactReport>> {
     // ponytail: counts the replayed rows only; the system prompt and tool
     // specs (a few k tokens) ride on the margin.
     let rows = store.history_rows(session_id, history.max(1))?;
     let mut hist = History::new(Vec::new(), replay_items(&rows));
-    if !needs_compaction_at(hist.tokens(), context_limit, threshold_pct) {
+    let window_line = window_of(context_limit) * threshold_pct / 100;
+    let first_here = !hist.items.iter().any(|i| i.summary_row.is_some());
+    let line = match imported_cap {
+        0 => window_line,
+        cap if first_here => (cap / 4).min(window_line),
+        cap => cap.min(window_line),
+    };
+    if hist.tokens() <= line {
         return Ok(None);
     }
     // The turn runs the same passes on its own replay (`agent::shrink`, in
     // memory, nothing stored): when they bring the history under the line,
     // no summary is paid for.
-    hist.cheap_passes(window_of(context_limit) * threshold_pct / 100);
-    if !needs_compaction_at(hist.tokens(), context_limit, threshold_pct) {
+    hist.cheap_passes(line);
+    if hist.tokens() <= line {
         return Ok(None);
     }
-    compact_with(store, session_id, summarizer, cancel, "auto")
+    let keep = if imported_cap > 0 {
+        imported_cap / 4
+    } else {
+        0
+    };
+    compact_keep(store, session_id, summarizer, cancel, "auto", keep)
 }
 
 /// Stored rows as the model's view, with tool calls and results paired and
@@ -1400,6 +1480,97 @@ mod tests {
         assert!(auto_compact(&store, &sid, 100, Some(64_000), &Canned, &c)
             .unwrap()
             .is_none());
+    }
+
+    /// A Hermes chat shaped like the 2026-11-25 one (YSERVICE: 20 prompts,
+    /// a 34 KB compaction note, ~150 tool rounds): on a 1M window the 75%
+    /// line never fires; as an imported session it is summarized on the
+    /// first turn here, keeping the newest 10k tokens verbatim, and then only
+    /// past the 40k cap. A native session of the same shape is left alone.
+    #[test]
+    fn an_imported_chat_is_summarized_on_its_first_turn_here() {
+        struct Any;
+        impl Summarizer for Any {
+            fn summarize(&self, _: &str, _: &Cancel) -> std::result::Result<String, String> {
+                Ok("resumo do Hermes".into())
+            }
+        }
+        let fill = |store: &Store, sid: &str| {
+            let note = format!("[CONTEXT COMPACTION] {}", "nota ".repeat(6_900));
+            store
+                .append(sid, &NewMessage::new(Role::User, note))
+                .unwrap();
+            let out = "linha de saída do roteador\n".repeat(55); // ~1.5 KB
+            for turn in 0..20 {
+                store
+                    .append(sid, &NewMessage::new(Role::User, format!("pedido {turn}")))
+                    .unwrap();
+                for k in 0..7 {
+                    let id = format!("c{turn}-{k}");
+                    store
+                        .append(
+                            sid,
+                            &NewMessage {
+                                tool_calls: Some(json!([{"id": id, "name": "terminal",
+                                    "arguments": format!(r#"{{"command":"cmd {turn} {k}"}}"#)}])),
+                                ..NewMessage::new(Role::Assistant, "verificando")
+                            },
+                        )
+                        .unwrap();
+                    store
+                        .append(
+                            sid,
+                            &NewMessage {
+                                tool_name: Some("terminal".into()),
+                                tool_calls: Some(json!({"tool_call_id": id})),
+                                ..NewMessage::new(Role::Tool, format!("{turn}-{k}\n{out}"))
+                            },
+                        )
+                        .unwrap();
+                }
+                store
+                    .append(
+                        sid,
+                        &NewMessage::new(Role::Assistant, format!("feito {turn}")),
+                    )
+                    .unwrap();
+            }
+        };
+        let tokens = |store: &Store, sid: &str| {
+            History::new(
+                Vec::new(),
+                replay_items(&store.history_rows(sid, 40).unwrap()),
+            )
+            .tokens()
+        };
+        let c = Cancel::default();
+        let store = Store::open_in_memory().unwrap();
+        let native = store.create_session("n", SessionSource::Native).unwrap().id;
+        fill(&store, &native);
+        let hermes = store.create_session("h", SessionSource::Hermes).unwrap().id;
+        fill(&store, &hermes);
+        assert!(!is_imported(&store, &native) && is_imported(&store, &hermes));
+        let before = tokens(&store, &hermes);
+        assert!(before > 40_000, "{before}");
+        let at = |sid: &str, cap| {
+            auto_compact_capped(&store, sid, 40, Some(1_000_000), 75, cap, &Any, &c).unwrap()
+        };
+        assert!(at(&native, 0).is_none(), "75% of 1M is far away");
+        let r = at(&hermes, 40_000).expect("first turn here: summarized");
+        let after = tokens(&store, &hermes);
+        println!("importada: {before} → {after} tokens de histórico");
+        assert!(after < 12_000, "{after}");
+        assert!(after > 1_000, "the newest rounds stay verbatim: {after}");
+        assert_eq!(r.tokens_after, after);
+        // Summarized once: the next turn is under the 40k cap.
+        assert!(at(&hermes, 40_000).is_none());
+        // Off: an imported chat behaves like a native one.
+        let other = store
+            .create_session("h2", SessionSource::Hermes)
+            .unwrap()
+            .id;
+        fill(&store, &other);
+        assert!(at(&other, 0).is_none());
     }
 
     #[test]

@@ -198,6 +198,18 @@ pub struct ContextSettings {
     /// with the workspace's `.zerith/PINNED.md`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pinned_instructions: Option<String>,
+    /// Teto "confortável" de histórico (tokens estimados) de uma conversa
+    /// importada do Hermes, Claude Code ou Codex: passou dele, o resumo roda
+    /// antes do turno, mesmo longe dos 75% da janela. Na primeira vez que a
+    /// conversa continua no Zerith, o histórico importado já é resumido.
+    /// Troca: menos tokens e passos mais rápidos por um resumo (uma chamada
+    /// ao modelo) e detalhe antigo só no resumo. `0` desliga as duas coisas.
+    #[serde(default = "default_imported_compact_tokens")]
+    pub imported_compact_tokens: usize,
+}
+
+fn default_imported_compact_tokens() -> usize {
+    40_000
 }
 
 impl Default for ContextSettings {
@@ -207,6 +219,7 @@ impl Default for ContextSettings {
             verify_on_stop: true,
             post_write_check: true,
             pinned_instructions: None,
+            imported_compact_tokens: default_imported_compact_tokens(),
         }
     }
 }

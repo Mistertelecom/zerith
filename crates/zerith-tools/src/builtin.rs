@@ -223,6 +223,7 @@ pub(crate) fn all() -> Vec<Box<dyn crate::Tool>> {
             json!({"type": "object", "properties": {
                 "command": {"type": "string"},
                 "timeout_secs": {"type": "integer", "description": "padrão 120, máximo 600"},
+                "workdir": {"type": "string", "description": "pasta onde rodar, relativa ao workspace (padrão: o workspace); use em vez de `cd x &&`"},
                 "run_in_background": {"type": "boolean", "description": "devolve um id na hora; leia com shell_output, encerre com shell_kill (até 4 jobs)"}
             }, "required": ["command"]}),
             "código de saída, stdout e stderr",
@@ -314,8 +315,28 @@ fn write_action(args: &Value, ctx: &CallCtx<'_>) -> Result<Option<Action>> {
     Ok(Some(Action::Write(ctx.resolve(str_arg(args, "path")?))))
 }
 
-fn shell_action(args: &Value, _: &CallCtx<'_>) -> Result<Option<Action>> {
-    Ok(Some(Action::Shell(str_arg(args, "command")?.to_string())))
+fn shell_action(args: &Value, ctx: &CallCtx<'_>) -> Result<Option<Action>> {
+    let cmd = str_arg(args, "command")?;
+    Ok(Some(Action::Shell(
+        ctx.policy.shell_subject(cmd, args["workdir"].as_str()),
+    )))
+}
+
+/// Where a `shell` call runs: `workdir` (relative to the workspace) or the
+/// workspace. Leaving the workspace was already judged by `shell_action`.
+/// Per-command cwd after Hermes `terminal(workdir=...)` (MIT).
+fn shell_dir(args: &Value, ctx: &CallCtx<'_>) -> Result<std::path::PathBuf> {
+    let Some(d) = args["workdir"].as_str().filter(|d| !d.trim().is_empty()) else {
+        return Ok(ctx.workspace.to_path_buf());
+    };
+    let dir = ctx.resolve(d.trim());
+    if !dir.is_dir() {
+        return Err(ToolError::BadArguments(format!(
+            "workdir não é um diretório: {}",
+            dir.display()
+        )));
+    }
+    Ok(dir)
 }
 
 /// Console text as Windows really writes it: UTF-8 when it is, the OEM code
@@ -702,8 +723,9 @@ fn shell_exec(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>, snapshot: bool) 
         // Before either branch: a background job mutates the workspace too.
         exec.host.before_shell(cmd, ctx.workspace);
     }
+    let dir = shell_dir(args, ctx)?;
     if args["run_in_background"].as_bool().unwrap_or(false) {
-        return crate::jobs::start(args, ctx.workspace, ctx.policy, exec.host);
+        return crate::jobs::start(args, &dir, ctx.policy, exec.host);
     }
     let secs = args["timeout_secs"].as_u64().unwrap_or(120).clamp(1, 600);
     let deadline = exec
@@ -713,7 +735,7 @@ fn shell_exec(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>, snapshot: bool) 
     // Wrap BEFORE configuring stdio: on macOS `sandbox_exec` creates a fresh
     // `Command`, so stdio set earlier would be dropped.
     let mut command = shell_command(cmd);
-    command.current_dir(ctx.workspace);
+    command.current_dir(&dir);
     let mut command = jail.wrap(command);
     command
         .stdin(Stdio::null())
@@ -1497,6 +1519,58 @@ mod ondav4_tests {
         assert!(out.contains("hostname PE-CORE-01"), "{out}");
         assert!(out.contains("interface GigabitEthernet0/0/0"), "{out}");
         assert!(out.contains("router bgp 65001"), "{out}");
+    }
+
+    #[test]
+    fn shell_runs_in_workdir_and_outside_needs_approval() {
+        let dir = scratch();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/marca.txt"), "aqui\n").unwrap();
+        let reg = Registry::new();
+        let bash = !cfg!(windows) || zerith_core::shellparse::windows_bash().is_some();
+        let cat = if bash {
+            "cat marca.txt"
+        } else {
+            "type marca.txt"
+        };
+        let pol = Policy::new(preset("workspace-write").unwrap(), Mode::Bypass, root);
+        let ctx = CallCtx {
+            workspace: pol.workspace.as_path(),
+            policy: &pol,
+            memory: None,
+            scope: None,
+        };
+        let out = reg
+            .call("shell", &json!({"command": cat, "workdir": "sub"}), &ctx)
+            .unwrap();
+        assert!(out.contains("aqui"), "{out}");
+        let err = reg
+            .call(
+                "shell",
+                &json!({"command": cat, "workdir": "nao-existe"}),
+                &ctx,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("workdir"), "{err}");
+
+        // Default mode: a workdir outside the workspace asks, even for a
+        // read-only command.
+        let strict = Policy::new(preset("workspace-write").unwrap(), Mode::Default, root);
+        let ctx = CallCtx {
+            workspace: strict.workspace.as_path(),
+            policy: &strict,
+            memory: None,
+            scope: None,
+        };
+        let (v, _) = reg
+            .authorize("shell", &json!({"command": "ls", "workdir": ".."}), &ctx)
+            .unwrap();
+        assert!(matches!(v, zerith_security::Verdict::Ask(_)), "{v:?}");
+        let (v, _) = reg
+            .authorize("shell", &json!({"command": "ls", "workdir": "sub"}), &ctx)
+            .unwrap();
+        assert_eq!(v, zerith_security::Verdict::Allow);
     }
 
     #[test]

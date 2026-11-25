@@ -844,8 +844,32 @@ impl Policy {
                 Some(Action::Read(path(s("path").unwrap_or("."))))
             }
             "write_file" | "edit_file" | "multi_edit" => Some(Action::Write(path(s("path")?))),
-            "shell" | "monitor" => Some(Action::Shell(s("command")?.to_string())),
+            "shell" | "monitor" => Some(Action::Shell(
+                self.shell_subject(s("command")?, s("workdir")),
+            )),
             _ => None,
+        }
+    }
+
+    /// The command the policy judges for a `shell` call run in `workdir`.
+    /// Inside the workspace (or no `workdir`): the command as given. Outside:
+    /// `cd "<dir>" && <cmd>`, so leaving the workspace asks (or a rule
+    /// decides) like any `cd` out of it, and a read-only command is no
+    /// longer a free pass to list another folder.
+    pub fn shell_subject(&self, cmd: &str, workdir: Option<&str>) -> String {
+        let Some(d) = workdir.map(str::trim).filter(|d| !d.is_empty()) else {
+            return cmd.to_string();
+        };
+        let p = PathBuf::from(d);
+        let dir = if p.is_absolute() {
+            p
+        } else {
+            self.workspace.join(p)
+        };
+        if self.inside_workspace(&dir) {
+            cmd.to_string()
+        } else {
+            format!("cd \"{}\" && {cmd}", dir.display())
         }
     }
 

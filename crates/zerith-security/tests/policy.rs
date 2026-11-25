@@ -239,6 +239,32 @@ fn the_mode_handle_switches_a_live_policy_and_its_clones() {
 }
 
 #[test]
+fn shell_workdir_outside_the_workspace_is_judged_as_a_cd_out() {
+    let dir = scratch();
+    std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+    let p = policy(
+        dir.path(),
+        "[permissions]\ndefault_mode = \"default\"\nallow = [\"shell(cargo *)\"]",
+    );
+    // Inside: same verdict as without workdir.
+    let inside = json!({"command": "cargo test", "workdir": "sub"});
+    assert_eq!(p.check_call("shell", &inside), Some(Verdict::Allow));
+    assert_eq!(
+        p.check_call("shell", &json!({"command": "ls", "workdir": "sub"})),
+        Some(Verdict::Allow)
+    );
+    // Outside: neither the allow rule nor "read-only" lets it through silently.
+    for cmd in ["cargo test", "ls"] {
+        let out = json!({"command": cmd, "workdir": ".."});
+        assert!(
+            matches!(p.check_call("shell", &out), Some(Verdict::Ask(_))),
+            "{cmd}"
+        );
+    }
+    assert!(p.shell_subject("ls", Some("..")).starts_with("cd \""));
+}
+
+#[test]
 fn check_call_maps_builtin_tool_arguments() {
     let dir = scratch();
     let p = policy(

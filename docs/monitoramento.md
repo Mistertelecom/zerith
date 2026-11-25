@@ -56,6 +56,13 @@ Se no seu RouterOS o campo tiver outro nome, ajuste `status_field`/
 sempre sairá vazia — use o Zabbix ou uma notificação do próprio Dude.
 Teste antes: no nó SSH, **Testar nó** mostra a saída real.
 
-## Zabbix
+## Zabbix (7.0)
 
-Veja `docs/zabbix.md`.
+Modelo **Equipamentos offline (Zabbix)**: nó **Zabbix** na operação
+`hosts_unavailable` (problema `Unavailable by ICMP ping` / `… is not
+available` ou interface de agente/SNMP indisponível). Cada linha sai como
+`- host (ip) — problema há Xh`.
+
+Preencha no nó Zabbix: `url` (`https://zabbix.exemplo/zabbix`),
+`token_secret` (nome do segredo com o token de API) e, opcional, `groups`.
+Detalhes, autenticação e como testar com Docker: `docs/zabbix.md`.

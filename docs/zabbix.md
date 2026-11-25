@@ -62,6 +62,13 @@ Saída de `problems`/`hosts_unavailable` (JSON, para o Transformar
 Erro do JSON-RPC (`error.message` + `error.data`) vira falha do nó com a
 mensagem do Zabbix; o token nunca aparece (é trocado por `***`).
 
+## Modelo pronto
+
+**Equipamentos offline (Zabbix)**: cron 07:50 → Zabbix `hosts_unavailable` →
+`Equipamentos offline às HH:MM (N):` / `- host (ip) — problema há Xh` → só
+avisa se houver → canal, com aviso de falha ligado. Veja
+`docs/monitoramento.md`.
+
 ## Como testar sem um Zabbix em produção
 
 Zabbix 7.0 mínimo em Docker (só para teste; troque as senhas):

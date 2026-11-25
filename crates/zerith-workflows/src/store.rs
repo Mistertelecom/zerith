@@ -756,6 +756,33 @@ pub fn starter_templates() -> Vec<Workflow> {
             }),
         },
     ));
+    base.push(offline_template(
+        now,
+        "zabbix-equipamentos-offline",
+        "Equipamentos offline (Zabbix)",
+        "Lista os hosts fora do ar no Zabbix 7.0 (problema de ICMP/agente ou interface \
+         indisponível) e avisa um grupo. Preencha: no nó Zabbix, a URL \
+         (https://zabbix.exemplo/zabbix) e `token_secret` (nome do segredo com o token de API; \
+         grave no servidor) e, se quiser, os grupos de hosts; no nó de aviso, o canal e o grupo \
+         (…@g.us). Horário no gatilho (padrão 07:50). A condição \"Há offline?\" pode ser \
+         removida para receber também o \"Nenhum equipamento offline\". Veja docs/zabbix.md.",
+        WorkflowNode {
+            id: "o2".into(),
+            kind: NodeKind::Zabbix,
+            label: "Zabbix: hosts indisponíveis".into(),
+            x: 310.0,
+            y: 120.0,
+            config: json!({
+                "url": "",
+                "token_secret": "",
+                "auth_mode": "header",
+                "operation": "hosts_unavailable",
+                "groups": "",
+                "timeout_secs": 30,
+                "insecure_tls": false
+            }),
+        },
+    ));
     base
 }
 
@@ -1108,6 +1135,34 @@ mod tests {
         );
         assert!(text.starts_with("Nenhum equipamento offline às "), "{text}");
         assert!(!sent, "condição barra o aviso sem offline");
+    }
+
+    #[test]
+    fn modelo_zabbix_offline_monta_texto_com_tempo() {
+        let wf = starter_templates()
+            .into_iter()
+            .find(|w| w.id == "zabbix-equipamentos-offline")
+            .unwrap();
+        assert_eq!(wf.nodes[0].config["cron"], "50 7 * * *");
+        assert_eq!(wf.nodes[1].kind, NodeKind::Zabbix);
+        assert_eq!(wf.alert.alert_after_failures, Some(1));
+
+        let desde = crate::unix_secs() - 3 * 3600 - 60;
+        let sample = json!([{"host": "olt-exemplo", "ip": "192.0.2.10",
+            "problema": "ICMP Ping: Unavailable by ICMP ping", "severidade": "Alta", "desde": desde}])
+        .to_string();
+        let (text, sent) = run_offline_template("zabbix-equipamentos-offline", &sample);
+        assert!(text.starts_with("Equipamentos offline às "), "{text}");
+        assert!(
+            text.ends_with(
+                "(1):\n- olt-exemplo (192.0.2.10) — ICMP Ping: Unavailable by ICMP ping há 3h"
+            ),
+            "{text}"
+        );
+        assert!(sent);
+        let (text, sent) = run_offline_template("zabbix-equipamentos-offline", "[]");
+        assert!(text.starts_with("Nenhum equipamento offline às "));
+        assert!(!sent);
     }
 
     #[test]

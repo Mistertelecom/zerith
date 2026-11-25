@@ -892,6 +892,107 @@ pub fn classify_network_command(vendor: Vendor, cmd: &str) -> NetCmdRisk {
     worst
 }
 
+/// A command about to be typed on a device, made to end on its own.
+/// `Ok((cmd, note))`: what to send and, when the Zerith changed or flagged
+/// it, a line for the result (`[ajustado: count=4 acrescentado]`).
+/// `Err(msg)`: never ends and has no stop parameter; not sent.
+///
+/// RouterOS (docs.mikrotik.com): `/ping` without `count=`, `/tool torch` and
+/// `/tool sniffer quick` without `duration=`, `/tool traceroute` without
+/// `count=`, `monitor`/`monitor-traffic` without `once` run until `q`;
+/// `print follow`/`follow-only` and `print interval=` never stop.
+/// Cisco/Huawei/Juniper pagers are handled by `Vendor::disable_paging_cmd`;
+/// their `ping` stops by itself (5 packets).
+pub fn prepare_network_command(
+    vendor: Vendor,
+    cmd: &str,
+) -> std::result::Result<(String, Option<String>), String> {
+    let low = cmd.trim().to_ascii_lowercase();
+    // `/ip/route/check` and `/ip route check` are the same path in v7.
+    let words: Vec<&str> = low
+        .split_whitespace()
+        .flat_map(|w| {
+            let parts: Vec<&str> = if w.contains('=') {
+                vec![w]
+            } else {
+                w.split('/').filter(|p| !p.is_empty()).collect()
+            };
+            parts
+        })
+        .collect();
+    let has = |w: &str| words.contains(&w);
+    let param = |p: &str| words.iter().any(|w| w.starts_with(p));
+    let first = words.first().copied().unwrap_or("");
+    let tool = |name: &str| first == name || (first == "tool" && words.get(1) == Some(&name));
+    let add = |extra: &str| {
+        Ok((
+            format!("{} {extra}", cmd.trim_end()),
+            Some(format!("[ajustado: {extra} acrescentado]")),
+        ))
+    };
+    match vendor {
+        Vendor::MikrotikRouterOs => {
+            if has("print") && (has("follow") || has("follow-only") || param("follow")) {
+                return Err("`print follow` não termina; use `print` com `where` (ex.: \
+                            /log print where topics~\"error\") ou `print count-only`"
+                    .into());
+            }
+            if has("print") && param("interval=") {
+                return Err(
+                    "`print interval=` repete para sempre; tire o `interval=` para uma leitura"
+                        .into(),
+                );
+            }
+            if tool("ping") && !param("count=") {
+                return add("count=4");
+            }
+            if (tool("torch") || (has("sniffer") && has("quick"))) && !param("duration=") {
+                return add("duration=5");
+            }
+            if tool("traceroute") && !param("count=") {
+                return add("count=1");
+            }
+            if (has("monitor") || has("monitor-traffic"))
+                && !has("once")
+                && !param("once=")
+                && !param("duration=")
+            {
+                return add("once");
+            }
+            if has("route") && has("check") {
+                return Ok((
+                    cmd.to_string(),
+                    Some(
+                        "[contínuo no RouterOS 7: o Zerith interrompe após o primeiro resultado]"
+                            .into(),
+                    ),
+                ));
+            }
+        }
+        Vendor::Linux => {
+            if low.starts_with("ping ") && !words.iter().any(|w| w.starts_with("-c")) {
+                return Ok((
+                    format!("ping -c 4 {}", cmd.trim()[4..].trim_start()),
+                    Some("[ajustado: -c 4 acrescentado]".into()),
+                ));
+            }
+            if (first == "tail" || first == "journalctl")
+                && words.iter().any(|w| *w == "-f" || *w == "--follow")
+                || first == "watch"
+            {
+                return Err(format!(
+                    "`{first}` contínuo não termina; leia uma vez (tail -n 200, journalctl -n 200)"
+                ));
+            }
+        }
+        // Gancho: VRP8/CE aceita `display ... | no-more`, mas o VRP5 não;
+        // `screen-length 0 temporary` (disable_paging_cmd) cobre os dois.
+        Vendor::HuaweiVrp => {}
+        _ => {}
+    }
+    Ok((cmd.to_string(), None))
+}
+
 fn has_cli_error(output: &str) -> Option<&'static str> {
     let low = output.to_ascii_lowercase();
     for (pat, label) in [
@@ -2292,10 +2393,17 @@ fn terminal_batch(args: &Value, _: &CallCtx<'_>, exec: &Exec<'_>) -> Result<Stri
             ));
             break;
         }
+        let (sent, adjusted) = match prepare_network_command(vendor, cmd) {
+            Ok(p) => p,
+            Err(why) => {
+                sections.push(format!("### {cmd}\n[não enviado pelo Zerith: {why}]"));
+                continue;
+            }
+        };
         let (out, alive) = terminal::send_session_command_with(
             "terminal_batch",
             id,
-            Some(cmd),
+            Some(&sent),
             None,
             true,
             None,
@@ -2304,7 +2412,8 @@ fn terminal_batch(args: &Value, _: &CallCtx<'_>, exec: &Exec<'_>) -> Result<Stri
             true,
             exec,
         )?;
-        sections.push(format!("### {cmd}\n{out}"));
+        let note = adjusted.map(|n| format!("{n}\n")).unwrap_or_default();
+        sections.push(format!("### {sent}\n{note}{out}"));
         if !alive {
             sections.push("[sessão encerrou durante o lote]".into());
             break;
@@ -4251,6 +4360,69 @@ router bgp 65001
             assert!(out.contains("[tempo esgotado após 2s"), "{out}");
             assert!(out.contains("aguardando 1"), "{out}");
             assert!(out.contains("ok: /system identity print"), "{out}");
+        });
+    }
+
+    #[test]
+    fn continuous_commands_get_a_stop_parameter_or_are_refused() {
+        let mk = Vendor::MikrotikRouterOs;
+        let p = |v, c| prepare_network_command(v, c);
+        assert_eq!(
+            p(mk, "/ping 8.8.8.8").unwrap(),
+            (
+                "/ping 8.8.8.8 count=4".into(),
+                Some("[ajustado: count=4 acrescentado]".into())
+            )
+        );
+        assert_eq!(p(mk, "/ping 8.8.8.8 count=2").unwrap().1, None);
+        assert_eq!(
+            p(mk, "/tool torch ether1").unwrap().0,
+            "/tool torch ether1 duration=5"
+        );
+        assert_eq!(
+            p(mk, "/interface monitor-traffic ether1").unwrap().0,
+            "/interface monitor-traffic ether1 once"
+        );
+        assert_eq!(
+            p(mk, "/interface/ethernet/monitor sfp1").unwrap().0,
+            "/interface/ethernet/monitor sfp1 once"
+        );
+        assert_eq!(
+            p(mk, "/tool sniffer quick interface=ether1").unwrap().0,
+            "/tool sniffer quick interface=ether1 duration=5"
+        );
+        let (c, n) = p(mk, "/ip route check 179.108.156.6").unwrap();
+        assert_eq!(c, "/ip route check 179.108.156.6");
+        assert!(n.unwrap().contains("contínuo"));
+        assert!(p(mk, "/log print follow").is_err());
+        assert!(p(mk, "/ip firewall connection print follow-only").is_err());
+        assert_eq!(p(mk, "/ip route print").unwrap().1, None);
+        assert_eq!(
+            p(Vendor::Linux, "ping 10.0.0.1").unwrap().0,
+            "ping -c 4 10.0.0.1"
+        );
+        assert!(p(Vendor::Linux, "tail -f /var/log/syslog").is_err());
+        assert_eq!(p(Vendor::CiscoIos, "ping 10.0.0.1").unwrap().1, None);
+    }
+
+    #[test]
+    fn batch_adjusts_ping_and_refuses_print_follow() {
+        with_fake_router("[admin@MK] > ", "mikrotik_router_os", |id, ctx, exec| {
+            let out = terminal_batch(
+                &json!({"id": id, "commands": ["/log print follow", "/ping 1.1.1.1"]}),
+                ctx,
+                exec,
+            )
+            .unwrap();
+            assert!(
+                out.contains("[não enviado pelo Zerith: `print follow`"),
+                "{out}"
+            );
+            assert!(
+                out.contains("### /ping 1.1.1.1 count=4\n[ajustado: count=4 acrescentado]"),
+                "{out}"
+            );
+            assert!(out.contains("ok: /ping 1.1.1.1 count=4"), "{out}");
         });
     }
 

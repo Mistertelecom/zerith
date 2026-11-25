@@ -738,10 +738,24 @@ fn send(args: &Value, _: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
             })
         })
         .transpose()?;
+    // A device session (net_connect) knows its vendor: commands that never
+    // end get their stop parameter, or are refused, before being typed.
+    let vendor = terminal_meta(id)
+        .and_then(|(v, _, _)| v)
+        .and_then(|v| crate::network::Vendor::parse(&v));
+    let (input, adjusted) = match (args["input"].as_str(), vendor) {
+        (Some(i), Some(v)) if enter && secret.is_none() && !i.trim().is_empty() => {
+            match crate::network::prepare_network_command(v, i) {
+                Ok((c, n)) => (Some(c), n),
+                Err(why) => return Ok(format!("{id}\n[não enviado pelo Zerith: {why}]")),
+            }
+        }
+        (i, _) => (i.map(str::to_string), None),
+    };
     let (text, alive) = send_session_command(
         "terminal_send",
         id,
-        args["input"].as_str(),
+        input.as_deref(),
         secret,
         enter,
         re.as_ref(),
@@ -750,12 +764,13 @@ fn send(args: &Value, _: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
         exec,
     )?;
     Ok(format!(
-        "{id}{}\n{text}",
+        "{id}{}\n{}{text}",
         if alive {
             ""
         } else {
             " — o programa encerrou; sessão fechada"
-        }
+        },
+        adjusted.map(|n| format!("{n}\n")).unwrap_or_default()
     ))
 }
 

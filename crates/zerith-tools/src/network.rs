@@ -4622,8 +4622,10 @@ router bgp 65001
         assert!(out.contains(" 599   dst-address=10.0.599.0/24"), "{out}");
         assert!(!out.contains("__ZB_END_"), "{out}");
         // The end marker costs one more round trip per command (here the
-        // 150 ms redraw of its echo).
-        assert!(took < Duration::from_secs(3), "{took:?}");
+        // 150 ms redraw of its echo): ~2.5 s locally, ~5 s on the macOS CI
+        // runner. The ceiling catches the old silence waits (2 s per
+        // command, 12 s+), not runner speed.
+        assert!(took < Duration::from_secs(8), "{took:?}");
     }
 
     /// RouterOS on a local socket as a real CCR (7.24) looks over ssh.

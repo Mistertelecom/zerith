@@ -196,6 +196,19 @@ fn off_topic_for_network(d: &Doc) -> bool {
         || n.starts_with("windows-")
 }
 
+/// Whether `text` is a network/infra request: two or more distinct vendor,
+/// platform or network words ([`PLATFORM`], [`NETWORK`]), the same rule the
+/// ranking uses to demote off-topic skills.
+pub fn is_network_request(text: &str) -> bool {
+    let mut seen = HashSet::new();
+    tokens(text)
+        .into_iter()
+        .filter(|w| PLATFORM.contains(&w.as_str()) || NETWORK.contains(&w.as_str()))
+        .filter(|w| seen.insert(w.clone()))
+        .count()
+        >= 2
+}
+
 /// How many skills the index holds (the enabled ones).
 pub fn count(lib: &Library) -> usize {
     index(lib).map_or(0, |i| i.docs.len())
@@ -782,6 +795,14 @@ fn query_words(query: &str) -> Vec<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_network_request_needs_two_network_words() {
+        assert!(is_network_request("liberar syslog no firewall da MikroTik"));
+        assert!(is_network_request("nat nat no concentrador"));
+        assert!(!is_network_request("corrija o teste de firewall"));
+        assert!(!is_network_request("refatore o parser em Rust"));
+    }
 
     fn scratch() -> PathBuf {
         let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-scratch");

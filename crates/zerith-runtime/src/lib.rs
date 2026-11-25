@@ -429,6 +429,51 @@ fn media_section(m: &zerith_core::settings::MediaSettings) -> String {
     )
 }
 
+/// Files that make a folder a code project (Hermes `coding_context.py`
+/// `_PROJECT_MARKERS`, MIT, the manifests only).
+const CODE_MARKERS: &[&str] = &[
+    "Cargo.toml",
+    "package.json",
+    "pyproject.toml",
+    "setup.py",
+    "requirements.txt",
+    "go.mod",
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+    "Gemfile",
+    "composer.json",
+    "CMakeLists.txt",
+    "Makefile",
+    "tsconfig.json",
+    "deno.json",
+    "mix.exs",
+    "pubspec.yaml",
+];
+
+/// Whether the Ponytail Token Saver (lazy senior dev: "YAGNI extremist",
+/// "Deletion before addition") belongs in this turn: only in a code
+/// workspace (the folder or one of its 6 parents has a manifest, the home
+/// folder not counted) and not on a network/infra request. On 2026-11-25,
+/// with Ponytail Ultra on, a MikroTik turn skipped loading any skill; "skip
+/// unnecessary work" reads as "skip the skill". Hermes gates its coding
+/// posture the same way (agent/coding_context.py `_detect_profile`, MIT).
+/// The saving it claims is on code (`estimate_ponytail_saved_tokens` counts
+/// fenced code only), so nothing is lost elsewhere. A session switching to
+/// code mid-way gets it back on the next turn that is not about network.
+fn ponytail_applies(dir: Option<&std::path::Path>, prompt: &str) -> bool {
+    if zerith_skills::search::is_network_request(prompt) {
+        return false;
+    }
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(std::path::PathBuf::from);
+    dir.into_iter()
+        .flat_map(|d| d.ancestors().take(7))
+        .filter(|d| home.as_deref() != Some(*d))
+        .any(|d| CODE_MARKERS.iter().any(|m| d.join(m).is_file()))
+}
+
 pub fn build_prompt_context(
     _title: &str,
     ctx: TurnContext<'_>,
@@ -462,7 +507,9 @@ pub fn build_prompt_context(
         .media;
     static_system.push_str(&media_section(media));
     if let Some(st) = ctx.settings {
-        if let Some(pt) = tokensaver::ponytail_prompt(st.token_saver.ponytail) {
+        let pt = tokensaver::ponytail_prompt(st.token_saver.ponytail)
+            .filter(|_| ponytail_applies(dir.as_deref(), prompt));
+        if let Some(pt) = pt {
             static_system.push_str("\n\n");
             static_system.push_str(pt);
         }
@@ -2925,6 +2972,38 @@ mod gateway_tests {
         let pt_pos = prompt.find("Ponytail Full").unwrap();
         let cv_pos = prompt.find("Caveman Full").unwrap();
         assert!(ag_pos < pt_pos && pt_pos < cv_pos, "{prompt}");
+    }
+
+    /// Ponytail only in a code workspace and off a network request; Caveman
+    /// stays everywhere.
+    #[test]
+    fn ponytail_is_for_code_turns_only() {
+        let mut settings = Settings::default();
+        settings.token_saver.ponytail = zerith_core::PonytailLevel::Ultra;
+        settings.token_saver.caveman = zerith_core::CavemanLevel::Ultra;
+        let code = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let plain = tempfile::tempdir().unwrap();
+        let build = |dir: &std::path::Path, prompt: &str| {
+            build_prompt_context(
+                "t",
+                TurnContext {
+                    settings: Some(&settings),
+                    project_dir: Some(dir),
+                    no_project_instructions: true,
+                    ..TurnContext::default()
+                },
+                false,
+                "s",
+                prompt,
+            )
+            .static_system
+        };
+        assert!(build(code, "refatore o parser").contains("Ponytail Ultra"));
+        let net = build(code, "libere o syslog no firewall da MikroTik");
+        assert!(!net.contains("Ponytail"), "{net}");
+        assert!(net.contains("Caveman Ultra"));
+        let scratch = build(plain.path(), "refatore o parser");
+        assert!(!scratch.contains("Ponytail"), "{scratch}");
     }
 
     #[test]

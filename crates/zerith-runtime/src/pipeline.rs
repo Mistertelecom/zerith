@@ -21,7 +21,7 @@ use serde_json::Value;
 use zerith_memory::{MemoryBackend, Scope};
 use zerith_providers::{Cancel, ToolCall};
 use zerith_security::{Action, Policy, Verdict};
-use zerith_tools::{CallCtx, HostEvent, Registry, OUTPUT_CAP_CHARS};
+use zerith_tools::{CallCtx, HostEvent, Registry};
 
 use crate::agent::{Approval, ApprovalGate};
 use crate::{spill, RunEvent};
@@ -674,24 +674,33 @@ impl Pipeline<'_> {
                 outcome.output = mark_external(&origin, &outcome.output);
             }
         }
-        let spilled = self.finalize(&p.inv.id, &mut outcome.output);
+        let spilled = self.finalize(&p.inv.name, &p.inv.id, &mut outcome.output);
         (outcome, spilled)
     }
 
     /// An output over the cap goes to a file when there is a place for it, and
     /// is cut otherwise; either way the model is told how to get the rest.
-    fn finalize(&self, call_id: &str, output: &mut String) -> Option<PathBuf> {
-        if output.len() <= OUTPUT_CAP_CHARS || output.chars().count() <= OUTPUT_CAP_CHARS {
+    /// Terminal and device output is cut per command (see
+    /// [`spill::cut_sections`]): the small commands of a batch stay whole.
+    fn finalize(&self, tool: &str, call_id: &str, output: &mut String) -> Option<PathBuf> {
+        let cap = zerith_tools::output_cap(tool);
+        if output.len() <= cap || output.chars().count() <= cap {
             return None;
         }
         let full = std::mem::take(output);
+        if cap == zerith_tools::TERMINAL_OUTPUT_CAP_CHARS {
+            let (shown, files) =
+                spill::cut_sections(self.spill_dir, self.session_id, call_id, &full, cap);
+            *output = shown;
+            return files.into_iter().next();
+        }
         if let Some(root) = self.spill_dir {
             if let Ok((path, shown)) = spill::spill(root, self.session_id, call_id, &full) {
                 *output = shown;
                 return Some(path);
             }
         }
-        *output = zerith_tools::truncate(full, OUTPUT_CAP_CHARS);
+        *output = zerith_tools::truncate(full, cap);
         None
     }
 }
@@ -2151,7 +2160,7 @@ mod external_tests {
     #[test]
     fn a_spilled_external_output_keeps_header_in_head_and_footer_in_tail() {
         let dir = tempfile::tempdir().unwrap();
-        let big = "linha da página\n".repeat(OUTPUT_CAP_CHARS / 8);
+        let big = "linha da página\n".repeat(zerith_tools::OUTPUT_CAP_CHARS / 8);
         let (out, spilled) = through("mcp__docs__read", &big, Some(dir.path()));
         let path = spilled.expect("big output spills");
         assert!(out.starts_with("[conteúdo externo de servidor MCP docs:"));

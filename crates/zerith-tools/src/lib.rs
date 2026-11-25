@@ -187,6 +187,25 @@ pub trait Tool: Send + Sync {
 /// head and say how much was cut, so the model knows to narrow the request.
 pub const OUTPUT_CAP_CHARS: usize = 30_000;
 
+/// The cap for device and terminal sessions (`terminal_*`, `net_*`,
+/// `ssh_command`): a firewall or a route table read in one batch has to
+/// arrive whole, or the model spends steps reading the spill file back.
+/// Hermes Agent (MIT) cuts terminal output at 50k chars
+/// (`tool_output_limits.py`) and persists results over 100k
+/// (`max_result_size_chars`); 60k sits above Hermes's cut, about 15k tokens.
+/// A batch over it is cut per command (runtime `spill::cut_batch`), so one
+/// giant table never pushes the other commands out.
+pub const TERMINAL_OUTPUT_CAP_CHARS: usize = 60_000;
+
+/// The output cap for `tool`.
+pub fn output_cap(tool: &str) -> usize {
+    if tool.starts_with("terminal_") || tool.starts_with("net_") || tool == "ssh_command" {
+        TERMINAL_OUTPUT_CAP_CHARS
+    } else {
+        OUTPUT_CAP_CHARS
+    }
+}
+
 /// `ToolSpec::source` prefix of a deferred tool: registered and runnable, but
 /// left out of the tool list sent to the model (a big MCP server's schemas cost
 /// tens of thousands of tokens per request). The model reaches it through
@@ -350,7 +369,7 @@ impl Registry {
     ) -> Result<String> {
         Ok(truncate(
             self.run_raw(name, args, ctx, cancel)?,
-            OUTPUT_CAP_CHARS,
+            output_cap(name),
         ))
     }
 

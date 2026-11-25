@@ -812,6 +812,18 @@ fn shell_exec(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>, snapshot: bool) 
     let mut parts = [("stdout", &stdout), ("stderr", &stderr)];
     if !status.success() {
         parts.swap(0, 1);
+        // A full stdout made the model miss `exit 1` (ufw/nft/iptables
+        // without root): the error lines and the root hint come first.
+        // The first line stays `exit N` (verify::exit_of reads it).
+        text.push_str("[o comando FALHOU]\n");
+        let errs = error_lines(&stderr, &stdout);
+        if !errs.is_empty() {
+            text.push_str(&format!("[erros]\n{}\n", errs.join("\n")));
+        }
+        if let Some(hint) = root_hint(cmd, &format!("{stderr}\n{stdout}")) {
+            text.push_str(&hint);
+            text.push('\n');
+        }
     }
     for (name, body) in parts.iter().filter(|(_, b)| !b.is_empty()) {
         if !text.ends_with('\n') {
@@ -827,6 +839,108 @@ fn shell_exec(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>, snapshot: bool) 
     } else {
         Err(ToolError::Failed(text))
     }
+}
+
+const ROOT_SIGNS: [&str; 7] = [
+    "permission denied",
+    "must be root",
+    "need to be root",
+    "operation not permitted",
+    "can't initialize iptables",
+    "you must be superuser",
+    "are you root",
+];
+
+/// Up to 6 lines of a failed run that read like errors, stderr first.
+fn error_lines(stderr: &str, stdout: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for l in stderr.lines().chain(stdout.lines()) {
+        let low = l.to_ascii_lowercase();
+        let hit = ROOT_SIGNS.iter().any(|s| low.contains(s))
+            || [
+                "error",
+                "erro",
+                "fatal",
+                "failed",
+                "falhou",
+                "denied",
+                "not found",
+            ]
+            .iter()
+            .any(|s| low.contains(s));
+        let line = l.trim().to_string();
+        if hit && !line.is_empty() && !out.contains(&line) {
+            out.push(line);
+            if out.len() == 6 {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// `sudo` in front of each command of a `;`/`&&`/`||` chain (not after a
+/// pipe: only the left side reads the protected thing).
+fn with_sudo(cmd: &str) -> String {
+    let mut out = String::new();
+    let mut rest = cmd.trim();
+    loop {
+        let cut = [";", "&&", "||"]
+            .iter()
+            .filter_map(|sep| rest.find(sep).map(|i| (i, sep.len())))
+            .min();
+        let (seg, tail) = match cut {
+            Some((i, n)) => (&rest[..i], Some(&rest[i..i + n])),
+            None => (rest, None),
+        };
+        let s = seg.trim();
+        if !s.is_empty() {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            if !s.starts_with("sudo ") {
+                out.push_str("sudo ");
+            }
+            out.push_str(s);
+        }
+        match (cut, tail) {
+            (Some((i, n)), Some(sep)) => {
+                out.push_str(&format!(" {sep}"));
+                rest = &rest[i + n..];
+            }
+            _ => break,
+        }
+    }
+    out.replace(" ;", ";")
+}
+
+/// A note for the model when a failure looks like missing root. For
+/// `ssh host 'cmd'` the ready-to-paste `ssh -t host 'sudo cmd'` (`-t`: sudo
+/// needs a terminal to ask for the password).
+fn root_hint(cmd: &str, output: &str) -> Option<String> {
+    let low = output.to_ascii_lowercase();
+    if !ROOT_SIGNS.iter().any(|s| low.contains(s)) {
+        return None;
+    }
+    let base = "[precisa de root: rode com sudo; se o sudo pedir senha, mostre o comando exato \
+                ao usuário e peça para ele rodar]";
+    let c = cmd.trim();
+    let ready = match c.strip_prefix("ssh ") {
+        Some(rest) => {
+            let q = rest.find(['\'', '"'])?;
+            let quote = &rest[q..=q];
+            let end = rest[q + 1..].rfind(quote)? + q + 1;
+            let host = rest[..q].trim();
+            let host = if host.split_whitespace().any(|w| w == "-t") {
+                host.to_string()
+            } else {
+                format!("-t {host}")
+            };
+            format!("ssh {host} {quote}{}{quote}", with_sudo(&rest[q + 1..end]))
+        }
+        None => with_sudo(c),
+    };
+    Some(format!("{base}\ncomando pronto: {ready}"))
 }
 
 fn memory_recall(args: &Value, ctx: &CallCtx<'_>, _: &Exec<'_>) -> Result<String> {
@@ -959,6 +1073,41 @@ fn session_search(args: &Value, _ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<S
     }
     let limit = args["limit"].as_u64().unwrap_or(10).clamp(1, 30) as usize;
     exec.host.session_search(query, limit)
+}
+
+#[cfg(test)]
+mod root_hint_tests {
+    use super::{error_lines, root_hint};
+
+    #[test]
+    fn missing_root_gets_a_note_and_a_ready_ssh_sudo_command() {
+        let out = "Status: active\nERROR: You need to be root to run this script\n";
+        let h = root_hint("ssh admin@fw1 'ufw status verbose'", out).unwrap();
+        assert!(h.starts_with("[precisa de root: rode com sudo;"), "{h}");
+        assert!(
+            h.ends_with("comando pronto: ssh -t admin@fw1 'sudo ufw status verbose'"),
+            "{h}"
+        );
+        let nft = "netlink: Error: cache initialization failed: Operation not permitted";
+        let h = root_hint(
+            "ssh -p 2222 root@10.0.0.2 \"nft list ruleset; iptables -S && ufw status\"",
+            nft,
+        )
+        .unwrap();
+        assert!(
+            h.ends_with(
+                "ssh -t -p 2222 root@10.0.0.2 \"sudo nft list ruleset; sudo iptables -S && sudo ufw status\""
+            ),
+            "{h}"
+        );
+        let ipt = "iptables v1.8.7 (nf_tables): can't initialize iptables table `filter': Permission denied (you must be root)";
+        assert!(root_hint("iptables -S", ipt)
+            .unwrap()
+            .ends_with("comando pronto: sudo iptables -S"));
+        assert!(root_hint("ls /nope", "ls: cannot access '/nope': No such file").is_none());
+        let errs = error_lines(ipt, "Chain INPUT\nline\n");
+        assert_eq!(errs.len(), 1);
+    }
 }
 
 #[cfg(test)]

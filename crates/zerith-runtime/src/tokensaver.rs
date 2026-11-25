@@ -208,6 +208,13 @@ pub fn compress_tool_output(tool_name: &str, text: &str) -> RtkOutcome {
     if !is_command_tool(tool_name) || text.len() < RTK_MIN_BYTES || text.len() > RTK_MAX_BYTES {
         return unchanged(text);
     }
+    // A RouterOS listing is all signal: every numbered row of a firewall or
+    // route table is a rule the model may have to cite, and smart-truncate,
+    // dedup-log's 2000-line cap and network-table would drop them. The
+    // pipeline already cut it per command to the terminal cap.
+    if is_routeros_listing(text) {
+        return unchanged(text);
+    }
     let mut out = compress_command_output(tool_name, text);
     if out.filter.is_some() {
         keep_frame(text, &mut out);
@@ -233,7 +240,35 @@ fn is_frame_line(line: &str) -> bool {
     (t.starts_with("exit ") && t.len() < 16)
         || t.starts_with("[saída completa:")
         || t.starts_with("[saída truncada")
+        || t.starts_with("[comando `")
         || t.starts_with("[AVISO]")
+}
+
+/// RouterOS output: a batch section for a `/path` command (`### /ip route
+/// print`), or three numbered `key=value` rows (`print terse`/`detail`:
+/// ` 12 X  chain=forward action=drop`).
+fn is_routeros_listing(text: &str) -> bool {
+    let numbered_row = |l: &str| {
+        let t = l.trim_start();
+        let digits = t.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 || !t[digits..].starts_with(' ') {
+            return false;
+        }
+        // Flags first (`X`, `As`, `DAc`, `;;;`), then the first `key=value`.
+        t[digits..]
+            .split_whitespace()
+            .take_while(|w| !w.contains('='))
+            .all(|w| w.len() <= 4)
+            && t[digits..]
+                .split_whitespace()
+                .find(|w| w.contains('='))
+                .and_then(|w| w.split_once('='))
+                .is_some_and(|(k, _)| {
+                    !k.is_empty() && k.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')
+                })
+    };
+    text.lines().any(|l| l.starts_with("### /"))
+        || text.lines().filter(|l| numbered_row(l)).take(3).count() == 3
 }
 
 /// Puts back frame lines a filter dropped: the exit line first, notes last.
@@ -1249,6 +1284,24 @@ mod network_rtk_tests {
         assert!(out.text.contains("router bgp 65001"));
         assert!(out.text.contains("10.0.0.1 255.255.255.252"));
         assert!(!out.text.contains("MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A"));
+    }
+
+    #[test]
+    fn routeros_firewall_and_route_listings_are_never_cut() {
+        let batch = crate::spill::tests::routeros_batch();
+        let out = compress_tool_output("terminal_batch", &batch);
+        assert_eq!(out.filter, None);
+        assert_eq!(out.text, batch);
+        // A bare `print terse` from terminal_send, no batch header.
+        let fw = batch
+            .split("\n### /ip route")
+            .next()
+            .unwrap()
+            .split_once('\n')
+            .unwrap()
+            .1
+            .repeat(5);
+        assert_eq!(compress_tool_output("terminal_send", &fw).text, fw);
     }
 
     #[test]

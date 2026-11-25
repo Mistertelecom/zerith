@@ -54,6 +54,7 @@ pub use tasks::{check as check_task_args, STATUSES as TASK_STATUSES};
 pub use terminal::{
     close_all_terminals, close_session_terminals, close_terminal, interrupt_terminal,
     list_active_terminals, send_terminal_input, set_terminal_change_hook, terminal_meta,
+    terminal_open_for,
     terminal_program, terminal_tail, TerminalSnapshot,
 };
 pub use web::SearchTool;

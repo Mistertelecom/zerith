@@ -795,6 +795,18 @@ fn turn_body(
         .map(|r| {
             let specs = r.specs();
             let large_registry = specs.len() > 20;
+            // Groups that stay once offered, or that the session needs
+            // whatever the last lines say (see `sticky_groups`).
+            let sticky = if large_registry && !is_root_orchestrator {
+                let devices = zerith_tools::network::load_inventory(
+                    &cwd,
+                    Some(zerith_core::Paths::resolve().root()),
+                )
+                .unwrap_or_default();
+                sticky_groups(store, session_id, &context_probe, &devices)
+            } else {
+                HashSet::new()
+            };
             specs
                 .into_iter()
                 // Deferred tools run through `mcp_call`: no schema per request.
@@ -805,7 +817,8 @@ fn turn_body(
                     if is_root_orchestrator {
                         is_orchestrator_root_tool(&s.name)
                     } else if large_registry {
-                        should_include_tool_schema(&s.name, &context_probe)
+                        tool_group(&s.name).is_some_and(|g| sticky.contains(g))
+                            || should_include_tool_schema(&s.name, &context_probe)
                     } else {
                         true
                     }
@@ -832,6 +845,9 @@ fn turn_body(
     let summarizer: &dyn Summarizer = agent.summarizer.unwrap_or(&default_summarizer);
     let mut summary_failed = false;
     let offered: Vec<String> = defs.iter().map(|d| d.name.clone()).collect();
+    if !is_root_orchestrator {
+        remember_groups(session_id, &offered);
+    }
 
     let pipe = Pipeline {
         core: agent.tools.zip(agent.policy),
@@ -2491,6 +2507,95 @@ pub(crate) fn is_orchestrator_root_tool(name: &str) -> bool {
     )
 }
 
+/// The filtered group a tool belongs to (see [`should_include_tool_schema`]);
+/// `None` for tools offered on every turn.
+pub(crate) fn tool_group(name: &str) -> Option<&'static str> {
+    if name.starts_with("net_") || name.starts_with("terminal_") || name == "serial_ports" {
+        Some("rede")
+    } else if name == "browser" || name.starts_with("browser_") {
+        Some("browser")
+    } else if name.starts_with("lsp_") {
+        Some("lsp")
+    } else if name.starts_with("workflow_") || name == "channel_list" {
+        Some("workflows")
+    } else if matches!(name, "image_generate" | "tts_speak" | "audio_transcribe") {
+        Some("midia")
+    } else if matches!(name, "create_skill" | "create_agent" | "delete_ai_item") {
+        Some("autoria")
+    } else {
+        None
+    }
+}
+
+/// Groups offered once in a session, by session id: a group stays for the
+/// rest of the conversation, so the tool list does not change between turns
+/// (and the prompt cache with it) and a device session never loses its
+/// tools mid-operation because the last lines stopped saying "ssh".
+/// ponytail: a few bytes per session, never pruned; after a restart the
+/// history query in `sticky_groups` recovers the groups whose tools were used.
+static STICKY_GROUPS: Mutex<Option<HashMap<String, HashSet<&'static str>>>> = Mutex::new(None);
+
+/// The groups this turn must offer whatever the keywords say: those already
+/// offered in the session (this process), those whose tools the session
+/// ever used (any process: the history says), the network group while the
+/// session has a terminal open, and the network group when `probe` names a
+/// device, host, client or site of the inventory.
+fn sticky_groups(
+    store: &Store,
+    session_id: &str,
+    probe: &str,
+    devices: &[zerith_tools::network::DeviceEntry],
+) -> HashSet<&'static str> {
+    let mut out: HashSet<&'static str> = STICKY_GROUPS
+        .lock()
+        .ok()
+        .and_then(|m| m.as_ref()?.get(session_id).cloned())
+        .unwrap_or_default();
+    if let Ok(mut st) = store.conn().prepare(
+        "SELECT DISTINCT tool_name FROM messages WHERE session_id = ?1 AND tool_name IS NOT NULL",
+    ) {
+        if let Ok(rows) = st.query_map([session_id], |r| r.get::<_, String>(0)) {
+            out.extend(rows.flatten().filter_map(|n| tool_group(&n)));
+        }
+    }
+    if zerith_tools::terminal_open_for(session_id) || inventory_mentioned(devices, probe) {
+        out.insert("rede");
+    }
+    out
+}
+
+/// Remembers the groups offered this turn (see [`STICKY_GROUPS`]).
+fn remember_groups(session_id: &str, names: &[String]) {
+    let groups: HashSet<&'static str> = names.iter().filter_map(|n| tool_group(n)).collect();
+    if groups.is_empty() {
+        return;
+    }
+    if let Ok(mut m) = STICKY_GROUPS.lock() {
+        m.get_or_insert_with(HashMap::new)
+            .entry(session_id.to_string())
+            .or_default()
+            .extend(groups);
+    }
+}
+
+/// Whether `text_lower` names a device, host, client or site of the
+/// inventory ("olha o core-01 da TelecomSul"). Names shorter than 3
+/// characters are skipped: "pe" would match half the language.
+fn inventory_mentioned(devices: &[zerith_tools::network::DeviceEntry], text_lower: &str) -> bool {
+    devices.iter().any(|d| {
+        [
+            Some(d.name.as_str()),
+            Some(d.host.as_str()),
+            d.client.as_deref(),
+            d.site.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|s| s.trim().to_lowercase())
+        .any(|s| s.chars().count() >= 3 && text_lower.contains(&s))
+    })
+}
+
 /// Contextual tool-schema filter for large built-in registries (> 20 tools).
 /// Keeps all core file, shell, task, subagent, skill, memory, diagnostics,
 /// terminal, and network tools on every turn, and only includes bulky niche
@@ -2700,6 +2805,67 @@ pub(crate) fn should_include_tool_schema(name: &str, context_lower: &str) -> boo
         .any(|kw| context_lower.contains(kw));
     }
     true
+}
+
+#[cfg(test)]
+mod sticky_group_tests {
+    use super::*;
+    use zerith_sessions::SessionSource;
+    use zerith_tools::network::DeviceEntry;
+
+    fn device() -> DeviceEntry {
+        DeviceEntry {
+            name: "core-01".into(),
+            client: Some("TelecomSul".into()),
+            host: "10.20.0.1".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_network_group_comes_from_the_inventory_history_and_stays() {
+        let store = Store::open_in_memory().unwrap();
+        let sid = store.create_session("t", SessionSource::Native).unwrap().id;
+        let devices = [device()];
+        let wants = |probe: &str| sticky_groups(&store, &sid, probe, &devices).contains("rede");
+
+        // No keyword of the list, but the inventory names the device/client.
+        let probe = "olha o core-01 da telecomsul";
+        assert!(!should_include_tool_schema("net_connect", probe));
+        assert!(wants(probe));
+        assert!(wants("e o 10.20.0.1?"));
+        assert!(!wants("corrija os testes do parser"));
+        assert!(!inventory_mentioned(
+            &[DeviceEntry {
+                name: "pe".into(),
+                ..Default::default()
+            }],
+            "pede um café"
+        ));
+
+        // A session that used a terminal tool keeps the group (any process).
+        store
+            .append(
+                &sid,
+                &NewMessage {
+                    tool_name: Some("terminal_send".into()),
+                    ..NewMessage::new(Role::Tool, "ok")
+                },
+            )
+            .unwrap();
+        assert!(wants("agora corrija os testes do parser"));
+
+        // Once offered in a session, a group stays (browser here).
+        let other = store.create_session("u", SessionSource::Native).unwrap().id;
+        let groups = |p: &str| sticky_groups(&store, &other, p, &[]);
+        assert!(!groups("resuma o readme").contains("browser"));
+        remember_groups(&other, &["browser_open".into(), "read_file".into()]);
+        let g = groups("resuma o readme");
+        assert!(g.contains("browser") && !g.contains("rede"), "{g:?}");
+        assert_eq!(tool_group("workflow_run"), Some("workflows"));
+        assert_eq!(tool_group("lsp_hover"), Some("lsp"));
+        assert_eq!(tool_group("shell"), None);
+    }
 }
 
 #[cfg(test)]

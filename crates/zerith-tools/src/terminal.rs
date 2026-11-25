@@ -99,6 +99,8 @@ struct TermMeta {
     client: Option<String>,
     vpn: Option<String>,
     transport: Option<String>,
+    /// The session that opened it (see [`terminal_open_for`]).
+    owner: Option<String>,
     buf: Arc<Mutex<VecDeque<u8>>>,
     input: Arc<Mutex<Box<dyn Write + Send>>>,
     last_used: Arc<Mutex<Instant>>,
@@ -304,6 +306,15 @@ pub fn list_active_terminals() -> Vec<TerminalSnapshot> {
         .collect();
     out.sort_by(|a, b| a.id.cmp(&b.id));
     out
+}
+
+/// Whether `session` has a live terminal open (in use or idle): the turn
+/// keeps the network tools offered while it does.
+pub fn terminal_open_for(session: &str) -> bool {
+    meta_table().lock().is_ok_and(|m| {
+        m.values()
+            .any(|t| t.owner.as_deref() == Some(session) && t.alive.load(Ordering::SeqCst))
+    })
 }
 
 /// Reads the trailing output buffer of `id` without consuming it.
@@ -662,6 +673,7 @@ pub(crate) fn open_with_meta(
         client: spec.client,
         vpn: spec.vpn,
         transport: spec.transport,
+        owner: exec.host.session(),
         buf: buf.clone(),
         input: input.clone(),
         last_used,

@@ -2475,6 +2475,7 @@ pub(crate) fn is_orchestrator_root_tool(name: &str) -> bool {
     matches!(
         name,
         "agent"
+            | "agent_manage"
             | "agent_result"
             | "agent_list"
             | "agent_send"

@@ -2342,8 +2342,9 @@ fn the_orchestrator_lists_a_background_child_and_writes_to_it() {
             )]),
             1 => {
                 let id = first_word_of_first_tool_result(b);
+                // Nome novo e nome antigo (apelido) na mesma conversa.
                 calls(&[
-                    ("c2", "agent_list", json!({})),
+                    ("c2", "agent_manage", json!({"action": "list"})),
                     (
                         "c3",
                         "agent_send",

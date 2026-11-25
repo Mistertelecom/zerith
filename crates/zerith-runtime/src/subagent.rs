@@ -323,7 +323,7 @@ pub fn child_registry(base: &Registry, r: &Resolved, depth: usize) -> Registry {
             && !matches!(n, "create_skill" | "create_agent" | "delete_ai_item")
             // The plan tools switch the parent's shared mode handle.
             && !matches!(n, "enter_plan_mode" | "exit_plan_mode")
-            && (can_spawn || !matches!(n, "agent" | "agent_result" | "agent_list" | "agent_send" | "agent_stop"))
+            && (can_spawn || !matches!(n, "agent" | "agent_manage"))
     });
     if can_spawn {
         // The child holds a permit already: its own children run one at a time.
@@ -1512,7 +1512,7 @@ impl Services for Runtime {
             }
         });
         Ok(format!(
-            "{id} iniciado em segundo plano; busque o resultado com agent_result"
+            "{id} iniciado em segundo plano; busque com agent_manage action=result"
         ))
     }
 
@@ -1553,7 +1553,12 @@ impl Services for Runtime {
                 let mut done: Vec<String> = m
                     .iter()
                     .filter(|(_, s)| s.parent == session && s.result().is_some())
-                    .map(|(id, s)| format!("{id} · {} · terminou; busque com agent_result", s.name))
+                    .map(|(id, s)| {
+                        format!(
+                            "{id} · {} · terminou; busque com agent_manage action=result",
+                            s.name
+                        )
+                    })
                     .collect();
                 done.sort();
                 lines.extend(done);
@@ -1578,7 +1583,9 @@ impl Services for Runtime {
                     return Err("`message` vazia".into());
                 }
                 if !c.send(format!("[mensagem do orquestrador] {msg}")) {
-                    return Err(format!("{id} já terminou; busque com agent_result"));
+                    return Err(format!(
+                        "{id} já terminou; busque com agent_manage action=result"
+                    ));
                 }
                 Ok(format!("entregue a {id}; ele lê no próximo passo"))
             }
@@ -1604,7 +1611,9 @@ impl Services for Runtime {
                         return r;
                     }
                     if Instant::now() >= until {
-                        return Ok(format!("{id} parando; busque o resto com agent_result"));
+                        return Ok(format!(
+                            "{id} parando; busque o resto com agent_manage action=result"
+                        ));
                     }
                     std::thread::sleep(Duration::from_millis(50));
                 }

@@ -1,4 +1,4 @@
-//! `agent` (subagents) and `agent_result` (collect a background one).
+//! `agent` (subagents) and `agent_manage` (follow, steer, stop or collect them).
 //!
 //! The tool only parses and forwards to `Services::agent`; running a child
 //! session is the runtime's job. Marked concurrency-safe: several `agent`
@@ -23,7 +23,7 @@ pub(crate) fn all(parallel: bool) -> Vec<Box<dyn Tool>> {
                 "agent": {"type": "string", "description": "executor, explore, plan, general, engenheiro-infra, workflow-architect ou outro agente definido (padrão: general)"},
                 "model": {"type": "string"},
                 "isolation": {"type": "string", "enum": ["worktree"], "description": "use \"worktree\" para isolar alterações em um git worktree temporário"},
-                "run_in_background": {"type": "boolean", "description": "devolve um id na hora; busque o resultado com agent_result"}
+                "run_in_background": {"type": "boolean", "description": "devolve um id na hora; busque com agent_manage action=result"}
             }, "required": ["description", "prompt"]}),
             "o texto final do subagente",
             Permission::Read,
@@ -43,55 +43,35 @@ pub(crate) fn all(parallel: bool) -> Vec<Box<dyn Tool>> {
                     .map_err(ToolError::Failed)
             },
         ),
+        // Uma ferramenta com `action` no lugar de agent_result/list/send/stop,
+        // que seguem aceitos como apelido (zerith_core::tool_alias). Falar com
+        // filhos que rodam durante o turno: conceito do Codex multi-agent v2
+        // (openai/codex, Apache-2.0).
         make(
-            "agent_result",
-            "Estado ou resultado final de um subagente iniciado com run_in_background.",
-            json!({"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}),
-            "running, ou o texto final do subagente",
-            Permission::Read,
-            10,
-            true,
-            |a, _, exec| result(a, exec),
-        ),
-        // Talking to children that run while this turn works (background, or
-        // in parallel): concept after Codex multi-agent v2 (openai/codex,
-        // Apache-2.0).
-        make(
-            "agent_list",
-            "Lista os subagentes desta conversa que ainda estão rodando: id, descrição, passos feitos e estado.",
-            json!({"type": "object", "properties": {}}),
-            "uma linha por subagente ativo",
-            Permission::Read,
-            10,
-            true,
-            |a, _, exec| control("list", a, exec),
-        ),
-        make(
-            "agent_send",
-            "Manda uma mensagem a um subagente em execução (iniciado com run_in_background); ele a lê no próximo passo, como nota no contexto dele. Use para corrigir o rumo ou acrescentar uma informação sem pará-lo.",
+            "agent_manage",
+            "Acompanha subagentes desta conversa. result: estado ou texto final de um iniciado com run_in_background. list: os que ainda rodam (id, descrição, passos, estado). send: manda `message` a um em execução, que a lê no próximo passo (corrige o rumo sem pará-lo). stop: para ele e os filhos dele e devolve o que já produziu; o custo conta para esta conversa.",
             json!({"type": "object", "properties": {
-                "id": {"type": "string", "description": "id do subagente (sub-N)"},
-                "message": {"type": "string"}
-            }, "required": ["id", "message"]}),
-            "confirmação de entrega",
-            Permission::Read,
-            10,
-            true,
-            |a, _, exec| control("send", a, exec),
-        ),
-        make(
-            "agent_stop",
-            "Para um subagente em execução e os subagentes dele. Devolve o que ele já produziu; o custo dele conta para esta conversa.",
-            json!({"type": "object", "properties": {
-                "id": {"type": "string", "description": "id do subagente (sub-N)"}
-            }, "required": ["id"]}),
-            "o que o subagente já tinha produzido",
+                "action": {"type": "string", "enum": ["result", "list", "send", "stop"]},
+                "id": {"type": "string", "description": "result/send/stop: id do subagente (sub-N)"},
+                "message": {"type": "string", "description": "send: o texto"}
+            }, "required": ["action"]}),
+            "result: running ou o texto final; list: uma linha por subagente; send: confirmação; stop: o que ele já tinha produzido",
             Permission::Read,
             60,
             true,
-            |a, _, exec| control("stop", a, exec),
+            manage,
         ),
     ]
+}
+
+fn manage(args: &Value, _: &crate::CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
+    match args["action"].as_str().unwrap_or("") {
+        "result" => result(args, exec),
+        op @ ("list" | "send" | "stop") => control(op, args, exec),
+        other => Err(ToolError::BadArguments(format!(
+            "action precisa ser result, list, send ou stop, não {other:?}"
+        ))),
+    }
 }
 
 fn control(op: &str, args: &Value, exec: &Exec<'_>) -> Result<String> {

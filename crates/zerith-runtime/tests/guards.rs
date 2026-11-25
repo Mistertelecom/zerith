@@ -170,7 +170,7 @@ deny = ["mcp__gh__push"]
 #[test]
 fn a_rule_or_hook_on_an_old_tool_name_covers_the_new_action() {
     let dir = scratch();
-    let text = "[permissions]\ndefault_mode = \"default\"\ndeny = [\"memory_save\"]\n";
+    let text = "[permissions]\ndefault_mode = \"default\"\ndeny = [\"memory_save\"]\nask = [\"agent_stop\"]\n";
     let (g, _) = guards(dir.path(), text);
     let mut c = call(dir.path(), "memory", json!({"action": "save", "text": "x"}));
     assert!(matches!(g.before(&mut c), Flow::Deny(_)));
@@ -178,6 +178,9 @@ fn a_rule_or_hook_on_an_old_tool_name_covers_the_new_action() {
     assert!(matches!(g.before(&mut c), Flow::Deny(_)));
     let mut c = call(dir.path(), "memory", json!({"action": "recall"}));
     assert_eq!(g.before(&mut c), Flow::Continue);
+    let stop = json!({"action": "stop", "id": "sub-1"});
+    let mut c = call(dir.path(), "agent_manage", stop);
+    assert!(matches!(g.before(&mut c), Flow::Ask(_)));
 
     let (g, _) = guards(dir.path(), &hook("PreToolUse", "memory_save", DENY_JSON));
     let mut c = call(dir.path(), "memory", json!({"action": "save", "text": "x"}));

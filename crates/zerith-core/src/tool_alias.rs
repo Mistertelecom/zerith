@@ -14,6 +14,10 @@ pub const LEGACY: &[(&str, &str, &str)] = &[
     ("memory_recall", "memory", "recall"),
     ("memory_update", "memory", "update"),
     ("memory_forget", "memory", "forget"),
+    ("agent_result", "agent_manage", "result"),
+    ("agent_list", "agent_manage", "list"),
+    ("agent_send", "agent_manage", "send"),
+    ("agent_stop", "agent_manage", "stop"),
 ];
 
 /// Nome antigo → (ferramenta nova, ação).

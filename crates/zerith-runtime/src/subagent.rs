@@ -300,7 +300,19 @@ pub fn child_registry(base: &Registry, r: &Resolved, depth: usize) -> Registry {
     let allowed: Vec<String> = match r.allow {
         Allow::ReadOnly => READ_ONLY_TOOLS.iter().map(|s| s.to_string()).collect(),
         Allow::All => all.clone(),
-        Allow::Def => r.def.effective_tools(&names),
+        Allow::Def => {
+            let mut t = r.def.effective_tools(&names);
+            // A definition written before `process` (`tools: [shell_output]`)
+            // gets the tool that replaced it, or the job tool would vanish
+            // from the child's list (the old names are not offered).
+            if t.iter().any(|n| n == "shell_output" || n == "shell_kill")
+                && names.contains(&"process")
+                && !t.iter().any(|n| n == "process")
+            {
+                t.push("process".into());
+            }
+            t
+        }
     };
     let can_spawn = depth < MAX_DEPTH;
     let mut reg = base.subset(|n| {

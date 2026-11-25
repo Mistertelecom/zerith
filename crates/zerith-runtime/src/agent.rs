@@ -799,6 +799,8 @@ fn turn_body(
                 .into_iter()
                 // Deferred tools run through `mcp_call`: no schema per request.
                 .filter(|s| !s.source.starts_with(zerith_tools::DEFERRED_SOURCE))
+                // Old names (`shell_output`) run but are not offered.
+                .filter(|s| !s.source.starts_with(zerith_tools::ALIAS_SOURCE))
                 .filter(|s| {
                     if is_root_orchestrator {
                         is_orchestrator_root_tool(&s.name)

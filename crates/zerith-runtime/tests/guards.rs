@@ -275,3 +275,33 @@ fn rewritten_input_faces_the_rules_again_and_the_model_is_told() {
     g.after(&same, &mut out);
     assert!(out.context.is_empty(), "{:?}", out.context);
 }
+
+/// A rule written for the old job tools still binds `process`, and one for
+/// `process` binds the old names (saved settings outlive the rename).
+#[test]
+fn rules_on_the_old_job_tool_names_bind_process_and_back() {
+    let dir = scratch();
+    let (g, _) = guards(
+        dir.path(),
+        "[permissions]\ndefault_mode = \"default\"\ndeny = [\"shell_kill\"]",
+    );
+    let mut kill = call(
+        dir.path(),
+        "process",
+        json!({"action": "kill", "id": "job-1"}),
+    );
+    assert!(matches!(g.before(&mut kill), Flow::Deny(_)));
+    let mut out = call(
+        dir.path(),
+        "process",
+        json!({"action": "output", "id": "job-1"}),
+    );
+    assert_eq!(g.before(&mut out), Flow::Continue);
+
+    let (g, _) = guards(
+        dir.path(),
+        "[permissions]\ndefault_mode = \"default\"\nask = [\"process\"]",
+    );
+    let mut old = call(dir.path(), "shell_output", json!({"id": "job-1"}));
+    assert!(matches!(g.before(&mut old), Flow::Ask(_)));
+}

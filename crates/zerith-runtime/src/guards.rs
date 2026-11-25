@@ -278,7 +278,17 @@ impl Guards {
             return Ok(None);
         }
         let subject = tool_subject(&call.name, &call.args);
-        match self.policy.check_rules(&call.name, subject.as_deref()) {
+        // A rule written for an old name (`shell_kill`) still binds
+        // `process` doing the same, and one for `process` binds the old name.
+        let verdicts: Vec<Verdict> = rule_names(&call.name, &call.args)
+            .into_iter()
+            .filter_map(|n| self.policy.check_rules(n, subject.as_deref()))
+            .collect();
+        let pick = |want: fn(&Verdict) -> bool| verdicts.iter().find(|v| want(v)).cloned();
+        let verdict = pick(|v| matches!(v, Verdict::Deny(_)))
+            .or_else(|| pick(|v| matches!(v, Verdict::Ask(_))))
+            .or_else(|| pick(|v| matches!(v, Verdict::Allow)));
+        match verdict {
             Some(Verdict::Deny(why)) => Err(Flow::Deny(why)),
             Some(Verdict::Ask(why)) => Ok(Some(why)),
             Some(Verdict::Allow) => Ok(None),
@@ -303,6 +313,18 @@ impl Guards {
             return Flow::Deny("o plano está vazio; escreva o plano em `plan`".into());
         }
         Flow::Ask(format!("Plano proposto:\n\n{}", plan.trim()))
+    }
+}
+
+/// The names whose permission rules apply to this call: the tool itself and,
+/// for the background-job tool, its old name for the same action
+/// (`process` kill ⇄ `shell_kill`, output ⇄ `shell_output`).
+fn rule_names<'a>(name: &'a str, args: &Value) -> Vec<&'a str> {
+    match (name, args.get("action").and_then(Value::as_str)) {
+        ("process", Some("kill")) => vec![name, "shell_kill"],
+        ("process", Some("output")) => vec![name, "shell_output"],
+        ("shell_kill" | "shell_output", _) => vec![name, "process"],
+        _ => vec![name],
     }
 }
 

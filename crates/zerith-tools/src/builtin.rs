@@ -224,7 +224,7 @@ pub(crate) fn all() -> Vec<Box<dyn crate::Tool>> {
                 "command": {"type": "string"},
                 "timeout_secs": {"type": "integer", "description": "padrão 120, máximo 600"},
                 "workdir": {"type": "string", "description": "pasta onde rodar, relativa ao workspace (padrão: o workspace); use em vez de `cd x &&`"},
-                "run_in_background": {"type": "boolean", "description": "devolve um id na hora; leia com shell_output, encerre com shell_kill (até 4 jobs)"}
+                "run_in_background": {"type": "boolean", "description": "devolve um id na hora e avisa sozinho quando terminar; ler ou encerrar antes: process (até 4 jobs)"}
             }, "required": ["command"]}),
             "código de saída, stdout e stderr",
             Permission::Shell,

@@ -1,6 +1,9 @@
 //! Background shell: `shell{run_in_background:true}` starts a job and returns
-//! its id; `shell_output` reads what it printed since the last look;
-//! `shell_kill` stops it. Jobs belong to the registry's [`crate::Host`] and
+//! its id; `process` reads what it printed since the last look (`output`),
+//! stops it (`kill`) or lists the jobs (`list`), and when the job ends on its
+//! own the turn gets one notice with the exit and the last lines, through the
+//! same channel as `monitor`. `shell_output` / `shell_kill` stay as unlisted
+//! aliases (workflows, agent `tools:` and rules may name them). Jobs belong to the registry's [`crate::Host`] and
 //! die with it, so a closed session leaves no stray process. The window lists
 //! and stops them through [`background_jobs`] / [`stop_background_job`].
 //!
@@ -78,6 +81,9 @@ struct Job {
     started: Instant,
     /// Set for a `monitor` job: its new lines are pushed to the turn.
     watch: Option<Watch>,
+    /// A plain job's end needs no notice: already told, read through
+    /// `process output`, or stopped on purpose.
+    notified: bool,
 }
 
 /// What a `monitor` job adds to a background job: who is told, until when,
@@ -101,6 +107,8 @@ pub const MONITOR_CHARS: usize = 2000;
 const MONITOR_STRIKES: u8 = 3;
 /// Longest a monitor may run.
 pub const MONITOR_MAX_SECS: u64 = 1800;
+/// Lines of output the end-of-job notice carries.
+pub const DONE_LINES: usize = 20;
 
 type Table = Mutex<Vec<(String, Job)>>;
 
@@ -170,7 +178,7 @@ pub fn background_jobs() -> Vec<BackgroundJob> {
 }
 
 /// The last `lines` lines job `id` printed, for the window. Read-only: what
-/// the model has not seen yet through `shell_output` stays unseen.
+/// the model has not seen yet through `process output` stays unseen.
 pub fn background_job_tail(id: &str, lines: usize) -> Option<String> {
     for table in tables() {
         let jobs = table.lock().ok()?;
@@ -184,7 +192,7 @@ pub fn background_job_tail(id: &str, lines: usize) -> Option<String> {
 }
 
 /// Stops job `id` wherever it runs (ids are unique per process): the window's
-/// Stop button. The model sees it as ended at its next `shell_output`.
+/// Stop button. The model sees it as ended at its next `process output`.
 /// Stops every job of the process: the window is closing.
 pub fn kill_all_jobs() {
     for table in tables() {
@@ -208,18 +216,7 @@ pub fn sessions_with_monitor_news() -> Vec<String> {
     for table in tables() {
         let Ok(mut jobs) = table.lock() else { continue };
         for (_, j) in jobs.iter_mut() {
-            let Some(w) = j.watch.as_ref().filter(|w| !w.closed) else {
-                continue;
-            };
-            let sent = w.sent;
-            let deadline = w.deadline;
-            let exited = j.exit.is_some() || matches!(j.jailed.child.try_wait(), Ok(Some(_)));
-            let line = j.out.lock().is_ok_and(|o| {
-                o.text.len() > sent
-                    && o.text.is_char_boundary(sent)
-                    && o.text[sent..].contains('\n')
-            });
-            if exited || line || Instant::now() >= deadline {
+            if has_news(j) {
                 if let Some(s) = &j.session {
                     if !out.contains(s) {
                         out.push(s.clone());
@@ -239,7 +236,7 @@ pub fn take_monitor_notices(session: &str) -> Vec<String> {
     for table in tables() {
         let owns = table.lock().is_ok_and(|jobs| {
             jobs.iter()
-                .any(|(_, j)| j.session.as_deref() == Some(session) && j.watch.is_some())
+                .any(|(_, j)| j.session.as_deref() == Some(session))
         });
         if owns {
             out.extend(Jobs { jobs: table }.monitor_notices());
@@ -310,7 +307,7 @@ impl Jobs {
             let alive = jobs.iter().filter(|(_, j)| j.exit.is_none()).count();
             if alive >= MAX_JOBS {
                 return Err(ToolError::Failed(format!(
-                    "já há {MAX_JOBS} jobs em segundo plano; encerre um com shell_kill"
+                    "já há {MAX_JOBS} jobs em segundo plano; encerre um com process action=kill"
                 )));
             }
             // Finished jobs whose output was read (or, for a monitor, whose
@@ -319,7 +316,7 @@ impl Jobs {
                 j.exit.is_none()
                     || match &j.watch {
                         Some(w) => !w.closed,
-                        None => j.out.lock().is_ok_and(|o| o.seen < o.text.len()),
+                        None => !j.notified || j.out.lock().is_ok_and(|o| o.seen < o.text.len()),
                     }
             });
             let jail = Jail::for_policy(policy);
@@ -347,6 +344,7 @@ impl Jobs {
                     session,
                     started: Instant::now(),
                     watch,
+                    notified: false,
                 },
             ));
             id
@@ -372,6 +370,8 @@ impl Jobs {
         join_readers_with_grace(to_join, Duration::from_millis(150));
         let mut jobs = self.jobs.lock().map_err(|_| poisoned())?;
         let j = find(&mut jobs, id)?;
+        // Read after it ended: the model knows, no notice follows.
+        j.notified |= j.exit.is_some();
         let mut o = j.out.lock().map_err(|_| poisoned())?;
         let mut cut = o.seen.min(o.text.len());
         while !o.text.is_char_boundary(cut) {
@@ -401,28 +401,38 @@ impl Jobs {
         kill_in(&self.jobs, id)
     }
 
-    /// Whether a monitor printed a whole new line, exited, or hit its
-    /// deadline since its last notice, without consuming anything.
-    pub fn monitors_have_news(&self) -> bool {
-        let Ok(mut jobs) = self.jobs.lock() else {
-            return false;
+    /// This registry's jobs, running or not yet collected, one per line.
+    pub fn list(&self) -> Result<String> {
+        let mut to_join = Vec::new();
+        let text = {
+            let mut jobs = self.jobs.lock().map_err(|_| poisoned())?;
+            let mut lines = Vec::new();
+            for (id, j) in jobs.iter_mut() {
+                to_join.extend(refresh(j));
+                let state = match &j.exit {
+                    Some(code) => format!("terminou ({code})"),
+                    None => format!("em execução há {}s", j.started.elapsed().as_secs()),
+                };
+                let kind = if j.watch.is_some() { " [monitor]" } else { "" };
+                lines.push(format!("{id}: {state}{kind} — {}", j.command));
+            }
+            if lines.is_empty() {
+                "nenhum job em segundo plano".to_string()
+            } else {
+                lines.join("\n")
+            }
         };
-        let mut news = false;
-        for (_, j) in jobs.iter_mut() {
-            let Some(w) = j.watch.as_ref().filter(|w| !w.closed) else {
-                continue;
-            };
-            let deadline = w.deadline;
-            let sent = w.sent;
-            let exited = j.exit.is_some() || matches!(j.jailed.child.try_wait(), Ok(Some(_)));
-            let line = j.out.lock().is_ok_and(|o| {
-                o.text.len() > sent
-                    && o.text.is_char_boundary(sent)
-                    && o.text[sent..].contains('\n')
-            });
-            news |= exited || line || Instant::now() >= deadline;
-        }
-        news
+        join_readers_with_grace(to_join, Duration::from_millis(150));
+        Ok(text)
+    }
+
+    /// Whether a monitor printed a whole new line, exited, or hit its
+    /// deadline since its last notice, or a plain job ended unannounced,
+    /// without consuming anything.
+    pub fn monitors_have_news(&self) -> bool {
+        self.jobs
+            .lock()
+            .is_ok_and(|mut jobs| jobs.iter_mut().any(|(_, j)| has_news(j)))
     }
 
     /// Stops every monitor of this registry and drops what it had to say:
@@ -447,6 +457,9 @@ impl Jobs {
                 if let Some(w) = j.watch.as_mut() {
                     w.closed = true;
                 }
+                // A plain job keeps running (a window, a server), but its
+                // end must not start a turn in a conversation just stopped.
+                j.notified = true;
             }
         }
     }
@@ -470,7 +483,17 @@ impl Jobs {
             return out;
         };
         for (id, j) in jobs.iter_mut() {
-            if j.watch.as_ref().is_none_or(|w| w.closed) {
+            if j.watch.is_none() {
+                if !j.notified {
+                    to_join.extend(refresh(j));
+                    if j.exit.is_some() {
+                        j.notified = true;
+                        out.extend(done_notice(id, j));
+                    }
+                }
+                continue;
+            }
+            if j.watch.as_ref().is_some_and(|w| w.closed) {
                 continue;
             }
             to_join.extend(refresh(j));
@@ -552,6 +575,8 @@ fn kill_in(table: &Table, id: &str) -> Result<String> {
         j.jailed.kill_tree();
         let readers = std::mem::take(&mut j.readers);
         j.exit = Some("encerrado".into());
+        // Stopped on purpose (the model, the window, the app closing).
+        j.notified = true;
         (format!("{id} encerrado: {}", j.command), readers)
     };
     join_readers_with_grace(to_join, Duration::from_secs(1));
@@ -568,7 +593,7 @@ fn find<'a>(jobs: &'a mut [(String, Job)], id: &str) -> Result<&'a mut Job> {
 impl Drop for Jobs {
     fn drop(&mut self) {
         // A background job is adopted by `KEEP`: it belongs to the app, not to
-        // the turn that started it, and stops with `shell_kill` (or when the
+        // the turn that started it, and stops with `process kill` (or when the
         // app closes). Everything else dies with its host, as before.
         if KEEP
             .lock()
@@ -584,6 +609,64 @@ impl Drop for Jobs {
             }
         }
     }
+}
+
+/// Whether `j` has something to tell the turn: a monitor with a new whole
+/// line, an exit or a passed deadline; a plain job that ended unannounced.
+fn has_news(j: &mut Job) -> bool {
+    let exited = j.exit.is_some() || matches!(j.jailed.child.try_wait(), Ok(Some(_)));
+    match j.watch.as_ref() {
+        None => !j.notified && exited,
+        Some(w) if w.closed => false,
+        Some(w) => {
+            let (sent, deadline) = (w.sent, w.deadline);
+            let line = j.out.lock().is_ok_and(|o| {
+                o.text.len() > sent
+                    && o.text.is_char_boundary(sent)
+                    && o.text[sent..].contains('\n')
+            });
+            exited || line || Instant::now() >= deadline
+        }
+    }
+}
+
+/// The one notice of a plain background job that ended on its own: exit and
+/// the last [`DONE_LINES`] lines (at most [`MONITOR_CHARS`]). Marks the
+/// output as seen. After Hermes `terminal(background, notify)` (MIT,
+/// tools/terminal_tool.py); no code copied.
+fn done_notice(id: &str, j: &Job) -> Option<String> {
+    let mut o = j.out.lock().ok()?;
+    let lines: Vec<&str> = o.text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let mut tail: Vec<&str> = Vec::new();
+    let mut size = 0;
+    for l in lines.iter().rev().take(DONE_LINES) {
+        if size + l.len() > MONITOR_CHARS {
+            break;
+        }
+        size += l.len() + 1;
+        tail.push(l);
+    }
+    tail.reverse();
+    let mut cmd: String = j.command.chars().take(80).collect();
+    if cmd.len() < j.command.len() {
+        cmd.push('…');
+    }
+    let code = j.exit.as_deref().unwrap_or("?");
+    let mut text = format!("[Job {id}: {cmd}] terminou ({code}).");
+    if tail.is_empty() {
+        text.push_str(" Sem saída.");
+    } else {
+        let omitted = lines.len() - tail.len();
+        text.push_str(" Últimas linhas:");
+        if omitted > 0 {
+            text.push_str(&format!(" [+{omitted} linhas antes]"));
+        }
+        text.push('\n');
+        text.push_str(&tail.join("\n"));
+    }
+    let end = o.text.len();
+    o.seen = end;
+    Some(text)
 }
 
 /// Notes the exit once and returns the reader handles for the caller to wait on
@@ -634,30 +717,64 @@ fn pump(r: Option<Box<dyn Read + Send>>, out: &Arc<Mutex<Output>>) -> Reader {
     Reader { done, handle }
 }
 
+/// `process` and its old names. Concept after Hermes `process` (MIT,
+/// tools/process_tool.py) and Claude Code's background-shell tools.
 pub(crate) fn all() -> Vec<Box<dyn Tool>> {
     vec![
         make(
-            "shell_output",
-            "Lê a saída nova de um job iniciado com shell run_in_background e diz se ele terminou.",
-            json!({"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}),
-            "estado do job e as linhas novas desde a última leitura",
-            Permission::Read,
-            10,
-            false,
-            |a, _, e| e.host.jobs().read(str_arg(a, "id")?),
-        ),
-        make(
-            "shell_kill",
-            "Encerra um job em segundo plano e os processos que ele iniciou.",
-            json!({"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}),
-            "confirmação",
+            "process",
+            "Jobs em segundo plano (shell run_in_background e monitor). action \"output\": a saída nova desde a última leitura e se terminou; \"kill\": encerra o job e o que ele iniciou; \"list\": os jobs desta conversa. Um job que termina sozinho já te avisa (código de saída e últimas linhas): não fique consultando.",
+            json!({"type": "object", "properties": {
+                "action": {"type": "string", "enum": ["output", "kill", "list"]},
+                "id": {"type": "string", "description": "id do job (job-N); não precisa para list"}
+            }, "required": ["action"]}),
+            "estado e saída nova do job, confirmação, ou a lista de jobs",
             Permission::Shell,
             10,
             false,
+            |a, _, e| match a["action"].as_str().unwrap_or("") {
+                "output" => e.host.jobs().read(str_arg(a, "id")?),
+                "kill" => e.host.jobs().kill(str_arg(a, "id")?),
+                "list" => e.host.jobs().list(),
+                other => Err(ToolError::BadArguments(format!(
+                    "action precisa ser output, kill ou list, não {other:?}"
+                ))),
+            },
+        ),
+        // The old names still run (workflows, agent `tools:`, saved rules and
+        // conversations name them) but are not offered to the model.
+        alias(
+            "shell_output",
+            Permission::Read,
+            |a, _, e| e.host.jobs().read(str_arg(a, "id")?),
+        ),
+        alias(
+            "shell_kill",
+            Permission::Shell,
             |a, _, e| e.host.jobs().kill(str_arg(a, "id")?),
         ),
         monitor_tool(),
     ]
+}
+
+/// An unlisted old name of `process` (source [`crate::ALIAS_SOURCE`]).
+fn alias(name: &str, permission: Permission, run: crate::fntool::RunFn) -> Box<dyn Tool> {
+    Box::new(crate::fntool::FnTool {
+        spec: crate::ToolSpec {
+            name: name.into(),
+            description: "Apelido antigo de process.".into(),
+            parameters: json!({"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}),
+            returns: "o mesmo que process",
+            permission,
+            timeout: Duration::from_secs(10),
+            cancellable: true,
+            local: true,
+            source: format!("{}process", crate::ALIAS_SOURCE),
+        },
+        action: |_, _| Ok(None),
+        run,
+        safe: false,
+    })
 }
 
 /// The `monitor` tool. Concept from Claude Code's Monitor (each output line
@@ -668,7 +785,7 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
 pub(crate) fn monitor_tool() -> Box<dyn Tool> {
     crate::fntool::make_with(
         "monitor",
-        "Roda um comando em segundo plano e te avisa sozinho, a cada passo, das linhas novas que ele imprime, até ele terminar, o prazo acabar ou você parar com shell_kill. Use para acompanhar algo demorado (build, deploy, log, ping contínuo) sem ficar perguntando: continue trabalhando e reaja quando o aviso chegar. Cada linha de stdout é um evento: filtre só o que importa, incluindo as falhas (ex.: `tail -f app.log | grep --line-buffered -E \"ERROR|ready|Traceback\"`); um monitor que imprime demais é parado. Para esperar uma condição única, prefira um comando que termina quando ela acontece (`until curl -s x; do sleep 2; done`).",
+        "Roda um comando em segundo plano e te avisa sozinho, a cada passo, das linhas novas que ele imprime, até ele terminar, o prazo acabar ou você parar com process action=kill. Use para acompanhar algo demorado (build, deploy, log, ping contínuo) sem ficar perguntando: continue trabalhando e reaja quando o aviso chegar. Cada linha de stdout é um evento: filtre só o que importa, incluindo as falhas (ex.: `tail -f app.log | grep --line-buffered -E \"ERROR|ready|Traceback\"`); um monitor que imprime demais é parado. Para esperar uma condição única, prefira um comando que termina quando ela acontece (`until curl -s x; do sleep 2; done`).",
         json!({"type": "object", "properties": {
             "command": {"type": "string", "description": "comando de shell; cada linha que ele imprime vira um aviso"},
             "description": {"type": "string", "description": "o que está sendo acompanhado, curto (aparece em cada aviso)"},
@@ -693,7 +810,7 @@ pub(crate) fn monitor_tool() -> Box<dyn Tool> {
                 e.host.session(),
             )?;
             Ok(format!(
-                "{id} monitorando \"{description}\" (prazo {}s). As linhas novas chegam sozinhas como avisos [Monitor {id}: ...]; não fique consultando. Para parar: shell_kill {id}.",
+                "{id} monitorando \"{description}\" (prazo {}s). As linhas novas chegam sozinhas como avisos [Monitor {id}: ...]; não fique consultando. Para parar: process action=kill id={id}.",
                 secs.clamp(1, MONITOR_MAX_SECS)
             ))
         },
@@ -711,7 +828,7 @@ pub(crate) fn start(
         .jobs()
         .start(str_arg(args, "command")?, cwd, policy, host.session())?;
     Ok(format!(
-        "{id} iniciado em segundo plano; use shell_output para ler a saída e shell_kill para encerrar"
+        "{id} iniciado em segundo plano. Quando terminar chega sozinho um aviso [Job {id}: ...] com o código de saída e as últimas linhas: continue trabalhando. Ler antes: process action=output id={id}; encerrar: process action=kill id={id}."
     ))
 }
 

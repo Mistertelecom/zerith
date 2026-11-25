@@ -300,6 +300,90 @@ fn a_job_can_be_killed_and_the_table_is_capped_at_four() {
     drop(r);
 }
 
+/// A plain background job tells the turn once when it ends (exit and last
+/// lines), like a monitor's final notice; `process` reads, lists and kills,
+/// and a job killed on purpose says nothing.
+#[test]
+fn a_finished_background_job_notifies_once_and_process_handles_the_rest() {
+    let dir = scratch();
+    let p = policy(dir.path());
+    let r = bound("s-done");
+    let cmd = if cfg!(windows) {
+        "echo linha-a&& echo linha-b&& exit 3"
+    } else {
+        "echo linha-a; echo linha-b; exit 3"
+    };
+    let started = call(
+        &r,
+        &p,
+        "shell",
+        json!({"command": cmd, "run_in_background": true}),
+    )
+    .unwrap();
+    assert!(started.contains("aviso"), "{started}");
+    let id = job_id(&started);
+    let mut notes = Vec::new();
+    for _ in 0..200 {
+        notes.extend(r.host().monitor_notices());
+        if !notes.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let text = notes.join("\n");
+    assert!(
+        text.starts_with(&format!("[Job {id}: ")) && text.contains("terminou (exit 3)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("linha-a") && text.contains("linha-b"),
+        "{text}"
+    );
+    assert!(r.host().monitor_notices().is_empty(), "only once");
+    assert!(!r.host().monitors_have_news());
+
+    let listed = call(&r, &p, "process", json!({"action": "list"})).unwrap();
+    assert!(
+        listed.contains(&id) && listed.contains("terminou"),
+        "{listed}"
+    );
+    let out = call(&r, &p, "process", json!({"action": "output", "id": id})).unwrap();
+    assert!(
+        out.contains("[sem saída nova]"),
+        "the notice showed it: {out}"
+    );
+
+    let long = if cfg!(windows) {
+        "ping -n 30 127.0.0.1 >nul"
+    } else {
+        "sleep 30"
+    };
+    let s = call(
+        &r,
+        &p,
+        "shell",
+        json!({"command": long, "run_in_background": true}),
+    )
+    .unwrap();
+    let killed = job_id(&s);
+    let k = call(&r, &p, "process", json!({"action": "kill", "id": killed})).unwrap();
+    assert!(k.contains("encerrado"), "{k}");
+    assert!(r.host().monitor_notices().is_empty(), "a kill is not news");
+    assert!(call(&r, &p, "process", json!({"action": "nada"})).is_err());
+
+    // The old names run, but only `process` is a listed tool.
+    let old = call(&r, &p, "shell_output", json!({"id": killed})).unwrap();
+    assert!(old.contains("terminou (encerrado)"), "{old}");
+    for old in ["shell_output", "shell_kill"] {
+        assert!(r
+            .get(old)
+            .unwrap()
+            .source
+            .starts_with(zerith_tools::ALIAS_SOURCE));
+    }
+    assert_eq!(r.get("process").unwrap().source, "built-in");
+}
+
 // --- web_fetch --------------------------------------------------------------
 
 fn serve_once(body: &'static str, ctype: &'static str) -> String {
@@ -527,6 +611,7 @@ fn the_new_tools_are_in_the_default_registry() {
         "ask_user",
         "shell_output",
         "shell_kill",
+        "process",
         "web_fetch",
     ] {
         assert!(r.get(n).is_some(), "{n}");

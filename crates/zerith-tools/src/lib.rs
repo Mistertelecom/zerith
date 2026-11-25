@@ -211,6 +211,11 @@ pub fn output_cap(tool: &str) -> usize {
 /// tens of thousands of tokens per request). The model reaches it through
 /// [`DISPATCH_TOOL`], and the runtime judges that call as the real tool.
 pub const DEFERRED_SOURCE: &str = "deferred:";
+/// `ToolSpec::source` prefix of an old tool name kept only so saved
+/// workflows, agent `tools:` lists and permission rules that cite it still
+/// work (`shell_output` → `process`): runnable, never offered to the model.
+/// The rest of the source names the tool that replaced it.
+pub const ALIAS_SOURCE: &str = "alias:";
 /// `{tool, arguments}`: calls a deferred tool by name (see `zerith-mcp`).
 pub const DISPATCH_TOOL: &str = "mcp_call";
 

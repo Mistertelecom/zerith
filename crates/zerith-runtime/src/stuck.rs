@@ -53,7 +53,7 @@ pub(crate) fn is_edit(name: &str) -> bool {
 
 /// Esperar e consultar em volta é legítimo: um ciclo só dessas não avisa.
 fn is_poll(name: &str) -> bool {
-    matches!(name, "sleep" | "shell_output" | "last_status")
+    matches!(name, "sleep" | "process" | "shell_output" | "last_status")
 }
 
 #[derive(Default)]

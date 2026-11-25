@@ -27,7 +27,7 @@ Leia o **primeiro** erro real do log, não o último: os erros seguintes costuma
 ```bash
 gh run watch <run-id> --exit-status      # bloqueia até terminar; código != 0 se falhar
 ```
-Para não travar a conversa, rode em segundo plano com `shell` e `run_in_background: true` e leia depois com `shell_output`.
+Para não travar a conversa, rode em segundo plano com `shell` e `run_in_background: true`; quando terminar chega um aviso sozinho com o código de saída e as últimas linhas (para ler antes, `process` com `action: "output"`).
 Se falhar de novo, volte ao passo 1. **Pare após 3 tentativas** sem progresso e explique ao usuário o que já tentou.
 
 ## Não faça

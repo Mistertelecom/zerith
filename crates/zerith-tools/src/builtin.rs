@@ -187,13 +187,12 @@ pub(crate) fn all() -> Vec<Box<dyn crate::Tool>> {
                 "path": {"type": "string", "description": "diretório ou arquivo (padrão: workspace)"},
                 "glob": {"type": "string", "description": "filtra arquivos, ex.: *.rs"},
                 "-i": {"type": "boolean", "description": "ignora maiúsculas (padrão true)"},
-                "case_insensitive": {"type": "boolean", "description": "alias de -i"},
                 "-A": {"type": "integer", "description": "linhas de contexto após a ocorrência"},
-                "after_context": {"type": "integer", "description": "alias de -A"},
                 "-B": {"type": "integer", "description": "linhas de contexto antes da ocorrência"},
-                "before_context": {"type": "integer", "description": "alias de -B"},
                 "-C": {"type": "integer", "description": "linhas de contexto antes e depois"},
-                "context": {"type": "integer", "description": "alias de -C"},
+                // case_insensitive, after_context, before_context e context
+                // continuam aceitos (search.rs) mas não são anunciados: cada
+                // parâmetro duplicado custa tokens em todo pedido.
                 "output_mode": {"type": "string", "enum": ["content", "files", "count"], "description": "content (padrão): linhas; files: só caminhos; count: ocorrências por arquivo"},
                 "head_limit": {"type": "integer", "description": "máximo de resultados (padrão e teto 500)"}
             }, "required": ["query"]}),
@@ -1244,6 +1243,29 @@ mod ondav4_tests {
             "busca case-sensitive não deveria casar lowercase: {ctx_grep}"
         );
         assert!(!ctx_grep.contains("skip.ignored"), "{ctx_grep}");
+
+        // The aliases are accepted but not announced.
+        let props = &reg.get("grep").unwrap().parameters["properties"];
+        for alias in [
+            "case_insensitive",
+            "after_context",
+            "before_context",
+            "context",
+        ] {
+            assert!(props.get(alias).is_none(), "{alias} anunciado no schema");
+        }
+        let by_alias = reg
+            .call(
+                "grep",
+                &json!({"query": "omega", "context": 1, "case_insensitive": true}),
+                &ctx,
+            )
+            .unwrap();
+        assert!(
+            by_alias.contains("sub/code-file.rs-2- NEEDLE Upper"),
+            "{by_alias}"
+        );
+        assert!(by_alias.contains("sub/code-file.rs:3: omega"), "{by_alias}");
     }
 
     #[test]

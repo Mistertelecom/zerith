@@ -482,6 +482,11 @@ fn read_pdf(path: &std::path::Path, args: &Value, raw: &[u8]) -> Result<String> 
     Ok(out)
 }
 
+/// Characters of one line `read_file` shows before cutting it.
+const READ_LINE_CHARS: usize = 2000;
+/// Characters one `read_file` call returns, roughly (stops on a line boundary).
+const READ_TOTAL_CHARS: usize = 100_000;
+
 fn read_file(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
     let path = ctx.resolve(str_arg(args, "path")?);
     let raw = std::fs::read(&path)?;
@@ -509,17 +514,36 @@ fn read_file(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String>
             path.display()
         );
     }
-    let mut out: String = text
-        .lines()
-        .enumerate()
-        .skip(offset - 1)
-        .take(limit)
-        .map(|(i, l)| format!("{}\t{l}\n", i + 1))
-        .collect();
-    let last = (offset - 1).saturating_add(limit).min(total);
+    // Line and total caps after Hermes `read_file` (MIT: 2000 chars per
+    // line, ~100K chars per read with a next offset): a minified JSON of one
+    // 500 KB line used to come back whole and fill the window.
+    let mut out = String::new();
+    let mut last = offset - 1;
+    for (i, l) in text.lines().enumerate().skip(offset - 1).take(limit) {
+        if last >= offset && out.len() >= READ_TOTAL_CHARS {
+            break;
+        }
+        let n = l.chars().count();
+        if n > READ_LINE_CHARS {
+            let head: String = l.chars().take(READ_LINE_CHARS).collect();
+            out.push_str(&format!(
+                "{}\t{head}… [linha cortada: {n} caracteres]\n",
+                i + 1
+            ));
+        } else {
+            out.push_str(&format!("{}\t{l}\n", i + 1));
+        }
+        last = i + 1;
+    }
     if last < total {
+        let cut = if out.len() >= READ_TOTAL_CHARS {
+            format!(" (limite de {READ_TOTAL_CHARS} caracteres)")
+        } else {
+            String::new()
+        };
         out.push_str(&format!(
-            "[linhas {offset}-{last} de {total}; use offset para continuar]\n"
+            "[linhas {offset}-{last} de {total}{cut}; próximo offset: {}]\n",
+            last + 1
         ));
     }
     if total == 0 {
@@ -1343,6 +1367,66 @@ mod ondav4_tests {
         assert!(out.contains("hostname PE-CORE-01"), "{out}");
         assert!(out.contains("interface GigabitEthernet0/0/0"), "{out}");
         assert!(out.contains("router bgp 65001"), "{out}");
+    }
+
+    #[test]
+    fn read_file_cuts_giant_lines_and_stops_near_the_total_cap() {
+        let dir = scratch();
+        let root = dir.path();
+        // A minified JSON of one 500 KB line.
+        let item = r#"{"id":12345,"nome":"porta-ge-0/0/1","vlan":130},"#;
+        let mut json = String::from("[");
+        while json.len() < 500_000 {
+            json.push_str(item);
+        }
+        json.push_str("{}]");
+        std::fs::write(root.join("min.json"), &json).unwrap();
+        let pol = Policy::new(preset("workspace-write").unwrap(), Mode::Bypass, root);
+        let ctx = CallCtx {
+            workspace: pol.workspace.as_path(),
+            policy: &pol,
+            memory: None,
+            scope: None,
+        };
+        let reg = Registry::new();
+        let out = reg
+            .call("read_file", &json!({"path": "min.json"}), &ctx)
+            .unwrap();
+        assert!(out.len() < 3000, "{} bytes", out.len());
+        assert!(
+            out.contains(&format!("… [linha cortada: {} caracteres]", json.len())),
+            "{out}"
+        );
+
+        // Many long lines: stops near 100K chars and says where to go on.
+        let line = "x".repeat(1500);
+        let many: String = (0..200)
+            .map(|_| {
+                format!(
+                    "{line}
+"
+                )
+            })
+            .collect();
+        std::fs::write(root.join("many.txt"), many).unwrap();
+        let out = reg
+            .call("read_file", &json!({"path": "many.txt"}), &ctx)
+            .unwrap();
+        assert!(out.len() < 105_000, "{} bytes", out.len());
+        let next = out
+            .rsplit("próximo offset: ")
+            .next()
+            .and_then(|t| t.trim_end().trim_end_matches(']').parse::<usize>().ok())
+            .expect("próximo offset");
+        assert!(next > 1 && next < 200, "{next}");
+        let rest = reg
+            .call(
+                "read_file",
+                &json!({"path": "many.txt", "offset": next}),
+                &ctx,
+            )
+            .unwrap();
+        assert!(rest.starts_with(&format!("{next}	")), "{}", &rest[..40]);
     }
 
     #[test]

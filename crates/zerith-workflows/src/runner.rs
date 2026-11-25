@@ -14,7 +14,7 @@ use crate::model::{
 };
 use crate::schedule::LocalDateTime;
 use crate::store::Store;
-use crate::{channels, ssh};
+use crate::{channels, report, ssh};
 use crate::{now_ms, unix_secs, Result, WorkflowError};
 
 pub trait AiExecutor: Send + Sync {
@@ -648,6 +648,17 @@ fn run_node(
                         .map(str::to_string)
                         .collect();
                     opts.store.unseen_items(&scope, &lines)?.join("\n")
+                }
+                "offline_report" => {
+                    let d = report::ReportOpts::default();
+                    let o = report::ReportOpts {
+                        status_field: cfg_str(cfg, "status_field").unwrap_or(d.status_field),
+                        down_values: cfg_str(cfg, "down_values").unwrap_or(d.down_values),
+                        title: cfg_str(cfg, "title").unwrap_or(d.title),
+                        empty_text: cfg_str(cfg, "empty_text").unwrap_or(d.empty_text),
+                    };
+                    let hhmm = now_dt.time_string();
+                    report::offline_report(prev, unix_secs(), &hhmm[..5], &o)
                 }
                 _ => {
                     let tpl = cfg_str(cfg, "template").unwrap_or("{{prev}}");
@@ -1370,7 +1381,10 @@ mod tests {
         let db_path = dir.path().join("workflows.db");
         let store = Store::open(&db_path).unwrap();
         store.seed_defaults().unwrap();
-        assert_eq!(store.list_workflows().unwrap().len(), 5);
+        assert_eq!(
+            store.list_workflows().unwrap().len(),
+            crate::starter_templates().len()
+        );
 
         let wf = Workflow {
             alert: Default::default(),

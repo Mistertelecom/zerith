@@ -1,0 +1,8 @@
+# EXEMPLO ILUSTRATIVO de "/dude device print detail without-paging" (formato print detail do RouterOS; nomes, IPs RFC 2544 e campos inventados para teste)
+Flags: X - disabled
+ 0   name="Roteador Borda" address=198.18.1.1 type="MikroTik" status=up
+     services-down=0
+ 1   name="Switch Bloco B" address=198.18.1.20 type="Switch"
+     status=down services-down=2
+ 2   name="radio-torre-3" addresses=198.18.1.31 status=down
+ 3 X name="impressora" address=198.18.1.90 status=unknown

@@ -4,6 +4,7 @@ pub mod alert;
 pub mod channels;
 pub mod model;
 pub mod remote;
+mod report;
 pub mod runner;
 pub mod schedule;
 pub mod scheduler;

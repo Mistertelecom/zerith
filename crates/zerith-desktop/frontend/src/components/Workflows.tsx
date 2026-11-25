@@ -2642,9 +2642,24 @@ function NodeInspector(props: {
               <option value="json_path">{tr(lang, "Extrair JSON (a.b.0)", "JSON path (a.b.0)")}</option>
               <option value="filter_lines">{tr(lang, "Filtrar linhas", "Filter lines")}</option>
               <option value="dedup_lines">{tr(lang, "Filtrar apenas inéditos (Anti-repetição)", "Only unseen lines (Deduplicate)")}</option>
+              <option value="offline_report">{tr(lang, "Relatório de offline (Dude / Zabbix)", "Offline report (Dude / Zabbix)")}</option>
             </select>
           </div>
-          {String(cfg.mode ?? "template") === "template" ? (
+          {String(cfg.mode ?? "") === "offline_report" ? (
+            <div className="wf-field">
+              <label>{tr(lang, "Campo de status & valores de queda (RouterOS)", "Status field & down values (RouterOS)")}</label>
+              <div className="pn-inline">
+                <input
+                  value={String(cfg.status_field ?? "status")}
+                  onChange={(e) => setCfg({ status_field: e.target.value })}
+                />
+                <input
+                  value={String(cfg.down_values ?? "down")}
+                  onChange={(e) => setCfg({ down_values: e.target.value })}
+                />
+              </div>
+            </div>
+          ) : String(cfg.mode ?? "template") === "template" ? (
             <div className="wf-field">
               <label>Template</label>
               <textarea

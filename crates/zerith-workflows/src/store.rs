@@ -727,7 +727,122 @@ pub fn starter_templates() -> Vec<Workflow> {
         last_status: None,
         bot_name: Some("workflow-architect".into()),
     });
+    base.push(offline_template(
+        now,
+        "dude-equipamentos-offline",
+        "Equipamentos offline (The Dude)",
+        "Lista os equipamentos fora do ar no The Dude (RouterOS com o pacote dude) e avisa um grupo. \
+         Preencha: no nó SSH, `device` (cliente/nome do inventário) ou host/usuário/porta e \
+         `password_secret` (nome do segredo com a senha; grave no servidor) — marque algoritmos \
+         antigos se o RouterOS for velho; no nó de aviso, o canal e o grupo (…@g.us). Horário no \
+         gatilho (padrão 07:50). Se o seu RouterOS não mostrar `status` no print detail, troque \
+         `status_field`/`down_values` no nó Transformar. A condição \"Há offline?\" pode ser \
+         removida para receber também o \"Nenhum equipamento offline\".",
+        WorkflowNode {
+            id: "o2".into(),
+            kind: NodeKind::SshCommand,
+            label: "Dude: listar dispositivos".into(),
+            x: 310.0,
+            y: 120.0,
+            config: json!({
+                "device": "",
+                "host": "",
+                "user": "",
+                "port": 22,
+                "password_secret": "",
+                "legacy_ssh": false,
+                "command": "/dude device print detail without-paging",
+                "timeout_secs": 60
+            }),
+        },
+    ));
     base
+}
+
+/// Molde dos modelos "Equipamentos offline": cron → consulta (`query`, id
+/// `o2`) → transform `offline_report` → "há offline?" → aviso no canal, com
+/// alerta de falha ligado (canal padrão do servidor).
+fn offline_template(
+    now: i64,
+    id: &str,
+    name: &str,
+    description: &str,
+    query: WorkflowNode,
+) -> Workflow {
+    let node = |id: &str, kind, label: &str, x: f64, config| WorkflowNode {
+        id: id.into(),
+        kind,
+        label: label.into(),
+        x,
+        y: 120.0,
+        config,
+    };
+    let edge = |id: &str, from: &str, to: &str, branch: Option<&str>| WorkflowEdge {
+        id: id.into(),
+        from: from.into(),
+        to: to.into(),
+        branch: branch.map(str::to_string),
+    };
+    Workflow {
+        alert: WorkflowAlert {
+            alert_after_failures: Some(1),
+            ..Default::default()
+        },
+        run_on: None,
+        id: id.into(),
+        name: name.into(),
+        description: description.into(),
+        icon: "server".into(),
+        enabled: false,
+        nodes: vec![
+            node(
+                "o1",
+                NodeKind::TriggerCron,
+                "Todo dia 07:50",
+                40.0,
+                json!({ "cron": "50 7 * * *" }),
+            ),
+            query,
+            node(
+                "o3",
+                NodeKind::Transform,
+                "Montar lista de offline",
+                580.0,
+                json!({
+                    "mode": "offline_report",
+                    "status_field": "status",
+                    "down_values": "down",
+                    "title": "Equipamentos offline",
+                    "empty_text": "Nenhum equipamento offline"
+                }),
+            ),
+            node(
+                "o4",
+                NodeKind::Condition,
+                "Há offline?",
+                850.0,
+                json!({ "mode": "not_contains", "pattern": "Nenhum equipamento offline" }),
+            ),
+            node(
+                "o5",
+                NodeKind::NotifyChannel,
+                "Avisar o grupo",
+                1120.0,
+                json!({ "channel_id": "", "target": "", "message": "{{prev}}" }),
+            ),
+        ],
+        edges: vec![
+            edge("oe1", "o1", "o2", None),
+            edge("oe2", "o2", "o3", None),
+            edge("oe3", "o3", "o4", None),
+            edge("oe4", "o4", "o5", Some("true")),
+        ],
+        created_at_ms: now,
+        updated_at_ms: now - 5000,
+        last_run_at_ms: None,
+        last_status: None,
+        bot_name: None,
+    }
 }
 
 fn default_templates(now: i64) -> Vec<Workflow> {
@@ -937,6 +1052,63 @@ fn default_templates(now: i64) -> Vec<Workflow> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Roda um modelo "Equipamentos offline" com a consulta fixada em `sample`
+    /// e o aviso fixado (sem canal); devolve (texto do transform, aviso rodou).
+    pub(crate) fn run_offline_template(id: &str, sample: &str) -> (String, bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("w.db")).unwrap();
+        let mut wf = starter_templates()
+            .into_iter()
+            .find(|w| w.id == id)
+            .unwrap();
+        for n in &mut wf.nodes {
+            match n.id.as_str() {
+                "o2" => n.config = json!({"pin_enabled": true, "pinned_output": sample}),
+                "o5" => n.config = json!({"pin_enabled": true, "pinned_output": "enviado"}),
+                _ => {}
+            }
+        }
+        let mut opts = crate::RunOptions {
+            store: &store,
+            data_root: dir.path(),
+            ai: &crate::NoopAiExecutor,
+            trigger_source: "manual",
+            tz_offset_minutes: 0,
+            initial_input: None,
+            on_event: &mut |_| {},
+        };
+        let run = crate::execute_workflow(&wf, &mut opts).unwrap();
+        assert_eq!(run.status, "ok", "{:?}", run.node_logs);
+        let log = |id: &str| run.node_logs.iter().find(|l| l.node_id == id).unwrap();
+        (log("o3").output.clone(), log("o5").status == "ok")
+    }
+
+    #[test]
+    fn modelo_dude_offline_monta_texto_e_so_avisa_com_offline() {
+        let wf = starter_templates()
+            .into_iter()
+            .find(|w| w.id == "dude-equipamentos-offline")
+            .unwrap();
+        assert_eq!(wf.nodes[0].config["cron"], "50 7 * * *");
+        assert_eq!(wf.alert.alert_after_failures, Some(1));
+        assert!(wf.nodes[1].config["command"]
+            .as_str()
+            .unwrap()
+            .starts_with("/dude device print detail"));
+
+        let sample = include_str!("fixtures/exemplo-dude-device-print-detail.txt");
+        let (text, sent) = run_offline_template("dude-equipamentos-offline", sample);
+        assert!(text.starts_with("Equipamentos offline às "), "{text}");
+        assert!(text.contains("(2):\n- Switch Bloco B (198.18.1.20)\n- radio-torre-3"));
+        assert!(sent);
+        let (text, sent) = run_offline_template(
+            "dude-equipamentos-offline",
+            &sample.replace("status=down", "status=up"),
+        );
+        assert!(text.starts_with("Nenhum equipamento offline às "), "{text}");
+        assert!(!sent, "condição barra o aviso sem offline");
+    }
 
     #[test]
     fn corrupt_graph_json_errors_instead_of_loading_empty() {

@@ -94,7 +94,8 @@ pub fn cut_sections(
         .filter(|&i| lines[i].starts_with("### "))
         .collect();
     // (header, body) per command; the text before the first header stays.
-    let (preamble, sections): (&[&str], Vec<(Option<&str>, &[&str])>) = if starts.is_empty() {
+    type Section<'a> = (Option<&'a str>, &'a [&'a str]);
+    let (preamble, sections): (&[&str], Vec<Section>) = if starts.is_empty() {
         (&[], vec![(None, &lines[..])])
     } else {
         let mut v = Vec::new();
@@ -207,7 +208,7 @@ fn thousands(n: usize) -> String {
     let s = n.to_string();
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             out.push('.');
         }
         out.push(c);

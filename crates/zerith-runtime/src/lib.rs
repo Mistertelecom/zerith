@@ -479,6 +479,7 @@ pub fn build_prompt_context(
     }
 
     if let Some(lib) = ctx.skills {
+        let pinned = ctx.agent.map_or(&[][..], |a| a.skills.as_slice());
         if let Ok(mut catalog) = lib.catalog() {
             catalog.sort_by(|a, b| a.0.cmp(&b.0));
             if !catalog.is_empty() {
@@ -507,7 +508,7 @@ pub fn build_prompt_context(
                             likely.join(", ")
                         ));
                     }
-                    let inlined = auto_inline_skills(lib, &catalog, prompt, 3600);
+                    let inlined = auto_inline_skills(lib, &catalog, prompt, pinned, 3600);
                     if !inlined.is_empty() {
                         dyn_parts.push(inlined);
                     }
@@ -522,7 +523,7 @@ pub fn build_prompt_context(
                     if !ranked.is_empty() {
                         dyn_parts.push(ranked);
                     }
-                    let inlined = auto_inline_skills(lib, &catalog, prompt, 3600);
+                    let inlined = auto_inline_skills(lib, &catalog, prompt, pinned, 3600);
                     if !inlined.is_empty() {
                         dyn_parts.push(inlined);
                     }
@@ -1571,18 +1572,32 @@ pub fn preloaded_skill_names(reminder: &str) -> Vec<String> {
 /// is pre-loaded by keyword guess: the model sees the catalog (or the BM25
 /// shortlist) and loads what fits with `skill`. A guess cost a 22 KB
 /// `security-audit` body on every "fix the failing tests".
+///
+/// The skills the active agent pins (`skills:` in its definition) come first:
+/// Hermes' `skills.auto_load` and `hermes -s` (agent/skill_commands.py
+/// `build_auto_load_prompt` / `build_preloaded_skills_prompt`, MIT) load a
+/// body only because someone chose it, never by guess; this is that.
+// ponytail: pinned bodies share the 3.6 KB budget with named ones; give them
+// their own if an agent pins a long skill and the cut hurts.
 fn auto_inline_skills(
     lib: &zerith_skills::Library,
     catalog: &[(String, String)],
     prompt: &str,
+    pinned: &[String],
     budget: usize,
 ) -> String {
-    let chosen: Vec<String> = catalog
+    let mut chosen: Vec<String> = pinned
         .iter()
-        .filter(|(n, _)| names_skill(prompt, n))
+        .filter(|n| catalog.iter().any(|(c, _)| c == *n))
+        .cloned()
+        .collect();
+    let named: Vec<String> = catalog
+        .iter()
+        .filter(|(n, _)| names_skill(prompt, n) && !chosen.contains(n))
         .map(|(n, _)| n.clone())
         .take(2)
         .collect();
+    chosen.extend(named);
     if chosen.is_empty() {
         return String::new();
     }
@@ -2193,6 +2208,7 @@ CORPO-{name}
             &lib,
             &catalog,
             "Os testes estão falhando, corrija o código",
+            &[],
             3600,
         );
         assert!(!fix.contains("CORPO-security-audit"), "{fix}");
@@ -2200,6 +2216,7 @@ CORPO-{name}
             &lib,
             &catalog,
             "Como entro numa MikroTik RouterOS por SSH?",
+            &[],
             3600,
         );
         assert!(ssh.is_empty(), "só pelo nome: {ssh}");
@@ -2207,9 +2224,21 @@ CORPO-{name}
             &lib,
             &catalog,
             "use a skill security-audit nos testes",
+            &[],
             3600,
         );
         assert!(named.contains("CORPO-security-audit"), "{named}");
+        // Pinned by the agent (`skills:`): loaded whatever the prompt says;
+        // a pinned name not installed is skipped.
+        let pinned = auto_inline_skills(
+            &lib,
+            &catalog,
+            "Os testes estão falhando",
+            &["security-audit".into(), "nao-existe".into()],
+            3600,
+        );
+        assert!(pinned.contains("CORPO-security-audit"), "{pinned}");
+        assert_eq!(preloaded_skill_names(&pinned), ["security-audit"]);
     }
 
     /// Every skill, grouped and sorted, cut at a word, same text every turn.

@@ -968,6 +968,29 @@ pub fn prepare_network_command(
                     ),
                 ));
             }
+            // RouterOS has no "paging off" for the session: a long `print`
+            // stops every screen on `-- [Q quit|D dump|down]`, one round
+            // trip each (a 4k-line route table is ~70). `without-paging`
+            // exists since v6. Plain CLI paths only: inside `[...]` or
+            // with `as-value` the print is a script value, not a screen.
+            // Right after `print`: everything after `where` is the filter.
+            let print_at = cmd
+                .to_ascii_lowercase()
+                .find(" print")
+                .map(|i| i + " print".len())
+                .filter(|&i| cmd[i..].is_empty() || cmd[i..].starts_with(' '));
+            if let Some(i) = print_at.filter(|_| {
+                low.starts_with('/')
+                    && !low.contains('[')
+                    && !has("without-paging")
+                    && !has("as-value")
+                    && !has("count-only")
+            }) {
+                return Ok((
+                    format!("{} without-paging{}", &cmd[..i], cmd[i..].trim_end()),
+                    None,
+                ));
+            }
         }
         Vendor::Linux => {
             if low.starts_with("ping ") && !words.iter().any(|w| w.starts_with("-c")) {
@@ -4332,6 +4355,139 @@ router bgp 65001
         let _ = terminal::close_terminal(&id);
     }
 
+    /// A RouterOS on a local socket that behaves like a real one over ssh:
+    /// the echo comes in two pieces with the prompt redrawn in the middle
+    /// (`/ip fir\r[admin@MK] > /ip firewall ...`) and a pause right after the
+    /// redrawn prompt; each answer takes 30 ms; a `print` without
+    /// `without-paging` stops every 60 lines on `-- [Q quit|D dump|down]`
+    /// until a space comes back. `/ip route print` has 600 rows, other
+    /// commands 5. Every answer ends with `fim: <cmd>`.
+    fn fake_routeros() -> u16 {
+        use std::io::{Read, Write};
+        const PROMPT: &[u8] = b"[admin@MK] > ";
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let Ok((mut s, _)) = l.accept() else { return };
+            let _ = s.set_nodelay(true);
+            let _ = s.write_all(PROMPT);
+            let mut line = Vec::new();
+            let mut b = [0u8; 1];
+            while let Ok(1) = s.read(&mut b) {
+                if b[0] != b'\r' && b[0] != b'\n' {
+                    line.push(b[0]);
+                    continue;
+                }
+                if line.is_empty() {
+                    continue;
+                }
+                let cmd = String::from_utf8_lossy(&std::mem::take(&mut line)).to_string();
+                let cut = cmd.len().min(7);
+                let _ = s.write_all(format!("{}\r", &cmd[..cut]).as_bytes());
+                let _ = s.write_all(PROMPT);
+                std::thread::sleep(Duration::from_millis(150));
+                let _ = s.write_all(format!("{cmd}\r\n").as_bytes());
+                std::thread::sleep(Duration::from_millis(30));
+                let rows = if cmd.contains("route print") { 600 } else { 5 };
+                let paged = cmd.contains("print") && !cmd.contains("without-paging");
+                for i in 0..rows {
+                    if paged && i > 0 && i % 60 == 0 {
+                        let _ = s.write_all(b"-- [Q quit|D dump|down]");
+                        loop {
+                            match s.read(&mut b) {
+                                Ok(1) if b[0] == b' ' => break,
+                                Ok(1) => {}
+                                _ => return,
+                            }
+                        }
+                        std::thread::sleep(Duration::from_millis(30));
+                        let _ = s.write_all(b"\r\x1b[K");
+                    }
+                    let _ = s.write_all(
+                        format!("{i:>4}   dst-address=10.0.{i}.0/24 gateway=179.108.156.1 distance=1\r\n")
+                            .as_bytes(),
+                    );
+                }
+                let _ = s.write_all(format!("fim: {cmd}\r\n").as_bytes());
+                let _ = s.write_all(PROMPT);
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn a_batch_of_six_routeros_prints_ends_on_the_prompt_fast() {
+        let port = fake_routeros();
+        let ws = std::env::current_dir().unwrap();
+        let policy = zerith_security::Policy::new(
+            zerith_security::preset("workspace-write").unwrap(),
+            zerith_security::Mode::Bypass,
+            &ws,
+        );
+        let ctx = CallCtx {
+            workspace: &ws,
+            policy: &policy,
+            memory: None,
+            scope: None,
+        };
+        let cancel = zerith_providers::Cancel::default();
+        let host = crate::Host::default();
+        let exec = Exec {
+            cancel: &cancel,
+            deadline: std::time::Instant::now() + Duration::from_secs(60),
+            timeout: Duration::from_secs(60),
+            host: &host,
+        };
+        let target = format!("telnet://127.0.0.1:{port}");
+        let (id, _, _) = terminal::open_with_meta(
+            OpenSpec {
+                command: &target,
+                cwd: &ws,
+                expect: None,
+                timeout_dur: Duration::from_secs(5),
+                auto_page: true,
+                secrets: Vec::new(),
+                vendor: Some("mikrotik_router_os".into()),
+                device: None,
+                host: None,
+                role: None,
+                client: None,
+                vpn: None,
+                transport: Some("telnet".into()),
+            },
+            &exec,
+        )
+        .unwrap();
+        let cmds = [
+            "/ip firewall filter print terse",
+            "/ip firewall nat print terse",
+            "/ip route print terse",
+            "/interface print",
+            "/ip address print",
+            "/system resource print",
+        ];
+        let started = std::time::Instant::now();
+        let out = terminal_batch(&json!({"id": id, "commands": cmds}), &ctx, &exec).unwrap();
+        let took = started.elapsed();
+        let _ = terminal::close_terminal(&id);
+        eprintln!("lote de 6 comandos no RouterOS falso: {took:?}");
+        // Every section holds its own answer and only its own.
+        let sections: Vec<&str> = out.split("### ").skip(1).collect();
+        assert_eq!(sections.len(), 6, "{out}");
+        for (sec, cmd) in sections.iter().zip(cmds) {
+            // The header is what was sent (`print` gets `without-paging`).
+            let sent = sec.lines().next().unwrap();
+            assert!(
+                sent.starts_with(&cmd[..cmd.find(" print").unwrap()]),
+                "{sec}"
+            );
+            assert!(sec.contains(&format!("fim: {sent}")), "{cmd}: {sec}");
+            assert_eq!(sec.matches("fim: ").count(), 1, "{cmd}: {sec}");
+        }
+        assert!(out.contains(" 599   dst-address=10.0.599.0/24"), "{out}");
+        assert!(took < Duration::from_secs(2), "{took:?}");
+    }
+
     #[test]
     fn batch_stops_routeros_monitor_and_slow_command_then_moves_on() {
         with_fake_router("[admin@MK] > ", "mikrotik_router_os", |id, ctx, exec| {
@@ -4393,7 +4549,25 @@ router bgp 65001
         assert!(n.unwrap().contains("contínuo"));
         assert!(p(mk, "/log print follow").is_err());
         assert!(p(mk, "/ip firewall connection print follow-only").is_err());
-        assert_eq!(p(mk, "/ip route print").unwrap().1, None);
+        assert_eq!(
+            p(mk, "/ip route print").unwrap(),
+            ("/ip route print without-paging".into(), None)
+        );
+        assert_eq!(
+            p(mk, "/ip firewall filter print terse where chain=input")
+                .unwrap()
+                .0,
+            "/ip firewall filter print without-paging terse where chain=input"
+        );
+        for kept in [
+            "/ip route print count-only",
+            "/ip route print without-paging",
+            ":put [/ip route print as-value]",
+            "/ip/route/print",
+            "/system identity printer",
+        ] {
+            assert_eq!(p(mk, kept).unwrap().0, kept);
+        }
         assert_eq!(
             p(Vendor::Linux, "ping 10.0.0.1").unwrap().0,
             "ping -c 4 10.0.0.1"

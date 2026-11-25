@@ -40,10 +40,13 @@ import {
   onWorkflowDone,
   onWorkflowEvent,
   onWorkflowsChanged,
+  onServerEvent,
+  onServerStatus,
   serversApi,
   workflowsApi,
   type AgentView,
   type ServerEntry,
+  type ServerStatus,
   type ChannelConfig,
   type ChannelGroup,
   type ChannelKind,
@@ -56,6 +59,7 @@ import {
 } from "../lib/api";
 import { tr, useLang, type Lang } from "../lib/i18n";
 import { BOT_EMBLEMS, BotEmblem } from "./BotEmblem";
+import { agoText, ServerDot } from "./Servers";
 import "../styles/workflows.css";
 
 const NODE_W = 222;
@@ -498,19 +502,114 @@ export function WorkflowsStudio(props: {
     }
   }, [selectedId, workflows, fitToView]);
 
+  // Servidores: status (bolinha, falhas seguidas, próxima execução) e a lista
+  // de lá (última execução, ativo) dos que têm workflows remotos.
+  const [srvStatus, setSrvStatus] = useState<Record<string, ServerStatus>>({});
+  const [remoteWfs, setRemoteWfs] = useState<Record<string, Workflow>>({});
+  const workflowsRef = useRef(workflows);
+  workflowsRef.current = workflows;
+  const remoteIds = useMemo(
+    () => [...new Set(workflows.map((w) => w.run_on).filter((s): s is string => Boolean(s)))].join(","),
+    [workflows],
+  );
+  const refreshRemote = useCallback(async () => {
+    const ids = remoteIds ? remoteIds.split(",") : [];
+    await Promise.all(
+      ids.map(async (sid) => {
+        await serversApi
+          .health(sid)
+          .then((st) => setSrvStatus((m) => ({ ...m, [sid]: st })))
+          .catch(() => undefined);
+        await serversApi
+          .workflows(sid)
+          .then((list) =>
+            setRemoteWfs((m) => {
+              const next = { ...m };
+              list.forEach((w) => (next[`${sid}/${w.id}`] = w));
+              return next;
+            }),
+          )
+          .catch(() => undefined);
+      }),
+    );
+  }, [remoteIds]);
+  useEffect(() => {
+    void serversApi
+      .status()
+      .then((l) => setSrvStatus(Object.fromEntries(l.map((s) => [s.id, s]))))
+      .catch(() => undefined);
+    void refreshRemote();
+  }, [refreshRemote]);
+
+  const fetchRuns = useCallback((id: string) => {
+    const sid = workflowsRef.current.find((w) => w.id === id)?.run_on;
+    return sid ? serversApi.runs(sid, id, 25) : workflowsApi.runs(id, 25);
+  }, []);
+
   useEffect(() => {
     if (!selectedId) return;
     let live = true;
-    void workflowsApi
-      .runs(selectedId, 25)
+    void fetchRuns(selectedId)
       .then((r) => {
         if (live) setRuns(r);
       })
-      .catch(() => undefined);
+      .catch((e) => {
+        if (live) {
+          setRuns([]);
+          setBanner({ text: String(e), tone: "err" });
+        }
+      });
     return () => {
       live = false;
     };
-  }, [selectedId]);
+  }, [selectedId, fetchRuns]);
+
+  // SSE dos servidores (reemitido pelo backend): nós ao vivo e fim de execução.
+  useEffect(() => {
+    let cancelled = false;
+    let offEv = () => {};
+    let offSt = () => {};
+    void onServerEvent((ev) => {
+      if (cancelled) return;
+      const wfId = String(ev.data.workflow_id ?? "");
+      if (ev.event === "node" && wfId === selectedIdRef.current) {
+        const ne = ev.data as unknown as NodeEvent;
+        setLiveNodes((prev) => ({ ...prev, [ne.node_id]: ne }));
+      }
+      if (ev.event === "run_finished") {
+        setRunningId((cur) => (cur === wfId ? null : cur));
+        void refreshRemote();
+        if (wfId === selectedIdRef.current) {
+          void fetchRuns(wfId)
+            .then((r) => {
+              if (!cancelled && wfId === selectedIdRef.current) setRuns(r);
+            })
+            .catch(() => undefined);
+          const ok = ev.data.status === "ok";
+          setBanner({
+            text: ok
+              ? tr(langRef.current, "Execução no servidor concluída", "Server run completed")
+              : String(ev.data.summary ?? "erro"),
+            tone: ok ? "ok" : "err",
+          });
+        }
+      }
+    }).then((fn) => {
+      if (cancelled) fn();
+      else offEv = fn;
+    });
+    void onServerStatus((st) => {
+      if (!cancelled) setSrvStatus((m) => ({ ...m, [st.id]: st }));
+    }).then((fn) => {
+      if (cancelled) fn();
+      else offSt = fn;
+    });
+    return () => {
+      cancelled = true;
+      offEv();
+      offSt();
+    };
+  }, [refreshRemote, fetchRuns]);
 
   useEffect(() => {
     setNodeTestOutput(null);
@@ -534,8 +633,7 @@ export function WorkflowsStudio(props: {
       setRunningId((cur) => (cur === run.workflow_id ? null : cur));
       void loadAll(true);
       if (run.workflow_id === selectedIdRef.current) {
-        void workflowsApi
-          .runs(run.workflow_id, 25)
+        void fetchRuns(run.workflow_id)
           .then((r) => {
             if (!cancelled && run.workflow_id === selectedIdRef.current) setRuns(r);
           })
@@ -562,7 +660,7 @@ export function WorkflowsStudio(props: {
       offDone();
       offChanged();
     };
-  }, [loadAll]);
+  }, [loadAll, fetchRuns]);
 
   const handleUndo = useCallback(() => {
     const prev = pastRef.current.pop();
@@ -845,7 +943,9 @@ export function WorkflowsStudio(props: {
     setRunningId(saved.id);
     setBanner({ text: tr(lang, "Executando fluxo...", "Running workflow..."), tone: "" });
     try {
-      await workflowsApi.runNow(saved.id);
+      // No servidor: o fim chega por `server:event` (run_finished).
+      if (saved.run_on) await serversApi.run(saved.run_on, saved.id);
+      else await workflowsApi.runNow(saved.id);
     } catch (e) {
       setRunningId(null);
       setBanner({ text: String(e), tone: "err" });
@@ -1174,11 +1274,18 @@ export function WorkflowsStudio(props: {
         </div>
 
         <div className="wf-rail-list">
-          {workflows.map((w) => {
+          {workflows.map((local) => {
+            // Remoto: status e ativo vêm do servidor (a cópia local é a de edição).
+            const sid = local.run_on;
+            const remote = sid ? remoteWfs[`${sid}/${local.id}`] : undefined;
+            const w = remote ? { ...local, enabled: remote.enabled, last_status: remote.last_status, last_run_at_ms: remote.last_run_at_ms } : local;
+            const st = sid ? srvStatus[sid] : undefined;
+            const fails = st?.daemon?.consecutive_failures?.[w.id] ?? 0;
+            const next = st?.daemon?.next_run?.workflow_id === w.id ? st.daemon.next_run.at_ms : null;
             const isRunning = runningId === w.id || w.last_status === "running";
             const status = isRunning
               ? "running"
-              : w.last_status === "error"
+              : w.last_status === "error" || fails > 0
                 ? "error"
                 : w.enabled
                   ? "on"
@@ -1219,17 +1326,44 @@ export function WorkflowsStudio(props: {
                     <span>{workflowScheduleLabel(w, lang)}</span>
                     <span>· {w.nodes.length} {tr(lang, "nós", "nodes")}</span>
                   </span>
+                  {sid ? (
+                    <span className="wf-roster-sub wf-remote" data-remote={sid}>
+                      <ServerDot status={st} />
+                      <span>{serverName(sid)}</span>
+                      {w.last_run_at_ms ? (
+                        <span title={tr(lang, "Última execução", "Last run")}>
+                          · {w.last_status ?? "?"} {agoText(w.last_run_at_ms)}
+                        </span>
+                      ) : null}
+                      {fails > 0 ? (
+                        <span className="wf-remote-bad">
+                          · {fails} {tr(lang, fails === 1 ? "falha" : "falhas seguidas", fails === 1 ? "failure" : "failures in a row")}
+                        </span>
+                      ) : null}
+                      {next ? (
+                        <span title={tr(lang, "Próxima execução", "Next run")}>
+                          · {tr(lang, "próx.", "next")} {new Date(next).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                        </span>
+                      ) : null}
+                    </span>
+                  ) : null}
                 </div>
                 <input
                   type="checkbox"
                   className="wf-switch"
                   checked={w.enabled}
-                  aria-label={tr(lang, "Ativar workflow", "Enable workflow")}
+                  aria-label={
+                    sid
+                      ? tr(lang, "Pausar/ativar no servidor", "Pause/enable on server")
+                      : tr(lang, "Ativar workflow", "Enable workflow")
+                  }
                   onClick={(e) => e.stopPropagation()}
                   onChange={(e) => {
                     const next = e.target.checked;
-                    void workflowsApi
-                      .toggle(w.id, next)
+                    const call = sid
+                      ? serversApi.setEnabled(sid, w.id, next).then(() => refreshRemote())
+                      : workflowsApi.toggle(w.id, next);
+                    void call
                       .then(() => {
                         setDraft((prev) =>
                           prev && prev.id === w.id ? { ...prev, enabled: next } : prev,
@@ -2041,7 +2175,7 @@ export function WorkflowsStudio(props: {
                 onClick={async () => {
                   if (!selectedId) return;
                   try {
-                    const r = await workflowsApi.runs(selectedId, 25);
+                    const r = await fetchRuns(selectedId);
                     setRuns(r);
                   } catch (e) {
                     setBanner({ text: String(e), tone: "err" });

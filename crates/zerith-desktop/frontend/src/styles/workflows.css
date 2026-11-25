@@ -1001,6 +1001,20 @@
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
 
+/* Workflow remoto: linha de saúde vinda do servidor */
+.wf-remote {
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.wf-remote .dot {
+  width: 6px;
+  height: 6px;
+  box-shadow: none;
+}
+.wf-remote-bad {
+  color: var(--danger-text);
+}
+
 /* 409 do servidor: recarregar ou sobrescrever */
 .wf-conflict {
   display: flex;

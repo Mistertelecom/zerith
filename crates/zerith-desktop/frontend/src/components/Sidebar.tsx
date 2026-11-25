@@ -22,6 +22,7 @@ import { translateText, tr, useLang } from "../lib/i18n";
 import { BotEmblem, emblemForAgent } from "./BotEmblem";
 import type { AppView } from "./TitleBar";
 import { Logo, ZerithMark } from "./ui";
+import { useServerTrouble } from "./Servers";
 
 const DAY = 86_400_000;
 const GROUPS_PT = ["Hoje", "Ontem", "Últimos 7 dias", "Mais antigas"] as const;
@@ -94,6 +95,7 @@ export function Sidebar(props: {
 }) {
   const { onNew, onNewBotChat, view } = props;
   const lang = useLang();
+  const serverTrouble = useServerTrouble();
   const [menu, setMenu] = useState<{
     id: string;
     title: string;
@@ -587,6 +589,14 @@ export function Sidebar(props: {
           <button className="list-row side-foot-row" onClick={props.onWorkflows}>
             <Workflow size={16} strokeWidth={1.75} />
             <span className="side-row-title">{tr(lang, "Automações", "Workflows")}</span>
+            {serverTrouble ? (
+              <span className="side-state" data-testid="wf-trouble">
+                <span
+                  className="dot danger"
+                  title={tr(lang, "Servidor fora do ar ou workflow remoto com falha", "Server down or remote workflow failing")}
+                />
+              </span>
+            ) : null}
           </button>
         ) : null}
         <button className="list-row side-foot-row" onClick={props.onQuotas}>

@@ -171,6 +171,7 @@ pub fn run() {
         .setup(move |app| {
             learn::bind(app.handle());
             chat::spawn_monitor_waker(app.handle().clone());
+            servers::spawn_monitor(app.handle().clone(), scheduler_root.clone());
             workflows::spawn_scheduler(app.handle().clone(), scheduler_root);
             let term_handle = app.handle().clone();
             zerith_tools::set_terminal_change_hook(std::sync::Arc::new(move || {
@@ -380,6 +381,10 @@ pub fn run() {
             servers::server_workflow_push,
             servers::server_workflow_pull,
             servers::server_workflow_delete,
+            servers::server_workflows,
+            servers::server_workflow_runs,
+            servers::server_workflow_run,
+            servers::server_workflow_enabled,
             update::update_check,
             update::update_install,
         ])

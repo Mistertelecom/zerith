@@ -1,7 +1,13 @@
 // Ajustes > Servidores: `zerith server` pareados pelo código `zerith-pair:`.
 import { useCallback, useEffect, useState } from "react";
 import { CircleAlert, FlaskConical, Plus, Server, Trash2, X } from "lucide-react";
-import { serversApi, type ServerColor, type ServerEntry, type ServerStatus } from "../lib/api";
+import {
+  onServerStatus,
+  serversApi,
+  type ServerColor,
+  type ServerEntry,
+  type ServerStatus,
+} from "../lib/api";
 import { Card, EmptyState } from "./ui";
 
 const DOT: Record<ServerColor, [string, string]> = {
@@ -23,6 +29,42 @@ export function ServerDot({ status }: { status?: ServerStatus }) {
   if (!status) return <span className="dot" title="Ainda não verificado" />;
   const [tone, label] = DOT[status.color];
   return <span className={"dot " + tone} title={status.error ?? label} aria-label={label} />;
+}
+
+/** Algo errado nos servidores: algum vermelho ou com workflow falhando. */
+export function serverTrouble(list: ServerStatus[]): boolean {
+  return list.some(
+    (s) =>
+      s.color === "red" ||
+      (s.health?.failing_workflows ?? 0) > 0 ||
+      Object.keys(s.daemon?.consecutive_failures ?? {}).length > 0,
+  );
+}
+
+/** Para o ponto vermelho da barra lateral: segue `server:status` do monitor. */
+export function useServerTrouble(): boolean {
+  const [all, setAll] = useState<Record<string, ServerStatus>>({});
+  useEffect(() => {
+    let cancelled = false;
+    let off = () => {};
+    void serversApi
+      .status()
+      .then((l) => {
+        if (!cancelled) setAll(Object.fromEntries(l.map((s) => [s.id, s])));
+      })
+      .catch(() => undefined);
+    void onServerStatus((st) => {
+      if (!cancelled) setAll((m) => ({ ...m, [st.id]: st }));
+    }).then((fn) => {
+      if (cancelled) fn();
+      else off = fn;
+    });
+    return () => {
+      cancelled = true;
+      off();
+    };
+  }, []);
+  return serverTrouble(Object.values(all));
 }
 
 export function ServersTab() {

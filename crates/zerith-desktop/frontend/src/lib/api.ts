@@ -1305,7 +1305,33 @@ export const serversApi = {
     invoke<Workflow>("server_workflow_pull", { serverId, id }),
   deleteWorkflow: (serverId: string, id: string) =>
     invoke<void>("server_workflow_delete", { serverId, id }),
+  workflows: (serverId: string) => invoke<Workflow[]>("server_workflows", { serverId }),
+  runs: (serverId: string, id: string, limit = 25) =>
+    invoke<WorkflowRun[]>("server_workflow_runs", { serverId, id, limit }),
+  run: (serverId: string, id: string) => invoke<string>("server_workflow_run", { serverId, id }),
+  setEnabled: (serverId: string, id: string, enabled: boolean) =>
+    invoke<Workflow>("server_workflow_enabled", { serverId, id, enabled }),
 };
+
+/** Evento SSE de um servidor (`run_started`, `node`, `run_finished`). */
+export interface ServerEvent {
+  server_id: string;
+  event: string;
+  data: Record<string, unknown>;
+}
+
+export function onServerEvent(handler: (ev: ServerEvent) => void): Promise<UnlistenFn> {
+  return listen<ServerEvent>("server:event", (e) => handler(e.payload)).catch(
+    () => () => undefined,
+  );
+}
+
+/** Status novo de um servidor (monitor do backend: SSE `daemon_status` ou health). */
+export function onServerStatus(handler: (st: ServerStatus) => void): Promise<UnlistenFn> {
+  return listen<ServerStatus>("server:status", (e) => handler(e.payload)).catch(
+    () => () => undefined,
+  );
+}
 
 export type Pushed =
   | { kind: "saved"; workflow: Workflow }

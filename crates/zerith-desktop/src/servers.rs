@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use tauri::State;
 use zerith_core::secrets::{Configured, SecretStore};
 use zerith_workflows::remote::{Health, PairingCode, RemoteClient, RemoteError};
-use zerith_workflows::{now_ms, random_token, DaemonStatus, Store, Workflow};
+use zerith_workflows::{now_ms, random_token, DaemonStatus, Store, Workflow, WorkflowRun};
 
 use crate::state::AppState;
 
@@ -416,6 +416,281 @@ pub async fn server_workflow_delete(
     .await
 }
 
+fn remote_call<T: Send + 'static>(
+    root: PathBuf,
+    server_id: String,
+    job: impl FnOnce(&RemoteClient) -> Result<T, RemoteError> + Send + 'static,
+) -> impl FnOnce() -> Result<T, String> + Send + 'static {
+    move || job(&client(&root, &Configured, &server_id)?).map_err(|e| e.to_string())
+}
+
+/// Lista do servidor (status, última execução, ativo) para o painel de saúde.
+#[tauri::command]
+pub async fn server_workflows(
+    state: State<'_, AppState>,
+    server_id: String,
+) -> Result<Vec<Workflow>, String> {
+    let root = state.root().to_path_buf();
+    blocking(remote_call(root, server_id, |c| c.list())).await
+}
+
+#[tauri::command]
+pub async fn server_workflow_runs(
+    state: State<'_, AppState>,
+    server_id: String,
+    id: String,
+    limit: Option<usize>,
+) -> Result<Vec<WorkflowRun>, String> {
+    let root = state.root().to_path_buf();
+    let lim = limit.unwrap_or(25).clamp(1, 200);
+    blocking(remote_call(root, server_id, move |c| c.runs(&id, lim))).await
+}
+
+/// Dispara no servidor; o resultado chega por `server:event` (`run_finished`).
+#[tauri::command]
+pub async fn server_workflow_run(
+    state: State<'_, AppState>,
+    server_id: String,
+    id: String,
+) -> Result<String, String> {
+    let root = state.root().to_path_buf();
+    blocking(remote_call(root, server_id, move |c| c.run(&id, None))).await
+}
+
+/// Pausa/ativa no servidor e espelha na cópia local (mesma versão de lá).
+#[tauri::command]
+pub async fn server_workflow_enabled(
+    state: State<'_, AppState>,
+    server_id: String,
+    id: String,
+    enabled: bool,
+) -> Result<Workflow, String> {
+    let root = state.root().to_path_buf();
+    blocking(with_store(root, move |r, s| {
+        let wf = client(r, &Configured, &server_id)?
+            .set_enabled(&id, enabled)
+            .map_err(|e| e.to_string())?;
+        s.save_workflow(&Workflow {
+            run_on: Some(server_id),
+            ..wf
+        })
+        .map_err(|e| e.to_string())
+    }))
+    .await
+}
+
+// ------------------------------------------------------------ monitor
+
+/// Evento SSE do servidor reemitido ao frontend como `server:event`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ServerEvent {
+    pub server_id: String,
+    pub event: String,
+    pub data: serde_json::Value,
+}
+
+/// Lê um fluxo `text/event-stream` e chama `on` a cada evento completo com
+/// (id, evento, data). Termina no fim do fluxo ou em erro de leitura.
+pub fn parse_sse(
+    r: impl std::io::BufRead,
+    mut on: impl FnMut(Option<&str>, &str, &str),
+) -> std::io::Result<()> {
+    let (mut id, mut event, mut data) = (None::<String>, String::new(), String::new());
+    for line in r.lines() {
+        let line = line?;
+        if line.is_empty() {
+            if !data.is_empty() {
+                let ev = if event.is_empty() { "message" } else { &event };
+                on(id.as_deref(), ev, data.trim_end_matches('\n'));
+            }
+            (id, event, data) = (None, String::new(), String::new());
+            continue;
+        }
+        let (k, v) = line.split_once(':').unwrap_or((&line, ""));
+        let v = v.strip_prefix(' ').unwrap_or(v);
+        match k {
+            "id" => id = Some(v.to_string()),
+            "event" => event = v.to_string(),
+            "data" => {
+                data.push_str(v);
+                data.push('\n');
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// O que merece notificação numa mudança de estado: o servidor caiu (era
+/// conhecido e não-vermelho, ficou vermelho) e workflows que passaram a
+/// falhar (estavam fora de `before`, entraram em `after`).
+pub fn alerts(
+    prev: Option<Color>,
+    now: Color,
+    before: &std::collections::BTreeSet<String>,
+    after: &std::collections::BTreeSet<String>,
+) -> (bool, Vec<String>) {
+    let down = now == Color::Red && prev.is_some_and(|p| p != Color::Red);
+    (down, after.difference(before).cloned().collect())
+}
+
+/// Workflows remotos falhando, por servidor (para notificar uma vez).
+static FAILING: Mutex<BTreeMap<String, std::collections::BTreeSet<String>>> =
+    Mutex::new(BTreeMap::new());
+static MONITOR_COLOR: Mutex<BTreeMap<String, Color>> = Mutex::new(BTreeMap::new());
+/// Servidores com uma thread de SSE viva.
+static WATCHED: Mutex<std::collections::BTreeSet<String>> =
+    Mutex::new(std::collections::BTreeSet::new());
+
+fn wf_name(root: &Path, id: &str) -> String {
+    crate::workflows::open_store(root)
+        .ok()
+        .and_then(|s| s.get_workflow(id).ok().flatten())
+        .map_or_else(|| id.to_string(), |w| w.name)
+}
+
+/// Atualiza a lista de falhas do servidor e notifica as novas.
+fn set_failing(
+    app: &tauri::AppHandle,
+    root: &Path,
+    server: &str,
+    f: impl FnOnce(&mut std::collections::BTreeSet<String>),
+) {
+    let (before, after) = {
+        let mut map = FAILING.lock().unwrap_or_else(|e| e.into_inner());
+        let set = map.entry(server.to_string()).or_default();
+        let before = set.clone();
+        f(set);
+        (before, set.clone())
+    };
+    let (_, new) = alerts(None, Color::Green, &before, &after);
+    let srv = find(root, server).map_or_else(|_| server.to_string(), |s| s.name);
+    for id in new {
+        crate::notify::ping(
+            app,
+            "Workflow falhou no servidor",
+            &format!("{} em {srv}", wf_name(root, &id)),
+        );
+    }
+}
+
+fn on_status(app: &tauri::AppHandle, root: &Path, st: ServerStatus) {
+    use tauri::Emitter;
+    record(root, &st);
+    // Cor vista pelo monitor (não a do último "Testar"): o aviso de queda sai
+    // uma vez mesmo que a tela tenha conferido antes.
+    let prev = MONITOR_COLOR
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(st.id.clone(), st.color);
+    let (down, _) = alerts(prev, st.color, &Default::default(), &Default::default());
+    if down {
+        let name = find(root, &st.id).map_or_else(|_| st.id.clone(), |s| s.name);
+        crate::notify::ping(
+            app,
+            "Servidor sem resposta",
+            &format!("{name}: {}", st.error.as_deref().unwrap_or("")),
+        );
+    }
+    if let Some(d) = &st.daemon {
+        let now: std::collections::BTreeSet<String> =
+            d.consecutive_failures.keys().cloned().collect();
+        set_failing(app, root, &st.id, |s| *s = now);
+    }
+    let _ = app.emit("server:status", &st);
+}
+
+/// Acompanha um servidor: SSE `GET /v1/events` reemitido como
+/// `server:event`; o `daemon_status` (a cada 30 s) vira `server:status`. Caiu
+/// a conexão: confere o health e reconecta com espera dobrando até 30 s (se o
+/// SSE não passar, por exemplo um proxy que bufferiza, isso vira polling do
+/// health a cada 30 s). Sai quando o servidor é removido.
+fn watch(app: tauri::AppHandle, root: PathBuf, id: String) {
+    use std::io::BufReader;
+    use std::time::Duration;
+    use tauri::Emitter;
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(5))
+        // daemon_status chega a cada 30 s: 75 s sem nada = conexão morta.
+        .timeout_read(Duration::from_secs(75))
+        .redirects(0)
+        .build();
+    let mut wait = Duration::from_secs(1);
+    let mut last_id: Option<String> = None;
+    while let Ok(s) = find(&root, &id) {
+        let token = Configured.get(&token_entry(&id)).unwrap_or_default();
+        let mut req = agent
+            .get(&format!("{}/v1/events", s.url))
+            .set("Authorization", &format!("Bearer {token}"))
+            .set("Accept", "text/event-stream");
+        if let Some(l) = &last_id {
+            req = req.set("Last-Event-ID", l);
+        }
+        if let Ok(resp) = req.call() {
+            wait = Duration::from_secs(1);
+            let _ = parse_sse(BufReader::new(resp.into_reader()), |eid, ev, data| {
+                if let Some(e) = eid {
+                    last_id = Some(e.to_string());
+                }
+                let data: serde_json::Value = serde_json::from_str(data).unwrap_or_default();
+                if ev == "daemon_status" {
+                    let h = serde_json::from_value(data.clone()).map_err(|e| e.to_string());
+                    on_status(&app, &root, status_of(&id, h, None));
+                    return;
+                }
+                if ev == "run_finished" {
+                    if let Some(wf) = data["workflow_id"].as_str() {
+                        let failed = data["status"] == "error";
+                        set_failing(&app, &root, &id, |s| {
+                            if failed {
+                                s.insert(wf.to_string());
+                            } else {
+                                s.remove(wf);
+                            }
+                        });
+                    }
+                }
+                let _ = app.emit(
+                    "server:event",
+                    ServerEvent {
+                        server_id: id.clone(),
+                        event: ev.to_string(),
+                        data,
+                    },
+                );
+            });
+        }
+        if find(&root, &id).is_err() {
+            break;
+        }
+        on_status(&app, &root, health(&root, &Configured, &id));
+        std::thread::sleep(wait);
+        wait = (wait * 2).min(Duration::from_secs(30));
+    }
+    WATCHED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&id);
+}
+
+/// Sobe uma thread de [`watch`] para cada servidor cadastrado (confere a
+/// lista a cada 10 s, então um servidor novo entra sozinho).
+pub fn spawn_monitor(app: tauri::AppHandle, root: PathBuf) {
+    std::thread::spawn(move || loop {
+        for s in load(&root) {
+            let fresh = WATCHED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(s.id.clone());
+            if fresh {
+                let (app, root) = (app.clone(), root.clone());
+                std::thread::spawn(move || watch(app, root, s.id));
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(10));
+    });
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -673,6 +948,47 @@ pub(crate) mod tests {
             push(dir.path(), &vault, &store, &v1, Some(cur.updated_at_ms)).unwrap(),
             Pushed::Saved(_)
         ));
+    }
+
+    #[test]
+    fn sse_vira_eventos_com_id() {
+        let raw = "event: daemon_status\ndata: {\"a\":1}\n\n: comentário\nid: 7\nevent: run_finished\ndata: {\"status\":\"error\"}\n\nid: 8\ndata: x\n";
+        let mut got = Vec::new();
+        parse_sse(std::io::Cursor::new(raw), |id, ev, d| {
+            got.push((id.map(String::from), ev.to_string(), d.to_string()))
+        })
+        .unwrap();
+        assert_eq!(
+            got,
+            vec![
+                (None, "daemon_status".into(), "{\"a\":1}".into()),
+                (
+                    Some("7".into()),
+                    "run_finished".into(),
+                    "{\"status\":\"error\"}".into()
+                ),
+            ],
+            "evento sem linha em branco final não sai pela metade"
+        );
+    }
+
+    #[test]
+    fn notifica_uma_vez_por_mudanca_de_estado() {
+        use std::collections::BTreeSet;
+        let set = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>();
+        let none = BTreeSet::new();
+        assert!(alerts(Some(Color::Green), Color::Red, &none, &none).0);
+        assert!(alerts(Some(Color::Yellow), Color::Red, &none, &none).0);
+        assert!(
+            !alerts(Some(Color::Red), Color::Red, &none, &none).0,
+            "já estava caído"
+        );
+        assert!(
+            !alerts(None, Color::Red, &none, &none).0,
+            "primeira leitura não avisa"
+        );
+        let (_, new) = alerts(None, Color::Green, &set(&["a"]), &set(&["a", "b"]));
+        assert_eq!(new, vec!["b".to_string()], "só o que passou a falhar");
     }
 
     #[test]

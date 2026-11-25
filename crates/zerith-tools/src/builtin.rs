@@ -831,14 +831,22 @@ fn shell_exec(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>, snapshot: bool) 
         .map(|c| c.to_string())
         .unwrap_or_else(|| "sinal".into());
     let mut text = format!("exit {code}\n");
+    let note = status.code().and_then(|c| exit_note(cmd, c));
+    let ok = status.success() || note.is_some_and(|(_, benign)| benign);
+    if let Some((what, true)) = note {
+        text.push_str(&format!("[{what}: não é falha]\n"));
+    }
     // On failure stderr goes first: if the output is cut, the error survives.
     let mut parts = [("stdout", &stdout), ("stderr", &stderr)];
-    if !status.success() {
+    if !ok {
         parts.swap(0, 1);
         // A full stdout made the model miss `exit 1` (ufw/nft/iptables
         // without root): the error lines and the root hint come first.
         // The first line stays `exit N` (verify::exit_of reads it).
         text.push_str("[o comando FALHOU]\n");
+        if let Some((what, false)) = note {
+            text.push_str(&format!("[{what}]\n"));
+        }
         let errs = error_lines(&stderr, &stdout);
         if !errs.is_empty() {
             text.push_str(&format!("[erros]\n{}\n", errs.join("\n")));
@@ -857,10 +865,44 @@ fn shell_exec(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>, snapshot: bool) 
     if status.success() && (killed_descendant || looks_like_detached_launch(cmd)) {
         text.push_str("\n[AVISO] O comando deixou ou tentou abrir um processo filho/janela em segundo plano, que foi ENCERRADO automaticamente ao fim do shell em primeiro plano. Para abrir janelas GUI ou servidores contínuos, execute o comando direto (sem `start`/`nohup`) UMA ÚNICA VEZ com `run_in_background: true`.");
     }
-    if status.success() {
+    if ok {
         Ok(text)
     } else {
         Err(ToolError::Failed(text))
+    }
+}
+
+/// What a non-zero exit means when it is not an error, or names how the
+/// process died: `(nota, benigno)`. Judged on the last command of the line,
+/// the one whose status the shell returns. After Hermes
+/// `_interpret_exit_code` / `_EXIT_CODE_SEMANTICS`
+/// (tools/terminal_tool_result.py, MIT); no code copied.
+fn exit_note(cmd: &str, code: i32) -> Option<(&'static str, bool)> {
+    // `&&` splits, a lone `&` does not (`2>&1` is a redirection).
+    let last = cmd
+        .split("&&")
+        .flat_map(|s| s.split(['|', ';', '\n']))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .last()?;
+    let word = last
+        .split_whitespace()
+        .find(|w| !w.contains('=') || w.starts_with('-'))
+        .unwrap_or_default();
+    let prog = word
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(word)
+        .trim_end_matches(".exe")
+        .to_ascii_lowercase();
+    match (prog.as_str(), code) {
+        ("grep" | "egrep" | "fgrep" | "rg", 1) => Some(("sem ocorrências", true)),
+        ("diff" | "cmp", 1) => Some(("arquivos diferem", true)),
+        ("test" | "[" | "[[", 1) => Some(("condição falsa", true)),
+        ("timeout", 124) => Some(("tempo esgotado (timeout)", false)),
+        (_, 137) => Some(("morto (SIGKILL/OOM?)", false)),
+        (_, 143) => Some(("terminado (SIGTERM)", false)),
+        _ => None,
     }
 }
 
@@ -1130,6 +1172,72 @@ mod root_hint_tests {
         assert!(root_hint("ls /nope", "ls: cannot access '/nope': No such file").is_none());
         let errs = error_lines(ipt, "Chain INPUT\nline\n");
         assert_eq!(errs.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod exit_note_tests {
+    use super::exit_note;
+
+    #[test]
+    fn known_exit_codes_get_a_note_and_benign_ones_are_not_failures() {
+        let benign = |c, n| assert_eq!(exit_note(c, n).map(|x| x.1), Some(true), "{c}");
+        benign("grep -r foo src", 1);
+        benign("cat a.log | LC_ALL=C /usr/bin/rg erro 2>&1", 1);
+        benign("diff a b", 1);
+        benign("cd x && cmp a b", 1);
+        benign("[ -f x ]", 1);
+        benign("test -d y", 1);
+        assert_eq!(exit_note("grep x y", 1).unwrap().0, "sem ocorrências");
+        assert_eq!(
+            exit_note("timeout 5 make", 124),
+            Some(("tempo esgotado (timeout)", false))
+        );
+        assert_eq!(
+            exit_note("cargo build", 137),
+            Some(("morto (SIGKILL/OOM?)", false))
+        );
+        assert_eq!(
+            exit_note("sleep 99", 143),
+            Some(("terminado (SIGTERM)", false))
+        );
+        // Only the last command decides; grep 2 is a real error.
+        assert_eq!(exit_note("grep foo x; make", 1), None);
+        assert_eq!(exit_note("grep foo x", 2), None);
+        assert_eq!(exit_note("make", 124), None);
+    }
+
+    #[test]
+    fn grep_without_matches_is_ok_and_keeps_exit_on_the_first_line() {
+        use crate::{CallCtx, Registry};
+        use zerith_security::{preset, Mode, Policy};
+        if cfg!(windows) && zerith_core::shellparse::windows_bash().is_none() {
+            return; // cmd has no grep
+        }
+        let root =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-scratch");
+        std::fs::create_dir_all(&root).unwrap();
+        let dir = tempfile::Builder::new().tempdir_in(root).unwrap();
+        std::fs::write(dir.path().join("a.txt"), "um\n").unwrap();
+        let pol = Policy::new(preset("workspace-write").unwrap(), Mode::Bypass, dir.path());
+        let ctx = CallCtx {
+            workspace: pol.workspace.as_path(),
+            policy: &pol,
+            memory: None,
+            scope: None,
+        };
+        let out = Registry::new()
+            .call(
+                "shell",
+                &serde_json::json!({"command": "grep nada a.txt"}),
+                &ctx,
+            )
+            .unwrap();
+        assert!(
+            out.starts_with("exit 1\n[sem ocorrências: não é falha]"),
+            "{out}"
+        );
+        assert!(!out.contains("FALHOU"), "{out}");
     }
 }
 

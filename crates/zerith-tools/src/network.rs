@@ -534,13 +534,40 @@ fn validate_ssh_token(field: &str, value: &str) -> std::result::Result<(), Strin
     if t.starts_with('-') {
         return Err(format!("{field} inválido (não pode começar com `-`): {t}"));
     }
+    // `+` only in the user: RouterOS console options (`admin+ct80w`).
     if !t.chars().all(|c| {
         c.is_ascii_alphanumeric()
             || matches!(c, '.' | '_' | '-' | ':' | '@' | '[' | ']' | '%' | ',')
+            || (c == '+' && field == "user")
     }) {
         return Err(format!("{field} contém caractere inválido: {t}"));
     }
     Ok(())
+}
+
+/// RouterOS console login options, after `+` in the login name (manual,
+/// "Command Line Interface" > "Console login options": `login_name ::=
+/// user_name [ '+' parameters ]`, number before letter): c = no colors,
+/// e = dumb terminal (no line redraw: the echo comes back clean instead of
+/// the prompt drawn in the middle of it), t = no terminal auto-detection,
+/// 511w = width (long commands neither wrap nor scroll), 4098h = height.
+/// netmiko 4.8.0 (MIT), `netmiko/mikrotik/mikrotik_ssh.py`
+/// `_modify_connection_params`, sends `+ct511w4098h`; the `e` is the one in
+/// the community.routeros SSH guide (`+cet512w`).
+const ROUTEROS_LOGIN_OPTS: &str = "+cet511w4098h";
+
+/// The name typed at login: RouterOS over ssh/telnet gets
+/// [`ROUTEROS_LOGIN_OPTS`] unless the user already carries `+` options.
+/// Only on the wire: the inventory and the vault keep the plain user.
+fn login_user(dev: &DeviceEntry, user: &str) -> String {
+    if dev.vendor == Vendor::MikrotikRouterOs
+        && dev.transport != DeviceTransport::Serial
+        && !user.contains('+')
+    {
+        format!("{user}{ROUTEROS_LOGIN_OPTS}")
+    } else {
+        user.to_string()
+    }
 }
 
 /// Builds a strict, flag-injection-free `ssh` invocation for [`DeviceEntry`].
@@ -588,7 +615,7 @@ pub fn build_ssh_command(dev: &DeviceEntry) -> std::result::Result<String, Strin
             "PubkeyAcceptedAlgorithms=+ssh-rsa".to_string(),
         ]);
     }
-    parts.push(format!("{user}@{}", dev.host.trim()));
+    parts.push(format!("{}@{}", login_user(dev, &user), dev.host.trim()));
     Ok(parts.join(" "))
 }
 
@@ -2255,7 +2282,7 @@ fn net_connect(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<Strin
         let (after_user, user_alive) = terminal::send_session_command(
             "net_connect",
             &id,
-            Some(dev.user.trim()),
+            Some(&login_user(&dev, dev.user.trim())),
             None,
             true,
             re.as_ref(),
@@ -4555,6 +4582,165 @@ router bgp 65001
         }
         assert!(out.contains(" 599   dst-address=10.0.599.0/24"), "{out}");
         assert!(took < Duration::from_secs(2), "{took:?}");
+    }
+
+    /// RouterOS on a local socket as a real CCR (7.24) looks over ssh.
+    /// Without console options the echo is redrawn with the prompt in the
+    /// middle (`/ip firewall con\r[joao@Masterlink] > /ip firewall ...`) and
+    /// cut at 48 columns with the line's end drawn over it; a login name
+    /// ending in `+cet511w4098h` (dumb, 511 columns) gets the plain echo.
+    /// One line at a time (what is typed meanwhile waits), Ctrl+C clears the
+    /// line. `connection print count-only` takes 8 s and ignores Ctrl+C/`q`,
+    /// then prints `1`; `:put "X"` prints X; anything else `ok: <cmd>`.
+    /// `login`: asks `Login:`/`Password:` and records the name typed.
+    fn fake_routeros_cli(login: Option<std::sync::Arc<std::sync::Mutex<String>>>) -> u16 {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        const PROMPT: &str = "[joao@Masterlink] > ";
+        const COLS: usize = 48;
+        fn read_line(s: &mut TcpStream) -> Option<String> {
+            let (mut line, mut b) = (Vec::new(), [0u8; 1]);
+            loop {
+                if !matches!(s.read(&mut b), Ok(1)) {
+                    return None;
+                }
+                match b[0] {
+                    b'\r' | b'\n' if !line.is_empty() => {
+                        return Some(String::from_utf8_lossy(&line).into())
+                    }
+                    b'\r' | b'\n' => {}
+                    3 => {
+                        line.clear();
+                        let _ = s.write_all(format!("\r\n{PROMPT}").as_bytes());
+                    }
+                    c => line.push(c),
+                }
+            }
+        }
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let Ok((mut s, _)) = l.accept() else { return };
+            let _ = s.set_nodelay(true);
+            let mut dumb = false;
+            if let Some(seen) = &login {
+                let _ = s.write_all(b"Login: ");
+                let Some(user) = read_line(&mut s) else {
+                    return;
+                };
+                dumb = user.ends_with("+cet511w4098h");
+                *seen.lock().unwrap() = user;
+                let _ = s.write_all(b"Password: ");
+                if read_line(&mut s).is_none() {
+                    return;
+                }
+                let _ = s.write_all(b"\r\n");
+            }
+            let _ = s.write_all(PROMPT.as_bytes());
+            while let Some(cmd) = read_line(&mut s) {
+                if dumb {
+                    let _ = s.write_all(format!("{cmd}\r\n").as_bytes());
+                } else {
+                    let first = &cmd[..cmd.len().min(24)];
+                    let _ = s.write_all(format!("{first}\r{PROMPT}").as_bytes());
+                    std::thread::sleep(Duration::from_millis(150));
+                    let shown = &cmd[..cmd.len().min(COLS)];
+                    let end = if cmd.len() > COLS {
+                        &cmd[cmd.len() - 2..]
+                    } else {
+                        ""
+                    };
+                    let _ = s.write_all(format!("{shown}\r{end}\r\n").as_bytes());
+                }
+                let answer = if let Some(x) = cmd
+                    .strip_prefix(":put \"")
+                    .and_then(|r| r.strip_suffix('"'))
+                {
+                    x.to_string()
+                } else if cmd.contains("connection print count-only") {
+                    std::thread::sleep(Duration::from_secs(8));
+                    "1".into()
+                } else {
+                    format!("ok: {cmd}")
+                };
+                let _ = s.write_all(format!("{answer}\r\n{PROMPT}").as_bytes());
+            }
+        });
+        port
+    }
+
+    /// Workspace, bypass policy and a 60 s deadline for a test call.
+    fn with_env(f: impl FnOnce(&CallCtx<'_>, &Exec<'_>)) {
+        let ws = std::env::current_dir().unwrap();
+        let policy = zerith_security::Policy::new(
+            zerith_security::preset("workspace-write").unwrap(),
+            zerith_security::Mode::Bypass,
+            &ws,
+        );
+        let ctx = CallCtx {
+            workspace: &ws,
+            policy: &policy,
+            memory: None,
+            scope: None,
+        };
+        let cancel = zerith_providers::Cancel::default();
+        let host = crate::Host::default();
+        let exec = Exec {
+            cancel: &cancel,
+            deadline: std::time::Instant::now() + Duration::from_secs(60),
+            timeout: Duration::from_secs(60),
+            host: &host,
+        };
+        f(&ctx, &exec);
+    }
+
+    #[test]
+    fn routeros_login_asks_for_a_dumb_wide_console() {
+        let mut dev = DeviceEntry {
+            host: "10.0.0.1".into(),
+            user: "admin".into(),
+            vendor: Vendor::MikrotikRouterOs,
+            ..Default::default()
+        };
+        let ssh = |d: &DeviceEntry| build_ssh_command(d).unwrap();
+        assert!(
+            ssh(&dev).ends_with(" admin+cet511w4098h@10.0.0.1"),
+            "{}",
+            ssh(&dev)
+        );
+        dev.user = "admin+ct80w".into();
+        assert!(
+            ssh(&dev).ends_with(" admin+ct80w@10.0.0.1"),
+            "{}",
+            ssh(&dev)
+        );
+        dev.user = "admin".into();
+        dev.vendor = Vendor::CiscoIos;
+        assert!(ssh(&dev).ends_with(" admin@10.0.0.1"), "{}", ssh(&dev));
+
+        // Telnet: the name typed carries the options; the device answers
+        // with a plain echo, no prompt redrawn inside it.
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let port = fake_routeros_cli(Some(seen.clone()));
+        with_env(|ctx, exec| {
+            let out = net_connect(
+                &json!({"transport": "telnet", "host": "127.0.0.1", "port": port,
+                        "user": "joao", "password": "senha-teste",
+                        "vendor": "mikrotik", "remember": false}),
+                ctx,
+                exec,
+            )
+            .unwrap();
+            let id = out.split_whitespace().next().unwrap().to_string();
+            assert_eq!(*seen.lock().unwrap(), "joao+cet511w4098h", "{out}");
+            assert!(!out.contains("senha-teste"), "{out}");
+            let cmd =
+                "/ip firewall address-list print without-paging terse where address=45.232.65.250";
+            let res = terminal_batch(&json!({"id": id, "commands": [cmd]}), ctx, exec).unwrap();
+            let _ = terminal::close_terminal(&id);
+            assert!(res.contains(&format!("ok: {cmd}")), "{res}");
+            assert!(!res.contains("Masterlink] > /ip"), "{res}");
+        });
     }
 
     #[test]

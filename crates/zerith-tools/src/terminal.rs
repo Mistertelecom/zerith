@@ -34,7 +34,9 @@ const CUT_HEAD_LINES: usize = 120;
 const CUT_TAIL_LINES: usize = 30;
 /// Marks output that went through the pager (the batch then turns paging off).
 pub(crate) const PAGED_NOTE: &str = "[paginação automática:";
-const IDLE_REAP: Duration = Duration::from_secs(20 * 60);
+/// A terminal idle this long is closed (a pause in the conversation; the
+/// next call reopens a `net_connect` session, see `Remembered`).
+const IDLE_REAP: Duration = Duration::from_secs(30 * 60);
 const BUF_CAP: usize = 4 * 1024 * 1024;
 const BUF_SHRINK_THRESHOLD: usize = 64 * 1024;
 
@@ -140,19 +142,133 @@ fn lock() -> std::sync::MutexGuard<'static, HashMap<String, Term>> {
     table().lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// The program a terminal session runs, for the approval rules (a session
-/// on `ssh` is remote access; every input to it is approved on its own).
-pub fn terminal_program(id: &str) -> Option<String> {
-    meta_table().lock().ok()?.get(id).map(|t| t.command.clone())
+/// What is kept of a terminal after it closes on its own (ssh dropped, idle
+/// reap, app restart of the session's turn): who opened it, on what, and the
+/// `net_connect` arguments that reopen it. Ids never repeat within a process,
+/// so the id alone names it. Forgotten on `terminal_close` and when the
+/// conversation is deleted. Idea from Hermes Agent's `process_registry.py`
+/// (MIT), which keeps a session's processes findable after they exit.
+// ponytail: memory only, so an app restart forgets it (the model then gets
+// the "chame net_connect de novo" error); a file per session if that matters.
+#[derive(Clone)]
+struct Remembered {
+    owner: Option<String>,
+    command: String,
+    vendor: Option<String>,
+    device: Option<String>,
+    role: Option<String>,
+    /// `net_connect` arguments; `None` for `terminal_open`, never reopened.
+    reopen: Option<Value>,
+    /// The live session's clock, still readable after it closed.
+    last_used: Arc<Mutex<Instant>>,
 }
 
-/// `(vendor, device, role)` metadata for an active terminal session.
+/// A dropped session is reopened only if it was used this recently: past
+/// that the model is told to connect again (a router is not logged into
+/// hours later behind the user's back).
+const REOPEN_WINDOW: Duration = Duration::from_secs(2 * 3600);
+
+fn remembered() -> std::sync::MutexGuard<'static, HashMap<String, Remembered>> {
+    static R: OnceLock<Mutex<HashMap<String, Remembered>>> = OnceLock::new();
+    R.get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// Records the `net_connect` arguments that reopen terminal `id`.
+pub(crate) fn remember_reopen(id: &str, args: Value) {
+    if let Some(r) = remembered().get_mut(id) {
+        r.reopen = Some(args);
+    }
+}
+
+/// The `net_connect` arguments for a dead terminal `id` of this conversation,
+/// when it is gone and was opened by `net_connect`.
+pub(crate) fn reopen_args(id: &str, session: Option<&str>) -> Option<Value> {
+    // A session whose program just died is still in the table until reaped.
+    reap();
+    if lock().contains_key(id) {
+        return None;
+    }
+    let r = remembered().get(id).cloned()?;
+    let recent = r
+        .last_used
+        .lock()
+        .is_ok_and(|t| t.elapsed() < REOPEN_WINDOW);
+    (recent && r.owner.as_deref() == session)
+        .then_some(r.reopen)
+        .flatten()
+}
+
+/// Gives the terminal `from` the id `to` (a reopened session keeps the id
+/// the model knows).
+pub(crate) fn rename_terminal(from: &str, to: &str) {
+    let mut t = lock();
+    let Some(mut term) = t.remove(from) else {
+        return;
+    };
+    term.meta.id = to.to_string();
+    if let Ok(mut m) = meta_table().lock() {
+        m.remove(from);
+        m.insert(to.to_string(), term.meta.clone());
+    }
+    let mut r = remembered();
+    if let Some(entry) = r.remove(from) {
+        r.insert(to.to_string(), entry);
+    }
+    t.insert(to.to_string(), term);
+    drop((t, r));
+    notify_changed();
+}
+
+/// The open terminals, and what the model should do about a dead `id`.
+pub(crate) fn missing_terminal(id: &str) -> String {
+    format!(
+        "terminal {id} não existe mais (abertos: {}); a sessão caiu ou foi fechada: chame \
+         net_connect de novo para abrir outra e use o id novo",
+        open_list(&lock())
+    )
+}
+
+/// The program a terminal session runs, for the approval rules (a session
+/// on `ssh` is remote access; every input to it is approved on its own).
+/// A terminal that closed on its own still answers: the next call may
+/// reopen it, and must be judged as reaching that same device.
+pub fn terminal_program(id: &str) -> Option<String> {
+    meta_table()
+        .lock()
+        .ok()?
+        .get(id)
+        .map(|t| t.command.clone())
+        .or_else(|| remembered().get(id).map(|r| r.command.clone()))
+}
+
+/// `(vendor, device, role)` metadata for an active terminal session, or for
+/// one that closed on its own (see [`terminal_program`]).
 pub fn terminal_meta(id: &str) -> Option<(Option<String>, Option<String>, Option<String>)> {
     meta_table()
         .lock()
         .ok()?
         .get(id)
         .map(|t| (t.vendor.clone(), t.device.clone(), t.role.clone()))
+        .or_else(|| {
+            remembered()
+                .get(id)
+                .map(|r| (r.vendor.clone(), r.device.clone(), r.role.clone()))
+        })
+}
+
+/// Closes every terminal opened by conversation `session` and forgets them
+/// (the conversation was deleted).
+pub fn close_session_terminals(session: &str) {
+    let ids: Vec<String> = remembered()
+        .iter()
+        .filter(|(_, r)| r.owner.as_deref() == Some(session))
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in ids {
+        let _ = close_terminal(&id);
+    }
 }
 
 /// Lists all open terminal sessions with live liveness/busy/idle status.
@@ -258,6 +374,8 @@ pub fn interrupt_terminal(id: &str) -> std::result::Result<(), String> {
 
 /// Closes terminal session `id` and terminates its child process.
 pub fn close_terminal(id: &str) -> std::result::Result<(), String> {
+    // Closed on purpose: never reopened behind the user's back.
+    let forgot = remembered().remove(id).is_some();
     let removed = lock().remove(id);
     if let Some(term) = removed {
         drop(term);
@@ -276,6 +394,9 @@ pub fn close_terminal(id: &str) -> std::result::Result<(), String> {
             notify_changed();
             return Ok(());
         }
+    }
+    if forgot {
+        return Ok(());
     }
     Err(format!("terminal {id} não existe"))
 }
@@ -463,6 +584,14 @@ fn reap() {
     if removed {
         notify_changed();
     }
+    // Past the reopen window a closed session is only an error message.
+    let live: Vec<String> = lock().keys().cloned().collect();
+    remembered().retain(|id, r| {
+        live.contains(id)
+            || r.last_used
+                .lock()
+                .is_ok_and(|t| t.elapsed() < REOPEN_WINDOW)
+    });
 }
 
 pub(crate) struct OpenSpec<'a> {
@@ -542,6 +671,18 @@ pub(crate) fn open_with_meta(
     if let Ok(mut m) = meta_table().lock() {
         m.insert(id.clone(), meta.clone());
     }
+    remembered().insert(
+        id.clone(),
+        Remembered {
+            owner: exec.host.session(),
+            command: meta.command.clone(),
+            vendor: meta.vendor.clone(),
+            device: meta.device.clone(),
+            role: meta.role.clone(),
+            reopen: None,
+            last_used: meta.last_used.clone(),
+        },
+    );
     notify_changed();
     let term = Term {
         meta: meta.clone(),
@@ -662,10 +803,8 @@ pub(crate) fn send_session_command_with(
     let mut t = {
         let mut table = lock();
         let Some(t) = table.remove(id) else {
-            return Err(ToolError::Failed(format!(
-                "terminal {id} não existe (abertos: {})",
-                open_list(&table)
-            )));
+            drop(table);
+            return Err(ToolError::Failed(missing_terminal(id)));
         };
         if t.owner.is_some() && t.owner != exec.host.session() {
             let err = format!("terminal {id} é de outra conversa");
@@ -722,9 +861,10 @@ pub(crate) fn send_session_command_with(
     Ok((text, alive))
 }
 
-fn send(args: &Value, _: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
+fn send(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
     let id = str_arg(args, "id")?;
     let re = expect(args)?;
+    let reopened = crate::network::reopen_if_dropped(id, ctx, exec)?.unwrap_or_default();
     let auto_page = args["auto_page"].as_bool().unwrap_or(true);
     let enter = args["enter"].as_bool().unwrap_or(true);
     // The vault read happens before the session is taken: an unknown name
@@ -764,7 +904,7 @@ fn send(args: &Value, _: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
         exec,
     )?;
     Ok(format!(
-        "{id}{}\n{}{text}",
+        "{reopened}{id}{}\n{}{text}",
         if alive {
             ""
         } else {

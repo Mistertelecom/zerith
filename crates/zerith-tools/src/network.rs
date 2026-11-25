@@ -2345,6 +2345,21 @@ fn net_connect(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<Strin
         }
     }
 
+    // A session that drops later is reopened on the same device. A password
+    // typed in this call is never kept: only the vault entry it may have
+    // been saved to above; without one the session is not reopened.
+    if alive && (direct_password.is_none() || dev.secret_ref.is_some()) {
+        let mut again = args.clone();
+        if let Some(o) = again.as_object_mut() {
+            o.remove("password");
+            o.insert("remember".into(), Value::Bool(false));
+            if direct_password.is_some() {
+                o.insert("secret_ref".into(), json!(dev.secret_ref));
+            }
+        }
+        terminal::remember_reopen(&id, again);
+    }
+
     Ok(format!(
         "{vpn_status_note}{id} conectado via {} a {} ({}, vendor={}, role={}{}{}){}\n{banner}",
         dev.transport.as_str(),
@@ -2362,6 +2377,40 @@ fn net_connect(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<Strin
             .unwrap_or_default(),
         if alive { "" } else { " — sessão encerrou" }
     ))
+}
+
+/// Before typing into terminal `id`: a `net_connect` session of this
+/// conversation that dropped (ssh timeout, idle reap, the previous turn's
+/// device rebooted) is opened again on the same device and keeps its id, so
+/// the model's next call just works. Returns the note to put on top of the
+/// result; `None` when the terminal is alive or cannot be reopened (the
+/// send then fails with the list of open terminals). Idea from Hermes
+/// Agent's `process_registry.py` (MIT): a session's processes outlive the
+/// call that started them.
+pub(crate) fn reopen_if_dropped(
+    id: &str,
+    ctx: &CallCtx<'_>,
+    exec: &Exec<'_>,
+) -> Result<Option<String>> {
+    let Some(args) = terminal::reopen_args(id, exec.host.session().as_deref()) else {
+        return Ok(None);
+    };
+    let out = net_connect(&args, ctx, exec).map_err(|e| {
+        ToolError::Failed(format!(
+            "terminal {id} tinha caído e não reabriu ({e}); chame net_connect de novo"
+        ))
+    })?;
+    let Some(new_id) = out.lines().find_map(|l| {
+        l.split_whitespace()
+            .next()
+            .filter(|w| w.starts_with("term-"))
+    }) else {
+        return Ok(None);
+    };
+    terminal::rename_terminal(new_id, id);
+    Ok(Some(format!(
+        "[terminal {id} reaberto: a sessão anterior tinha caído]\n"
+    )))
 }
 
 /// `commands` items: a string, or `{"cmd": "...", "timeout_secs": N}` for a
@@ -2384,7 +2433,7 @@ fn batch_items(args: &Value) -> Vec<(String, Option<u64>)> {
         .unwrap_or_default()
 }
 
-fn terminal_batch(args: &Value, _: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
+fn terminal_batch(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
     let id = str_arg(args, "id")?;
     let items = batch_items(args);
     if items.is_empty() {
@@ -2392,6 +2441,7 @@ fn terminal_batch(args: &Value, _: &CallCtx<'_>, exec: &Exec<'_>) -> Result<Stri
             "commands precisa ter ao menos um comando".into(),
         ));
     }
+    let reopened = reopen_if_dropped(id, ctx, exec)?;
     let cmds: Vec<&String> = items.iter().map(|(c, _)| c).collect();
     let stop_on_error = args["stop_on_error"].as_bool().unwrap_or(true);
     let auto_page = args["auto_page"].as_bool().unwrap_or(true);
@@ -2469,7 +2519,11 @@ fn terminal_batch(args: &Value, _: &CallCtx<'_>, exec: &Exec<'_>) -> Result<Stri
             }
         }
     }
-    Ok(sections.join("\n\n"))
+    Ok(format!(
+        "{}{}",
+        reopened.unwrap_or_default(),
+        sections.join("\n\n")
+    ))
 }
 
 fn load_config_input(raw: &str, workspace: &Path) -> String {
@@ -4486,6 +4540,96 @@ router bgp 65001
         }
         assert!(out.contains(" 599   dst-address=10.0.599.0/24"), "{out}");
         assert!(took < Duration::from_secs(2), "{took:?}");
+    }
+
+    #[test]
+    fn a_dropped_device_session_reopens_under_the_same_id() {
+        use std::io::{Read, Write};
+        // Answers one command per connection, then hangs up (ssh timeout).
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for n in 1..=2 {
+                let Ok((mut s, _)) = l.accept() else { return };
+                let _ = s.write_all(b"[admin@MK] > ");
+                let mut line = Vec::new();
+                let mut b = [0u8; 1];
+                while let Ok(1) = s.read(&mut b) {
+                    if b[0] == b'\r' && !line.is_empty() {
+                        let cmd = String::from_utf8_lossy(&line).to_string();
+                        let _ = s.write_all(
+                            format!("{cmd}\r\nconexão {n}: {cmd}\r\n[admin@MK] > ").as_bytes(),
+                        );
+                        std::thread::sleep(Duration::from_millis(100));
+                        break;
+                    }
+                    if b[0] != b'\r' && b[0] != b'\n' {
+                        line.push(b[0]);
+                    }
+                }
+            }
+        });
+        let ws = std::env::current_dir().unwrap();
+        let policy = zerith_security::Policy::new(
+            zerith_security::preset("workspace-write").unwrap(),
+            zerith_security::Mode::Bypass,
+            &ws,
+        );
+        let ctx = CallCtx {
+            workspace: &ws,
+            policy: &policy,
+            memory: None,
+            scope: None,
+        };
+        let cancel = zerith_providers::Cancel::default();
+        let host = crate::Host::default();
+        let exec = Exec {
+            cancel: &cancel,
+            deadline: std::time::Instant::now() + Duration::from_secs(30),
+            timeout: Duration::from_secs(30),
+            host: &host,
+        };
+        let out = net_connect(
+            &json!({"transport": "telnet", "host": "127.0.0.1", "port": port,
+                    "vendor": "mikrotik", "remember": false}),
+            &ctx,
+            &exec,
+        )
+        .unwrap();
+        let id = out.split_whitespace().next().unwrap().to_string();
+        let first = terminal_batch(
+            &json!({"id": id, "commands": ["/system identity print"]}),
+            &ctx,
+            &exec,
+        )
+        .unwrap();
+        assert!(first.contains("conexão 1:"), "{first}");
+        // The device hung up; the next call reopens it, same id.
+        std::thread::sleep(Duration::from_millis(400));
+        let again = terminal_batch(
+            &json!({"id": id, "commands": ["/ip address print"]}),
+            &ctx,
+            &exec,
+        )
+        .unwrap();
+        assert!(
+            again.starts_with(&format!(
+                "[terminal {id} reaberto: a sessão anterior tinha caído]"
+            )),
+            "{again}"
+        );
+        assert!(again.contains("conexão 2:"), "{again}");
+        // Closed on purpose: never reopened, the error lists what is open.
+        terminal::close_terminal(&id).unwrap();
+        let err = terminal_batch(
+            &json!({"id": id, "commands": ["/ip address print"]}),
+            &ctx,
+            &exec,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("chame net_connect de novo"), "{err}");
+        assert!(err.contains("abertos:"), "{err}");
     }
 
     #[test]

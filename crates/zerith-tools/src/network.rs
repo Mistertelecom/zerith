@@ -930,6 +930,20 @@ pub fn classify_network_command(vendor: Vendor, cmd: &str) -> NetCmdRisk {
 /// `print follow`/`follow-only` and `print interval=` never stop.
 /// Cisco/Huawei/Juniper pagers are handled by `Vendor::disable_paging_cmd`;
 /// their `ping` stops by itself (5 packets).
+/// Default deadline for a command known to be slow on a busy device, when
+/// the call gave none. RouterOS `/ip firewall connection print` walks the
+/// whole conntrack table: on a CCR1036 with ~69k connections a filtered
+/// print took 47-54 s (measured), so the 20 s default always cut it short.
+// ponytail: one known case; add others when measured.
+fn slow_command_secs(vendor: Vendor, cmd: &str) -> Option<u64> {
+    let low = cmd.to_ascii_lowercase();
+    let words: Vec<&str> = low.split(['/', ' ']).filter(|w| !w.is_empty()).collect();
+    let conntrack = words
+        .windows(3)
+        .any(|w| w == ["firewall", "connection", "print"]);
+    (vendor == Vendor::MikrotikRouterOs && conntrack).then_some(120)
+}
+
 pub fn prepare_network_command(
     vendor: Vendor,
     cmd: &str,
@@ -2476,7 +2490,10 @@ fn terminal_batch(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<St
 
     let mut sections = Vec::with_capacity(cmds.len());
     for (idx, (cmd, own_secs)) in items.iter().enumerate() {
-        let secs = own_secs.unwrap_or(per_cmd_secs).clamp(2, 300);
+        let explicit = own_secs.or(args["timeout_secs"].as_u64());
+        let secs = explicit
+            .unwrap_or_else(|| slow_command_secs(vendor, cmd).unwrap_or(per_cmd_secs))
+            .clamp(2, 300);
         if exec.cancel.is_cancelled() {
             sections.push(format!(
                 "### [{}/{}] {cmd}\n[cancelado]",
@@ -4958,6 +4975,24 @@ router bgp 65001
             assert!(out.contains("aguardando 1"), "{out}");
             assert!(out.contains("ok: /system identity print"), "{out}");
         });
+    }
+
+    #[test]
+    fn conntrack_print_gets_a_longer_default_deadline() {
+        let ros = Vendor::MikrotikRouterOs;
+        assert_eq!(
+            slow_command_secs(ros, "/ip firewall connection print where dst-port=5514"),
+            Some(120)
+        );
+        assert_eq!(
+            slow_command_secs(ros, "/ip/firewall/connection/print count-only"),
+            Some(120)
+        );
+        assert_eq!(slow_command_secs(ros, "/ip firewall filter print"), None);
+        assert_eq!(
+            slow_command_secs(Vendor::CiscoIos, "show ip firewall connection print"),
+            None
+        );
     }
 
     #[test]

@@ -2273,6 +2273,12 @@ CORPO-{name}
             "destaques: {:?}",
             likely_skills(&lib, SYSLOG_DUDE_PROMPT, &devices)
         );
+        let mut seen = std::collections::HashSet::new();
+        println!(
+            "net_connect: {:?}",
+            device_skills_note(&lib, "t (h, vendor=mikrotik_router_os, role=x)", &mut seen)
+                .map(|n| n.lines().take(3).collect::<Vec<_>>().join(" | "))
+        );
     }
 
     /// A named device brings its vendor; a client narrows same-named ones;

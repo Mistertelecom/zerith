@@ -1044,23 +1044,22 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
     vec![
         make_with(
             "net_inventory",
-            "Gerencia e consulta o inventário multi-cliente de hosts, VMs Linux, servidores Proxmox e equipamentos de rede \
-             (`.zerith/inventory.toml` e global) sem o usuário precisar editar arquivos manualmente. \
-             `action`: `list` (padrão, filtra por `client`, `site`, `vpn`, `tag`, `vendor`, `role`, `query`), \
-             `upsert` (cadastra/atualiza dispositivo com `client`, `site`, `vpn`, `host`, `user`, `vendor`, `role` e grava `password` \
-             automaticamente no Cofre do Sistema), `remove` (remove dispositivo), ou `save_vpn` (salva arquivo `.conf` do WireGuard \
-             para um cliente em `~/.zerith/vpn/<vpn>.conf`).",
+            "Inventário de equipamentos, servidores e VMs por cliente (`.zerith/inventory.toml` e o global). \
+             `action`: `list` (padrão; filtros `client`, `site`, `vpn`, `tag`, `vendor`, `role`, `query`), \
+             `upsert` (cadastra ou atualiza; `password` vai para o cofre de segredos), `remove`, \
+             `save_vpn` (grava o `.conf` WireGuard do cliente em `~/.zerith/vpn/<vpn>.conf`). \
+             Use antes de conectar, para achar host, usuário e VPN.",
             json!({"type": "object", "properties": {
                 "action": {"type": "string", "description": "list (padrão) | upsert | remove | save_vpn"},
                 "name": {"type": "string", "description": "nome do equipamento/VM (ex.: core-01, pve-01, olt-centro)"},
                 "client": {"type": "string", "description": "nome do cliente/empresa (ex.: TelecomSul, HospitalVida)"},
                 "site": {"type": "string", "description": "POP / Datacenter / Filial (ex.: DC-Curitiba, POP-Norte)"},
                 "vpn": {"type": "string", "description": "nome do túnel WireGuard associado ao cliente (ex.: wg-telecomsul)"},
-                "vpn_config": {"type": "string", "description": "conteúdo texto do .conf WireGuard ou caminho do arquivo para salvar automaticamente"},
+                "vpn_config": {"type": "string", "description": "texto do .conf WireGuard ou caminho do arquivo"},
                 "host": {"type": "string", "description": "IP/hostname ou porta serial"},
                 "port": {"type": "integer", "description": "porta SSH/Telnet (padrão 22 ou 23)"},
                 "user": {"type": "string"},
-                "password": {"type": "string", "description": "em upsert: grava automaticamente no Cofre do Sistema e vincula secret_ref"},
+                "password": {"type": "string", "description": "upsert: vai para o cofre de segredos e vira secret_ref"},
                 "secret_ref": {"type": "string"},
                 "transport": {"type": "string", "description": "ssh | telnet | serial"},
                 "serial_port": {"type": "string"},
@@ -1075,7 +1074,7 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
                 "tag": {"type": "string", "description": "filtro por tag em action=list"},
                 "query": {"type": "string", "description": "filtro livre em action=list"}
             }}),
-            "lista ou confirmação de cadastro automático multi-cliente com cofre e VPN",
+            "list: equipamentos encontrados; demais ações: confirmação",
             Permission::Read,
             10,
             true,
@@ -1091,16 +1090,16 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
         ),
         make_with(
             "net_vpn",
-            "Orquestra túneis WireGuard multi-cliente (`status`, `list`, `switch`, `up`, `down`). \
-             Em `switch` (ou `up`), garante exclusividade quando clientes usam as mesmas faixas de IP privado (`10.0.0.0/24`, `192.168.1.0/24`): \
-             desliga automaticamente o túnel WireGuard do cliente anterior, fecha terminais daquele túnel e liga a VPN do cliente solicitado.",
+            "Túneis WireGuard por cliente: `status` (padrão), `list`, `switch`, `up`, `down`. \
+             `switch`/`up` derruba o túnel do cliente anterior (faixas privadas podem colidir), fecha os terminais dele \
+             e sobe o do cliente pedido.",
             json!({"type": "object", "properties": {
                 "action": {"type": "string", "description": "status (padrão) | list | switch | up | down"},
                 "vpn": {"type": "string", "description": "nome do perfil WireGuard (ex.: wg-telecomsul)"},
-                "client": {"type": "string", "description": "nome do cliente (descobre o túnel vinculado no inventário automaticamente)"},
+                "client": {"type": "string", "description": "cliente (o túnel vem do inventário)"},
                 "vpn_config": {"type": "string", "description": "opcional: texto ou caminho do .conf para salvar antes de subir"}
             }}),
-            "status dos túneis WireGuard ativos, AllowedIPs e confirmação de chaveamento entre clientes",
+            "túneis ativos com AllowedIPs, ou confirmação da troca",
             Permission::Shell,
             45,
             false,
@@ -1113,18 +1112,17 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
         ),
         make_with(
             "net_connect",
-            "Abre uma sessão interativa de alta velocidade via SSH, Telnet nativo ou Porta Serial (Console COMx / /dev/ttyUSBx) \
-             em uma VM Linux, servidor Proxmox ou roteador/switch/firewall/OLT do inventário (`device`, com suporte a `client` para desambiguar nomes repetidos como `core-01`) \
-             ou por parâmetros (`host`/`serial_port`, `client`, `vpn`, `transport`, `user`, `vendor`). \
-             Se o equipamento/cliente tiver `vpn` WireGuard configurada, chaveia a VPN automaticamente antes de conectar. \
-             Com `remember: true` (padrão quando `client` é informado), salva o equipamento e a senha no cofre automaticamente após conectar.",
+            "Abre uma sessão interativa por SSH, Telnet ou serial (COMx, /dev/ttyUSBx) com um equipamento, servidor ou VM: \
+             pelo inventário (`device`, com `client` se o nome se repete) ou por `host`/`serial_port`, `transport`, `user`, `vendor`. \
+             Sobe antes a VPN WireGuard do cliente, se houver. Com `remember` (padrão quando há `client`), grava o equipamento \
+             no inventário e a senha no cofre. Depois use `terminal_batch` com o id devolvido.",
             json!({"type": "object", "properties": {
                 "device": {"type": "string", "description": "nome no inventory.toml (ex.: core-01 ou TelecomSul/core-01)"},
                 "client": {"type": "string", "description": "cliente/empresa dono do equipamento (ex.: TelecomSul)"},
                 "site": {"type": "string", "description": "POP / Datacenter / Filial opcional"},
-                "vpn": {"type": "string", "description": "túnel WireGuard do cliente (chaveado automaticamente antes de conectar)"},
-                "auto_vpn": {"type": "boolean", "description": "liga/troca automaticamente a VPN WireGuard do cliente se necessário, padrão true"},
-                "remember": {"type": "boolean", "description": "salva/atualiza automaticamente o equipamento no inventário e a senha no cofre ao conectar (padrão true quando client é informado)"},
+                "vpn": {"type": "string", "description": "túnel WireGuard do cliente (sobe antes de conectar)"},
+                "auto_vpn": {"type": "boolean", "description": "sobe ou troca a VPN WireGuard do cliente se preciso, padrão true"},
+                "remember": {"type": "boolean", "description": "grava o equipamento no inventário e a senha no cofre ao conectar (padrão true quando há client)"},
                 "transport": {"type": "string", "description": "ssh (padrão) | telnet | serial"},
                 "host": {"type": "string", "description": "IP/hostname (ou porta serial como COM3 / /dev/ttyUSB0)"},
                 "serial_port": {"type": "string", "description": "porta serial explícita (ex.: COM3, /dev/ttyUSB0, /dev/ttyS0)"},
@@ -1134,13 +1132,13 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
                 "vendor": {"type": "string", "description": "cisco_ios|cisco_nxos|cisco_xr|huawei_vrp|juniper_junos|mikrotik_router_os|fortinet_forti_os|linux|generic"},
                 "role": {"type": "string", "description": "core|border|distribution|access|firewall|lab|server"},
                 "secret_ref": {"type": "string", "description": "chave no cofre (zerith secret set <nome>)"},
-                "password": {"type": "string", "description": "senha direta (gravada automaticamente no cofre se remember=true)"},
+                "password": {"type": "string", "description": "senha direta (vai para o cofre se remember=true)"},
                 "jump_host": {"type": "string"},
                 "legacy_ssh": {"type": "boolean"},
                 "disable_paging": {"type": "boolean", "description": "padrão true"},
                 "timeout_secs": {"type": "integer", "description": "padrão 25"}
             }}),
-            "id do terminal (`term-N`), cliente, VPN, transporte, banner inicial e confirmação de paginação",
+            "id do terminal (`term-N`), cliente, VPN, transporte, banner e se a paginação foi desligada",
             Permission::Shell,
             130,
             false,
@@ -1149,10 +1147,9 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
         ),
         make_with(
             "terminal_batch",
-            "Executa uma sequência de comandos em um terminal aberto (`terminal_open` ou `net_connect`), \
-             separando a saída por comando com detecção automática de paginação e de erros de CLI. \
-             Comando contínuo (monitor, `print follow`, ping sem fim) ou que estoura o prazo é \
-             interrompido (q/Ctrl+C) e o lote segue para o próximo.",
+            "Roda uma lista de comandos num terminal aberto (`terminal_open` ou `net_connect`) e devolve a saída \
+             separada por comando, passando a paginação e marcando erros de CLI. Comando contínuo (monitor, \
+             `print follow`, ping sem fim) ou que estoura o prazo é interrompido (q/Ctrl+C) e o lote segue.",
             json!({"type": "object", "properties": {
                 "id": {"type": "string"},
                 // Só texto no schema: `anyOf` é recusado por parte dos provedores
@@ -1172,17 +1169,15 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
         ),
         make_with(
             "net_diff",
-            "Compara duas configurações de roteador/switch/firewall (`before` e `after`, como caminhos de arquivo \
-             ou texto inline) de forma hierárquica por bloco (`interface`, `router bgp`, `ip vrf`, `route-policy`, etc.), \
-             ignorando ruído volátil (timestamps, `ntp clock-period`) e gerando automaticamente o bloco de Rollback \
-             (`no ...` para Cisco / `undo ...` para Huawei VRP). Por padrão mostra 100% da configuração real sem mascarar \
-             nada (`sanitize_secrets: false`); ative `sanitize_secrets: true` apenas quando quiser ocultar senhas/chaves \
-             para relatórios externos.",
+            "Compara duas configurações de equipamento (`before` e `after`: caminho ou texto) por bloco \
+             (`interface`, `router bgp`, `route-policy`...), ignora ruído (timestamps, `ntp clock-period`) \
+             e monta o rollback (`no ...` Cisco, `undo ...` Huawei). Segredos aparecem como estão; \
+             `sanitize_secrets: true` os mascara para relatório externo.",
             json!({"type": "object", "properties": {
                 "before": {"type": "string", "description": "caminho do arquivo ou texto da configuração anterior"},
                 "after": {"type": "string", "description": "caminho do arquivo ou texto da configuração nova"},
                 "vendor": {"type": "string", "description": "cisco_ios|cisco_nxos|cisco_xr|huawei_vrp|juniper_junos|mikrotik_router_os|fortinet_forti_os|generic (auto-detectado se omitido)"},
-                "sanitize_secrets": {"type": "boolean", "description": "padrão false (visibilidade total para consultoria); true mascara segredos para relatório externo"}
+                "sanitize_secrets": {"type": "boolean", "description": "padrão false; true mascara senhas e chaves"}
             }, "required": ["before", "after"]}),
             "diff hierárquico por bloco e script de rollback pronto para colar",
             Permission::Read,
@@ -1193,11 +1188,10 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
         ),
         make_with(
             "net_probe",
-            "Sonda conectividade TCP concorrente, resolução DNS, RTT em ms e banner inicial de gerência/roteamento \
-             (SSH 22, Telnet 23, BGP 179, NETCONF 830, Proxmox VE 8006, Winbox 8291, MikroTik API 8728/8729, HTTP/HTTPS 80/443/8443) \
-             para um ou mais hosts (`host`, `hosts` ou `subnet` como `10.0.0.1-20` / `10.0.0.0/28`). \
-             Com `auto_register_client`, identifica automaticamente o tipo de cada equipamento descoberto pelo banner/porta \
-             (Proxmox VE, MikroTik, Huawei, Cisco, FortiGate, VM Linux) e já o cadastra no inventário do cliente!",
+            "Testa portas TCP de gerência em paralelo (SSH 22, Telnet 23, BGP 179, NETCONF 830, Proxmox 8006, \
+             Winbox 8291, API MikroTik 8728/8729, HTTP/HTTPS 80/443/8443) em `host`, `hosts` ou `subnet` \
+             (`10.0.0.1-20`, `10.0.0.0/28`), com DNS, RTT e banner. Use para descobrir o que responde numa rede. \
+             Com `auto_register_client`, deduz o tipo pelo banner/porta e cadastra os hosts no inventário do cliente.",
             json!({"type": "object", "properties": {
                 "host": {"type": "string", "description": "hostname ou IP único"},
                 "hosts": {"type": "array", "items": {"type": "string"}, "description": "lista de hostnames ou IPs"},
@@ -1205,12 +1199,12 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
                 "ports": {"type": "array", "items": {"type": "integer"}, "description": "padrão [22, 23, 80, 179, 443, 830, 8006, 8291, 8443, 8728, 8729]"},
                 "timeout_ms": {"type": "integer", "description": "timeout TCP por porta em ms, padrão 1200"},
                 "grab_banner": {"type": "boolean", "description": "lê banner inicial (ex.: SSH-2.0-...), padrão true"},
-                "auto_register_client": {"type": "string", "description": "se informado, cadastra automaticamente os hosts ativos encontrados neste cliente no inventory.toml"},
-                "site": {"type": "string", "description": "site opcional para o cadastro automático"},
+                "auto_register_client": {"type": "string", "description": "cadastra os hosts que responderem neste cliente do inventário"},
+                "site": {"type": "string", "description": "site para o cadastro"},
                 "vpn": {"type": "string", "description": "túnel WireGuard opcional para vincular aos hosts descobertos"},
                 "user": {"type": "string", "description": "usuário padrão opcional para os hosts descobertos (ex.: admin ou root)"}
             }}),
-            "tabela markdown com DNS, status da porta, RTT em ms, banner e resumo de auto-cadastro",
+            "tabela com DNS, estado de cada porta, RTT em ms, banner e o que foi cadastrado",
             Permission::Network,
             60,
             true,
@@ -1224,8 +1218,8 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
         ),
         make_with(
             "net_broadcast",
-            "Executa um comando simultaneamente em paralelo em múltiplos terminais abertos (`ids`, ou todos os terminais abertos \
-             de um `client` ou `vendor`, ou todos os terminais ativos se omitido), devolvendo a comparação lado a lado com o tempo de resposta de cada equipamento/VM.",
+            "Roda um comando em paralelo em vários terminais abertos (`ids`; ou os de um `client` ou `vendor`; \
+             sem filtro, todos) e devolve a saída de cada um lado a lado, com o tempo de resposta.",
             json!({"type": "object", "properties": {
                 "command": {"type": "string", "description": "comando a executar em paralelo em todos os terminais selecionados"},
                 "ids": {"type": "array", "items": {"type": "string"}, "description": "lista opcional de IDs (ex.: [\"term-1\", \"term-2\"]); se omitido, usa todos os terminais ativos ou filtrados por client/vendor"},
@@ -1234,7 +1228,7 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
                 "auto_page": {"type": "boolean", "description": "padrão true"},
                 "timeout_secs": {"type": "integer", "description": "timeout por host em segundos, padrão 20"}
             }, "required": ["command"]}),
-            "saída consolidada em paralelo de todos os hosts com tempo em ms",
+            "saída de cada terminal com o tempo em ms",
             Permission::Shell,
             300,
             false,
@@ -1246,9 +1240,9 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
         ),
         make_with(
             "net_backup",
-            "Coleta o backup completo da configuração (`running-config`, `current-configuration`, `/export`, etc.) \
-             de um ou mais terminais abertos (`id`, `ids` ou `client`), salva em `backups/<cliente>/<equipamento>/latest.cfg` \
-             (mantendo histórico timestamped) e executa automaticamente o `net_diff` contra o último backup salvo.",
+            "Baixa a configuração (`running-config`, `current-configuration`, `/export`...) de terminais abertos \
+             (`id`, `ids` ou `client`), grava em `backups/<cliente>/<equipamento>/latest.cfg` com histórico por data \
+             e compara com o backup anterior (como `net_diff`).",
             json!({"type": "object", "properties": {
                 "id": {"type": "string", "description": "ID de um terminal aberto (ex.: term-1)"},
                 "ids": {"type": "array", "items": {"type": "string"}, "description": "lista de terminais abertos para fazer backup em lote"},
@@ -1256,7 +1250,7 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
                 "command": {"type": "string", "description": "comando customizado opcional (auto-detectado pelo vendor se omitido)"},
                 "timeout_secs": {"type": "integer", "description": "padrão 45"}
             }}),
-            "caminhos dos arquivos de backup salvos e diff hierárquico contra o backup anterior",
+            "caminhos dos backups gravados e o diff contra o anterior",
             Permission::Shell,
             300,
             false,
@@ -1270,10 +1264,11 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
         ),
         make_with(
             "serial_ports",
-            "Descobre e lista todas as portas seriais / cabos Console USB-Serial (`COM1..COM99` no Windows com nome do adaptador FTDI/CH340/PL2303, \
-             `/dev/ttyUSB*`, `/dev/ttyACM*`, `/dev/ttyS*`, `/dev/cu.*` no Linux/macOS) conectados ao computador.",
+            "Lista as portas seriais e cabos console USB-serial do computador (`COMn` no Windows com o adaptador \
+             FTDI/CH340/PL2303; `/dev/ttyUSB*`, `/dev/ttyACM*`, `/dev/ttyS*`, `/dev/cu.*` no Linux/macOS). \
+             Use antes de `net_connect` com `transport: serial`.",
             json!({"type": "object", "properties": {}}),
-            "lista de portas seriais disponíveis para uso imediato no net_connect",
+            "uma porta serial por linha",
             Permission::Read,
             10,
             true,
@@ -1282,9 +1277,9 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
         ),
         make_with(
             "net_transfer",
-            "Transfere arquivos, backups, capturas `.pcap`, logs ou firmwares (`direction: \"upload\" | \"download\"`) \
-             via SCP/SFTP entre o computador local (`local_path`) e uma VM Linux, servidor Proxmox ou roteador (`remote_path`), \
-             usando o cadastro do inventário (`device`, `client`) ou `host`/`user`/`port` e chaveando a VPN WireGuard automaticamente.",
+            "Copia arquivos por SCP/SFTP entre o computador (`local_path`) e um equipamento, servidor ou VM \
+             (`remote_path`), em `direction` `upload` ou `download`: backups, `.pcap`, logs, firmware. \
+             Acha o destino pelo inventário (`device`, `client`) ou por `host`/`user`/`port` e sobe a VPN do cliente antes.",
             json!({"type": "object", "properties": {
                 "direction": {"type": "string", "description": "upload | download"},
                 "device": {"type": "string", "description": "nome no inventory.toml (ex.: pve-01 ou TelecomSul/pve-01)"},
@@ -1296,7 +1291,7 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
                 "remote_path": {"type": "string", "description": "caminho do arquivo/pasta no servidor/roteador remoto"},
                 "auto_vpn": {"type": "boolean", "description": "padrão true"}
             }, "required": ["direction", "local_path", "remote_path"]}),
-            "confirmação da transferência com tamanho em bytes e tempo decorrido",
+            "tamanho em bytes e tempo da cópia",
             Permission::Shell,
             300,
             false,
@@ -1310,9 +1305,9 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
         ),
         make_with(
             "net_path",
-            "Diagnostica qualidade de enlace, latência, perda de pacotes, Jitter (min/avg/max ms), \
-             Descoberta Automática de Path MTU sem fragmentação (`1500` Ethernet, `1492` PPPoE, `1472` VLAN, `1420` WireGuard, `1400` IPsec, `1360` GRE/MPLS) \
-             e Traceroute até um host ou equipamento (`host` ou `device` + `client`).",
+            "Mede o caminho até `host` (ou `device` + `client`): perda, latência e jitter (min/avg/max ms), \
+             maior MTU sem fragmentar (referências: 1500 Ethernet, 1492 PPPoE, 1420 WireGuard, 1400 IPsec) \
+             e, com `traceroute`, os saltos. Use para enlace lento, perda ou suspeita de MTU.",
             json!({"type": "object", "properties": {
                 "host": {"type": "string", "description": "IP ou hostname de destino"},
                 "device": {"type": "string", "description": "opcional: nome do dispositivo no inventory.toml"},
@@ -1322,7 +1317,7 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
                 "traceroute": {"type": "boolean", "description": "executa traceroute/tracert, padrão false"},
                 "port": {"type": "integer", "description": "porta TCP fallback para medir RTT/jitter se ICMP for bloqueado, padrão 22"}
             }}),
-            "relatório completo de perda, jitter, Path MTU máximo sem fragmentação e saltos",
+            "perda, latência, jitter, MTU máximo e saltos",
             Permission::Network,
             60,
             true,
@@ -3982,6 +3977,26 @@ fn net_path(args: &Value, ctx: &CallCtx<'_>, _exec: &Exec<'_>) -> Result<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Descrição diz o que faz, quando usar e o que devolve; propaganda só
+    /// gasta schema em toda requisição.
+    #[test]
+    fn network_descriptions_carry_no_marketing() {
+        for t in all() {
+            let s = t.spec();
+            let text = format!("{} {} {}", s.description, s.returns, s.parameters).to_lowercase();
+            for word in [
+                "alta velocidade",
+                "poderos",
+                "100%",
+                "automaticamente",
+                "!\"",
+            ] {
+                assert!(!text.contains(word), "{}: {word}", s.name);
+            }
+            assert!(s.description.chars().count() < 600, "{}", s.name);
+        }
+    }
 
     #[test]
     fn inventory_parses_and_merges_workspace_over_global() {

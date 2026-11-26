@@ -9,6 +9,8 @@ import { createRoot } from "react-dom/client";
 import { emit } from "@tauri-apps/api/event";
 import { installMock } from "./mock";
 import App from "../App";
+import "@fontsource-variable/inter";
+import "@fontsource-variable/jetbrains-mono";
 import "../styles/index.css";
 
 const q = new URLSearchParams(location.search);

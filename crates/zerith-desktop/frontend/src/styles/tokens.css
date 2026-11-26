@@ -59,6 +59,32 @@
   --code-bg: #0a0a0a;
   --code-banner: #111111;
 
+  /* chat (transcrição): paleta própria, só dentro da conversa; a moldura
+     continua monocromática (DESIGN.md, exceção do chat). Todo texto daqui
+     mede >= 4.5:1 sobre --bg-base, --code-bg e --layer-2 (balão). */
+  --chat-accent: #fab283;
+  --chat-link: #9dbefe;
+  --chat-heading: #b79cf2;
+  --chat-code: #7fd88f;
+  --chat-code-bg: rgba(255, 255, 255, 0.08);
+  --chat-quote: #fab283;
+  --chat-marker: #fab283;
+  /* realce de sintaxe */
+  --syn-kw: #c4a2ff;
+  --syn-str: #7fd88f;
+  --syn-num: #f5a742;
+  --syn-cmt: #8f8f8f;
+  --syn-type: #79c0ff;
+  --syn-fn: #d2a8ff;
+  --syn-key: #93c5fd;
+  --syn-ip: #7dd3fc;
+  --syn-net: #f1c06a;
+  /* diff */
+  --diff-add: #7fd88f;
+  --diff-add-bg: rgba(127, 216, 143, 0.12);
+  --diff-del: #ff8a8a;
+  --diff-del-bg: rgba(255, 107, 107, 0.13);
+
   /* shadows */
   --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.6);
   --shadow-2: 0 0 0 1px rgba(255, 255, 255, 0.04), 0 8px 24px rgba(0, 0, 0, 0.6);
@@ -145,6 +171,27 @@
 
   --code-bg: #fafafa;
   --code-banner: #f3f3f3;
+
+  --chat-accent: #a84c0c;
+  --chat-link: #1d5fc9;
+  --chat-heading: #6a3fc4;
+  --chat-code: #17703d;
+  --chat-code-bg: rgba(0, 0, 0, 0.06);
+  --chat-quote: #a84c0c;
+  --chat-marker: #a84c0c;
+  --syn-kw: #7a3ad6;
+  --syn-str: #17703d;
+  --syn-num: #9a5600;
+  --syn-cmt: #5c5c5c;
+  --syn-type: #0550ae;
+  --syn-fn: #6639ba;
+  --syn-key: #0a58ca;
+  --syn-ip: #0369a1;
+  --syn-net: #9a5b00;
+  --diff-add: #12733a;
+  --diff-add-bg: rgba(31, 157, 74, 0.12);
+  --diff-del: #c4202b;
+  --diff-del-bg: rgba(217, 45, 56, 0.1);
 
   --shadow-1: 0 1px 2px rgba(15, 23, 42, 0.06);
   --shadow-2: 0 1px 2px rgba(15, 23, 42, 0.05), 0 4px 14px rgba(15, 23, 42, 0.07);

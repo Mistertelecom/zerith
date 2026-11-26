@@ -9,6 +9,13 @@ composer flutuante).
 Acento monocromático (branco no dark, preto no light). Cor só para estado (ok/warn/danger). Logo:
 `icons/logo-white.svg` / `logo-black.svg`, componente `<ZerithMark>`.
 
+**Exceção: o chat (pedido do usuário, 2026-11).** A transcrição da conversa tem paleta própria,
+no estilo opencode: `--chat-*` (acento pêssego, link azul, título violeta, código verde, citação e
+marcadores), `--syn-*` (realce de sintaxe) e `--diff-*` (diff). Valem só dentro da transcrição
+(markdown, balão do usuário, raciocínio, ferramentas, diff). A moldura (sidebar, topo, composer,
+ajustes, painel) continua monocromática. Todo texto dessas paletas mede ≥ 4.5:1 sobre `--bg-base`,
+`--code-bg` e `--layer-2`, nos dois temas.
+
 Todo componente obedece a este arquivo. Conflito com ele = não faça.
 
 ## Regras duras
@@ -40,6 +47,8 @@ Todo componente obedece a este arquivo. Conflito com ele = não faça.
 | Hairlines | `--line` (padrão) `--line-strong` (foco, cartão aberto) `--line-faint` |
 | Texto | `--label-primary` `--label-secondary` `--label-tertiary` `--label-caption` |
 | Acento (monocromático) | `--accent` `--accent-text` `--accent-soft` `--ring` `--on-accent` |
+| Chat (só na transcrição) | `--chat-accent` `--chat-link` `--chat-heading` `--chat-code` `--chat-code-bg` `--chat-quote` `--chat-marker` |
+| Sintaxe / diff (só na transcrição) | `--syn-kw/str/num/cmt/type/fn/key/ip/net` · `--diff-add` `--diff-add-bg` `--diff-del` `--diff-del-bg` |
 | Estado | `--ok` `--warn` `--danger` `--done` + `*-soft` (fundo) + `*-text` |
 | Sombra | `--shadow-1` (encostado) `--shadow-2` (cartão) `--shadow-3` (popover/diálogo) `--shadow-composer` `--glow-accent` |
 | Raio | `--r-xs 6` `--r-sm 8` `--r-md 12` `--r-lg 16` `--r-xl 22` `--r-full` |

@@ -358,24 +358,18 @@
   tab-size: 4;
 }
 
-/* syntax highlighting tokens (>= 4.5:1 on --code-bg in dark and light) */
-.hl-kw { color: var(--done); font-weight: 560; }
-.hl-str { color: var(--ok-text); }
-.hl-num { color: var(--warn-text); }
-.hl-cmt { color: var(--label-tertiary); font-style: italic; }
-.hl-type { color: #79c0ff; }
-.hl-fn { color: #d2a8ff; }
-.hl-key { color: #93c5fd; }
-.hl-ip { color: #7dd3fc; font-weight: 560; }
-.hl-net { color: #f1c06a; }
-.hl-ok { color: var(--ok-text); font-weight: 560; }
-.hl-danger { color: var(--danger-text); font-weight: 560; }
-
-:root[data-theme="light"] .hl-type { color: #0550ae; }
-:root[data-theme="light"] .hl-fn { color: #6639ba; }
-:root[data-theme="light"] .hl-key { color: #0a58ca; }
-:root[data-theme="light"] .hl-ip { color: #0369a1; }
-:root[data-theme="light"] .hl-net { color: #9a5b00; }
+/* syntax highlighting: paleta --syn-* do chat (>= 4.5:1 sobre --code-bg nos dois temas) */
+.hl-kw { color: var(--syn-kw); font-weight: 560; }
+.hl-str { color: var(--syn-str); }
+.hl-num { color: var(--syn-num); }
+.hl-cmt { color: var(--syn-cmt); font-style: italic; }
+.hl-type { color: var(--syn-type); }
+.hl-fn { color: var(--syn-fn); }
+.hl-key { color: var(--syn-key); }
+.hl-ip { color: var(--syn-ip); font-weight: 560; }
+.hl-net { color: var(--syn-net); }
+.hl-ok { color: var(--diff-add); font-weight: 560; }
+.hl-danger { color: var(--diff-del); font-weight: 560; }
 
 /* ---- reasoning -------------------------------------------------------- */
 

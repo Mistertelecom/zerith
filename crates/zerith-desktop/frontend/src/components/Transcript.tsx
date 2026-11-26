@@ -29,7 +29,7 @@ import {
 import type { Block, ToolRow } from "../lib/turn";
 import { ZerithMark } from "./ui";
 import { FileLangBadge } from "./FileLangIcon";
-import { TurnChanges } from "./Changes";
+import { DiffLines, TurnChanges, rows as diffRows, type Row as DiffRow } from "./Changes";
 export { FileLangBadge };
 import { highlightCode } from "./highlight";
 import {
@@ -960,6 +960,153 @@ function Markdown({ text, streaming, className }: { text: string; streaming: boo
 
 const STATE_LABEL = { run: "executando", ok: "concluída", fail: "falhou" } as const;
 
+const isShellTool = (name: string) => /^(shell|bash|exec|powershell|terminal_|net_)/.test(name);
+const EDIT_TOOLS = new Set(["edit_file", "write_file", "multi_edit", "apply_patch"]);
+const READ_TOOLS = new Set(["read_file", "grep", "glob"]);
+// ponytail: teto de linhas do diff montado dos argumentos; um write_file enorme
+// mostra só o começo (a caixa já rola). Subir se fizer falta.
+const MAX_DIFF_ROWS = 400;
+
+/** O comando de uma chamada de shell/terminal: `command`, `input` ou a lista do lote. */
+function commandOf(a: Record<string, unknown> | null): string | null {
+  if (!a) return null;
+  for (const k of ["command", "cmd", "input"]) {
+    const v = a[k];
+    if (typeof v === "string" && v.trim()) return v.replace(/\n+$/, "");
+  }
+  if (Array.isArray(a.commands)) {
+    const list = a.commands
+      .map((c: unknown) =>
+        typeof c === "string"
+          ? c
+          : c && typeof c === "object" && typeof (c as { cmd?: unknown }).cmd === "string"
+            ? (c as { cmd: string }).cmd
+            : "",
+      )
+      .filter(Boolean);
+    if (list.length) return list.join("\n");
+  }
+  return null;
+}
+
+const textLines = (s: string) => s.replace(/\n$/, "").split("\n");
+
+/** Diff de uma ferramenta de edição: o unificado da prévia quando vier, senão
+ * montado dos argumentos (old_string/new_string, edits, content, patch). */
+function editDiff(
+  name: string,
+  a: Record<string, unknown> | null,
+  preview?: string,
+): { list: DiffRow[]; numbers: boolean } | null {
+  if (preview && /^@@ -\d+/m.test(preview)) return { list: diffRows(preview), numbers: true };
+  if (!a) return null;
+  const out: DiffRow[] = [];
+  const pair = (oldS: unknown, newS: unknown) => {
+    if (typeof oldS === "string" && oldS) for (const t of textLines(oldS)) out.push({ kind: "del", text: t });
+    if (typeof newS === "string" && newS) for (const t of textLines(newS)) out.push({ kind: "add", text: t });
+  };
+  if (name === "edit_file") pair(a.old_string, a.new_string);
+  else if (name === "multi_edit" && Array.isArray(a.edits)) {
+    const edits = a.edits as unknown[];
+    edits.forEach((e, i) => {
+      if (!e || typeof e !== "object") return;
+      const ed = e as Record<string, unknown>;
+      if (edits.length > 1) out.push({ kind: "hunk", text: `edição ${i + 1}` });
+      pair(ed.old_string, ed.new_string);
+    });
+  } else if (name === "write_file") pair("", a.content);
+  else if (name === "apply_patch" && typeof a.patch === "string") {
+    for (const t of textLines(a.patch)) {
+      if (/^\*\*\* (Begin|End) Patch/.test(t)) continue;
+      if (t.startsWith("***") || t.startsWith("@@")) out.push({ kind: "hunk", text: t.replace(/^\*\*\* /, "") });
+      else if (t[0] === "+") out.push({ kind: "add", text: t.slice(1) });
+      else if (t[0] === "-") out.push({ kind: "del", text: t.slice(1) });
+      else out.push({ kind: "ctx", text: t.slice(1) });
+    }
+  }
+  return out.length ? { list: out.slice(0, MAX_DIFF_ROWS), numbers: false } : null;
+}
+
+/** Saída mono rolável (240px). A primeira linha `exit N` do shell vira etiqueta. */
+function ToolOutput({ text, lang, exitTag }: { text: string; lang: string; exitTag: boolean }) {
+  const m = exitTag ? /^exit (\S+)\r?\n?/.exec(text) : null;
+  const rest = m ? text.slice(m[0].length) : text;
+  return (
+    <div className="tool-out-wrap">
+      {m ? <span className={"tool-exit " + (m[1] === "0" ? "ok" : "fail")}>exit {m[1]}</span> : null}
+      {rest.trim() ? (
+        <pre className="tool-out">
+          <HighlightedCode lang={lang} text={rest} />
+        </pre>
+      ) : null}
+    </div>
+  );
+}
+
+/** Corpo aberto de uma ferramenta, conforme o tipo: comando + saída, diff,
+ * arquivo realçado pela extensão ou JSON. */
+function ToolBody(props: {
+  row: ToolRow;
+  argsObj: Record<string, unknown> | null;
+  parsed: unknown;
+  path: string | null;
+  out: string | undefined;
+}) {
+  const { row, argsObj, out } = props;
+  if (isShellTool(row.name)) {
+    const cmd = commandOf(argsObj);
+    const lang = /^(net_|terminal_)/.test(row.name) ? "net" : "sh";
+    return (
+      <div className="tool-detail">
+        {cmd ? (
+          <div className="tool-cmd">
+            <span className="tool-prompt" aria-hidden>
+              $
+            </span>
+            <code>
+              <HighlightedCode lang={lang} text={cmd} />
+            </code>
+          </div>
+        ) : null}
+        {out ? <ToolOutput text={out} lang={lang === "net" ? "net" : ""} exitTag /> : null}
+      </div>
+    );
+  }
+  if (EDIT_TOOLS.has(row.name)) {
+    const diff = editDiff(row.name, argsObj, row.preview);
+    return (
+      <div className="tool-detail">
+        {diff ? (
+          <div className="tool-diff">
+            <DiffLines list={diff.list} numbers={diff.numbers} />
+          </div>
+        ) : null}
+        {out && !diff?.numbers ? <ToolOutput text={out} lang="" exitTag={false} /> : null}
+      </div>
+    );
+  }
+  if (READ_TOOLS.has(row.name)) {
+    const base = props.path?.split(/[\\/]/).pop() ?? "";
+    const ext = base.includes(".") ? (base.split(".").pop() ?? "") : "";
+    return <div className="tool-detail">{out ? <ToolOutput text={out} lang={ext} exitTag={false} /> : null}</div>;
+  }
+  const hasArgs =
+    props.parsed !== null && typeof props.parsed === "object" && Object.keys(props.parsed).length > 0;
+  const outJson = out ? /^\s*[[{]/.test(out) && parseArgs(out) !== null : false;
+  return (
+    <div className="tool-detail">
+      {hasArgs ? (
+        <pre className="tool-out tool-args">
+          <HighlightedCode lang="json" text={JSON.stringify(props.parsed, null, 2)} />
+        </pre>
+      ) : !out && row.args ? (
+        <pre className="tool-out tool-args">{row.args}</pre>
+      ) : null}
+      {out ? <ToolOutput text={out} lang={outJson ? "json" : ""} exitTag={false} /> : null}
+    </div>
+  );
+}
+
 const FILE_TOOLS = new Set([
   "read_file",
   "edit_file",
@@ -1116,7 +1263,9 @@ function ToolLine({ row, sessionId }: { row: ToolRow; sessionId?: string | null 
       ) : null}
       </div>
       {liveTail && !open ? <pre className="tool-body live">{liveTail}</pre> : null}
-      {open && body ? <pre className="tool-body">{body}</pre> : null}
+      {open && body ? (
+        <ToolBody row={row} argsObj={argsObj} parsed={parsed} path={rawPath} out={row.preview ?? row.progress} />
+      ) : null}
     </div>
   );
 }

@@ -11,10 +11,10 @@ import { FileLangBadge } from "./Transcript";
 const cache = new Map<string, Promise<FileChange[]>>();
 const undone = new Map<string, string>();
 
-type Row = { kind: "hunk" | "add" | "del" | "ctx"; text: string; old?: number; now?: number };
+export type Row = { kind: "hunk" | "add" | "del" | "ctx"; text: string; old?: number; now?: number };
 
 /** Unified hunks into rows with old/new line numbers. */
-function rows(diff: string): Row[] {
+export function rows(diff: string): Row[] {
   const out: Row[] = [];
   let o = 0;
   let n = 0;
@@ -115,17 +115,25 @@ function Diff({ file, mode }: { file: FileChange; mode: DiffMode }) {
           )}
         </div>
       ) : (
-        <div className="diff-lines">
-          {list.map((r, i) => (
-            <div key={i} className={"diff-line " + r.kind}>
-              <span className="diff-ln">{r.old ?? ""}</span>
-              <span className="diff-ln">{r.now ?? ""}</span>
-              <span className="diff-sign">{r.kind === "add" ? "+" : r.kind === "del" ? "-" : ""}</span>
-              <span className="diff-text">{r.text}</span>
-            </div>
-          ))}
-        </div>
+        <DiffLines list={list} />
       )}
+    </div>
+  );
+}
+
+/** Diff unificado colorido; `numbers` falso esconde as colunas de linha
+ * (diff montado dos argumentos de uma ferramenta, sem números reais). */
+export function DiffLines({ list, numbers = true }: { list: Row[]; numbers?: boolean }) {
+  return (
+    <div className="diff-lines">
+      {list.map((r, i) => (
+        <div key={i} className={"diff-line " + r.kind}>
+          {numbers ? <span className="diff-ln">{r.old ?? ""}</span> : null}
+          {numbers ? <span className="diff-ln">{r.now ?? ""}</span> : null}
+          <span className="diff-sign">{r.kind === "add" ? "+" : r.kind === "del" ? "-" : ""}</span>
+          <span className="diff-text">{r.text}</span>
+        </div>
+      ))}
     </div>
   );
 }

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Check, CircleAlert, HelpCircle, ShieldAlert, ShieldCheck } from "lucide-react";
 import type { Question } from "../lib/api";
-import { toolIcon } from "./Transcript";
+import { HighlightedCode, toolIcon } from "./Transcript";
 
 export function ApprovalCard(props: {
   tool: string;
@@ -47,7 +47,14 @@ export function ApprovalCard(props: {
           {props.tool}
         </span>
       </div>
-      <pre className="ask-body">{props.summary}</pre>
+      {/* O pedido mostra o texto exato (nada de markdown, que esconderia `*` ou
+          um link); só ganha cor quando é comando de shell/terminal. */}
+      <pre className="ask-body">
+        <HighlightedCode
+          lang={/bash|shell|exec|command|terminal|powershell|net_/i.test(props.tool) ? "sh" : ""}
+          text={props.summary}
+        />
+      </pre>
       {props.always ? (
         <p className="ask-rule">
           "Sempre neste projeto" grava a regra <code>{props.always}</code> nas suas permissões deste projeto.

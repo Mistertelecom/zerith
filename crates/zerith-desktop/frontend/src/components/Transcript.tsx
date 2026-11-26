@@ -347,17 +347,19 @@ function SubagentCard({ block }: { block: Extract<Block, { kind: "subagent" }> }
             <>
               <ul className="subagent-steps">
                 {block.steps.map((s, idx) => (
-                  <li key={idx}>{s}</li>
+                  <li key={idx}>
+                    <Markdown text={s} streaming={false} />
+                  </li>
                 ))}
               </ul>
               {block.summary &&
               block.summary.trim() !==
                 block.steps[block.steps.length - 1]?.trim() ? (
-                <p className="subagent-summary">{block.summary}</p>
+                <Markdown className="subagent-summary" text={block.summary} streaming={false} />
               ) : null}
             </>
           ) : (
-            <p className="subagent-summary">{block.summary}</p>
+            <Markdown className="subagent-summary" text={block.summary ?? ""} streaming={false} />
           )}
         </div>
       ) : null}
@@ -576,7 +578,7 @@ function inlines(nodes: Inline[]): ReactNode[] {
   });
 }
 
-const HighlightedCode = memo(function HighlightedCode({
+export const HighlightedCode = memo(function HighlightedCode({
   lang,
   text,
 }: {
@@ -939,7 +941,7 @@ const StableMarkdown = memo(function StableMarkdown({ text }: { text: string }) 
   return <>{blocks(tree)}</>;
 });
 
-function Markdown({ text, streaming }: { text: string; streaming: boolean }) {
+function Markdown({ text, streaming, className }: { text: string; streaming: boolean; className?: string }) {
   const { stable, tail } = useMemo(
     () => (streaming ? splitStableMarkdown(text) : { stable: text, tail: "" }),
     [text, streaming],
@@ -949,7 +951,7 @@ function Markdown({ text, streaming }: { text: string; streaming: boolean }) {
     [tail],
   );
   return (
-    <div className={"md" + (streaming ? " streaming" : "")}>
+    <div className={"md" + (streaming ? " streaming" : "") + (className ? " " + className : "")}>
       {stable ? <StableMarkdown text={stable} /> : null}
       {tailTree.length ? blocks(tailTree) : null}
     </div>
@@ -1142,7 +1144,11 @@ const AssistantBlock = memo(function AssistantBlock(props: {
               <span className="think-label">{thinking ? "Pensando…" : "Raciocínio"}</span>
               <ChevronRight size={14} strokeWidth={2} className="chev" />
             </button>
-            {showReasoning ? <div className="think-body">{b.reasoning}</div> : null}
+            {showReasoning ? (
+              <div className="think-body">
+                <Markdown text={b.reasoning} streaming={b.streaming && !b.text} />
+              </div>
+            ) : null}
           </div>
         ) : null}
         {b.tools.length > 0 ? (
@@ -1210,6 +1216,11 @@ const UserRow = memo(function UserRow(props: {
   // Attached images arrive as `![nome](<path>)` lines (Composer).
   const imgs = useMemo(() => [...b.text.matchAll(USER_IMG)], [b.text]);
   const text = imgs.length ? b.text.replace(USER_IMG, "").trim() : b.text;
+  // Mensagem longa (mais de 12 linhas) começa dobrada em 8, com "Mostrar tudo".
+  const long = useMemo(() => text.split("\n").length > 12, [text]);
+  const [expanded, setExpanded] = useState(false);
+  const bodyId = useId();
+  const folded = long && !expanded;
   return (
     <div className="msg-user-row">
       <div className="msg-user">
@@ -1220,7 +1231,23 @@ const UserRow = memo(function UserRow(props: {
             ))}
           </div>
         ) : null}
-        {text}
+        {text ? (
+          <div id={bodyId} className={"msg-user-text" + (folded ? " folded" : "")}>
+            <Markdown text={text} streaming={false} />
+          </div>
+        ) : null}
+        {long ? (
+          <button
+            type="button"
+            className="msg-user-more"
+            aria-expanded={expanded}
+            aria-controls={bodyId}
+            onClick={() => setExpanded((v) => !v)}
+          >
+            <ChevronRight size={14} strokeWidth={2} className="chev" />
+            {expanded ? "Mostrar menos" : "Mostrar tudo"}
+          </button>
+        ) : null}
       </div>
       {onEdit && b.id != null ? (
         <div className="msg-actions">
@@ -1336,7 +1363,7 @@ export function Transcript(props: {
               return (
                 <div key={`n-${nOrd++}`} className="msg-note">
                   <Info size={14} strokeWidth={2} />
-                  <span>{b.text}</span>
+                  <Markdown text={b.text} streaming={false} />
                 </div>
               );
             }

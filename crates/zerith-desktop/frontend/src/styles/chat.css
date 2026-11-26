@@ -51,15 +51,46 @@
 
 .msg-user {
   align-self: flex-end;
-  max-width: 76%;
+  max-width: min(82%, 64ch);
   padding: 10px 14px;
   border-radius: var(--r-lg) var(--r-lg) var(--r-xs) var(--r-lg);
   background: var(--layer-2);
   color: var(--label-primary);
   font-size: var(--fs-body);
   line-height: 1.6;
-  white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+.msg-user .md {
+  line-height: 1.6;
+}
+/* Mensagem longa dobrada: 8 linhas (1.6 x 14px) e um gradiente para o balão. */
+.msg-user-text.folded {
+  max-height: calc(8 * 1.6em);
+  overflow: hidden;
+  -webkit-mask-image: linear-gradient(to bottom, var(--label-primary) 55%, transparent);
+  mask-image: linear-gradient(to bottom, var(--label-primary) 55%, transparent);
+}
+.msg-user-more {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 26px;
+  margin: 4px 0 -4px -6px;
+  padding: 0 8px 0 4px;
+  border-radius: var(--r-xs);
+  color: var(--chat-accent);
+  font-size: var(--fs-small);
+  font-weight: 550;
+  transition: background var(--t-base) var(--ease);
+}
+.msg-user-more:hover {
+  background: var(--hover);
+}
+.msg-user-more[aria-expanded="true"] .chev {
+  transform: rotate(90deg);
+}
+.msg-user-more .chev {
+  color: currentColor;
 }
 
 .msg-assistant {
@@ -122,11 +153,16 @@
   margin-top: 2px;
   color: var(--label-caption);
 }
-.msg-note > span {
+.msg-note > .md {
   flex: 1;
   min-width: 0;
-  white-space: pre-wrap;
+  color: inherit;
+  font-size: inherit;
+  line-height: inherit;
   overflow-wrap: anywhere;
+}
+.msg-note > .md > * + * {
+  margin-top: 4px;
 }
 
 .convo-empty {
@@ -410,9 +446,45 @@
   background: var(--hover);
   color: var(--label-secondary);
 }
+/* Enquanto só há raciocínio, o título ganha um brilho que corre (shimmer);
+   com movimento reduzido fica parado na cor secundária. */
 .think.live .think-label,
 .thinking-live .think-label {
-  animation: breathe 1.6s var(--ease) infinite;
+  background: linear-gradient(
+      90deg,
+      var(--label-tertiary) 0%,
+      var(--label-tertiary) 35%,
+      var(--label-primary) 50%,
+      var(--label-tertiary) 65%,
+      var(--label-tertiary) 100%
+    )
+    0 0 / 250% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: think-shimmer 1.8s linear infinite;
+}
+@keyframes think-shimmer {
+  from {
+    background-position: 100% 0;
+  }
+  to {
+    background-position: 0% 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .think.live .think-label,
+  .thinking-live .think-label {
+    animation: none;
+    background: none;
+    color: var(--label-secondary);
+  }
+}
+[data-motion="reduced"] .think.live .think-label,
+[data-motion="reduced"] .thinking-live .think-label {
+  animation: none;
+  background: none;
+  color: var(--label-secondary);
 }
 /* Shown while the model thinks and nothing has streamed yet. */
 .thinking-live {
@@ -432,11 +504,23 @@
   margin: 6px 0 2px -1px;
   padding: 2px 0 2px 14px;
   border-left: 2px solid var(--line-strong);
-  color: var(--label-tertiary);
-  font-size: var(--fs-ui);
-  line-height: 1.65;
-  white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+/* raciocínio: markdown em 13px secundário, títulos sem a cor do chat */
+.think-body .md {
+  color: var(--label-secondary);
+  font-size: var(--fs-ui);
+  line-height: 1.6;
+}
+.think-body .md > * + * {
+  margin-top: 8px;
+}
+.think-body .md :is(h1, h2, h3, h4) {
+  font-size: var(--fs-ui);
+  color: var(--label-primary);
+}
+.think-body .md strong {
+  color: var(--label-primary);
 }
 
 /* ---- tool rows -------------------------------------------------------- */
@@ -2025,7 +2109,7 @@
   border-color: var(--line-strong);
 }
 .subagent-card.failed {
-  border-color: rgba(239, 68, 68, 0.35);
+  border-color: var(--danger-soft);
 }
 .subagent-head {
   display: flex;
@@ -2053,7 +2137,7 @@
   flex: none;
   margin-right: 8px;
   padding: 2px 10px;
-  border-radius: var(--r-full, 999px);
+  border-radius: var(--r-full);
   border: 1px solid var(--line);
   background: transparent;
   color: var(--label-secondary);
@@ -2061,7 +2145,7 @@
   cursor: pointer;
 }
 .subagent-stop:hover:not(:disabled) {
-  color: var(--danger-text, #f87171);
+  color: var(--danger-text);
   border-color: currentColor;
 }
 .subagent-head:hover:not(:disabled) {
@@ -2078,10 +2162,10 @@
   height: 18px;
 }
 .subagent-icon.done {
-  color: var(--ok-text, #34d399);
+  color: var(--ok-text);
 }
 .subagent-icon.failed {
-  color: var(--danger-text, #f87171);
+  color: var(--danger-text);
 }
 .subagent-icon.cancelled {
   color: var(--label-caption);
@@ -2089,7 +2173,7 @@
 .subagent-role {
   flex: none;
   padding: 2px 7px;
-  border-radius: var(--r-full, 999px);
+  border-radius: var(--r-full);
   background: var(--layer-2);
   border: 1px solid var(--line);
   color: var(--label-secondary);
@@ -2126,13 +2210,13 @@
   font-weight: 550;
 }
 .subagent-status.running {
-  color: var(--accent-text, #a5b4fc);
+  color: var(--accent-text);
 }
 .subagent-status.done {
-  color: var(--ok-text, #34d399);
+  color: var(--ok-text);
 }
 .subagent-status.failed {
-  color: var(--danger-text, #f87171);
+  color: var(--danger-text);
 }
 .subagent-status.cancelled {
   color: var(--label-caption);
@@ -2140,7 +2224,7 @@
 .subagent-head .chev {
   flex: none;
   color: var(--label-caption);
-  transition: transform var(--t-fast, 120ms) var(--ease, ease);
+  transition: transform var(--t-fast) var(--ease);
 }
 .subagent-card.open .subagent-head .chev {
   transform: rotate(90deg);
@@ -2171,11 +2255,21 @@
 .subagent-steps li {
   overflow-wrap: anywhere;
 }
+.subagent-steps .md,
+.subagent-summary.md {
+  color: inherit;
+  font-size: var(--fs-small);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.subagent-steps .md {
+  font-family: var(--mono);
+}
+.subagent-summary.md > * + * {
+  margin-top: 6px;
+}
 .subagent-summary {
   margin: 0;
-  line-height: 1.5;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
 }
 .subagent-steps + .subagent-summary {
   margin-top: 8px;

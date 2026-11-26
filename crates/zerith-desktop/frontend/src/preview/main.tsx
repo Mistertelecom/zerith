@@ -131,11 +131,33 @@ async function drive() {
   await turn({ type: "toolCall", id: "t2", name: "grep", args: '{"pattern":"AgentBuilder"}' });
   await turn({ type: "toolResult", id: "t2", name: "grep", ok: true, preview: "openai.rs:74  let agent = ureq::AgentBuilder::new()" });
   await turn({ type: "toolCall", id: "t3", name: "bash", args: '{"command":"cargo test -p zerith-providers"}' });
-  await turn({ type: "toolResult", id: "t3", name: "bash", ok: false, preview: "error[E0063]: missing field `auth`" });
+  await turn({
+    type: "toolResult",
+    id: "t3",
+    name: "bash",
+    ok: false,
+    preview:
+      "exit 1\n[o comando FALHOU]\nerror[E0063]: missing field `auth` in initializer of `Client`\n  --> crates/zerith-providers/src/openai.rs:41:9",
+  });
+  await turn({ type: "notice", text: "Contexto em **72%**: compacte com `/compact` se a conversa crescer." });
+  await turn({ type: "subagent", id: "sa1", name: "explorer: mapear usos de `ureq`", state: "running", summary: "Lendo `codex.rs` e `http.rs`…", model: "anthropic:claude-haiku-4-5" });
   await turn({ type: "delta", text: "Achei o ponto: o agente é recriado a cada chamada. " });
   await turn({ type: "delta", text: "Vou extrair `http::client` e reaproveitar a conexão." });
   await turn({ type: "usage", input: 41_200, output: 2_350 });
   await turn({ type: "saved", tool: "bash", before: 9_000, after: 1_200 });
+
+  // &tab=expand (shots.sh: `chat:expand`): abre raciocínio e ferramentas do
+  // histórico; &scroll=<px|top> rola a transcrição para fotografar o meio.
+  if (q.get("tab") === "expand") {
+    await wait(300);
+    document.querySelectorAll<HTMLElement>(".think-head, .tool-head:not(:disabled), .msg-user-more").forEach((b) => b.click());
+  }
+  const chatScroll = q.get("scroll") ?? (q.get("tab") === "top" ? "0" : null);
+  if (chatScroll) {
+    await wait(400);
+    const t = document.querySelector<HTMLElement>(".transcript");
+    if (t) t.scrollTop = Number(chatScroll);
+  }
 
   if (scene === "approval") {
     await turn({ type: "approval", id: 7, tool: "bash", summary: "cargo test -p zerith-providers --all-features", always: "shell(cargo test *)" });

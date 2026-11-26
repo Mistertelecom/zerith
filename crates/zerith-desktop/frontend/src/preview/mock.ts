@@ -559,21 +559,21 @@ const messages: Record<
     content: string;
     reasoning: string | null;
     tool_name: string | null;
+    tool_calls?: unknown;
   }[]
 > = {
   s1: [
+    {"role": "user", "content": "Migre o cliente HTTP do provedor OpenAI e mantenha os testes passando.\n\nContexto:\n- hoje `openai.rs` cria um `ureq::Agent` a cada chamada\n- o *streaming* abre outra conexão por cima\n- o Codex usa o mesmo caminho\n\nRegras:\n1. **nada** muda na API pública\n2. um cliente só por processo\n3. timeout configurável\n\nDepois rode `cargo test -p zerith-providers` e me diga o que falhou.\nSe o teste de streaming quebrar, pare e pergunte antes de mexer no parser.\nNão toque no `codex.rs` nesta rodada.", "reasoning": null, "tool_name": null},
+    {"id": 3, "role": "assistant", "content": "", "reasoning": "Primeiro rodo os testes para ver o **estado atual**; depois edito `openai.rs`.\n\n- se `auth` faltar, o erro aparece no build\n- o `join` já existe em `http.rs`", "tool_calls": [{"id": "h1", "name": "shell", "arguments": "{\"command\": \"cargo test -p zerith-providers --lib 2>&1 | tail -n 5\"}"}], "tool_name": null},
+    {"id": 4, "role": "tool", "tool_name": "shell", "tool_calls": {"tool_call_id": "h1"}, "content": "exit 101\n[o comando FALHOU]\nerror[E0063]: missing field `auth` in initializer of `Client`\n  --> crates/zerith-providers/src/openai.rs:41:9\n   |\n41 |         Client { cfg, agent }\n   |         ^^^^^^ missing `auth`\nerror: could not compile `zerith-providers` (lib) due to 1 previous error", "reasoning": null},
+    {"id": 5, "role": "assistant", "content": "", "tool_calls": [{"id": "h2", "name": "edit_file", "arguments": "{\"path\": \"crates/zerith-providers/src/openai.rs\", \"old_string\": \"    let agent = ureq::agent();\\n    let url = format!(\\\"{base}{path}\\\");\", \"new_string\": \"    let client = http::client(timeout);\\n    let url = join(base, path);\\n    // um cliente s\\u00f3 por processo\"}"}, {"id": "h3", "name": "web_fetch", "arguments": "{\"url\": \"https://docs.rs/ureq/latest/ureq/struct.Agent.html\", \"max_chars\": 4000}"}], "reasoning": null, "tool_name": null},
+    {"id": 6, "role": "tool", "tool_name": "edit_file", "tool_calls": {"tool_call_id": "h2"}, "content": "1 ocorrência(s) substituída(s) em crates/zerith-providers/src/openai.rs", "reasoning": null},
+    {"id": 7, "role": "tool", "tool_name": "web_fetch", "tool_calls": {"tool_call_id": "h3"}, "content": "{\"status\": 200, \"title\": \"ureq 3.0 — Agent\", \"bytes\": 18422}", "reasoning": null},
     {
-      role: "user",
-      content:
-        "Migre o cliente HTTP do provedor OpenAI e mantenha os testes passando.",
-      reasoning: null,
-      tool_name: null,
-    },
-    {
-      id: 2,
+      id: 8,
       role: "assistant",
       content:
-        "Vou ler o cliente atual, trocar a implementação e rodar os testes.\n\n## O que muda\n\n1. `openai.rs` passa a usar `http::client(timeout)`\n2. A URL é montada com `join(base, path)`\n3. **Nenhuma** mudança na API pública\n\n```rust\nlet client = http::client(timeout);\nlet url = join(base, path);\nsend(client)\n```\n\nRisco: a mudança toca o fluxo de *streaming* — vou rodar `cargo test -p zerith-providers` no fim." +
+        "# Cliente HTTP do OpenAI\n\nVou ler o cliente atual, trocar a implementação e rodar os testes. A referência é a [documentação do ureq](https://docs.rs/ureq).\n\n> O teste de streaming fica de fora até você confirmar a troca do parser.\n\n## O que muda\n\n### Arquivos tocados\n\n- `openai.rs`: o cliente\n- `http.rs`: novo, com `client()` e `join()`\n\n### Passos\n\n1. `openai.rs` passa a usar `http::client(timeout)`\n2. A URL é montada com `join(base, path)`\n3. **Nenhuma** mudança na API pública\n\n```rust\nlet client = http::client(timeout);\nlet url = join(base, path);\nsend(client)\n```\n\nRisco: a mudança toca o fluxo de *streaming* — vou rodar `cargo test -p zerith-providers` no fim." +
         "\n\n| Arquivo | Linhas | Estado |\n|:--|--:|:--|\n| `openai.rs` | 214 | editado |\n| `http.rs` | 38 | novo |\n| `codex.rs` | 0 | sem mudança |\n\n![Prévia da tela](" +
         PREVIEW_IMG +
         ")",
@@ -1132,7 +1132,7 @@ export function installMock(theme: string) {
         case "checkpoints":
           return [1, 2];
         case "turn_changes":
-          return a.messageId === 2 ? PREVIEW_CHANGES : [];
+          return a.messageId === 8 ? PREVIEW_CHANGES : [];
         case "turn_undo":
           return { done: true, conflicts: [], filesRestored: 1, filesRemoved: 1, errors: [] };
         case "read_image":

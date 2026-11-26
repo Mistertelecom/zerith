@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import {
   Archive,
   Brain,
@@ -65,7 +65,7 @@ function stripBotPrefix(title: string, name: string): string {
   return title.trim();
 }
 
-export function Sidebar(props: {
+export const Sidebar = memo(function Sidebar(props: {
   sessions: Session[];
   selected: string | null;
   query: string;
@@ -610,4 +610,4 @@ export function Sidebar(props: {
       </div>
     </aside>
   );
-}
+});

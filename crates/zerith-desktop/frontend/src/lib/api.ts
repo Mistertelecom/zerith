@@ -93,7 +93,7 @@ export type TurnEvent =
       ok: boolean;
       preview: string;
     }
-  | { type: "toolProgress"; tool: string; chunk: string }
+  | { type: "toolProgress"; toolCallId?: string | null; tool: string; chunk: string }
   | { type: "steered"; text: string }
   | { type: "skillsLoaded"; names: string[] }
   | { type: "approval"; id: number; tool: string; summary: string; always?: string | null }
@@ -130,6 +130,7 @@ export type TurnEvent =
   | {
       type: "done";
       stored: number | null;
+      userMessageId?: number | null;
       text: string;
       promptTokens: number;
       completionTokens: number;

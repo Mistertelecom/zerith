@@ -12,10 +12,11 @@
 //! Ignored files (`.gitignore`, the global excludes and [`EXCLUDE`]) are not
 //! in the snapshot: a restore neither brings them back nor deletes them.
 
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -32,9 +33,16 @@ const SLOW_PAUSE: Duration = Duration::from_secs(24 * 60 * 60);
 /// Heavy folders nobody wants snapshotted; `.gitignore` files apply on top.
 const EXCLUDE: &str = "node_modules/\ntarget/\n.venv/\nvenv/\n__pycache__/\n.gradle/\ndist/\n";
 
-// ponytail: one lock per process, so turns in different workspaces wait for
-// each other's snapshot; per-repository locks if that ever shows up.
-static LOCK: Mutex<()> = Mutex::new(());
+/// Per-workspace lock so concurrent turns in different workspaces never wait
+/// for each other's shadow git snapshot or restore.
+fn workspace_lock(work: &Path) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    let abs = std::path::absolute(work).unwrap_or_else(|_| work.to_path_buf());
+    let key = plain(std::fs::canonicalize(&abs).unwrap_or(abs));
+    let map = LOCKS.get_or_init(Default::default);
+    let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+    Arc::clone(guard.entry(key).or_default())
+}
 
 /// What `shadow.tree` holds.
 #[derive(Debug, Serialize, Deserialize)]
@@ -80,7 +88,8 @@ pub(super) fn snapshot(data_root: &Path, work: &Path, turn_dir: &Path) {
 /// Puts the workspace back to `snap` (`apply`), or only lists what that
 /// would change.
 pub(super) fn restore(data_root: &Path, snap: &Snap, apply: bool) -> Result<Outcome, String> {
-    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let lock = workspace_lock(&snap.workspace);
+    let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut repo = open(data_root, &snap.workspace, RESTORE_TIMEOUT)?;
     // A scratch copy of the index: same stat cache, the persistent one stays.
     let scratch = repo
@@ -113,7 +122,8 @@ fn refused(work: &Path, data_root: &Path) -> Option<String> {
 }
 
 fn take(data_root: &Path, work: &Path) -> Result<Snap, String> {
-    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let lock = workspace_lock(work);
+    let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
     let repo = open(data_root, work, SNAPSHOT_TIMEOUT)?;
     let slow = repo.git_dir.join("too-slow");
     let recent = std::fs::metadata(&slow)

@@ -156,17 +156,34 @@ export function applyEvent(prev: TurnState, ev: TurnEvent): TurnState {
     case "toolProgress": {
       const a = assistant(state);
       let idx = -1;
-      for (let i = a.tools.length - 1; i >= 0; i--) {
-        if (a.tools[i].ok === undefined && a.tools[i].name === ev.tool) {
-          idx = i;
-          break;
-        }
-      }
-      if (idx < 0) {
+      if (ev.toolCallId) {
         for (let i = a.tools.length - 1; i >= 0; i--) {
-          if (a.tools[i].ok === undefined) {
+          if (a.tools[i].id === ev.toolCallId && a.tools[i].ok === undefined) {
             idx = i;
             break;
+          }
+        }
+        if (idx < 0) {
+          for (let i = a.tools.length - 1; i >= 0; i--) {
+            if (a.tools[i].id === ev.toolCallId) {
+              idx = i;
+              break;
+            }
+          }
+        }
+      } else {
+        for (let i = a.tools.length - 1; i >= 0; i--) {
+          if (a.tools[i].ok === undefined && a.tools[i].name === ev.tool) {
+            idx = i;
+            break;
+          }
+        }
+        if (idx < 0) {
+          for (let i = a.tools.length - 1; i >= 0; i--) {
+            if (a.tools[i].ok === undefined) {
+              idx = i;
+              break;
+            }
           }
         }
       }
@@ -197,7 +214,7 @@ export function applyEvent(prev: TurnState, ev: TurnEvent): TurnState {
       // Uma rodada acabou: a resposta dela fecha, e a próxima abre outra.
       const last = state.blocks[state.blocks.length - 1];
       if (last?.kind === "assistant" && last.streaming) assistant(state).streaming = false;
-      state.blocks = [...state.blocks, { kind: "note", text: ev.text }];
+      state.blocks = [...state.blocks, { kind: "note", text: ev.text, sub: ev.state }];
       return state;
     }
     case "steered":
@@ -303,6 +320,9 @@ export function applyEvent(prev: TurnState, ev: TurnEvent): TurnState {
       state.saved = Math.max(state.saved, ev.savedTokens);
       if (!a.text && ev.text) a.text = ev.text;
       if (ev.stored != null) a.stored = ev.stored;
+      if (ev.userMessageId != null) {
+        state.blocks = attachUserMessageId(state.blocks, ev.userMessageId);
+      }
       return state;
     }
     case "failed": {
@@ -334,6 +354,17 @@ export function finishTurn(prev: TurnState, cancelled = false): TurnState {
     a.error = "O turno terminou sem resposta.";
   }
   return state;
+}
+
+/** Attaches `userMessageId` directly to the last un-indexed `user` block
+ * when the backend delivers it on `done`, avoiding a full history refetch. */
+export function attachUserMessageId(blocks: Block[], userMessageId: number): Block[] {
+  let i = blocks.length - 1;
+  while (i >= 0 && !(blocks[i].kind === "user" && (blocks[i] as { id?: number }).id == null)) i--;
+  if (i < 0 || blocks.some((b) => b.kind === "user" && b.id === userMessageId)) return blocks;
+  const out = [...blocks];
+  out[i] = { ...(blocks[i] as Block & { kind: "user" }), id: userMessageId };
+  return out;
 }
 
 /** The prompt just sent has no row id until the store has it ("Editar" needs

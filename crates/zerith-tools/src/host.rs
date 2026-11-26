@@ -367,6 +367,19 @@ impl Host {
         }
     }
 
+    /// Runs the registered workspace snapshot hook unconditionally (for `apply_patch`
+    /// and arbitrary mutators that may delete, move, or create multiple files).
+    pub fn snapshot_workspace(&self, workspace: &Path) {
+        let hook = self
+            .before_shell
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(f) = hook {
+            f(workspace);
+        }
+    }
+
     /// Err (pt-BR, for the model) when `path` exists, this session never read
     /// it, or it changed since. New files and unbound hosts pass.
     pub fn check_editable(&self, path: &Path) -> Result<()> {

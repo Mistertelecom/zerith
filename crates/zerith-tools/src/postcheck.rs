@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use regex::Regex;
 
@@ -45,7 +45,9 @@ enum Checker {
 }
 
 /// Em ordem: o primeiro que acusa algo encerra (sintaxe antes de lint, sem
-/// o mesmo erro de sintaxe repetido por dois verificadores).
+/// o mesmo erro de sintaxe repetido por dois verificadores). Para Python,
+/// `ruff` já verifica sintaxe (`E9`) e nomes indefinidos (`F82`) em um único
+/// processo nativo; `python` só entra como fallback se `ruff` não estiver instalado.
 fn checkers(path: &Path) -> &'static [Checker] {
     let ext = path
         .extension()
@@ -53,7 +55,7 @@ fn checkers(path: &Path) -> &'static [Checker] {
         .unwrap_or("")
         .to_ascii_lowercase();
     match ext.as_str() {
-        "py" => &[Checker::Python, Checker::Ruff],
+        "py" => &[Checker::Ruff, Checker::Python],
         "sh" | "bash" => &[Checker::Bash, Checker::ShellCheck],
         "js" | "mjs" | "cjs" => &[Checker::Node],
         "ps1" | "psm1" => &[Checker::Pwsh],
@@ -115,8 +117,13 @@ impl Checker {
     }
 
     fn parse(self, out: &str) -> Vec<Diag> {
-        let re = |p: &str| Regex::new(p).expect("regex fixa");
-        let pick = |r: Regex, skip: fn(&str) -> bool| -> Vec<Diag> {
+        static RE_COLON_PREFIX: OnceLock<Regex> = OnceLock::new();
+        static RE_LINE_COL: OnceLock<Regex> = OnceLock::new();
+        static RE_BASH_LINE: OnceLock<Regex> = OnceLock::new();
+        static RE_NODE_LINE: OnceLock<Regex> = OnceLock::new();
+        static RE_NODE_ERR: OnceLock<Regex> = OnceLock::new();
+
+        let pick = |r: &Regex, skip: fn(&str) -> bool| -> Vec<Diag> {
             out.lines()
                 .filter_map(|l| r.captures(l.trim_end()))
                 .filter_map(|c| {
@@ -129,20 +136,34 @@ impl Checker {
                 .collect()
         };
         match self {
-            Checker::Python | Checker::Pwsh => pick(re(r"^(\d+): (.+)$"), |_| false),
+            Checker::Python | Checker::Pwsh => pick(
+                RE_COLON_PREFIX.get_or_init(|| Regex::new(r"^(\d+): (.+)$").expect("regex fixa")),
+                |_| false,
+            ),
             // ruff concise e shellcheck gcc: `arquivo:L:C: msg`.
-            Checker::Ruff | Checker::ShellCheck => pick(re(r":(\d+):\d+: (.+)$"), |_| false),
+            Checker::Ruff | Checker::ShellCheck => pick(
+                RE_LINE_COL.get_or_init(|| Regex::new(r":(\d+):\d+: (.+)$").expect("regex fixa")),
+                |_| false,
+            ),
             // A linha que repete o código vem entre crases: não é erro.
-            Checker::Bash => pick(re(r": line (\d+): (.+)$"), |m| m.starts_with('`')),
+            Checker::Bash => pick(
+                RE_BASH_LINE
+                    .get_or_init(|| Regex::new(r": line (\d+): (.+)$").expect("regex fixa")),
+                |m| m.starts_with('`'),
+            ),
             // `arquivo:L`, o trecho, o `^`, e `SyntaxError: msg`.
             Checker::Node => {
+                let re_line =
+                    RE_NODE_LINE.get_or_init(|| Regex::new(r":(\d+)$").expect("regex fixa"));
+                let re_err =
+                    RE_NODE_ERR.get_or_init(|| Regex::new(r"^\w*Error: ").expect("regex fixa"));
                 let line = out
                     .lines()
-                    .find_map(|l| re(r":(\d+)$").captures(l.trim_end()))
+                    .find_map(|l| re_line.captures(l.trim_end()))
                     .and_then(|c| c[1].parse().ok());
                 let msg = out
                     .lines()
-                    .find(|l| re(r"^\w*Error: ").is_match(l))
+                    .find(|l| re_err.is_match(l))
                     .map(|l| l.trim().to_string());
                 match (line, msg) {
                     (Some(line), Some(msg)) => vec![Diag { line, msg }],
@@ -228,6 +249,10 @@ fn diags(name: &Path, bytes: &[u8], deadline: Instant) -> Option<Vec<Diag>> {
             if !found.is_empty() {
                 return Some(found);
             }
+            // Ruff already covers Python syntax (E9) + lint; skip python fallback when Ruff passed.
+            if c == Checker::Ruff {
+                break;
+            }
         }
         ran.then(Vec::new)
     })();
@@ -279,14 +304,51 @@ fn render(errs: &[Diag]) -> String {
 /// O conteúdo do arquivo antes da gravação (`None` dentro: não existia).
 pub(crate) struct Before(Option<Vec<u8>>);
 
+type FileStamp = Option<(u64, Option<SystemTime>)>;
+type SettingsKey = (PathBuf, PathBuf);
+type SettingsStamp = (FileStamp, FileStamp, FileStamp);
+type EnabledSettingsCache = Mutex<HashMap<SettingsKey, (SettingsStamp, bool)>>;
+
+fn file_stamp(path: &Path) -> FileStamp {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.len(), meta.modified().ok()))
+}
+
+fn post_write_check_enabled(workspace: &Path) -> bool {
+    static CACHE: OnceLock<EnabledSettingsCache> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let paths = zerith_core::Paths::resolve();
+    let user_file = paths.settings();
+    let key = (user_file.clone(), workspace.to_path_buf());
+    let stamp = (
+        file_stamp(&user_file),
+        file_stamp(&workspace.join(".zerith").join("settings.toml")),
+        file_stamp(&workspace.join(".zerith").join("settings.local.toml")),
+    );
+    if let Ok(g) = cache.lock() {
+        if let Some((cached_stamp, enabled)) = g.get(&key) {
+            if *cached_stamp == stamp {
+                return *enabled;
+            }
+        }
+    }
+    let enabled = zerith_core::Settings::load(&paths, Some(workspace))
+        .settings
+        .context
+        .post_write_check;
+    if let Ok(mut g) = cache.lock() {
+        g.insert(key, (stamp, enabled));
+    }
+    enabled
+}
+
 /// Chamar antes de gravar. `None` quando não há verificador para a
 /// extensão ou `[context] post_write_check = false`.
 pub(crate) fn before(workspace: &Path, path: &Path) -> Option<Before> {
     if checkers(path).is_empty() {
         return None;
     }
-    let settings = zerith_core::Settings::load(&zerith_core::Paths::resolve(), Some(workspace));
-    if !settings.settings.context.post_write_check {
+    if !post_write_check_enabled(workspace) {
         return None;
     }
     Some(Before(std::fs::read(path).ok()))
@@ -364,7 +426,7 @@ mod tests {
         assert!(checkers(Path::new("a.rs")).is_empty());
         assert_eq!(
             checkers(Path::new("A.PY")),
-            &[Checker::Python, Checker::Ruff]
+            &[Checker::Ruff, Checker::Python]
         );
     }
 
@@ -422,7 +484,7 @@ mod tests {
         ];
         for (name, broken, shifted, other) in cases {
             let path = dir.path().join(name);
-            if checkers(&path).first().and_then(|c| c.program()).is_none() {
+            if !checkers(&path).iter().any(|c| c.program().is_some()) {
                 eprintln!("{name}: verificador ausente, pulando");
                 continue;
             }

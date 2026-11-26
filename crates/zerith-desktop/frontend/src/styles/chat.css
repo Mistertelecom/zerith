@@ -4,6 +4,14 @@
 
 /* ---- transcript ----------------------------------------------------- */
 
+.transcript-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
 .transcript {
   flex: 1;
   min-height: 0;
@@ -28,6 +36,15 @@
     var(--label-primary) calc(100% - 24px),
     transparent
   );
+}
+
+.transcript-end {
+  position: absolute;
+  right: 24px;
+  bottom: 12px;
+  z-index: 5;
+  background: var(--layer-3);
+  box-shadow: var(--shadow-2);
 }
 
 .stack {
@@ -258,7 +275,11 @@
   color: var(--label-caption);
   transition: transform var(--t-fast) var(--ease);
 }
-.open > button > .chev {
+.open > button > .chev,
+.open > .tool-row > .tool-head .chev,
+.tool.open > .tool-row > .tool-head .chev,
+.tool-burst.open > .tool-burst-head .chev,
+.tool-batch-item.open > .tool-batch-head-row .chev {
   transform: rotate(90deg);
 }
 
@@ -541,8 +562,9 @@
 .tool-head {
   display: flex;
   align-items: center;
-  gap: 10px;
-  width: 100%;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
   height: 28px;
   padding: 0 8px;
   border-radius: var(--r-sm);
@@ -1704,7 +1726,14 @@
   font-size: var(--fs-caption);
 }
 .btw-error {
-  color: var(--danger, var(--label-secondary));
+  color: var(--danger-text);
+}
+.btw-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 2px;
 }
 .learned-body {
   display: grid;
@@ -1822,7 +1851,8 @@
   display: flex;
   align-items: center;
   gap: 8px;
-  width: 100%;
+  flex: 1;
+  min-width: 0;
   height: 30px;
   padding: 0 8px;
   border-radius: var(--r-sm);
@@ -1949,13 +1979,13 @@
 }
 .diff-split-row > .diff-ln.add,
 .diff-split-row > .diff-ln:has(+ .diff-split-cell.add) {
-  background: var(--ok-soft);
-  color: var(--ok-text);
+  background: var(--diff-add-bg);
+  color: var(--diff-add);
 }
 .diff-split-row > .diff-ln.del,
 .diff-split-row > .diff-ln:has(+ .diff-split-cell.del) {
-  background: var(--danger-soft);
-  color: var(--danger-text);
+  background: var(--diff-del-bg);
+  color: var(--diff-del);
 }
 .diff-split-row > .diff-ln.empty,
 .diff-split-row > .diff-ln:has(+ .diff-split-cell.empty) {
@@ -1968,11 +1998,11 @@
   color: var(--label-secondary);
 }
 .diff-split-cell.add {
-  background: var(--ok-soft);
+  background: var(--diff-add-bg);
   color: var(--label-primary);
 }
 .diff-split-cell.del {
-  background: var(--danger-soft);
+  background: var(--diff-del-bg);
   color: var(--label-primary);
 }
 .diff-split-cell.empty {
@@ -2363,4 +2393,206 @@
   padding-top: 8px;
   border-top: 1px solid var(--line-faint);
   color: var(--label-primary);
+}
+
+/* ---- Pro Tool Display (sub-actions, diff stats, batch, rollback, burst) ---- */
+
+.tool-sub-pill {
+  flex: none;
+  padding: 1px 6px;
+  border-radius: var(--r-xs);
+  background: var(--layer-2);
+  border: 1px solid var(--line);
+  color: var(--label-secondary);
+  font-size: var(--fs-caption);
+  font-weight: 550;
+  line-height: 1.4;
+}
+
+.tool-diff-stats {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+  font-family: var(--mono);
+  font-size: var(--fs-caption);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.tool-stat-add {
+  color: var(--diff-add);
+}
+.tool-stat-del {
+  color: var(--diff-del);
+}
+
+.tool-subhead {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-family: var(--mono);
+  font-size: var(--fs-small);
+  color: var(--label-secondary);
+}
+.tool-subhead-key {
+  color: var(--label-tertiary);
+}
+.tool-subhead-val {
+  color: var(--label-primary);
+  overflow-wrap: anywhere;
+}
+
+.tool-detail-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.tool-image-preview {
+  display: flex;
+  align-items: flex-start;
+}
+
+.tool-batch-preamble {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: var(--fs-small);
+  color: var(--label-tertiary);
+}
+.tool-batch-list {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+.tool-batch-item {
+  border: 1px solid var(--line-faint);
+  border-radius: var(--r-sm);
+  background: var(--bg-base);
+  overflow: hidden;
+  min-width: 0;
+}
+.tool-batch-item.err {
+  border-color: var(--danger-soft);
+}
+.tool-batch-head-row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding-right: 4px;
+}
+.tool-batch-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex: 1;
+  min-width: 0;
+  height: 28px;
+  padding: 0 8px;
+  text-align: left;
+  font-size: var(--fs-small);
+  color: var(--label-primary);
+  transition: background var(--t-base) var(--ease);
+}
+.tool-batch-head:hover {
+  background: var(--hover);
+}
+.tool-batch-status {
+  display: grid;
+  place-items: center;
+  flex: none;
+}
+.tool-batch-status.ok {
+  color: var(--ok-text);
+}
+.tool-batch-status.err {
+  color: var(--danger-text);
+}
+.tool-batch-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mono);
+  font-weight: 500;
+}
+.tool-batch-ms {
+  flex: none;
+  padding: 1px 6px;
+  border-radius: var(--r-full);
+  background: var(--layer-2);
+  border: 1px solid var(--line);
+  color: var(--label-tertiary);
+  font-family: var(--mono);
+  font-size: var(--fs-caption);
+  font-variant-numeric: tabular-nums;
+}
+.tool-batch-body {
+  padding: 8px;
+  border-top: 1px solid var(--line-faint);
+  background: var(--code-bg);
+}
+.tool-batch-body .tool-out {
+  border: 0;
+  padding: 0;
+  background: transparent;
+}
+
+.tool-rollback {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  padding: 8px 10px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--line);
+  background: var(--layer-2);
+}
+.tool-rollback-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.tool-rollback-title {
+  font-size: var(--fs-small);
+  font-weight: 600;
+  color: var(--label-secondary);
+}
+
+.tool-burst {
+  border-radius: var(--r-sm);
+}
+.tool-burst.open {
+  background: var(--layer-1);
+  box-shadow: inset 0 0 0 1px var(--line);
+}
+.tool-burst-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  height: 28px;
+  padding: 0 8px;
+  border-radius: var(--r-sm);
+  text-align: left;
+  transition: background var(--t-base) var(--ease);
+}
+.tool-burst-head:hover {
+  background: var(--hover);
+}
+.tool-burst-head .tool-state {
+  color: var(--label-caption);
+}
+.tool-burst-body {
+  display: grid;
+  gap: 2px;
+  padding: 4px 4px 6px 20px;
+  border-top: 1px solid var(--line-faint);
+}
+
+.msg-note-badge {
+  flex: none;
+  margin-top: 1px;
 }

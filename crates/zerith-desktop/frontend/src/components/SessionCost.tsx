@@ -1,7 +1,7 @@
 // Custo em US$ (preços públicos do OpenRouter): a linha da conversa no
 // painel de uso e o resumo por período na aba Uso. Ideia do CostTracker do
 // Goose (aaif-goose/goose, Apache-2.0).
-import { useEffect, useState } from "react";
+import { memo, useEffect, useState } from "react";
 import { CircleDollarSign } from "lucide-react";
 import { api, type CostLine, type CostView } from "../lib/api";
 import { tr, type Lang } from "../lib/i18n";
@@ -163,7 +163,7 @@ function Share({ part, whole }: { part: number; whole: number }) {
 }
 
 /** Custo da conversa, relido quando o uso gravado muda (fim de um turno). */
-export function SessionCost(p: { sessionId: string; requests: number; lang: Lang }) {
+export const SessionCost = memo(function SessionCost(p: { sessionId: string; requests: number; lang: Lang }) {
   const [cost, setCost] = useState<CostView | null>(null);
   useEffect(() => {
     let live = true;
@@ -178,4 +178,4 @@ export function SessionCost(p: { sessionId: string; requests: number; lang: Lang
   if (!cost || cost.by_model.length === 0)
     return null;
   return <CostRows cost={cost} lang={p.lang} />;
-}
+});

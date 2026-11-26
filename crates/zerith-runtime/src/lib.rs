@@ -157,6 +157,7 @@ pub enum RunEvent {
     },
     /// Live incremental stdout/stderr or terminal output while a tool runs.
     ToolProgress {
+        tool_call_id: Option<String>,
         tool: String,
         chunk: String,
     },
@@ -262,6 +263,7 @@ pub struct TurnContext<'a> {
 pub struct TurnReport {
     pub session_id: String,
     pub message_id: i64,
+    pub user_message_id: Option<i64>,
     pub text: String,
     pub reasoning: Option<String>,
     /// Summed over every step: what the turn cost.
@@ -451,20 +453,13 @@ const CODE_MARKERS: &[&str] = &[
     "pubspec.yaml",
 ];
 
-/// Whether the Ponytail Token Saver (lazy senior dev: "YAGNI extremist",
-/// "Deletion before addition") belongs in this turn: only in a code
+/// Whether the workspace qualifies for the Ponytail Token Saver (lazy senior
+/// dev: "YAGNI extremist", "Deletion before addition"): only in a code
 /// workspace (the folder or one of its 6 parents has a manifest, the home
-/// folder not counted) and not on a network/infra request. On 2026-11-25,
-/// with Ponytail Ultra on, a MikroTik turn skipped loading any skill; "skip
-/// unnecessary work" reads as "skip the skill". Hermes gates its coding
-/// posture the same way (agent/coding_context.py `_detect_profile`, MIT).
-/// The saving it claims is on code (`estimate_ponytail_saved_tokens` counts
-/// fenced code only), so nothing is lost elsewhere. A session switching to
-/// code mid-way gets it back on the next turn that is not about network.
-fn ponytail_applies(dir: Option<&std::path::Path>, prompt: &str) -> bool {
-    if zerith_skills::search::is_network_request(prompt) {
-        return false;
-    }
+/// folder not counted). Kept strictly prompt-invariant so `static_system`
+/// preserves the provider KV/prompt cache; per-turn network requests add an
+/// override note inside `dynamic_reminder`.
+fn ponytail_applies(dir: Option<&std::path::Path>) -> bool {
     let home = std::env::var_os("USERPROFILE")
         .or_else(|| std::env::var_os("HOME"))
         .map(std::path::PathBuf::from);
@@ -506,12 +501,14 @@ pub fn build_prompt_context(
         .unwrap_or_else(|| zerith_core::Settings::load(&paths, None).settings)
         .media;
     static_system.push_str(&media_section(media));
+    let mut ponytail_active = false;
     if let Some(st) = ctx.settings {
         let pt = tokensaver::ponytail_prompt(st.token_saver.ponytail)
-            .filter(|_| ponytail_applies(dir.as_deref(), prompt));
+            .filter(|_| ponytail_applies(dir.as_deref()));
         if let Some(pt) = pt {
             static_system.push_str("\n\n");
             static_system.push_str(pt);
+            ponytail_active = true;
         }
         if let Some(cv) = tokensaver::caveman_prompt(st.token_saver.caveman) {
             static_system.push_str("\n\n");
@@ -520,6 +517,12 @@ pub fn build_prompt_context(
     }
 
     let mut dyn_parts: Vec<String> = Vec::new();
+    if ponytail_active && zerith_skills::search::is_network_request(prompt) {
+        dyn_parts.push(
+            "Para este pedido de rede/infraestrutura, desconsidere as instruções de concisão Ponytail acima: carregue a skill aplicável e execute o diagnóstico completo normalmente."
+                .to_string(),
+        );
+    }
 
     if let (Some(mem), Some(scope)) = (ctx.memory, ctx.scope) {
         if let Some(f) = zerith_memory::extract_allowed(mem, session_id, prompt) {
@@ -605,6 +608,7 @@ pub fn build_prompt_context(
 /// Attaches transient dynamic context to the originating user message in an
 /// outgoing `ChatRequest` slice without mutating persisted history or
 /// hook/steer user injections.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn inject_dynamic_reminder(
     messages: &mut [zerith_providers::ChatMessage],
     target_idx: Option<usize>,
@@ -1773,6 +1777,13 @@ pub fn vendor_terms(v: zerith_tools::network::Vendor) -> &'static [&'static str]
         CiscoNxos => &["cisco", "nexus", "nxos"],
         CiscoXr => &["cisco", "iosxr"],
         HuaweiVrp => &["huawei", "vrp"],
+        HuaweiOlt => &["huawei", "olt", "smartax", "gpon"],
+        ZteOlt => &["zte", "olt", "gpon"],
+        FiberHomeOlt => &["fiberhome", "olt", "gpon"],
+        Datacom => &["datacom", "dmos", "olt"],
+        VyOS => &["vyos", "router"],
+        AristaEos => &["arista", "eos"],
+        Proxmox => &["proxmox", "pve"],
         JuniperJunos => &["juniper", "junos"],
         FortinetFortiOs => &["fortinet", "fortigate", "fortios"],
         Linux | Generic => &[],
@@ -2974,8 +2985,8 @@ mod gateway_tests {
         assert!(ag_pos < pt_pos && pt_pos < cv_pos, "{prompt}");
     }
 
-    /// Ponytail only in a code workspace and off a network request; Caveman
-    /// stays everywhere.
+    /// Ponytail stays workspace-invariant in `static_system` for prompt cache
+    /// stability; a network request adds an override note in `dynamic_reminder`.
     #[test]
     fn ponytail_is_for_code_turns_only() {
         let mut settings = Settings::default();
@@ -2996,14 +3007,26 @@ mod gateway_tests {
                 "s",
                 prompt,
             )
-            .static_system
         };
-        assert!(build(code, "refatore o parser").contains("Ponytail Ultra"));
-        let net = build(code, "libere o syslog no firewall da MikroTik");
-        assert!(!net.contains("Ponytail"), "{net}");
-        assert!(net.contains("Caveman Ultra"));
+        let code_ctx = build(code, "refatore o parser");
+        assert!(code_ctx.static_system.contains("Ponytail Ultra"));
+        assert_eq!(code_ctx.dynamic_reminder, None);
+
+        let net_ctx = build(code, "libere o syslog no firewall da MikroTik");
+        assert_eq!(
+            net_ctx.static_system, code_ctx.static_system,
+            "static_system must remain prompt-invariant for cache hits"
+        );
+        assert!(net_ctx.static_system.contains("Caveman Ultra"));
+        let net_rem = net_ctx.dynamic_reminder.as_deref().unwrap_or("");
+        assert!(net_rem.contains("Ponytail"), "{net_rem}");
+
         let scratch = build(plain.path(), "refatore o parser");
-        assert!(!scratch.contains("Ponytail"), "{scratch}");
+        assert!(
+            !scratch.static_system.contains("Ponytail"),
+            "{}",
+            scratch.static_system
+        );
     }
 
     #[test]
@@ -3054,6 +3077,10 @@ mod gateway_tests {
         );
         assert_eq!(plain.static_system, a.static_system);
         assert_eq!(plain.dynamic_reminder, None);
+
+        let mut msgs = vec![zerith_providers::ChatMessage::user("oi")];
+        inject_dynamic_reminder(&mut msgs, Some(0), a.dynamic_reminder.as_deref());
+        assert!(msgs[0].content.contains("<system-reminder>"));
     }
 
     #[test]

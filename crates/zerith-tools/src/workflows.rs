@@ -106,7 +106,7 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
                             "type": "object",
                             "properties": {
                                 "id": {"type": "string"},
-                                "kind": {"type": "string", "enum": ["trigger_cron", "trigger_manual", "trigger_webhook", "shell", "ssh_command", "http_request", "ai_agent", "condition", "transform", "delay", "loop", "notify_channel", "save_file"]},
+                                "kind": {"type": "string", "enum": ["trigger_cron", "trigger_manual", "trigger_webhook", "shell", "ssh_command", "http_request", "zabbix", "ai_agent", "condition", "transform", "delay", "loop", "notify_channel", "save_file"]},
                                 "label": {"type": "string"},
                                 "x": {"type": "number"},
                                 "y": {"type": "number"},

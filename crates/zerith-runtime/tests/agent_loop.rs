@@ -1112,3 +1112,93 @@ fn the_step_budget_is_told_to_the_model_as_synthetic_context() {
     let second = fake.seen.lock().unwrap()[1].1.to_string();
     assert!(second.contains("[orçamento: passo 1 de 2"), "{second}");
 }
+
+#[test]
+fn dynamic_reminder_persists_and_pinned_note_is_not_duplicated_across_turns() {
+    let dir = workspace();
+    let fake1 = serve(vec![text("resposta 1")]);
+    let fake2 = serve(vec![text("resposta 2")]);
+    let store = Store::open_in_memory().unwrap();
+    let sid = session(&store);
+
+    let mut settings = zerith_core::Settings::default();
+    settings.context.pinned_instructions = Some("sempre rode testes".into());
+    let policy = Policy::new(
+        preset("workspace-write").unwrap(),
+        Mode::Default,
+        dir.path(),
+    );
+
+    let r1 = run_agent_turn(
+        &store,
+        &client(&fake1.url, Protocol::OpenAi),
+        TurnContext {
+            settings: Some(&settings),
+            project_dir: Some(dir.path()),
+            no_project_instructions: true,
+            ..TurnContext::default()
+        },
+        AgentOptions {
+            policy: Some(&policy),
+            dynamic_context: Some("lembrete dinamico 1".into()),
+            ..Default::default()
+        },
+        &sid,
+        "m",
+        "oi",
+        &Cancel::default(),
+        |_| {},
+    )
+    .unwrap();
+    assert!(r1.user_message_id.is_some());
+
+    let r2 = run_agent_turn(
+        &store,
+        &client(&fake2.url, Protocol::OpenAi),
+        TurnContext {
+            settings: Some(&settings),
+            project_dir: Some(dir.path()),
+            no_project_instructions: true,
+            ..TurnContext::default()
+        },
+        AgentOptions {
+            policy: Some(&policy),
+            dynamic_context: Some("lembrete dinamico 2".into()),
+            ..Default::default()
+        },
+        &sid,
+        "m",
+        "tudo bem?",
+        &Cancel::default(),
+        |_| {},
+    )
+    .unwrap();
+    assert!(r2.user_message_id.is_some());
+
+    let seen1 = fake1.seen.lock().unwrap();
+    let seen2 = fake2.seen.lock().unwrap();
+    let msgs1 = seen1[0].1["messages"].as_array().unwrap();
+    let msgs2 = seen2[0].1["messages"].as_array().unwrap();
+
+    // Every message sent on Turn 1 must appear byte-identically as the prefix of Turn 2.
+    assert!(msgs2.len() > msgs1.len());
+    assert_eq!(&msgs2[..msgs1.len()], &msgs1[..]);
+
+    // Pinned note must appear only once in Turn 2's messages and once in the store.
+    let pinned_count = msgs2
+        .iter()
+        .filter(|m| {
+            m["content"]
+                .as_str()
+                .is_some_and(|c| c.contains("sempre rode testes"))
+        })
+        .count();
+    assert_eq!(pinned_count, 1, "pinned_note duplicated: {msgs2:?}");
+
+    let stored = store.messages(&sid, 100, 0).unwrap();
+    let dyn_rows: Vec<_> = stored
+        .iter()
+        .filter(|m| m.raw == Some(json!({"dynamic_reminder": true})))
+        .collect();
+    assert_eq!(dyn_rows.len(), 2);
+}

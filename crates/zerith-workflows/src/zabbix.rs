@@ -35,12 +35,12 @@ use crate::runner::secret_value;
 use crate::{Result, WorkflowError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AuthMode {
+pub enum AuthMode {
     Header,
     Body,
 }
 
-pub(crate) struct Client {
+pub struct Client {
     endpoint: String,
     token: String,
     auth: AuthMode,
@@ -48,7 +48,7 @@ pub(crate) struct Client {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct Offline {
+pub struct Offline {
     pub host: String,
     pub ip: String,
     pub problema: String,
@@ -72,7 +72,7 @@ fn s(v: &Value, key: &str) -> String {
     }
 }
 
-fn severity_name(code: &str) -> String {
+pub fn severity_name(code: &str) -> String {
     match code {
         "0" => "Não classificada",
         "1" => "Informação",
@@ -164,8 +164,23 @@ fn insecure_tls_config() -> Result<Arc<rustls::ClientConfig>> {
     Ok(Arc::new(cfg))
 }
 
+/// Constrói um `ureq::Agent` reutilizável (com `redirects(0)` e `insecure_tls` opcional).
+pub fn build_http_agent(timeout: Duration, insecure_tls: bool) -> ureq::Agent {
+    let mut b = ureq::AgentBuilder::new().timeout(timeout).redirects(0);
+    if insecure_tls {
+        let cfg = insecure_tls_config().expect("rustls ring provider supports safe TLS versions");
+        b = b.tls_config(cfg);
+    }
+    b.build()
+}
+
+/// Lê um segredo pelo nome no cofre configurado do Zerith.
+pub fn vault_secret(name: &str) -> Result<String> {
+    secret_value(name)
+}
+
 impl Client {
-    pub(crate) fn new(
+    pub fn new(
         url: &str,
         token: String,
         auth: AuthMode,
@@ -184,15 +199,11 @@ impl Client {
         } else {
             format!("{}/api_jsonrpc.php", url.trim_end_matches('/'))
         };
-        let mut b = ureq::AgentBuilder::new().timeout(timeout).redirects(0);
-        if insecure_tls {
-            b = b.tls_config(insecure_tls_config()?);
-        }
         Ok(Self {
             endpoint,
             token,
             auth,
-            agent: b.build(),
+            agent: build_http_agent(timeout, insecure_tls),
         })
     }
 
@@ -206,7 +217,7 @@ impl Client {
     }
 
     /// Uma chamada JSON-RPC; `error` vira falha com `message` e `data`.
-    pub(crate) fn call(&self, method: &str, params: Value) -> Result<Value> {
+    pub fn call(&self, method: &str, params: Value) -> Result<Value> {
         let mut body = json!({"jsonrpc": "2.0", "method": method, "params": params, "id": 1});
         let mut req = self
             .agent
@@ -264,7 +275,7 @@ impl Client {
             .ok_or_else(|| self.err(format!("Zabbix {method}: resposta sem `result`")))
     }
 
-    fn call_list(&self, method: &str, params: Value) -> Result<Vec<Value>> {
+    pub fn call_list(&self, method: &str, params: Value) -> Result<Vec<Value>> {
         match self.call(method, params)? {
             Value::Array(a) => Ok(a),
             other => Err(self.err(format!(
@@ -275,7 +286,7 @@ impl Client {
     }
 
     /// Ids dos grupos de hosts pelo nome exato.
-    fn group_ids(&self, names: &[String]) -> Result<Option<Vec<String>>> {
+    pub fn group_ids(&self, names: &[String]) -> Result<Option<Vec<String>>> {
         if names.is_empty() {
             return Ok(None);
         }
@@ -293,7 +304,7 @@ impl Client {
     }
 
     /// IP principal de cada host (interface `main=1`, agente antes de SNMP).
-    fn host_ips(&self, hostids: &[String]) -> Result<HashMap<String, String>> {
+    pub fn host_ips(&self, hostids: &[String]) -> Result<HashMap<String, String>> {
         if hostids.is_empty() {
             return Ok(HashMap::new());
         }
@@ -306,7 +317,7 @@ impl Client {
     }
 
     /// Problemas ativos com host e IP.
-    pub(crate) fn problems(
+    pub fn problems(
         &self,
         groupids: Option<&[String]>,
         severities: Option<&[u8]>,
@@ -365,7 +376,7 @@ impl Client {
 
     /// Hosts fora do ar: problemas que casam com `patterns` (ICMP, agente) e
     /// interfaces `available = 2`; um item por host.
-    pub(crate) fn hosts_unavailable(
+    pub fn hosts_unavailable(
         &self,
         groupids: Option<&[String]>,
         patterns: &[String],
@@ -468,7 +479,7 @@ fn severities(cfg: &Value) -> Option<Vec<u8>> {
 }
 
 /// Executa o nó. `interp`: interpolação do runner (`{{prev}}`, `{{secret:x}}`).
-pub(crate) fn run(cfg: &Value, interp: &dyn Fn(&str) -> String) -> Result<String> {
+pub fn run(cfg: &Value, interp: &dyn Fn(&str) -> String) -> Result<String> {
     let url = cfg_str(cfg, "url")
         .map(interp)
         .ok_or_else(|| WorkflowError::Exec("URL do Zabbix obrigatória".into()))?;

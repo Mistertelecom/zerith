@@ -939,6 +939,23 @@ pub fn auto_compact_routed_at(
         .or_else(|| {
             zerith_providers::models::context_window(first.as_ref().map_or(model, |c| &c.model))
         });
+    let imported_cap =
+        if settings.context.imported_compact_tokens > 0 && is_imported(store, session_id) {
+            settings.context.imported_compact_tokens
+        } else {
+            0
+        };
+    let Some((keep, mut hist)) = compaction_needed(
+        store,
+        session_id,
+        history,
+        limit,
+        threshold_pct,
+        imported_cap,
+    )?
+    else {
+        return Ok(None);
+    };
 
     let sum_spec = compact_model_spec(settings, model);
     let sum_cand = if sum_spec == model {
@@ -955,24 +972,22 @@ pub fn auto_compact_routed_at(
         Some((cl, m)) => (cl, m.as_str()),
         None => (client, model),
     };
-    let imported_cap = if is_imported(store, session_id) {
-        settings.context.imported_compact_tokens
-    } else {
-        0
+    let log = TurnLog::outside_turn(store, session_id);
+    let summarizer = ClientSummarizer {
+        client,
+        model: sum_model,
     };
-    let r = auto_compact_capped(
+    let r = summarize_into(
         store,
         session_id,
-        history,
-        limit,
-        threshold_pct,
-        imported_cap,
-        &ClientSummarizer {
-            client,
-            model: sum_model,
-        },
+        &mut hist,
+        keep,
+        &summarizer,
         cancel,
-    )?;
+        &log,
+        "auto",
+    )
+    .map_err(|e| RunError::Provider(ProviderError::Transport(e)))?;
     if let Some(rep) = &r {
         // ponytail: the host path does not know the session's folder; the
         // hook runs in the process's. Pass the workspace if a hook needs it.
@@ -1060,17 +1075,14 @@ pub fn is_imported(store: &Store, session_id: &str) -> bool {
 /// is lower on purpose: every step re-sends the history, so a smaller one is
 /// faster and cheaper. The price is one summary call and old detail only in
 /// the summary. `[context] imported_compact_tokens = 0` turns it off.
-#[allow(clippy::too_many_arguments)]
-pub fn auto_compact_capped(
+fn compaction_needed(
     store: &Store,
     session_id: &str,
     history: usize,
     context_limit: Option<u32>,
     threshold_pct: usize,
     imported_cap: usize,
-    summarizer: &dyn Summarizer,
-    cancel: &Cancel,
-) -> Result<Option<CompactReport>> {
+) -> Result<Option<(usize, History)>> {
     // ponytail: counts the replayed rows only; the system prompt and tool
     // specs (a few k tokens) ride on the margin.
     let rows = store.history_rows(session_id, history.max(1))?;
@@ -1096,6 +1108,31 @@ pub fn auto_compact_capped(
         imported_cap / 4
     } else {
         0
+    };
+    Ok(Some((keep, hist)))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn auto_compact_capped(
+    store: &Store,
+    session_id: &str,
+    history: usize,
+    context_limit: Option<u32>,
+    threshold_pct: usize,
+    imported_cap: usize,
+    summarizer: &dyn Summarizer,
+    cancel: &Cancel,
+) -> Result<Option<CompactReport>> {
+    let Some((keep, _)) = compaction_needed(
+        store,
+        session_id,
+        history,
+        context_limit,
+        threshold_pct,
+        imported_cap,
+    )?
+    else {
+        return Ok(None);
     };
     compact_keep(store, session_id, summarizer, cancel, "auto", keep)
 }
@@ -1162,6 +1199,7 @@ fn is_synthetic_raw(raw: Option<&serde_json::Value>) -> bool {
         || obj.contains_key("subagents_joined")
         || obj.contains_key("monitor")
         || obj.contains_key("summary")
+        || obj.contains_key("dynamic_reminder")
 }
 
 fn row_to_chat(m: &Message) -> Option<ChatMessage> {
@@ -1598,6 +1636,7 @@ mod tests {
             "hook_stop",
             "subagents_joined",
             "monitor",
+            "dynamic_reminder",
         ] {
             store
                 .append(
@@ -1622,7 +1661,7 @@ mod tests {
             .unwrap();
 
         let replayed = replay(&store.recent_messages(&sid, 50).unwrap());
-        assert_eq!(replayed.len(), 8);
+        assert_eq!(replayed.len(), 9);
         assert!(
             !replayed[0].synthetic,
             "plain user message is not synthetic"

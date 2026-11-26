@@ -674,83 +674,95 @@ const LAST_RENDERED_TEXT = new WeakMap<Text, string>();
 const ORIG_ATTR = new WeakMap<Element, Map<string, string>>();
 const LAST_RENDERED_ATTR = new WeakMap<Element, Map<string, string>>();
 const SKIP_TAGS = new Set(["SCRIPT", "STYLE", "CODE", "PRE", "TEXTAREA"]);
+const SKIP_SELECTOR =
+  "pre, code, textarea, .mono, .mono-path, .term-tail, .side-list .side-row-title, .msg-user, .md, .think-body, .msg-note > span, .tool-body, .tool-arg, .tool-file, .tool-diff, .diff-lines, .tool-out-wrap, .tool-cmd, .tool-out, .ask-body, .learned-preview, .learned-item-text, .subagent-title, .subagent-live, .subagent-body, .changes-diff, .change-path";
 const ATTRS = ["placeholder", "title", "aria-label"] as const;
+let domWasTranslated = false;
 
 function shouldSkipElement(el: Element | null): boolean {
   if (!el) return true;
   if (SKIP_TAGS.has(el.tagName)) return true;
-  if (
-    el.closest(
-      "pre, code, textarea, .mono, .mono-path, .term-tail, .side-list .side-row-title, .msg-user, .md, .think-body, .msg-note > span, .tool-body, .tool-arg, .tool-file, .ask-body, .learned-preview, .learned-item-text, .subagent-title, .subagent-live, .subagent-body, .changes-diff, .change-path",
-    )
-  ) {
+  if (el.closest(SKIP_SELECTOR)) {
     return true;
   }
   return false;
 }
 
 function applyDomTranslation(root: Node, lang: Lang): void {
+  if (
+    root.nodeType === Node.ELEMENT_NODE
+      ? shouldSkipElement(root as Element)
+      : shouldSkipElement(root.parentElement)
+  ) {
+    return;
+  }
   const walker = document.createTreeWalker(
     root,
     NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT,
+    {
+      acceptNode(node: Node): number {
+        if (node.nodeType === Node.ELEMENT_NODE) {
+          return shouldSkipElement(node as Element)
+            ? NodeFilter.FILTER_REJECT
+            : NodeFilter.FILTER_ACCEPT;
+        }
+        return NodeFilter.FILTER_ACCEPT;
+      },
+    },
   );
   let node: Node | null = walker.currentNode;
   while (node) {
     if (node.nodeType === Node.TEXT_NODE) {
       const textNode = node as Text;
-      if (!shouldSkipElement(textNode.parentElement)) {
-        const current = textNode.nodeValue ?? "";
-        const orig = ORIG_TEXT.get(textNode);
-        if (orig === undefined) {
-          if (current.trim()) ORIG_TEXT.set(textNode, current);
-        } else {
-          // If React updated the text node to a new value (not our previous translation), update stored original
-          if (
-            current !== orig &&
-            current !== LAST_RENDERED_TEXT.get(textNode) &&
-            current.trim()
-          ) {
-            ORIG_TEXT.set(textNode, current);
-          }
+      const current = textNode.nodeValue ?? "";
+      const orig = ORIG_TEXT.get(textNode);
+      if (orig === undefined) {
+        if (current.trim()) ORIG_TEXT.set(textNode, current);
+      } else {
+        // If React updated the text node to a new value (not our previous translation), update stored original
+        if (
+          current !== orig &&
+          current !== LAST_RENDERED_TEXT.get(textNode) &&
+          current.trim()
+        ) {
+          ORIG_TEXT.set(textNode, current);
         }
-        const base = ORIG_TEXT.get(textNode);
-        if (base) {
-          const next = translateText(base, lang);
-          if (textNode.nodeValue !== next) {
-            textNode.nodeValue = next;
-          }
-          LAST_RENDERED_TEXT.set(textNode, next);
+      }
+      const base = ORIG_TEXT.get(textNode);
+      if (base) {
+        const next = translateText(base, lang);
+        if (textNode.nodeValue !== next) {
+          textNode.nodeValue = next;
         }
+        LAST_RENDERED_TEXT.set(textNode, next);
       }
     } else if (node.nodeType === Node.ELEMENT_NODE) {
       const el = node as Element;
-      if (!shouldSkipElement(el)) {
-        let attrMap = ORIG_ATTR.get(el);
-        let lastAttrMap = LAST_RENDERED_ATTR.get(el);
-        for (const attr of ATTRS) {
-          const val = el.getAttribute(attr);
-          if (!val) continue;
-          if (!attrMap) {
-            attrMap = new Map<string, string>();
-            ORIG_ATTR.set(el, attrMap);
-          }
-          const orig = attrMap.get(attr);
-          if (orig === undefined) {
-            attrMap.set(attr, val);
-          } else if (val !== orig && val !== lastAttrMap?.get(attr)) {
-            attrMap.set(attr, val);
-          }
-          const base = attrMap.get(attr) ?? val;
-          const next = translateText(base, lang);
-          if (!lastAttrMap) {
-            lastAttrMap = new Map<string, string>();
-            LAST_RENDERED_ATTR.set(el, lastAttrMap);
-          }
-          if (val !== next) {
-            el.setAttribute(attr, next);
-          }
-          lastAttrMap.set(attr, next);
+      let attrMap = ORIG_ATTR.get(el);
+      let lastAttrMap = LAST_RENDERED_ATTR.get(el);
+      for (const attr of ATTRS) {
+        const val = el.getAttribute(attr);
+        if (!val) continue;
+        if (!attrMap) {
+          attrMap = new Map<string, string>();
+          ORIG_ATTR.set(el, attrMap);
         }
+        const orig = attrMap.get(attr);
+        if (orig === undefined) {
+          attrMap.set(attr, val);
+        } else if (val !== orig && val !== lastAttrMap?.get(attr)) {
+          attrMap.set(attr, val);
+        }
+        const base = attrMap.get(attr) ?? val;
+        const next = translateText(base, lang);
+        if (!lastAttrMap) {
+          lastAttrMap = new Map<string, string>();
+          LAST_RENDERED_ATTR.set(el, lastAttrMap);
+        }
+        if (val !== next) {
+          el.setAttribute(attr, next);
+        }
+        lastAttrMap.set(attr, next);
       }
     }
     node = walker.nextNode();
@@ -762,6 +774,14 @@ export function useDomTranslator(lang: Lang): void {
   useEffect(() => {
     if (typeof document === "undefined" || !document.body) return;
     document.documentElement.lang = lang;
+    if (lang === "pt-BR") {
+      if (domWasTranslated) {
+        applyDomTranslation(document.body, "pt-BR");
+        domWasTranslated = false;
+      }
+      return;
+    }
+    domWasTranslated = true;
     const target = document.body;
     const observeOpts: MutationObserverInit = {
       childList: true,
@@ -770,7 +790,8 @@ export function useDomTranslator(lang: Lang): void {
     };
     let raf = 0;
     let applying = false;
-    const run = () => {
+    const dirtyRoots = new Set<Element>();
+    const runFull = () => {
       if (applying || !document.body) return;
       applying = true;
       observer.disconnect();
@@ -781,16 +802,77 @@ export function useDomTranslator(lang: Lang): void {
         observer.observe(target, observeOpts);
       }
     };
-    const observer = new MutationObserver(() => {
-      if (applying || raf) return;
+    const runDirty = () => {
+      if (applying || !document.body || dirtyRoots.size === 0) return;
+      const rootSet = new Set<Element>();
+      for (const el of dirtyRoots) {
+        if (el.isConnected && !shouldSkipElement(el)) {
+          rootSet.add(el);
+        }
+      }
+      dirtyRoots.clear();
+      if (rootSet.size === 0) return;
+      applying = true;
+      observer.disconnect();
+      try {
+        for (const el of rootSet) {
+          let ancestor = el.parentElement;
+          let covered = false;
+          while (ancestor) {
+            if (rootSet.has(ancestor)) {
+              covered = true;
+              break;
+            }
+            ancestor = ancestor.parentElement;
+          }
+          if (!covered) {
+            applyDomTranslation(el, lang);
+          }
+        }
+      } finally {
+        applying = false;
+        observer.observe(target, observeOpts);
+      }
+    };
+    const observer = new MutationObserver((mutations) => {
+      if (applying) return;
+      for (const m of mutations) {
+        if (m.type === "characterData") {
+          const parent = m.target.parentElement;
+          if (parent && !shouldSkipElement(parent)) {
+            dirtyRoots.add(parent);
+          }
+        } else if (m.type === "childList") {
+          const targetEl =
+            m.target.nodeType === Node.ELEMENT_NODE
+              ? (m.target as Element)
+              : m.target.parentElement;
+          if (!targetEl || shouldSkipElement(targetEl)) continue;
+          let sawText = false;
+          for (let i = 0; i < m.addedNodes.length; i++) {
+            const added = m.addedNodes[i];
+            if (added.nodeType === Node.ELEMENT_NODE) {
+              const el = added as Element;
+              if (!shouldSkipElement(el)) dirtyRoots.add(el);
+            } else if (added.nodeType === Node.TEXT_NODE) {
+              sawText = true;
+            }
+          }
+          if (sawText) {
+            dirtyRoots.add(targetEl);
+          }
+        }
+      }
+      if (dirtyRoots.size === 0 || raf) return;
       raf = requestAnimationFrame(() => {
         raf = 0;
-        run();
+        runDirty();
       });
     });
-    run();
+    runFull();
     return () => {
       if (raf) cancelAnimationFrame(raf);
+      dirtyRoots.clear();
       observer.disconnect();
     };
   }, [lang]);

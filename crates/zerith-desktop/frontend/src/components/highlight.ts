@@ -421,8 +421,19 @@ function highlightNet(code: string): Token[] {
       continue;
     }
 
-    // `!` at line start (ignoring spaces) or `#` comments in Cisco/Huawei/MikroTik/Juniper
+    // `!` at line start (ignoring spaces) or `#` comments in Cisco/Huawei/MikroTik/Juniper,
+    // while leaving Markdown headings (`# ...`..`###### ...` at col 0) readable.
     if (ch === 35) {
+      const atLineStart = i === 0 || code[i - 1] === "\n";
+      if (atLineStart) {
+        let hashes = 1;
+        while (i + hashes < n && code[i + hashes] === "#" && hashes <= 6) hashes += 1;
+        if (hashes <= 6 && (code[i + hashes] === " " || code[i + hashes] === "\t")) {
+          pushToken(out, undefined, code.slice(i, i + hashes));
+          i += hashes;
+          continue;
+        }
+      }
       const end = scanLineEnd(code, i);
       pushToken(out, "hl-cmt", code.slice(i, end));
       i = end;

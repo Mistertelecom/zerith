@@ -279,7 +279,7 @@ impl Store {
                 "SELECT id FROM messages WHERE session_id = ?1 AND superseded = 0 AND role = 'user'
                  AND CASE WHEN raw IS NULL OR NOT json_valid(raw) THEN 1 ELSE NOT EXISTS (
                      SELECT 1 FROM json_each(raw) WHERE key IN
-                     ('summary', 'hook_context', 'hook_stop', 'tool_context', 'subagents_joined')) END
+                     ('summary', 'hook_context', 'hook_stop', 'tool_context', 'subagents_joined', 'dynamic_reminder')) END
                  ORDER BY id DESC LIMIT 1 OFFSET ?2",
                 params![session_id, window.saturating_sub(1) as i64],
                 |r| r.get(0),

@@ -1,6 +1,7 @@
 //! Read-only search tools: `list_dir`, `glob` and `grep` (ripgrep when
 //! available, a parallel gitignore-aware walker otherwise).
 
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -196,6 +197,20 @@ fn walk<'a>(
 }
 
 const MAX_MATCHES: usize = 500;
+const MAX_GREP_FILE_BYTES: u64 = 4 * 1024 * 1024;
+const BINARY_SNIFF_BYTES: usize = 8 * 1024;
+
+fn read_searchable_text(path: &Path) -> Option<String> {
+    let meta = std::fs::metadata(path).ok()?;
+    if meta.len() > MAX_GREP_FILE_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    if bytes[..bytes.len().min(BINARY_SNIFF_BYTES)].contains(&0) {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
 
 pub(super) fn glob(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
     let pattern = str_arg(args, "pattern")?.replace('\\', "/");
@@ -241,7 +256,8 @@ fn try_rg_grep(
     after: usize,
     cap: usize,
     base: &Path,
-) -> Option<String> {
+    exec: &Exec<'_>,
+) -> Option<Result<String>> {
     if !rg_available() || base.is_file() {
         return None;
     }
@@ -249,8 +265,6 @@ fn try_rg_grep(
     cmd.current_dir(base)
         .arg("--color")
         .arg("never")
-        .arg("--sort")
-        .arg("path")
         .arg("--no-heading");
     if literal {
         cmd.arg("-F");
@@ -279,51 +293,142 @@ fn try_rg_grep(
         }
     }
     cmd.arg("--").arg(raw).arg(".");
-    let out = cmd.stdin(Stdio::null()).output().ok()?;
-    let code = out.status.code().unwrap_or(2);
-    if code == 2 {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let stdout = child.stdout.take()?;
+    let mut reader = BufReader::new(stdout);
     let mut lines = Vec::new();
     let mut truncated = false;
-    for l in text.lines() {
-        if lines.len() >= cap {
-            truncated = true;
-            break;
+    let mut raw_line = String::new();
+    loop {
+        if let Err(e) = exec.check() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Some(Err(e));
         }
-        let clean_path = l
-            .strip_prefix("./")
-            .or_else(|| l.strip_prefix(".\\"))
-            .unwrap_or(l);
-        if mode == "content" {
-            if clean_path == "--" {
-                lines.push("--".to_string());
-            } else if let Some((file, ln, sep, body)) = parse_rg_content_line(clean_path) {
-                lines.push(format!("{file}{sep}{ln}{sep} {body}"));
-            } else {
-                lines.push(clean_path.replace('\\', "/"));
+        raw_line.clear();
+        match reader.read_line(&mut raw_line) {
+            Ok(0) => break,
+            Ok(_) => {
+                if lines.len() >= cap {
+                    truncated = true;
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
+                let l = raw_line.trim_end_matches(['\r', '\n']);
+                let clean_path = l
+                    .strip_prefix("./")
+                    .or_else(|| l.strip_prefix(".\\"))
+                    .unwrap_or(l);
+                if mode == "content" {
+                    if clean_path == "--" {
+                        lines.push("--".to_string());
+                    } else if let Some((file, ln, sep, body)) =
+                        parse_rg_content_line_ctx(clean_path, before > 0 || after > 0, Some(base))
+                    {
+                        lines.push(format!("{file}{sep}{ln}{sep} {body}"));
+                    } else {
+                        lines.push(clean_path.replace('\\', "/"));
+                    }
+                } else if let Some((f, c)) = clean_path.rsplit_once(':') {
+                    lines.push(format!("{}:{c}", f.replace('\\', "/")));
+                } else {
+                    lines.push(clean_path.replace('\\', "/"));
+                }
             }
-        } else if let Some((f, c)) = clean_path.rsplit_once(':') {
-            lines.push(format!("{}:{c}", f.replace('\\', "/")));
-        } else {
-            lines.push(clean_path.replace('\\', "/"));
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    if !truncated {
+        let status = child.wait().ok()?;
+        let code = status.code().unwrap_or(2);
+        if code == 2 && lines.is_empty() {
+            return None;
         }
     }
     if lines.is_empty() {
-        return Some("nenhuma ocorrência".into());
+        return Some(Ok("nenhuma ocorrência".into()));
+    }
+    if !truncated && mode != "content" {
+        lines.sort();
     }
     if truncated {
         lines.push(format!("[parado em {cap} resultados]"));
     }
-    Some(lines.join("\n"))
+    Some(Ok(lines.join("\n")))
 }
 
+fn has_clean_extension(file: &str) -> bool {
+    let base = file.rsplit(['/', '\\']).next().unwrap_or(file);
+    let Some((stem, ext)) = base.rsplit_once('.') else {
+        return false;
+    };
+    !stem.is_empty()
+        && !ext.is_empty()
+        && ext.len() <= 10
+        && ext.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+fn pick_best_rg_candidate(line: &str, candidates: &[(usize, usize, u8)]) -> (usize, usize, u8) {
+    let mut best = candidates[0];
+    let mut best_score = (false, false, false, false, false, false);
+    for (idx, &(i, j, sep)) in candidates.iter().enumerate() {
+        let file = &line[..i];
+        let body = &line[j + 1..];
+        let head_end = body
+            .find(char::is_whitespace)
+            .map_or(line.len(), |off| j + 1 + off);
+        let head = &line[j + 1..head_end];
+        let has_later_candidate = candidates.iter().any(|&(i2, _, _)| i2 > j);
+        let has_slash_before_later = has_later_candidate && head.contains(['/', '\\']);
+        let no_earlier_ext_match = !candidates[..idx].iter().any(|&(i0, _, sep0)| {
+            (sep0 == b':' || sep0 == sep) && has_clean_extension(&line[..i0])
+        });
+        let no_candidate_in_head = !candidates.iter().any(|&(i2, _, _)| i2 > j && i2 < head_end);
+        let score = (
+            !file.contains(char::is_whitespace),
+            !has_slash_before_later,
+            no_earlier_ext_match,
+            has_clean_extension(file),
+            sep == b':',
+            no_candidate_in_head,
+        );
+        if idx == 0 || score > best_score {
+            best = (i, j, sep);
+            best_score = score;
+        }
+    }
+    best
+}
+
+#[cfg(test)]
 fn parse_rg_content_line(line: &str) -> Option<(String, &str, char, &str)> {
+    parse_rg_content_line_ctx(line, true, None)
+}
+
+fn parse_rg_content_line_ctx<'a>(
+    line: &'a str,
+    allow_context: bool,
+    base: Option<&Path>,
+) -> Option<(String, &'a str, char, &'a str)> {
     let bytes = line.as_bytes();
-    for i in 0..bytes.len() {
+    let mut candidates: Vec<(usize, usize, u8)> = Vec::new();
+    for i in 1..bytes.len() {
         let sep = bytes[i];
-        if sep != b':' && sep != b'-' {
+        if sep != b':' && !(allow_context && sep == b'-') {
+            continue;
+        }
+        // Windows drive letter (`C:\...` / `C:/...`).
+        if sep == b':' && i == 1 && bytes[0].is_ascii_alphabetic() {
             continue;
         }
         let mut j = i + 1;
@@ -331,13 +436,31 @@ fn parse_rg_content_line(line: &str) -> Option<(String, &str, char, &str)> {
             j += 1;
         }
         if j > i + 1 && j < bytes.len() && bytes[j] == sep {
-            let file = line[..i].replace('\\', "/");
             let ln = &line[i + 1..j];
-            let body = line[j + 1..].trim_end();
-            return Some((file, ln, sep as char, body));
+            // ripgrep line numbers are 1-based and never have leading zeros (`01`).
+            if !ln.starts_with('0') {
+                candidates.push((i, j, sep));
+            }
         }
     }
-    None
+    if candidates.is_empty() {
+        return None;
+    }
+    let (i, j, sep) = if candidates.len() == 1 {
+        candidates[0]
+    } else if let Some(dir) = base {
+        candidates
+            .iter()
+            .copied()
+            .find(|&(i, _, _)| dir.join(&line[..i]).is_file())
+            .unwrap_or_else(|| pick_best_rg_candidate(line, &candidates))
+    } else {
+        pick_best_rg_candidate(line, &candidates)
+    };
+    let file = line[..i].replace('\\', "/");
+    let ln = &line[i + 1..j];
+    let body = line[j + 1..].trim_end();
+    Some((file, ln, sep as char, body))
 }
 
 pub(super) fn grep(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
@@ -396,8 +519,9 @@ pub(super) fn grep(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<S
         after,
         cap,
         &base,
+        exec,
     ) {
-        return Ok(fast);
+        return fast;
     }
 
     let mut candidates = Vec::new();
@@ -432,7 +556,7 @@ pub(super) fn grep(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<S
                             if exec.cancel.is_cancelled() {
                                 break;
                             }
-                            if let Ok(text) = std::fs::read_to_string(path) {
+                            if let Some(text) = read_searchable_text(path) {
                                 let (lines, hits) =
                                     scan_file(shown, &text, re_ref, mode, before, after);
                                 if hits > 0 {
@@ -455,7 +579,7 @@ pub(super) fn grep(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<S
     } else {
         for (shown, path) in &candidates {
             exec.check()?;
-            let Ok(text) = std::fs::read_to_string(path) else {
+            let Some(text) = read_searchable_text(path) else {
                 continue;
             };
             let (lines, hits) = scan_file(shown, &text, &re, mode, before, after);
@@ -571,10 +695,62 @@ fn is_mappable_ext(rel: &str) -> bool {
     let lower = rel.to_ascii_lowercase();
     [
         ".rs", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".go", ".c", ".h", ".cpp",
-        ".hpp", ".java", ".kt", ".rb", ".sh", ".sql", ".cfg", ".conf", ".rsc", ".ios", ".vrp",
+        ".cc", ".cxx", ".hpp", ".hh", ".hxx", ".java", ".kt", ".rb", ".sh", ".sql", ".cfg",
+        ".conf", ".rsc", ".ios", ".vrp", ".junos", ".yml", ".yaml",
     ]
     .iter()
     .any(|ext| lower.ends_with(ext))
+}
+
+fn is_c_cpp_ext(lower_path: &str) -> bool {
+    [".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx"]
+        .iter()
+        .any(|ext| lower_path.ends_with(ext))
+}
+
+fn is_c_cpp_symbol(trimmed: &str) -> bool {
+    const CC_PREFIXES: &[&str] = &[
+        "class ",
+        "struct ",
+        "enum ",
+        "union ",
+        "namespace ",
+        "typedef ",
+        "using ",
+        "template<",
+        "template <",
+    ];
+    if CC_PREFIXES.iter().any(|p| trimmed.starts_with(p)) {
+        return true;
+    }
+    let Some((before_paren, _)) = trimmed.split_once('(') else {
+        return false;
+    };
+    if before_paren.contains('=') || before_paren.contains(';') {
+        return false;
+    }
+    let ends_like_fn = trimmed.ends_with('{')
+        || trimmed.ends_with(')')
+        || trimmed.ends_with(';')
+        || trimmed.ends_with("const")
+        || trimmed.ends_with("override")
+        || trimmed.ends_with("noexcept")
+        || trimmed.ends_with("final");
+    if !ends_like_fn {
+        return false;
+    }
+    let tokens: Vec<&str> = before_paren.split_whitespace().collect();
+    if tokens.is_empty() {
+        return false;
+    }
+    const CONTROL_KW: &[&str] = &[
+        "if", "for", "while", "switch", "return", "else", "do", "case", "catch", "delete", "throw",
+        "goto", "sizeof", "assert",
+    ];
+    if CONTROL_KW.contains(&tokens[0]) {
+        return false;
+    }
+    tokens.len() >= 2 || before_paren.contains("::")
 }
 
 fn clean_signature(line: &str) -> String {
@@ -594,7 +770,31 @@ fn clean_signature(line: &str) -> String {
     }
 }
 
-fn is_symbol_line(rel: &str, trimmed: &str) -> bool {
+fn is_yaml_symbol(trimmed: &str, indent: usize) -> bool {
+    if trimmed == "---" || trimmed == "..." {
+        return false;
+    }
+    let low = trimmed.to_ascii_lowercase();
+    if indent <= 6 && low.starts_with("- name:") {
+        return true;
+    }
+    if indent <= 4 && (low.starts_with("hosts:") || low.starts_with("- hosts:")) {
+        return true;
+    }
+    if indent == 0 && !trimmed.starts_with('-') {
+        if let Some((key, _)) = trimmed.split_once(':') {
+            let k = key.trim();
+            return !k.is_empty()
+                && k.as_bytes()
+                    .first()
+                    .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+                && !k.contains(' ');
+        }
+    }
+    false
+}
+
+fn is_symbol_line(rel: &str, trimmed: &str, indent: usize) -> bool {
     if trimmed.is_empty()
         || trimmed.starts_with("//")
         || trimmed.starts_with('#')
@@ -605,62 +805,123 @@ fn is_symbol_line(rel: &str, trimmed: &str) -> bool {
         return false;
     }
     let lower_path = rel.to_ascii_lowercase();
+    if lower_path.ends_with(".yml") || lower_path.ends_with(".yaml") {
+        return is_yaml_symbol(trimmed, indent);
+    }
+    if indent > 4 {
+        return false;
+    }
+    if lower_path.ends_with(".rsc") {
+        let low = trimmed.to_ascii_lowercase();
+        let is_menu = trimmed.starts_with('/')
+            && trimmed
+                .as_bytes()
+                .get(1)
+                .is_some_and(u8::is_ascii_alphabetic);
+        return is_menu || low.starts_with(":global ") || low.starts_with(":local ");
+    }
     if lower_path.ends_with(".cfg")
         || lower_path.ends_with(".conf")
-        || lower_path.ends_with(".rsc")
         || lower_path.ends_with(".ios")
         || lower_path.ends_with(".vrp")
+        || lower_path.ends_with(".junos")
     {
         let low = trimmed.to_ascii_lowercase();
         return [
             "hostname ",
             "sysname ",
+            "set system host-name ",
             "interface ",
             "router bgp",
             "router ospf",
+            "router ospf6",
             "router isis",
+            "router rip",
+            "router static",
             "bgp ",
             "ospf ",
+            "isis ",
+            "route-map ",
+            "route-policy ",
+            "policy-map ",
+            "class-map ",
+            "ip access-list ",
+            "ipv6 access-list ",
+            "access-list ",
+            "acl ",
+            "ip prefix-list ",
+            "ipv6 prefix-list ",
+            "ip community-list ",
+            "ip as-path ",
             "ip vrf ",
             "ip vpn-instance ",
             "vrf definition ",
-            "/interface",
-            "/routing",
-            "/ip firewall",
+            "vrf ",
+            "vlan ",
+            "bridge-domain ",
+            "mpls ",
+            "l2vpn ",
+            "evpn ",
+            "interfaces {",
+            "protocols {",
+            "routing-options {",
+            "policy-options {",
+            "routing-instances {",
         ]
         .iter()
         .any(|p| low.starts_with(p));
+    }
+    if is_c_cpp_ext(&lower_path) {
+        return is_c_cpp_symbol(trimmed);
     }
 
     const CODE_PREFIXES: &[&str] = &[
         "pub fn ",
         "pub async fn ",
         "pub const fn ",
+        "pub unsafe fn ",
         "pub(crate) fn ",
+        "pub(crate) async fn ",
+        "pub(crate) const fn ",
         "pub(super) fn ",
         "fn ",
         "async fn ",
+        "const fn ",
+        "unsafe fn ",
         "pub struct ",
         "pub(crate) struct ",
+        "pub(super) struct ",
         "struct ",
         "pub enum ",
         "pub(crate) enum ",
+        "pub(super) enum ",
         "enum ",
         "pub trait ",
+        "pub(crate) trait ",
         "trait ",
         "impl ",
         "impl<",
+        "unsafe impl ",
         "pub mod ",
+        "pub(crate) mod ",
         "pub type ",
+        "pub(crate) type ",
+        "macro_rules! ",
         "export function ",
         "export async function ",
         "export default function ",
+        "export default async function ",
         "function ",
+        "async function ",
         "export class ",
+        "export default class ",
+        "export abstract class ",
+        "abstract class ",
         "class ",
         "export interface ",
         "interface ",
         "export type ",
+        "export enum ",
         "export const ",
         "def ",
         "async def ",
@@ -680,11 +941,8 @@ pub(crate) fn extract_file_symbols(
     let mut out = Vec::new();
     for (idx, raw) in text.lines().enumerate() {
         let indent = raw.len() - raw.trim_start().len();
-        if indent > 4 {
-            continue;
-        }
         let trimmed = raw.trim();
-        if is_symbol_line(rel, trimmed) {
+        if is_symbol_line(rel, trimmed, indent) {
             out.push((idx + 1, clean_signature(trimmed)));
             if out.len() >= max_per_file {
                 break;
@@ -694,9 +952,86 @@ pub(crate) fn extract_file_symbols(
     out
 }
 
+fn norm_rel_path(s: &str) -> String {
+    s.trim()
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .trim_matches('/')
+        .to_ascii_lowercase()
+}
+
+fn is_entrypoint_file(norm_path: &str) -> bool {
+    let name = norm_path.rsplit('/').next().unwrap_or(norm_path);
+    matches!(
+        name,
+        "lib.rs"
+            | "main.rs"
+            | "mod.rs"
+            | "index.ts"
+            | "index.tsx"
+            | "index.js"
+            | "index.jsx"
+            | "app.tsx"
+            | "app.ts"
+            | "__init__.py"
+            | "main.py"
+            | "main.go"
+            | "main.c"
+            | "main.cpp"
+    )
+}
+
+/// Sort key for `repo_map` `focus` proximity ranking (smaller sorts first):
+/// same file > same directory > shared prefix segments (more first) >
+/// entrypoint files (`lib.rs`, `main.rs`, `index.ts`, ...) > alphabetical.
+fn focus_rank_key(shown: &str, focus_norm: &str) -> (u8, usize, u8, String) {
+    let p = norm_rel_path(shown);
+    let p_segs: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
+    let f_segs: Vec<&str> = focus_norm.split('/').filter(|s| !s.is_empty()).collect();
+    let p_name = p_segs.last().copied().unwrap_or("");
+    let p_stem = p_name.split('.').next().unwrap_or(p_name);
+    let p_dir = &p_segs[..p_segs.len().saturating_sub(1)];
+    let f_dir = if f_segs.len() > 1 {
+        &f_segs[..f_segs.len() - 1]
+    } else {
+        &[]
+    };
+    let shared_prefix = p_segs
+        .iter()
+        .zip(f_segs.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let has_slash = focus_norm.contains('/');
+
+    let same_file = p == focus_norm
+        || p_name == focus_norm
+        || (!has_slash && p_stem == focus_norm)
+        || (has_slash && p.ends_with(&format!("/{focus_norm}")));
+    let same_dir = (!f_dir.is_empty() && p_dir == f_dir)
+        || (!f_segs.is_empty() && p_dir == f_segs)
+        || (!has_slash
+            && (p_name.contains(focus_norm) || p_dir.iter().any(|seg| seg.contains(focus_norm))));
+
+    let tier = if same_file {
+        0
+    } else if same_dir {
+        1
+    } else if shared_prefix > 0 || (has_slash && p.contains(focus_norm)) {
+        2
+    } else {
+        3
+    };
+    let entrypoint_rank = if is_entrypoint_file(&p) { 0 } else { 1 };
+    (tier, usize::MAX - shared_prefix, entrypoint_rank, p)
+}
+
 pub(super) fn repo_map(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
     let base = ctx.resolve(args["path"].as_str().unwrap_or("."));
     let filter = args["glob"].as_str();
+    let focus = args["focus"]
+        .as_str()
+        .map(norm_rel_path)
+        .filter(|s| !s.is_empty());
     let max_chars = args["max_chars"]
         .as_u64()
         .map_or(6_000usize, |n| (n as usize).clamp(500, 24_000));
@@ -721,6 +1056,10 @@ pub(super) fn repo_map(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Resu
 
     if files.is_empty() {
         return Ok("nenhum arquivo de código ou configuração encontrado para mapear".into());
+    }
+
+    if let Some(focus_norm) = focus.as_deref() {
+        files.sort_by_cached_key(|(shown, _)| focus_rank_key(shown, focus_norm));
     }
 
     let mut out = String::new();
@@ -757,7 +1096,7 @@ pub(super) fn repo_map(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Resu
 
     if truncated {
         out.push_str(&format!(
-            "[repo_map truncado em {max_chars} caracteres: {mapped_files}/{} arquivos, {total_symbols} símbolos — use path ou glob para focar]",
+            "[repo_map truncado em {max_chars} caracteres: {mapped_files}/{} arquivos, {total_symbols} símbolos — use path, glob ou focus para focar]",
             files.len()
         ));
     } else {
@@ -766,4 +1105,64 @@ pub(super) fn repo_map(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Resu
         ));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_rg_content_line_handles_digits_in_filenames_context_and_windows_paths() {
+        assert_eq!(
+            parse_rg_content_line("router-01-core.cfg:12:set system host-name r1"),
+            Some((
+                "router-01-core.cfg".to_string(),
+                "12",
+                ':',
+                "set system host-name r1"
+            ))
+        );
+        assert_eq!(
+            parse_rg_content_line("router-12-core.cfg:12:set port 1:2:3"),
+            Some((
+                "router-12-core.cfg".to_string(),
+                "12",
+                ':',
+                "set port 1:2:3"
+            ))
+        );
+        assert_eq!(
+            parse_rg_content_line("foo-2024-01.log-15-context line"),
+            Some(("foo-2024-01.log".to_string(), "15", '-', "context line"))
+        );
+        assert_eq!(
+            parse_rg_content_line("foo-2024-01-bar-15-context line"),
+            Some(("foo-2024-01-bar".to_string(), "15", '-', "context line"))
+        );
+        assert_eq!(
+            parse_rg_content_line(r"C:\repo\router-01-core.cfg:12:line"),
+            Some(("C:/repo/router-01-core.cfg".to_string(), "12", ':', "line"))
+        );
+        assert_eq!(
+            parse_rg_content_line(r"C:\repo\dir-12-prod\foo-2024-01.log-15-context"),
+            Some((
+                "C:/repo/dir-12-prod/foo-2024-01.log".to_string(),
+                "15",
+                '-',
+                "context"
+            ))
+        );
+        assert_eq!(
+            parse_rg_content_line("dir:12:sub/file.txt:7:hello:8:world"),
+            Some(("dir:12:sub/file.txt".to_string(), "7", ':', "hello:8:world"))
+        );
+        assert_eq!(
+            parse_rg_content_line("src/a.rs-9-see b.rs:4:call()"),
+            Some(("src/a.rs".to_string(), "9", '-', "see b.rs:4:call()"))
+        );
+        assert_eq!(
+            parse_rg_content_line_ctx("a-12-b.txt:3:x-9-y", false, None),
+            Some(("a-12-b.txt".to_string(), "3", ':', "x-9-y"))
+        );
+    }
 }

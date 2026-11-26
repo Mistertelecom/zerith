@@ -125,6 +125,7 @@ pub enum TurnEvent {
         after: u64,
     },
     ToolProgress {
+        tool_call_id: Option<String>,
         tool: String,
         chunk: String,
     },
@@ -142,6 +143,7 @@ pub enum TurnEvent {
     },
     Done {
         stored: Option<i64>,
+        user_message_id: Option<i64>,
         text: String,
         prompt_tokens: u64,
         completion_tokens: u64,
@@ -246,7 +248,15 @@ fn shape(ev: RunEvent) -> Option<TurnEvent> {
             before: before_bytes as u64,
             after: after_bytes as u64,
         },
-        RunEvent::ToolProgress { tool, chunk } => TurnEvent::ToolProgress { tool, chunk },
+        RunEvent::ToolProgress {
+            tool_call_id,
+            tool,
+            chunk,
+        } => TurnEvent::ToolProgress {
+            tool_call_id,
+            tool,
+            chunk,
+        },
         RunEvent::Steered { text } => TurnEvent::Steered { text },
         RunEvent::SkillsLoaded { names } => TurnEvent::SkillsLoaded { names },
     })
@@ -271,9 +281,6 @@ pub fn run(
     // Usually already up (started with the app). One that died restarts in the
     // background; this turn goes direct instead of waiting for the boot.
     zerith_runtime::bili::ensure(&setup.root, cfg.context.billion_context, false);
-    // User messages replayed per turn: the execution profile's, as in the CLI.
-    let limits = cfg.profile.limits();
-    let history = limits.history_window;
     // `configured_providers_from` reuses the already-loaded `Settings` so we
     // never parse settings.toml twice per turn.
     let provider = crate::wire::configured_providers_from(&cfg, &setup.root)
@@ -281,6 +288,31 @@ pub fn run(
         .next()
         .ok_or_else(|| "Nenhum provedor configurado".to_string())?;
     let client = Client::new(provider).map_err(|e| zerith_providers::explain::headline(&e))?;
+    run_with_loaded(
+        &store, &paths, cfg, &client, setup, session_id, model, prompt, cancel, approvals,
+        questions, inbox, on,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_with_loaded(
+    store: &Store,
+    paths: &zerith_core::Paths,
+    cfg: zerith_core::Settings,
+    client: &Client,
+    setup: &Setup,
+    session_id: &str,
+    model: &str,
+    prompt: &str,
+    cancel: &Cancel,
+    approvals: &ApprovalGate,
+    questions: &QuestionGate,
+    inbox: Option<&InboxReceiver>,
+    on: &mut dyn FnMut(TurnEvent),
+) -> Result<TurnOutcome, String> {
+    // User messages replayed per turn: the execution profile's, as in the CLI.
+    let limits = cfg.profile.limits();
+    let history = limits.history_window;
 
     let memory = if setup.memory_paused {
         None
@@ -313,7 +345,7 @@ pub fn run(
 
     let mut tools = Registry::new();
     let build_mcp = || {
-        let mut reg = zerith_mcp::McpRegistry::load(&paths, Some(&setup.workspace));
+        let mut reg = zerith_mcp::McpRegistry::load(paths, Some(&setup.workspace));
         if let Some(c) = &contrib {
             reg.extend(c.mcp.iter().map(|(_, s)| s.clone()).collect());
         }
@@ -348,7 +380,7 @@ pub fn run(
     if let Some(p) = policy.as_ref() {
         let have: Vec<String> = tools.specs().iter().map(|s| s.name.clone()).collect();
         for t in zerith_tools::authoring_tools(zerith_tools::Authoring {
-            paths: zerith_core::Paths::with_root(&setup.root),
+            paths: paths.clone(),
             project_dir: Some(setup.workspace.clone()),
             tools: have,
             mode: p.mode().settings_name().to_string(),
@@ -365,15 +397,21 @@ pub fn run(
         });
     let extra = contrib.as_ref().map(|c| c.agents.as_slice()).unwrap_or(&[]);
     let agent = setup.agent.as_ref().and_then(|n| {
-        zerith_core::agents::find_with_extra(&paths, Some(&setup.workspace), extra, n)
+        zerith_core::agents::find_with_extra(paths, Some(&setup.workspace), extra, n)
     });
 
     if cancel.is_cancelled() {
         return Ok(TurnOutcome::Cancelled);
     }
 
+    let routed_ctx_limit = zerith_runtime::resolve_gateway(&settings, model, client.config())
+        .0
+        .candidates
+        .into_iter()
+        .next()
+        .and_then(|c| c.config.context_limit);
     auto_compact(
-        &store, &settings, &client, session_id, model, history, cancel, on,
+        store, &settings, client, session_id, model, history, cancel, on,
     );
 
     if cancel.is_cancelled() {
@@ -387,8 +425,8 @@ pub fn run(
     });
     let mut digest = zerith_runtime::learn::TurnDigest::new(&prompt);
     let result = run_agent_turn(
-        &store,
-        &client,
+        store,
+        client,
         TurnContext {
             memory: memory.as_ref().map(|m| m as &dyn MemoryBackend),
             scope: Some(&scope),
@@ -452,6 +490,7 @@ pub fn run(
                 store.set_session_model(session_id, r.model_used.as_deref(), provider.as_deref());
             on(TurnEvent::Done {
                 stored: Some(r.message_id),
+                user_message_id: r.user_message_id,
                 text: r.text,
                 prompt_tokens: r.prompt_tokens,
                 completion_tokens: r.completion_tokens,
@@ -462,12 +501,7 @@ pub fn run(
             });
             // Best-effort background pre-compaction when context usage sits in [70%, 85%).
             let model_for_win = r.model_used.as_deref().unwrap_or(model);
-            let ctx_limit = zerith_runtime::resolve_gateway(&settings, model, client.config())
-                .0
-                .candidates
-                .into_iter()
-                .next()
-                .and_then(|c| c.config.context_limit)
+            let ctx_limit = routed_ctx_limit
                 .or(client.config().context_limit)
                 .or_else(|| zerith_providers::models::context_window(model_for_win));
             if let Some(win) = ctx_limit.filter(|&w| w > 0) {
@@ -654,8 +688,10 @@ pub fn run_goal(
     on: &mut dyn FnMut(TurnEvent),
 ) -> Result<TurnOutcome, String> {
     use zerith_runtime::goal;
+    let store = Store::open(&setup.db).map_err(|e| e.to_string())?;
     let paths = zerith_core::Paths::with_root(&setup.root);
     let settings = zerith_core::Settings::load(&paths, Some(&setup.workspace)).settings;
+    zerith_runtime::bili::ensure(&setup.root, settings.context.billion_context, false);
     let provider = crate::wire::configured_providers_from(&settings, &setup.root)
         .into_iter()
         .next()
@@ -707,7 +743,11 @@ pub fn run_goal(
                 }
                 tap(e);
             };
-            last = run(
+            last = run_with_loaded(
+                &store,
+                &paths,
+                settings.clone(),
+                &client,
                 setup,
                 session_id,
                 model,
@@ -814,5 +854,49 @@ mod tests {
         );
         assert_eq!(launch_dir(Some(sys), Some(&exe), home.clone()), home);
         assert_eq!(launch_dir(None, None, home.clone()), home);
+    }
+
+    #[test]
+    fn done_event_serializes_user_message_id_in_camel_case() {
+        let ev = TurnEvent::Done {
+            stored: Some(42),
+            user_message_id: Some(41),
+            text: "ok".into(),
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            saved_tokens: 0,
+            model_used: None,
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v["type"], "done");
+        assert_eq!(v["stored"], 42);
+        assert_eq!(v["userMessageId"], 41);
+    }
+
+    #[test]
+    fn tool_progress_event_serializes_tool_call_id_in_camel_case() {
+        let shaped = shape(RunEvent::ToolProgress {
+            tool_call_id: Some("call_123".into()),
+            tool: "net_broadcast".into(),
+            chunk: "[ok] core-01 (142ms)\n".into(),
+        })
+        .unwrap();
+        let v = serde_json::to_value(&shaped).unwrap();
+        assert_eq!(v["type"], "toolProgress");
+        assert_eq!(v["toolCallId"], "call_123");
+        assert_eq!(v["tool"], "net_broadcast");
+        assert_eq!(v["chunk"], "[ok] core-01 (142ms)\n");
+
+        let unlinked = shape(RunEvent::ToolProgress {
+            tool_call_id: None,
+            tool: "shell".into(),
+            chunk: "tick\n".into(),
+        })
+        .unwrap();
+        let v2 = serde_json::to_value(&unlinked).unwrap();
+        assert_eq!(v2["type"], "toolProgress");
+        assert!(v2["toolCallId"].is_null());
     }
 }

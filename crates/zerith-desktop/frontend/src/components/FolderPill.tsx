@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { Check, ChevronDown, ExternalLink, Folder, FolderOpen, GitBranch } from "lucide-react";
 
 /** Last segment of a Windows or POSIX path. */
@@ -23,7 +23,7 @@ export function measurePillPopover(
 
 /** The conversation's folder: recent folders, the OS picker, and Explorer.
  * Same look as the composer's other pills (PillMenu classes). */
-export function FolderPill(props: {
+export const FolderPill = memo(function FolderPill(props: {
   /** Checked-out git branch of the folder, if it is a repository. */
   branch?: string | null;
   value: string;
@@ -124,4 +124,4 @@ export function FolderPill(props: {
       ) : null}
     </div>
   );
-}
+});

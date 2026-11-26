@@ -317,14 +317,33 @@ fn an_unknown_tool_lists_the_offered_ones_and_suggests_the_closest() {
 #[test]
 fn only_read_only_tools_are_concurrency_safe() {
     let r = Registry::new();
-    for name in ["read_file", "list_dir", "glob", "grep", "memory_recall"] {
+    for name in [
+        "read_file",
+        "view_image",
+        "list_dir",
+        "glob",
+        "grep",
+        "memory_recall",
+        "skill",
+        "diagnostics",
+        "lsp",
+    ] {
         assert!(r.concurrency_safe(name, &json!({})), "{name}");
     }
     assert!(r.concurrency_safe("memory", &json!({"action": "recall"})));
+    assert!(r.concurrency_safe("process", &json!({"action": "list"})));
+    assert!(r.concurrency_safe("process", &json!({"action": "output"})));
     for name in ["write_file", "edit_file", "shell", "nope", "memory_save"] {
         assert!(!r.concurrency_safe(name, &json!({})), "{name}");
     }
     assert!(!r.concurrency_safe("memory", &json!({"action": "save"})));
+    assert!(!r.concurrency_safe("process", &json!({"action": "kill"})));
+    assert!(r.concurrency_safe("net_snmp", &json!({})));
+    assert!(r.concurrency_safe("net_api", &json!({})));
+    assert!(r.concurrency_safe("net_api", &json!({"method": "HEAD"})));
+    assert!(!r.concurrency_safe("net_api", &json!({"method": "POST"})));
+    assert!(r.concurrency_safe("net_zabbix", &json!({"action": "problems"})));
+    assert!(!r.concurrency_safe("net_zabbix", &json!({"action": "ack"})));
     assert!(r.uses_memory("memory_recall") && r.uses_memory("memory") && !r.uses_memory("grep"));
 }
 

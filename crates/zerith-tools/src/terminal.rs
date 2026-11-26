@@ -999,9 +999,18 @@ fn collect(
     let echo = cmd.map(echo_tail).filter(|e| !e.is_empty());
     let mut echo_seen = echo.is_none();
     let strict = t.meta.vendor.as_deref().and_then(vendor_prompt);
+    let mut analyzed = false;
+    let mut pager_like = false;
+    let mut strict_hit: Option<bool> = None;
+    let mut has_newline = false;
+    let mut prompt_like = false;
+    let mut expect_hit = false;
+    let mut monitor: Option<&'static [u8]> = None;
+    let mut repeating_hit = false;
     let note = loop {
         std::thread::sleep(Duration::from_millis(12));
         let now = len();
+        let buf_changed = now != last || !analyzed;
         if now != last {
             (last, changed) = (now, Instant::now());
         }
@@ -1034,65 +1043,71 @@ fn collect(
             last_emit = Instant::now();
         }
         let quiet = changed.elapsed();
-        let tail_bytes: Vec<u8> = t
-            .buf
-            .lock()
-            .map(|b| {
-                let start = b.len().saturating_sub(LOOP_TAIL_BYTES);
-                b.range(start..).copied().collect()
-            })
-            .unwrap_or_default();
-        let tail_clean = clean(&tail_bytes);
-        if auto_page && pages < MAX_AUTO_PAGES && now > page_at && looks_like_pager(&tail_clean) {
-            if let Ok(mut w) = t.input.lock() {
-                if w.write_all(b" ").and_then(|_| w.flush()).is_ok() {
-                    pages += 1;
-                    page_at = now;
-                    changed = Instant::now();
-                    continue;
-                }
-            }
-        }
-        let pager_waiting = auto_page && pages < MAX_AUTO_PAGES && looks_like_pager(&tail_clean);
-        if !echo_seen {
-            let head: Vec<u8> = t
+        if buf_changed {
+            let tail_bytes: Vec<u8> = t
                 .buf
                 .lock()
-                .map(|b| b.range(..b.len().min(ECHO_SCAN_BYTES)).copied().collect())
+                .map(|b| {
+                    let start = b.len().saturating_sub(LOOP_TAIL_BYTES);
+                    b.range(start..).copied().collect()
+                })
                 .unwrap_or_default();
-            echo_seen = echo.as_deref().is_some_and(|e| clean(&head).contains(e));
+            let tail_clean = clean(&tail_bytes);
+            pager_like = looks_like_pager(&tail_clean);
+            if auto_page && pages < MAX_AUTO_PAGES && now > page_at && pager_like {
+                if let Ok(mut w) = t.input.lock() {
+                    if w.write_all(b" ").and_then(|_| w.flush()).is_ok() {
+                        pages += 1;
+                        page_at = now;
+                        changed = Instant::now();
+                        analyzed = true;
+                        continue;
+                    }
+                }
+            }
+            if !echo_seen {
+                let head: Vec<u8> = t
+                    .buf
+                    .lock()
+                    .map(|b| b.range(..b.len().min(ECHO_SCAN_BYTES)).copied().collect())
+                    .unwrap_or_default();
+                echo_seen = echo.as_deref().is_some_and(|e| clean(&head).contains(e));
+            }
+            strict_hit = strict.map(|re| {
+                !tail_bytes.ends_with(b"\n")
+                    && tail_clean.lines().last().is_some_and(|l| re.is_match(l))
+            });
+            has_newline = tail_clean.contains('\n');
+            prompt_like = looks_like_prompt(&tail_clean);
+            expect_hit = expect.is_some_and(|re| re.is_match(&tail_clean));
+            monitor = monitor_key(&tail_clean);
+            repeating_hit = !prompt_like && repeating_tail(&tail_clean).is_some();
+            analyzed = true;
         }
+        let pager_waiting = auto_page && pages < MAX_AUTO_PAGES && pager_like;
         // The vendor's own prompt alone on the last line, after the echo:
         // the command is over, no need to wait for quiet (30 ms only so a
         // line split by the network is not taken for one). The redrawn
         // prompt inside an echo (`/ip fir[admin@MK] >`) is not alone.
-        let strict_hit = strict.map(|re| {
-            !tail_bytes.ends_with(b"\n")
-                && tail_clean.lines().last().is_some_and(|l| re.is_match(l))
-        });
         let at_vendor_prompt =
             echo_seen && strict_hit == Some(true) && quiet >= Duration::from_millis(30);
         // Anything else that ends like a prompt waits a little for quiet;
         // longer before the echo, or when it is not the vendor's shape.
-        let prompt_settle = match (
-            echo_seen && strict_hit != Some(false),
-            tail_clean.contains('\n'),
-        ) {
+        let prompt_settle = match (echo_seen && strict_hit != Some(false), has_newline) {
             (false, _) => Duration::from_millis(600),
             (true, true) => Duration::from_millis(80),
             (true, false) => Duration::from_millis(120),
         };
         // A monitor footer keeps output flowing, so "quiet for 2 s" never
         // comes and the footer is not a prompt.
-        let monitor = monitor_key(&tail_clean);
         let done = !pager_waiting
             && match expect {
-                Some(re) => re.is_match(&tail_clean),
+                Some(_) => expect_hit,
                 None => {
                     now > 0
                         && (at_vendor_prompt
                             || quiet >= Duration::from_secs(2) && monitor.is_none()
-                            || (quiet >= prompt_settle && looks_like_prompt(&tail_clean)))
+                            || (quiet >= prompt_settle && prompt_like))
                 }
             };
         if done {
@@ -1107,13 +1122,13 @@ fn collect(
                 break Some(Err(stop_continuous(t, monitor, Stop::Monitor)));
             }
         }
-        if !looks_like_prompt(&tail_clean) && repeating_tail(&tail_clean).is_some() {
+        if repeating_hit {
             break Some(Err(stop_continuous(t, monitor, Stop::Monitor)));
         }
         if now >= MAX_CMD_BYTES {
             break Some(Err(stop_continuous(t, monitor, Stop::Bytes)));
         }
-        if auto_page && pages >= MAX_AUTO_PAGES && looks_like_pager(&tail_clean) {
+        if auto_page && pages >= MAX_AUTO_PAGES && pager_like {
             break Some(Err(stop_continuous(t, Some(b"q"), Stop::Pages)));
         }
         if !t.proc.alive() || !t.meta.alive.load(Ordering::SeqCst) {
@@ -1676,96 +1691,139 @@ impl Proc {
     }
 }
 
-/// Processes raw Telnet RFC 854 stream bytes, stripping IAC negotiation
-/// sequences and generating immediate negotiation replies (including NAWS
-/// 250x60 window size so router output never wraps at 80 columns).
-pub(crate) fn strip_and_reply_telnet_iac(raw: &[u8]) -> (Vec<u8>, Vec<u8>) {
-    let mut clean_out = Vec::with_capacity(raw.len());
-    let mut replies = Vec::new();
-    let mut i = 0;
-    while i < raw.len() {
-        if raw[i] != 0xFF {
-            clean_out.push(raw[i]);
-            i += 1;
-            continue;
-        }
-        if i + 1 >= raw.len() {
-            break;
-        }
-        let cmd = raw[i + 1];
-        match cmd {
-            0xFF => {
-                clean_out.push(0xFF);
-                i += 2;
+/// Stateful Telnet RFC 854 IAC parser that buffers incomplete IAC or
+/// subnegotiation (`IAC SB ... IAC SE`) byte sequences across TCP chunk reads.
+#[derive(Default)]
+pub(crate) struct TelnetIacParser {
+    pending: Vec<u8>,
+}
+
+impl TelnetIacParser {
+    pub(crate) fn process(&mut self, chunk: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let buf: std::borrow::Cow<'_, [u8]> = if self.pending.is_empty() {
+            std::borrow::Cow::Borrowed(chunk)
+        } else {
+            let mut combined = std::mem::take(&mut self.pending);
+            combined.extend_from_slice(chunk);
+            std::borrow::Cow::Owned(combined)
+        };
+        let raw = buf.as_ref();
+        let mut clean_out = Vec::with_capacity(raw.len());
+        let mut replies = Vec::new();
+        let mut i = 0;
+        while i < raw.len() {
+            if raw[i] != 0xFF {
+                clean_out.push(raw[i]);
+                i += 1;
+                continue;
             }
-            // IAC DO <opt>
-            0xFD => {
-                if i + 2 >= raw.len() {
-                    break;
-                }
-                let opt = raw[i + 2];
-                if opt == 0x03 {
-                    // SUPPRESS-GO-AHEAD -> IAC WILL SGA
-                    replies.extend_from_slice(&[0xFF, 0xFB, 0x03]);
-                } else if opt == 0x1F {
-                    // NAWS -> IAC WILL NAWS + subnegotiation 250x60
-                    replies.extend_from_slice(&[
-                        0xFF, 0xFB, 0x1F, 0xFF, 0xFA, 0x1F, 0x00, 250, 0x00, 60, 0xFF, 0xF0,
-                    ]);
-                } else {
-                    // IAC WONT <opt>
-                    replies.extend_from_slice(&[0xFF, 0xFC, opt]);
-                }
-                i += 3;
+            if i + 1 >= raw.len() {
+                self.pending.extend_from_slice(&raw[i..]);
+                break;
             }
-            // IAC WILL <opt>
-            0xFB => {
-                if i + 2 >= raw.len() {
-                    break;
+            let cmd = raw[i + 1];
+            match cmd {
+                0xFF => {
+                    clean_out.push(0xFF);
+                    i += 2;
                 }
-                let opt = raw[i + 2];
-                if opt == 0x01 || opt == 0x03 {
-                    // ECHO or SGA -> IAC DO <opt>
-                    replies.extend_from_slice(&[0xFF, 0xFD, opt]);
-                } else {
-                    // IAC DONT <opt>
-                    replies.extend_from_slice(&[0xFF, 0xFE, opt]);
-                }
-                i += 3;
-            }
-            // IAC WONT / IAC DONT
-            0xFC | 0xFE => {
-                if i + 2 >= raw.len() {
-                    break;
-                }
-                i += 3;
-            }
-            // IAC SB ... IAC SE
-            0xFA => {
-                i += 2;
-                while i + 1 < raw.len() {
-                    if raw[i] == 0xFF && raw[i + 1] == 0xF0 {
-                        i += 2;
+                // IAC DO <opt>
+                0xFD => {
+                    if i + 2 >= raw.len() {
+                        self.pending.extend_from_slice(&raw[i..]);
                         break;
                     }
-                    i += 1;
+                    let opt = raw[i + 2];
+                    if opt == 0x03 {
+                        // SUPPRESS-GO-AHEAD -> IAC WILL SGA
+                        replies.extend_from_slice(&[0xFF, 0xFB, 0x03]);
+                    } else if opt == 0x1F {
+                        // NAWS -> IAC WILL NAWS + subnegotiation 250x60
+                        replies.extend_from_slice(&[
+                            0xFF, 0xFB, 0x1F, 0xFF, 0xFA, 0x1F, 0x00, 250, 0x00, 60, 0xFF, 0xF0,
+                        ]);
+                    } else {
+                        // IAC WONT <opt>
+                        replies.extend_from_slice(&[0xFF, 0xFC, opt]);
+                    }
+                    i += 3;
+                }
+                // IAC WILL <opt>
+                0xFB => {
+                    if i + 2 >= raw.len() {
+                        self.pending.extend_from_slice(&raw[i..]);
+                        break;
+                    }
+                    let opt = raw[i + 2];
+                    if opt == 0x01 || opt == 0x03 {
+                        // ECHO or SGA -> IAC DO <opt>
+                        replies.extend_from_slice(&[0xFF, 0xFD, opt]);
+                    } else {
+                        // IAC DONT <opt>
+                        replies.extend_from_slice(&[0xFF, 0xFE, opt]);
+                    }
+                    i += 3;
+                }
+                // IAC WONT / IAC DONT
+                0xFC | 0xFE => {
+                    if i + 2 >= raw.len() {
+                        self.pending.extend_from_slice(&raw[i..]);
+                        break;
+                    }
+                    i += 3;
+                }
+                // IAC SB ... IAC SE
+                0xFA => {
+                    let mut j = i + 2;
+                    let mut closed = false;
+                    while j + 1 < raw.len() {
+                        if raw[j] == 0xFF {
+                            if raw[j + 1] == 0xF0 {
+                                j += 2;
+                                closed = true;
+                                break;
+                            } else if raw[j + 1] == 0xFF {
+                                j += 2;
+                                continue;
+                            }
+                        }
+                        j += 1;
+                    }
+                    if !closed {
+                        if raw.len() - i <= 4096 {
+                            self.pending.extend_from_slice(&raw[i..]);
+                        }
+                        break;
+                    }
+                    i = j;
+                }
+                _ => {
+                    i += 2;
                 }
             }
-            _ => {
-                i += 2;
-            }
         }
+        (clean_out, replies)
     }
-    (clean_out, replies)
 }
 
 struct TelnetReader {
     stream: std::net::TcpStream,
     alive: Arc<AtomicBool>,
+    iac: TelnetIacParser,
+    pending_clean: Vec<u8>,
 }
 
 impl Read for TelnetReader {
     fn read(&mut self, out_buf: &mut [u8]) -> std::io::Result<usize> {
+        if out_buf.is_empty() {
+            return Ok(0);
+        }
+        if !self.pending_clean.is_empty() {
+            let copy_len = self.pending_clean.len().min(out_buf.len());
+            out_buf[..copy_len].copy_from_slice(&self.pending_clean[..copy_len]);
+            self.pending_clean.drain(..copy_len);
+            return Ok(copy_len);
+        }
         let mut raw = [0u8; 4096];
         loop {
             let n = match self.stream.read(&mut raw) {
@@ -1779,7 +1837,7 @@ impl Read for TelnetReader {
                     return Err(e);
                 }
             };
-            let (clean_bytes, reply) = strip_and_reply_telnet_iac(&raw[..n]);
+            let (clean_bytes, reply) = self.iac.process(&raw[..n]);
             if !reply.is_empty() {
                 let _ = self.stream.write_all(&reply);
                 let _ = self.stream.flush();
@@ -1787,6 +1845,10 @@ impl Read for TelnetReader {
             if !clean_bytes.is_empty() {
                 let copy_len = clean_bytes.len().min(out_buf.len());
                 out_buf[..copy_len].copy_from_slice(&clean_bytes[..copy_len]);
+                if copy_len < clean_bytes.len() {
+                    self.pending_clean
+                        .extend_from_slice(&clean_bytes[copy_len..]);
+                }
                 return Ok(copy_len);
             }
         }
@@ -1844,6 +1906,8 @@ fn spawn_telnet(target: &str) -> std::io::Result<Spawned> {
         Box::new(TelnetReader {
             stream: r_stream,
             alive,
+            iac: TelnetIacParser::default(),
+            pending_clean: Vec::new(),
         }),
     ))
 }
@@ -2034,22 +2098,46 @@ impl OsProc {
 
     fn kill(&mut self) {
         let mut child = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        #[cfg(unix)]
+        {
+            let pgid = child.id();
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", &format!("-{pgid}")])
+                .status();
+        }
         let _ = child.kill();
         let _ = child.wait();
+    }
+}
+
+#[cfg(not(windows))]
+impl Drop for OsProc {
+    fn drop(&mut self) {
+        self.kill();
     }
 }
 
 /// `script` gives the program a pseudo-terminal without a pty crate.
 #[cfg(not(windows))]
 fn spawn_os(command: &str, cwd: &std::path::Path) -> std::io::Result<Spawned> {
+    #[cfg(unix)]
+    use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
+    let pty_cmd = format!("stty cols 250 rows 60 2>/dev/null; {command}");
     let mut c = Command::new("script");
     if cfg!(target_os = "macos") {
-        c.args(["-q", "/dev/null", "sh", "-c", command]);
+        c.args(["-q", "/dev/null", "sh", "-c", &pty_cmd]);
     } else {
-        c.args(["-qfec", command, "/dev/null"]);
+        c.args(["-qfec", &pty_cmd, "/dev/null"]);
     }
+    #[cfg(unix)]
+    c.process_group(0);
     let mut child = c
+        .env("COLUMNS", "250")
+        .env("LINES", "60")
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -2287,6 +2375,34 @@ mod tests {
             &exec,
         );
         assert!(hook_called.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn telnet_iac_parser_buffers_incomplete_sequences_across_chunks() {
+        let mut p = TelnetIacParser::default();
+
+        // Chunk 1 ends right on 0xFF (IAC).
+        let (clean1, rep1) = p.process(b"Hello\xff");
+        assert_eq!(clean1, b"Hello");
+        assert!(rep1.is_empty());
+
+        // Chunk 2 completes IAC DO NAWS (0xFD 0x1F) and starts IAC WILL (0xFF 0xFB).
+        let (clean2, rep2) = p.process(b"\xfd\x1f world\xff\xfb");
+        assert_eq!(clean2, b" world");
+        assert_eq!(
+            rep2,
+            vec![0xFF, 0xFB, 0x1F, 0xFF, 0xFA, 0x1F, 0x00, 250, 0x00, 60, 0xFF, 0xF0]
+        );
+
+        // Chunk 3 completes IAC WILL ECHO (0x01) and starts an unclosed IAC SB (with escaped 0xFF 0xFF inside).
+        let (clean3, rep3) = p.process(b"\x01!\xff\xfa\x18\x00xterm\xff\xff");
+        assert_eq!(clean3, b"!");
+        assert_eq!(rep3, vec![0xFF, 0xFD, 0x01]);
+
+        // Chunk 4 closes the subnegotiation with IAC SE (0xFF 0xF0) followed by prompt text.
+        let (clean4, rep4) = p.process(b"-256color\xff\xf0Login:");
+        assert_eq!(clean4, b"Login:");
+        assert!(rep4.is_empty());
     }
 
     /// Live check of `zerith chat` asking s/n on a real console. Needs the

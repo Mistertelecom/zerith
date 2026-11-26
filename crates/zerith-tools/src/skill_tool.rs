@@ -32,7 +32,7 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
             "o corpo da skill e, se houver, as ferramentas que ela declara",
             Permission::Read,
             10,
-            false,
+            true,
             |a, _, e| {
                 let name = check(a)?;
                 let (_, svc) = e.host.bound()?;

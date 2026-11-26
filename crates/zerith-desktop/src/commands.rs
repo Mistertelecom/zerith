@@ -178,6 +178,17 @@ pub async fn reveal_workspace(path: String) -> Cmd<()> {
     wire::reveal(&native)
 }
 
+fn is_hidden_transcript_row(raw: Option<&serde_json::Value>) -> bool {
+    let Some(obj) = raw.and_then(|v| v.as_object()) else {
+        return false;
+    };
+    obj.contains_key("dynamic_reminder")
+        || obj.contains_key("hook_context")
+        || obj.contains_key("hook_stop")
+        || obj.contains_key("tool_context")
+        || obj.contains_key("subagents_joined")
+}
+
 /// The newest `limit` messages of a conversation, oldest first: a long chat
 /// opens on its latest answer.
 #[tauri::command]
@@ -193,6 +204,7 @@ pub async fn session_messages(
         })
         .map(|v| {
             v.into_iter()
+                .filter(|m| !is_hidden_transcript_row(m.raw.as_ref()))
                 .map(|m| ChatMessage {
                     id: m.id,
                     role: m.role.as_str().to_string(),
@@ -418,4 +430,28 @@ pub async fn session_usage(
     session_id: String,
 ) -> Cmd<zerith_sessions::usage::SessionUsageTotals> {
     state.with_store(|s| s.session_usage(&session_id).map_err(|e| e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_hidden_transcript_row;
+    use serde_json::json;
+
+    #[test]
+    fn transcript_hides_synthetic_context_rows_including_dynamic_reminder() {
+        for key in [
+            "dynamic_reminder",
+            "hook_context",
+            "hook_stop",
+            "tool_context",
+            "subagents_joined",
+        ] {
+            assert!(
+                is_hidden_transcript_row(Some(&json!({ key: true }))),
+                "{key} must be hidden from UI transcript"
+            );
+        }
+        assert!(!is_hidden_transcript_row(None));
+        assert!(!is_hidden_transcript_row(Some(&json!({"steer": true}))));
+    }
 }

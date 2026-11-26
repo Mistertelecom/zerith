@@ -22,7 +22,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, Once};
+use std::sync::{Mutex, Once, OnceLock};
 
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -116,13 +116,19 @@ pub struct RestoreReport {
     pub notes: Vec<String>,
 }
 
+struct LazyInit {
+    db_path: PathBuf,
+    boundary: i64,
+}
+
 /// An open checkpoint for one turn. `Send + Sync`: tools may share it behind an
 /// `Arc` and call `record_file` from parallel calls.
 pub struct Checkpoint {
-    dir: PathBuf,
     data_root: PathBuf,
     pub session: String,
     pub turn: i64,
+    lazy: Option<LazyInit>,
+    begun: OnceLock<std::result::Result<(PathBuf, i64), String>>,
     state: Mutex<(Manifest, HashSet<String>)>,
     snapped: Once,
 }
@@ -203,6 +209,46 @@ impl Checkpoint {
             params![session],
             |r| r.get(0),
         )?;
+        let dir = Self::init_turn_storage(store, data_root, session, turn, boundary)?;
+        let begun = OnceLock::new();
+        let _ = begun.set(Ok((dir, turn)));
+        Ok(Self {
+            data_root: data_root.to_path_buf(),
+            session: session.to_string(),
+            turn,
+            lazy: None,
+            begun,
+            state: Mutex::new((Manifest::default(), HashSet::new())),
+            snapped: Once::new(),
+        })
+    }
+
+    /// Defers creating the checkpoint directory and SQLite row until the first
+    /// mutating file/shell tool runs, so read-only turns pay zero checkpoint I/O.
+    pub fn begin_lazy(
+        db_path: PathBuf,
+        data_root: PathBuf,
+        session: impl Into<String>,
+        boundary: i64,
+    ) -> Self {
+        Self {
+            data_root,
+            session: session.into(),
+            turn: 0,
+            lazy: Some(LazyInit { db_path, boundary }),
+            begun: OnceLock::new(),
+            state: Mutex::new((Manifest::default(), HashSet::new())),
+            snapped: Once::new(),
+        }
+    }
+
+    fn init_turn_storage(
+        store: &Store,
+        data_root: &Path,
+        session: &str,
+        turn: i64,
+        boundary: i64,
+    ) -> Result<PathBuf> {
         let dir = turn_dir(data_root, session, turn);
         if dir.exists() {
             std::fs::remove_dir_all(&dir)?;
@@ -214,14 +260,30 @@ impl Checkpoint {
             params![session, turn, boundary, now_ms()],
         )?;
         prune(store, data_root, session, turn - KEEP_TURNS)?;
-        Ok(Self {
-            dir,
-            data_root: data_root.to_path_buf(),
-            session: session.to_string(),
-            turn,
-            state: Mutex::new((Manifest::default(), HashSet::new())),
-            snapped: Once::new(),
-        })
+        Ok(dir)
+    }
+
+    fn ensure_begun(&self) -> Result<(&Path, i64)> {
+        let res = self.begun.get_or_init(|| {
+            let Some(lazy) = &self.lazy else {
+                return Err("checkpoint sem configuração".to_string());
+            };
+            let store = Store::open(&lazy.db_path).map_err(|e| e.to_string())?;
+            let turn = next_turn(&store, &self.session).map_err(|e| e.to_string())?;
+            let dir = Self::init_turn_storage(
+                &store,
+                &self.data_root,
+                &self.session,
+                turn,
+                lazy.boundary,
+            )
+            .map_err(|e| e.to_string())?;
+            Ok((dir, turn))
+        });
+        match res {
+            Ok((dir, turn)) => Ok((dir.as_path(), *turn)),
+            Err(e) => Err(CheckpointError::Io(std::io::Error::other(e.clone()))),
+        }
     }
 
     /// Snapshots `workspace` before the turn's first mutation; later calls
@@ -231,14 +293,17 @@ impl Checkpoint {
     /// is recorded, and a restore of this turn falls back to the per-file
     /// copies and says so.
     pub fn snapshot(&self, workspace: &Path) {
-        self.snapped
-            .call_once(|| shadow::snapshot(&self.data_root, workspace, &self.dir));
+        self.snapped.call_once(|| match self.ensure_begun() {
+            Ok((dir, _)) => shadow::snapshot(&self.data_root, workspace, dir),
+            Err(e) => eprintln!("zerith: checkpoint indisponível: {e}"),
+        });
     }
 
     /// Saves the current state of `path`, once per file per turn. **Call it
     /// from `write_file` / `edit_file` before mutating**; if it returns an
     /// error, do not make the edit and show the error to the model.
     pub fn record_file(&self, path: &Path) -> Result<()> {
+        let (dir, turn) = self.ensure_begun()?;
         let abs = std::path::absolute(path)?;
         let key = abs
             .to_str()
@@ -261,13 +326,13 @@ impl Checkpoint {
                 }
                 if manifest.bytes + meta.len() > MAX_TURN_BYTES {
                     return Err(CheckpointError::TurnTooLarge {
-                        turn: self.turn,
+                        turn,
                         used: manifest.bytes,
                         cap: MAX_TURN_BYTES,
                     });
                 }
                 let blob = manifest.entries.len().to_string();
-                std::fs::copy(&abs, self.dir.join(&blob))?;
+                std::fs::copy(&abs, dir.join(&blob))?;
                 manifest.bytes += meta.len();
                 Entry {
                     path: key.clone(),
@@ -288,9 +353,9 @@ impl Checkpoint {
         manifest.entries.push(entry);
         // Blob first, manifest second: a crash leaves an unreferenced blob,
         // never a manifest pointing at nothing.
-        let tmp = self.dir.join("manifest.json.tmp");
+        let tmp = dir.join("manifest.json.tmp");
         std::fs::write(&tmp, serde_json::to_vec(&*manifest)?)?;
-        std::fs::rename(&tmp, self.dir.join("manifest.json"))?;
+        std::fs::rename(&tmp, dir.join("manifest.json"))?;
         seen.insert(dedup_key);
         Ok(())
     }

@@ -937,8 +937,13 @@ fn stream_event_json(e: RunEvent) -> Option<serde_json::Value> {
             "after_bytes": after_bytes,
             "filter": filter,
         }),
-        RunEvent::ToolProgress { tool, chunk } => serde_json::json!({
+        RunEvent::ToolProgress {
+            tool_call_id,
+            tool,
+            chunk,
+        } => serde_json::json!({
             "type": "tool_progress",
+            "tool_call_id": tool_call_id,
             "tool": tool,
             "chunk": chunk,
         }),

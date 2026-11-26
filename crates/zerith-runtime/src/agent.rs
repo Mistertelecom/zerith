@@ -572,8 +572,8 @@ fn turn_body(
     on_event: &mut dyn FnMut(RunEvent),
     log: &TurnLog<'_>,
 ) -> Result<(TurnReport, &'static str)> {
-    if let Some(dir) = &agent.spill_dir {
-        spill::prune(dir, SPILL_MAX_AGE);
+    if let Some(dir) = agent.spill_dir.clone() {
+        std::thread::spawn(move || spill::prune(&dir, SPILL_MAX_AGE));
     }
     // hooks run where the turn's tools act: the session's folder, not the
     // process's (the desktop starts from anywhere)
@@ -615,39 +615,38 @@ fn turn_body(
         prompt_context = prompt_out.additional_context;
     }
     // Checkpoint first: its boundary is the newest message *before* this
-    // prompt, so a conversation rewind removes the prompt too. A failure only
-    // disables rewind for this turn; it never stops the turn.
+    // prompt, so a conversation rewind removes the prompt too. Storage and
+    // SQLite row creation stay lazy until the first mutating file/shell tool.
+    let prompt_row_id = store.append(session_id, &NewMessage::new(Role::User, prompt))?;
     let mut turn_checkpoint = agent.parent_checkpoint.clone();
     if turn_checkpoint.is_none() {
-        if let (Some(_), Some(root)) = (
+        if let (Some(_), Some(db_path)) = (
             agent.tools,
-            store.conn().path().filter(|p| !p.is_empty()).and_then(|p| {
-                std::path::Path::new(p)
-                    .parent()
-                    .map(std::path::Path::to_path_buf)
-            }),
+            store
+                .conn()
+                .path()
+                .filter(|p| !p.is_empty())
+                .map(std::path::PathBuf::from),
         ) {
-            let opened = checkpoints::next_turn(store, session_id)
-                .and_then(|turn| checkpoints::Checkpoint::begin(store, &root, session_id, turn));
-            match opened {
-                Ok(cp) => turn_checkpoint = Some(Arc::new(cp)),
-                Err(e) => eprintln!("zerith: checkpoint indisponível: {e}"),
+            if let Some(root) = db_path.parent().map(Path::to_path_buf) {
+                turn_checkpoint = Some(Arc::new(checkpoints::Checkpoint::begin_lazy(
+                    db_path,
+                    root,
+                    session_id,
+                    prompt_row_id.saturating_sub(1),
+                )));
             }
         }
     }
     if let (Some(r), Some(cp)) = (agent.tools, turn_checkpoint.as_ref()) {
-        // The whole workspace is snapshotted at the turn's first
-        // mutation, so rewind also undoes what any child or shell changed.
+        // Pure file edits record per-file undo copies without a heavy
+        // `git add -A`; shell/apply_patch still trigger workspace snapshots.
         let cp_w = Arc::clone(cp);
-        let ws = cwd.clone();
-        r.host().on_before_write(move |p| {
-            cp_w.snapshot(&ws);
-            cp_w.record_file(p).map_err(|e| e.to_string())
-        });
+        r.host()
+            .on_before_write(move |p| cp_w.record_file(p).map_err(|e| e.to_string()));
         let cp_s = Arc::clone(cp);
         r.host().on_before_shell(move |ws| cp_s.snapshot(ws));
     }
-    let prompt_row_id = store.append(session_id, &NewMessage::new(Role::User, prompt))?;
 
     let kids_saved = if let (Some(r), Some(p)) = (agent.tools, agent.policy) {
         Some(subagent::bind(
@@ -758,19 +757,45 @@ fn turn_body(
         )?;
         hist.push(ChatMessage::synthetic_user(text), cid);
     }
-    // Pinned instructions, after the prompt of every turn: a summary or a
-    // dropped turn can hide an older copy, never this one.
-    // ponytail: one copy per turn stays in history (short texts expected,
-    // 8 KB cap); skip a copy still visible if long pins start to weigh.
+    // Pinned instructions: skip appending a duplicate row when the exact same
+    // note is already present in the active post-summary window, preserving
+    // the provider KV/prompt cache prefix across turns.
     if let Some(note) = crate::pinned_note(ctx.settings, &cwd) {
+        let post_summary_start = hist
+            .items
+            .iter()
+            .rposition(|it| it.summary_row.is_some())
+            .map_or(0, |i| i + 1);
+        let already_active = hist.items[post_summary_start..]
+            .iter()
+            .any(|it| it.msg.content == note);
+        if !already_active {
+            let id = store.append(
+                session_id,
+                &NewMessage {
+                    raw: Some(json!({"tool_context": true})),
+                    ..NewMessage::new(Role::User, note.clone())
+                },
+            )?;
+            hist.push(ChatMessage::synthetic_user(note), id);
+        }
+    }
+    // Persist non-empty dynamic_reminder as a synthetic context message right
+    // after User_N so Turn N+1 replays the exact same prefix without busting
+    // the KV/prompt cache at User_N.
+    if let Some(rem) = dynamic_reminder
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+    {
         let id = store.append(
             session_id,
             &NewMessage {
-                raw: Some(json!({"tool_context": true})),
-                ..NewMessage::new(Role::User, note.clone())
+                raw: Some(json!({"dynamic_reminder": true})),
+                ..NewMessage::new(Role::User, rem.to_string())
             },
         )?;
-        hist.push(ChatMessage::synthetic_user(note), id);
+        hist.push(ChatMessage::synthetic_user(rem.to_string()), id);
     }
 
     let context_probe = {
@@ -935,13 +960,7 @@ fn turn_body(
             "step/start",
             json!({"n": step, "tokens_estimate": hist.tokens()}),
         );
-        let mut chat_msgs = hist.chat();
-        let prompt_msg_idx = hist
-            .items
-            .iter()
-            .position(|it| it.lo == prompt_row_id && it.hi == prompt_row_id)
-            .map(|i| hist.system.len() + i);
-        crate::inject_dynamic_reminder(&mut chat_msgs, prompt_msg_idx, dynamic_reminder.as_deref());
+        let chat_msgs = hist.chat();
         let mut req = ChatRequest::new(model, chat_msgs).prompt_cache_key(session_id);
         if let Some(effort) = agent
             .reasoning_effort
@@ -1223,14 +1242,10 @@ fn turn_body(
                 close_cancelled(store, session_id, &out.calls[i..], &mut hist, log)?;
                 return Err(ProviderError::Cancelled.into());
             }
-            // Consecutive safe calls form a group; anything else stands alone
-            // and is a barrier.
-            let mut j = i + 1;
-            if pipe.is_safe(&out.calls[i]) {
-                while j < out.calls.len() && pipe.is_safe(&out.calls[j]) {
-                    j += 1;
-                }
-            }
+            // Consecutive parallelizable calls form a group (stateless safe
+            // tools plus target-disjoint terminal_batch/terminal_send/net_connect);
+            // anything else stands alone and is a barrier.
+            let j = i + pipe.plan_batch(&out.calls[i..]);
             let group = &out.calls[i..j];
             let mut prepared = Vec::with_capacity(group.len());
             for call in group {
@@ -1299,7 +1314,7 @@ fn turn_body(
                             output: "erro: `code` precisa ter o script Python".into(),
                         }
                     } else {
-                        crate::code_exec::run(&pipe, &p.inv.cwd, code, cancel, on_event)
+                        crate::code_exec::run(&pipe, &p.inv.id, &p.inv.cwd, code, cancel, on_event)
                     };
                     p.settled = Some(crate::pipeline::ToolOutcome::new(out.ok, out.output));
                 }
@@ -1542,6 +1557,7 @@ fn turn_body(
         TurnReport {
             session_id: session_id.to_string(),
             message_id: last.0,
+            user_message_id: Some(prompt_row_id),
             text: last.1,
             reasoning: last.2,
             prompt_tokens,
@@ -2457,7 +2473,7 @@ fn request(
 fn orchestrator_block(model: &str, exec_label: &str) -> String {
     format!(
     "# Modo Orquestrador Ativo (Pensamento: `{model}` → Execução: `{exec_label}`)\n\
-     Você é o **Modelo de Pensamento (Arquiteto/Orquestrador)**. Você tem acesso direto somente-leitura (`list_dir`, `read_file`, `grep`, `glob`, `skill`, `net_inventory`) para inspecionar o projeto antes de agir; as ferramentas de mutação e execução (`shell`, `edit_file`, `write_file`, `multi_edit`, `net_connect`, `terminal_batch`) rodam nos subagentes executores (**`{exec_label}`**).\n\
+     Você é o **Modelo de Pensamento (Arquiteto/Orquestrador)**. Você tem acesso direto somente-leitura (`list_dir`, `read_file`, `grep`, `glob`, `repo_map`, `lsp`, `diagnostics`, `view_image`, `web_search`, `web_fetch`, `skill`, `net_inventory`, `net_zabbix`) para inspecionar o projeto antes de agir; as ferramentas de mutação e execução (`shell`, `edit_file`, `write_file`, `multi_edit`, `net_connect`, `terminal_batch`) rodam nos subagentes executores (**`{exec_label}`**).\n\
      Regras obrigatórias de segurança e fluxo:\n\
      1. **Inspecione antes de delegar:** Use `list_dir`/`read_file` para verificar se já existem arquivos do usuário no destino. NUNCA mande sobrescrever um arquivo existente sem antes ler o atual e pedir ao Executor para preservá-lo/fazer backup ou editar incrementalmente.\n\
      2. **Delegue o objetivo, não o conteúdo:** Chame `agent` (`\"executor\"`, `\"explore\"`, etc.) com um `prompt` autossuficiente que diga o que fazer, quais arquivos ler, as regras e como saber que terminou (ex.: o comando de teste que deve passar). NÃO escreva no prompt o código, o documento ou o diagnóstico prontos: o executor lê os arquivos e escreve. Pensar tudo aqui e ditar gasta sua saída inteira e o executor só copia. Para tarefas independentes, dispare em paralelo.\n\
@@ -2477,14 +2493,16 @@ pub(crate) fn is_orchestrator_root_tool(name: &str) -> bool {
         name,
         "agent"
             | "agent_manage"
-            | "agent_result"
-            | "agent_list"
-            | "agent_send"
-            | "agent_stop"
             | "read_file"
             | "list_dir"
             | "glob"
             | "grep"
+            | "repo_map"
+            | "lsp"
+            | "diagnostics"
+            | "view_image"
+            | "web_search"
+            | "web_fetch"
             | "task_create"
             | "task_update"
             | "task_list"
@@ -2493,14 +2511,9 @@ pub(crate) fn is_orchestrator_root_tool(name: &str) -> bool {
             | "skill"
             | "skill_search"
             | "memory"
-            | "memory_save"
-            | "memory_recall"
-            | "memory_update"
-            | "memory_forget"
-            | "memory_search"
-            | "memory_delete"
             | "session_search"
             | "net_inventory"
+            | "net_zabbix"
             | "workflow_list"
             | "channel_list"
             | "enter_plan_mode"
@@ -2517,11 +2530,14 @@ pub(crate) fn tool_group(name: &str) -> Option<&'static str> {
         Some("rede")
     } else if name == "browser" || name.starts_with("browser_") {
         Some("browser")
-    } else if name.starts_with("lsp_") {
+    } else if name == "lsp" || name.starts_with("lsp_") {
         Some("lsp")
     } else if name.starts_with("workflow_") || name == "channel_list" {
         Some("workflows")
-    } else if matches!(name, "image_generate" | "tts_speak" | "audio_transcribe") {
+    } else if matches!(
+        name,
+        "generate_image" | "generate_video" | "image_generate" | "tts_speak" | "audio_transcribe"
+    ) {
         Some("midia")
     } else if matches!(name, "create_skill" | "create_agent" | "delete_ai_item") {
         Some("autoria")
@@ -2641,7 +2657,6 @@ pub(crate) fn should_include_tool_schema(name: &str, context_lower: &str) -> boo
             "equipamento",
             "inventário",
             "inventario",
-            "cliente",
             "vpn",
             "wireguard",
             "rede do",
@@ -2651,12 +2666,9 @@ pub(crate) fn should_include_tool_schema(name: &str, context_lower: &str) -> boo
             "latência",
             "latencia",
             "perda de pacote",
-            "backup",
             "net_",
             "terminal_",
             "term-",
-            "servidor",
-            "server",
             "vm ",
             "máquina virtual",
             "noc",
@@ -2722,18 +2734,31 @@ pub(crate) fn should_include_tool_schema(name: &str, context_lower: &str) -> boo
         .iter()
         .any(|kw| context_lower.contains(kw));
     }
-    // They exist only when the user picked a model for them (media.rs), and
-    // a keyword list missed "gere a imagem": always offered.
-    if matches!(name, "generate_image" | "generate_video") {
-        return true;
-    }
-    if matches!(name, "image_generate" | "tts_speak" | "audio_transcribe") {
+    if matches!(
+        name,
+        "generate_image" | "generate_video" | "image_generate" | "tts_speak" | "audio_transcribe"
+    ) {
         return [
+            "imagem",
+            "image",
+            "vídeo",
+            "video",
+            "desenh",
+            "ilustr",
+            "foto",
+            "banner",
+            "logo",
+            "poster",
+            "pôster",
+            "thumbnail",
+            "miniatura",
+            "animaç",
+            "animac",
             "gerar imagem",
-            "crie uma imagem",
-            "desenhe",
-            "ilustra",
-            "generate image",
+            "gerar vídeo",
+            "gerar video",
+            "generate_image",
+            "generate_video",
             "image_generate",
             "tts",
             "voz",
@@ -2866,8 +2891,17 @@ mod sticky_group_tests {
         let g = groups("resuma o readme");
         assert!(g.contains("browser") && !g.contains("rede"), "{g:?}");
         assert_eq!(tool_group("workflow_run"), Some("workflows"));
+        assert_eq!(tool_group("lsp"), Some("lsp"));
         assert_eq!(tool_group("lsp_hover"), Some("lsp"));
+        assert_eq!(tool_group("generate_image"), Some("midia"));
+        assert_eq!(tool_group("generate_video"), Some("midia"));
         assert_eq!(tool_group("shell"), None);
+
+        // Once media tools are offered in a session, "midia" stays sticky.
+        let media_sid = store.create_session("m", SessionSource::Native).unwrap().id;
+        assert!(!sticky_groups(&store, &media_sid, "corrija o bug", &[]).contains("midia"));
+        remember_groups(&media_sid, &["generate_image".into()]);
+        assert!(sticky_groups(&store, &media_sid, "corrija o bug", &[]).contains("midia"));
     }
 }
 
@@ -3011,19 +3045,55 @@ mod approval_grant_tests {
 
     #[test]
     fn orchestrator_root_keeps_brain_tools_and_delegates_execution_tools() {
-        assert!(is_orchestrator_root_tool("agent"));
-        assert!(is_orchestrator_root_tool("read_file"));
-        assert!(is_orchestrator_root_tool("list_dir"));
-        assert!(is_orchestrator_root_tool("glob"));
-        assert!(is_orchestrator_root_tool("grep"));
-        assert!(is_orchestrator_root_tool("task_create"));
-        assert!(is_orchestrator_root_tool("skill"));
-        assert!(is_orchestrator_root_tool("net_inventory"));
-        assert!(!is_orchestrator_root_tool("shell"));
-        assert!(!is_orchestrator_root_tool("edit_file"));
-        assert!(!is_orchestrator_root_tool("write_file"));
-        assert!(!is_orchestrator_root_tool("net_connect"));
-        assert!(!is_orchestrator_root_tool("terminal_batch"));
+        for allowed in [
+            "agent",
+            "agent_manage",
+            "read_file",
+            "list_dir",
+            "glob",
+            "grep",
+            "repo_map",
+            "lsp",
+            "diagnostics",
+            "view_image",
+            "web_search",
+            "web_fetch",
+            "task_create",
+            "skill",
+            "memory",
+            "net_inventory",
+            "net_zabbix",
+            "generate_image",
+            "generate_video",
+        ] {
+            assert!(
+                is_orchestrator_root_tool(allowed),
+                "expected root tool: {allowed}"
+            );
+        }
+        for excluded in [
+            "shell",
+            "edit_file",
+            "write_file",
+            "net_connect",
+            "terminal_batch",
+            // Dead legacy aliases removed from root whitelist:
+            "agent_result",
+            "agent_list",
+            "agent_send",
+            "agent_stop",
+            "memory_save",
+            "memory_recall",
+            "memory_update",
+            "memory_forget",
+            "memory_search",
+            "memory_delete",
+        ] {
+            assert!(
+                !is_orchestrator_root_tool(excluded),
+                "unexpected root tool: {excluded}"
+            );
+        }
     }
 
     #[test]
@@ -3035,13 +3105,33 @@ mod approval_grant_tests {
         assert!(!should_include_tool_schema("browser_click", netops_ctx));
         assert!(!should_include_tool_schema("lsp_hover", netops_ctx));
         assert!(!should_include_tool_schema("image_generate", netops_ctx));
+        assert!(!should_include_tool_schema("generate_image", netops_ctx));
+        assert!(!should_include_tool_schema("generate_video", netops_ctx));
         assert!(!should_include_tool_schema("create_skill", netops_ctx));
 
-        // Real tool names: `browser` and `generate_image` used to slip
-        // through, and net/terminal schemas rode along on coding turns.
+        // Real tool names: `browser` and `generate_image`/`generate_video` are
+        // pruned on pure coding/networking turns to save schema tokens.
         let code_ctx = "os testes estão falhando, corrija o código em netcalc/";
-        for t in ["net_connect", "net_inventory", "terminal_send", "browser"] {
+        for t in [
+            "net_connect",
+            "net_inventory",
+            "terminal_send",
+            "browser",
+            "generate_image",
+            "generate_video",
+        ] {
             assert!(!should_include_tool_schema(t, code_ctx), "{t}");
+        }
+        // Generic programming prompts mentioning server/backup/client must not inject ~3.5k tokens of net_* schemas.
+        for generic in [
+            "o servidor http falhou no endpoint /health",
+            "faca backup do sqlite antes da migracao",
+            "o cliente http retornou 502",
+        ] {
+            assert!(
+                !should_include_tool_schema("net_connect", generic),
+                "{generic}"
+            );
         }
         assert!(should_include_tool_schema("read_file", code_ctx));
         assert!(should_include_tool_schema(
@@ -3052,16 +3142,20 @@ mod approval_grant_tests {
             "browser",
             "abra o painel do grafana"
         ));
-        // Media tools exist only with a model chosen, so they always go:
-        // "gere a imagem" fell through the old keyword list.
+        // Media tools unlock immediately on media-intent prompts and stay sticky
+        // via `tool_group(...) == Some("midia")`.
         for p in [
             "gere a imagem de um gato segurando uma espaço nave",
+            "crie um vídeo curto do pôr do sol",
             "faça um vídeo curto do pôr do sol",
             "crie uma imagem de um gato",
+            "desenhe um logo para o projeto",
         ] {
             assert!(should_include_tool_schema("generate_image", p), "{p}");
             assert!(should_include_tool_schema("generate_video", p), "{p}");
         }
+        assert_eq!(tool_group("generate_image"), Some("midia"));
+        assert_eq!(tool_group("generate_video"), Some("midia"));
         assert!(is_orchestrator_root_tool("generate_image"));
 
         let browser_ctx = "abra o navegador em https://10.0.0.1 e tire um screenshot";

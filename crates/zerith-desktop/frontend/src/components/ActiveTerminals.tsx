@@ -1,6 +1,6 @@
 // Active interactive terminals (`terminal_open`, `net_connect`) with live tail
 // inspection, client/VPN/transport badges, command history, quick keys, and log copy.
-import { useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { Check, Copy, Eye, EyeOff, Send, Square, Terminal, X } from "lucide-react";
 import {
   onTerminalsChanged,
@@ -15,7 +15,7 @@ function ago(secs: number, lang: Lang): string {
   return tr(lang, `ocioso ${Math.floor(secs / 3600)}h`, `idle ${Math.floor(secs / 3600)}h`);
 }
 
-export function ActiveTerminals({ active }: { active: boolean }) {
+export const ActiveTerminals = memo(function ActiveTerminals({ active }: { active: boolean }) {
   const lang = useLang();
   const [items, setItems] = useState<TerminalSnapshot[]>([]);
   const [openTail, setOpenTail] = useState<string | null>(null);
@@ -267,4 +267,4 @@ export function ActiveTerminals({ active }: { active: boolean }) {
       })}
     </section>
   );
-}
+});

@@ -162,11 +162,43 @@ impl Pipeline<'_> {
 
     /// May this raw call join a parallel group? Judged on the model's own
     /// arguments; `run_group` checks again after middleware.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_safe(&self, call: &ToolCall) -> bool {
         let Some((tools, _)) = self.core else {
             return false;
         };
-        parse_args(&call.arguments).is_ok_and(|a| tools.concurrency_safe(&call.name, &a))
+        parse_args(&call.arguments).is_ok_and(|a| is_call_concurrency_safe(tools, &call.name, &a))
+    }
+
+    /// How many leading calls from `calls` can share one parallel execution batch.
+    /// Stateless `concurrency_safe` tools always batch together; `terminal_batch`,
+    /// `terminal_send`, and `net_connect` batch together only when their target keys
+    /// (`id`, `device`, `host`) are strictly non-empty and pairwise disjoint.
+    pub fn plan_batch(&self, calls: &[ToolCall]) -> usize {
+        if calls.is_empty() {
+            return 0;
+        }
+        let Some((tools, _)) = self.core else {
+            return 1;
+        };
+        let mut seen_targets = std::collections::HashSet::new();
+        let mut count = 0;
+        for call in calls {
+            let Ok(args) = parse_args(&call.arguments) else {
+                break;
+            };
+            match call_safety(tools, &call.name, &args) {
+                CallSafety::AlwaysSafe => count += 1,
+                CallSafety::DisjointTarget(k) => {
+                    if !seen_targets.insert(k) {
+                        break;
+                    }
+                    count += 1;
+                }
+                CallSafety::Barrier => break,
+            }
+        }
+        count.max(1)
     }
 
     /// Phases 1-4: arguments, before-middleware, policy, approval.
@@ -343,6 +375,7 @@ impl Pipeline<'_> {
                 let summary = inv
                     .args
                     .get("input")
+                    .or_else(|| inv.args.get("command"))
                     .and_then(Value::as_str)
                     .map(str::to_string)
                     .or_else(|| {
@@ -519,9 +552,7 @@ impl Pipeline<'_> {
         })));
         let _guard = ClearLive(sink);
 
-        let all_safe = todo
-            .iter()
-            .all(|&i| tools.concurrency_safe(&jobs[i].inv.name, &jobs[i].inv.args));
+        let all_safe = jobs_can_run_parallel(tools, jobs, &todo);
         if max_parallel <= 1 || todo.len() < 2 || !all_safe {
             let cancel = self.cancel;
             for i in todo {
@@ -532,10 +563,12 @@ impl Pipeline<'_> {
                 out[i] = Some(if tools.uses_memory(&inv.name) {
                     self.run_one(tools, policy, inv)
                 } else {
-                    self.pumped_live(on_event, &live_rx, || run_plain(tools, policy, inv, cancel))
+                    self.pumped_live(on_event, &live_rx, Some(&inv.id), || {
+                        run_plain(tools, policy, inv, cancel)
+                    })
                 });
             }
-            Self::drain_live(&live_rx, on_event);
+            Self::drain_live(&live_rx, on_event, |_| None);
             return out;
         }
 
@@ -583,21 +616,54 @@ impl Pipeline<'_> {
                 if self.relays() {
                     self.pump(on_event);
                 }
-                Self::drain_live(&live_rx, on_event);
+                Self::drain_live(&live_rx, on_event, |tool| {
+                    Self::resolve_parallel_tool_call_id(jobs, &pool, tool)
+                });
                 std::thread::sleep(Duration::from_millis(15));
             }
         });
         if self.relays() {
             self.pump(on_event);
         }
-        Self::drain_live(&live_rx, on_event);
+        Self::drain_live(&live_rx, on_event, |tool| {
+            Self::resolve_parallel_tool_call_id(jobs, &pool, tool)
+        });
         out
     }
 
-    fn drain_live(live_rx: &mpsc::Receiver<HostEvent>, on_event: &mut dyn FnMut(RunEvent)) {
+    fn resolve_parallel_tool_call_id(
+        jobs: &[Prepared],
+        pool: &[usize],
+        tool: &str,
+    ) -> Option<String> {
+        if pool.len() == 1 {
+            return Some(jobs[pool[0]].inv.id.clone());
+        }
+        let mut matched: Option<&str> = None;
+        for &i in pool {
+            if jobs[i].inv.name == tool {
+                if matched.is_some() {
+                    return None;
+                }
+                matched = Some(jobs[i].inv.id.as_str());
+            }
+        }
+        matched.map(str::to_string)
+    }
+
+    fn drain_live(
+        live_rx: &mpsc::Receiver<HostEvent>,
+        on_event: &mut dyn FnMut(RunEvent),
+        mut resolve_id: impl FnMut(&str) -> Option<String>,
+    ) {
         while let Ok(ev) = live_rx.try_recv() {
             if let HostEvent::ToolProgress { tool, chunk } = ev {
-                on_event(RunEvent::ToolProgress { tool, chunk });
+                let tool_call_id = resolve_id(&tool);
+                on_event(RunEvent::ToolProgress {
+                    tool_call_id,
+                    tool,
+                    chunk,
+                });
             }
         }
     }
@@ -629,6 +695,7 @@ impl Pipeline<'_> {
         &self,
         on_event: &mut dyn FnMut(RunEvent),
         live_rx: &mpsc::Receiver<HostEvent>,
+        tool_call_id: Option<&str>,
         job: impl FnOnce() -> R + Send,
     ) -> R {
         std::thread::scope(|s| {
@@ -644,17 +711,21 @@ impl Pipeline<'_> {
                 if self.relays() {
                     self.pump(on_event);
                 }
-                Self::drain_live(live_rx, on_event);
+                Self::drain_live(live_rx, on_event, |_| tool_call_id.map(str::to_string));
                 if let Ok(HostEvent::ToolProgress { tool, chunk }) =
                     live_rx.recv_timeout(Duration::from_millis(15))
                 {
-                    on_event(RunEvent::ToolProgress { tool, chunk });
+                    on_event(RunEvent::ToolProgress {
+                        tool_call_id: tool_call_id.map(str::to_string),
+                        tool,
+                        chunk,
+                    });
                 }
             }
             if self.relays() {
                 self.pump(on_event);
             }
-            Self::drain_live(live_rx, on_event);
+            Self::drain_live(live_rx, on_event, |_| tool_call_id.map(str::to_string));
             h.join().unwrap_or_else(|p| std::panic::resume_unwind(p))
         })
     }
@@ -730,6 +801,135 @@ impl Pipeline<'_> {
         *output = zerith_tools::truncate(full, cap);
         None
     }
+}
+
+enum CallSafety {
+    AlwaysSafe,
+    DisjointTarget(String),
+    Barrier,
+}
+
+fn non_empty_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
+    args.get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+fn target_key(name: &str, args: &Value) -> Option<String> {
+    match name {
+        "terminal_batch" | "terminal_send" => {
+            non_empty_str(args, "id").map(|id| format!("term:{id}"))
+        }
+        "net_connect" => {
+            if let Some(dev) = non_empty_str(args, "device") {
+                let dev_l = dev.to_ascii_lowercase();
+                if let Some(client) = non_empty_str(args, "client").filter(|_| !dev.contains('/')) {
+                    return Some(format!("net:{}/{dev_l}", client.to_ascii_lowercase()));
+                }
+                return Some(format!("net:{dev_l}"));
+            }
+            if let Some(host) = non_empty_str(args, "host") {
+                return Some(format!("net:{}", host.to_ascii_lowercase()));
+            }
+            if let Some(sp) = non_empty_str(args, "serial_port") {
+                return Some(format!("net:{}", sp.to_ascii_lowercase()));
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn is_net_api_read_only(args: &Value) -> bool {
+    let method = args
+        .get("method")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("GET")
+        .to_ascii_uppercase();
+    matches!(method.as_str(), "GET" | "HEAD")
+}
+
+fn is_net_snmp_read_only(args: &Value) -> bool {
+    let action = args
+        .get("action")
+        .or_else(|| args.get("op"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("get")
+        .to_ascii_lowercase();
+    matches!(action.as_str(), "get" | "walk" | "bulkwalk")
+}
+
+fn is_net_zabbix_mutating(args: &Value) -> bool {
+    let action = args
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if matches!(action.as_str(), "ack" | "acknowledge") {
+        return true;
+    }
+    if action == "raw" {
+        let method = args
+            .get("method")
+            .or_else(|| args.get("rpc_method"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        if method.ends_with(".create")
+            || method.ends_with(".update")
+            || method.ends_with(".delete")
+            || method.ends_with(".acknowledge")
+            || method.ends_with(".massadd")
+            || method.ends_with(".massupdate")
+            || method.ends_with(".massremove")
+        {
+            return true;
+        }
+        return !(method.ends_with(".get") || method == "apiinfo.version");
+    }
+    false
+}
+
+fn is_call_concurrency_safe(tools: &Registry, name: &str, args: &Value) -> bool {
+    match name {
+        "net_snmp" => is_net_snmp_read_only(args),
+        "net_api" => is_net_api_read_only(args),
+        "net_zabbix" => !is_net_zabbix_mutating(args),
+        _ => tools.concurrency_safe(name, args),
+    }
+}
+
+fn call_safety(tools: &Registry, name: &str, args: &Value) -> CallSafety {
+    if is_call_concurrency_safe(tools, name, args) {
+        return CallSafety::AlwaysSafe;
+    }
+    match target_key(name, args) {
+        Some(k) => CallSafety::DisjointTarget(k),
+        None => CallSafety::Barrier,
+    }
+}
+
+fn jobs_can_run_parallel(tools: &Registry, jobs: &[Prepared], todo: &[usize]) -> bool {
+    let mut seen_targets = std::collections::HashSet::new();
+    for &i in todo {
+        match call_safety(tools, &jobs[i].inv.name, &jobs[i].inv.args) {
+            CallSafety::AlwaysSafe => {}
+            CallSafety::DisjointTarget(k) => {
+                if !seen_targets.insert(k) {
+                    return false;
+                }
+            }
+            CallSafety::Barrier => return false,
+        }
+    }
+    true
 }
 
 /// Tools whose output can carry device or service secrets. Edits are left
@@ -936,6 +1136,144 @@ fn classify_terminal_call(
     args: &Value,
 ) -> Option<(zerith_tools::network::NetCmdRisk, bool, String)> {
     use zerith_tools::network::{classify_network_command, DeviceRole, NetCmdRisk, Vendor};
+    match tool {
+        "net_snmp" => {
+            return Some(if is_net_snmp_read_only(args) {
+                (NetCmdRisk::ReadOnly, false, "net_snmp:readonly".into())
+            } else {
+                (NetCmdRisk::Mutation, false, "net_snmp:mutation".into())
+            });
+        }
+        "net_api" => {
+            return Some(if is_net_api_read_only(args) {
+                (NetCmdRisk::ReadOnly, false, "net_api:readonly".into())
+            } else {
+                (NetCmdRisk::Mutation, false, "net_api:mutation".into())
+            });
+        }
+        "net_zabbix" => {
+            return Some(if is_net_zabbix_mutating(args) {
+                (NetCmdRisk::Mutation, false, "net_zabbix:mutation".into())
+            } else {
+                (NetCmdRisk::ReadOnly, false, "net_zabbix:readonly".into())
+            });
+        }
+        _ => {}
+    }
+    if tool == "net_broadcast" {
+        let mut cmds: Vec<&str> = Vec::new();
+        if let Some(c) = args.get("command").and_then(Value::as_str) {
+            if !c.trim().is_empty() {
+                cmds.push(c);
+            }
+        }
+        if let Some(arr) = args.get("commands").and_then(Value::as_array) {
+            for c in arr.iter().filter_map(Value::as_str) {
+                if !c.trim().is_empty() {
+                    cmds.push(c);
+                }
+            }
+        }
+        if cmds.is_empty() {
+            return None;
+        }
+        let explicit_ids: Vec<String> = args
+            .get("id")
+            .and_then(Value::as_str)
+            .map(|s| vec![s.to_string()])
+            .or_else(|| {
+                args.get("ids").and_then(Value::as_array).map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+            })
+            .unwrap_or_default();
+        let client_f = args
+            .get("client")
+            .and_then(Value::as_str)
+            .map(str::to_ascii_lowercase);
+        let vendor_f = args
+            .get("vendor")
+            .and_then(Value::as_str)
+            .map(str::to_ascii_lowercase);
+
+        let matching: Vec<_> = zerith_tools::list_active_terminals()
+            .into_iter()
+            .filter(|t| {
+                if !explicit_ids.is_empty() {
+                    return explicit_ids.iter().any(|id| id == &t.id);
+                }
+                if let Some(cf) = &client_f {
+                    if !t
+                        .client
+                        .as_deref()
+                        .is_some_and(|c| c.to_ascii_lowercase().contains(cf))
+                    {
+                        return false;
+                    }
+                }
+                if let Some(vf) = &vendor_f {
+                    if !t
+                        .vendor
+                        .as_deref()
+                        .is_some_and(|v| v.to_ascii_lowercase().contains(vf))
+                    {
+                        return false;
+                    }
+                }
+                true
+            })
+            .collect();
+
+        let mut vendors: Vec<Vendor> = matching
+            .iter()
+            .filter_map(|t| t.vendor.as_deref().and_then(Vendor::parse))
+            .collect();
+        if let Some(v) = args
+            .get("vendor")
+            .and_then(Value::as_str)
+            .and_then(Vendor::parse)
+        {
+            if !vendors.contains(&v) {
+                vendors.push(v);
+            }
+        }
+        if vendors.is_empty() {
+            vendors.push(Vendor::Generic);
+        }
+        let critical = matching.iter().any(|t| {
+            t.role
+                .as_deref()
+                .and_then(DeviceRole::parse)
+                .is_some_and(DeviceRole::is_critical)
+        });
+        let mut worst = NetCmdRisk::ReadOnly;
+        for cmd in cmds {
+            for &vendor in &vendors {
+                let r = classify_network_command(vendor, cmd);
+                if r > worst {
+                    worst = r;
+                }
+            }
+        }
+        let scope = if !explicit_ids.is_empty() {
+            explicit_ids.join(",")
+        } else if let Some(cf) = client_f {
+            format!("client:{cf}")
+        } else if let Some(vf) = vendor_f {
+            format!("vendor:{vf}")
+        } else {
+            "all".to_string()
+        };
+        let grant_key = match worst {
+            NetCmdRisk::ReadOnly => format!("net_broadcast:readonly:{scope}"),
+            NetCmdRisk::Mutation => format!("net_broadcast:mutation:{scope}"),
+            NetCmdRisk::Dangerous => format!("net_broadcast:dangerous:{scope}"),
+        };
+        return Some((worst, critical, grant_key));
+    }
     if !matches!(tool, "terminal_send" | "terminal_batch") {
         return None;
     }
@@ -1219,7 +1557,10 @@ pub fn save_always(paths: &zerith_core::Paths, workspace: &Path, rule: &str) -> 
 /// A shell command that reaches another machine's prompt (SSH, Telnet, serial
 /// tools). Each one is approved on its own, never by a session grant.
 fn remote_access(tool: &str, args: &Value) -> bool {
-    if tool == "net_connect" {
+    if matches!(
+        tool,
+        "net_connect" | "net_broadcast" | "net_transfer" | "net_snmp" | "net_api" | "net_zabbix"
+    ) {
         return true;
     }
     const REMOTE: &[&str] = &[
@@ -1359,6 +1700,264 @@ mod remote_tests {
             "monitor",
             &json!({ "command": "tail -f app.log" })
         ));
+        assert!(remote_access(
+            "net_broadcast",
+            &json!({ "command": "show version" })
+        ));
+        assert!(remote_access(
+            "net_transfer",
+            &json!({ "direction": "download", "local_path": "a", "remote_path": "b" })
+        ));
+    }
+
+    #[test]
+    fn net_broadcast_is_classified_by_command_risk() {
+        use super::classify_terminal_call;
+        use zerith_tools::network::NetCmdRisk;
+
+        let ro = classify_terminal_call("net_broadcast", &json!({ "command": "show version" }))
+            .expect("classified");
+        assert_eq!(ro.0, NetCmdRisk::ReadOnly);
+        assert!(ro.2.starts_with("net_broadcast:readonly:"));
+
+        let mk_ro = classify_terminal_call(
+            "net_broadcast",
+            &json!({ "command": "/system resource print", "vendor": "mikrotik_router_os" }),
+        )
+        .expect("classified");
+        assert_eq!(mk_ro.0, NetCmdRisk::ReadOnly);
+
+        let mut_cmd = classify_terminal_call(
+            "net_broadcast",
+            &json!({ "command": "configure terminal", "client": "TelecomSul" }),
+        )
+        .expect("classified");
+        assert_eq!(mut_cmd.0, NetCmdRisk::Mutation);
+        assert!(mut_cmd.2.contains("client:telecomsul"));
+
+        for dangerous in [
+            "reload",
+            "reset-configuration",
+            "erase startup-config",
+            "shutdown",
+            "/system reset-configuration",
+        ] {
+            let res = classify_terminal_call("net_broadcast", &json!({ "command": dangerous }))
+                .expect("classified");
+            assert_eq!(res.0, NetCmdRisk::Dangerous, "failed for {dangerous}");
+            assert!(res.2.starts_with("net_broadcast:dangerous:"));
+        }
+
+        let batch_danger = classify_terminal_call(
+            "net_broadcast",
+            &json!({ "commands": ["show version", "reload"] }),
+        )
+        .expect("classified");
+        assert_eq!(batch_danger.0, NetCmdRisk::Dangerous);
+    }
+
+    #[test]
+    fn wave_d_tools_classify_read_vs_write_and_approval_gates() {
+        use super::{classify_terminal_call, Pipeline};
+        use crate::agent::{approval_channel, Approval};
+        use crate::RunEvent;
+        use std::time::Duration;
+        use zerith_providers::{Cancel, ToolCall};
+        use zerith_security::{preset, Action, Mode, Policy};
+        use zerith_tools::network::NetCmdRisk;
+        use zerith_tools::{CallCtx, Exec, Permission, Registry, Tool, ToolSpec};
+
+        assert!(remote_access("net_snmp", &json!({ "action": "walk" })));
+        assert!(remote_access("net_api", &json!({ "method": "GET" })));
+        assert!(remote_access(
+            "net_zabbix",
+            &json!({ "action": "problems" })
+        ));
+
+        // net_api: GET/HEAD (or missing method) is ReadOnly; POST/PUT/PATCH/DELETE is Mutation.
+        for ro in [
+            json!({}),
+            json!({"method": "GET"}),
+            json!({"method": "get"}),
+            json!({"method": "HEAD"}),
+        ] {
+            let (risk, _, key) = classify_terminal_call("net_api", &ro).unwrap();
+            assert_eq!(risk, NetCmdRisk::ReadOnly, "{ro}");
+            assert_eq!(key, "net_api:readonly");
+        }
+        for mut_m in ["POST", "PUT", "PATCH", "DELETE", "post"] {
+            let (risk, _, key) =
+                classify_terminal_call("net_api", &json!({"method": mut_m})).unwrap();
+            assert_eq!(risk, NetCmdRisk::Mutation, "{mut_m}");
+            assert_eq!(key, "net_api:mutation");
+        }
+
+        // net_zabbix: read queries vs ack / mutating raw methods.
+        for ro in [
+            json!({"action": "problems"}),
+            json!({"action": "hosts"}),
+            json!({"action": "items"}),
+            json!({"action": "history"}),
+            json!({"action": "raw", "method": "host.get"}),
+            json!({"action": "raw", "method": "apiinfo.version"}),
+        ] {
+            let (risk, _, key) = classify_terminal_call("net_zabbix", &ro).unwrap();
+            assert_eq!(risk, NetCmdRisk::ReadOnly, "{ro}");
+            assert_eq!(key, "net_zabbix:readonly");
+        }
+        for mut_arg in [
+            json!({"action": "ack", "event_id": "1"}),
+            json!({"action": "raw", "method": "host.create"}),
+            json!({"action": "raw", "method": "trigger.update"}),
+            json!({"action": "raw", "method": "host.delete"}),
+            json!({"action": "raw", "method": "event.acknowledge"}),
+        ] {
+            let (risk, _, key) = classify_terminal_call("net_zabbix", &mut_arg).unwrap();
+            assert_eq!(risk, NetCmdRisk::Mutation, "{mut_arg}");
+            assert_eq!(key, "net_zabbix:mutation");
+        }
+
+        // net_snmp: get / walk / bulkwalk are ReadOnly.
+        for act in [
+            json!({}),
+            json!({"action": "get"}),
+            json!({"action": "walk"}),
+            json!({"action": "bulkwalk"}),
+        ] {
+            let (risk, _, key) = classify_terminal_call("net_snmp", &act).unwrap();
+            assert_eq!(risk, NetCmdRisk::ReadOnly, "{act}");
+            assert_eq!(key, "net_snmp:readonly");
+        }
+
+        struct StubNetTool(ToolSpec);
+        impl Tool for StubNetTool {
+            fn spec(&self) -> &ToolSpec {
+                &self.0
+            }
+            fn action(
+                &self,
+                _args: &serde_json::Value,
+                _ctx: &CallCtx<'_>,
+            ) -> zerith_tools::Result<Option<Action>> {
+                Ok(Some(Action::Network(self.0.name.clone())))
+            }
+            fn run(
+                &self,
+                _args: &serde_json::Value,
+                _ctx: &CallCtx<'_>,
+                _exec: &Exec<'_>,
+            ) -> zerith_tools::Result<String> {
+                Ok("ok".into())
+            }
+        }
+        let mut reg = Registry::empty();
+        for name in ["net_api", "net_zabbix", "net_snmp"] {
+            reg.register(Box::new(StubNetTool(ToolSpec {
+                name: name.into(),
+                description: name.into(),
+                parameters: json!({"type": "object"}),
+                returns: "text",
+                permission: Permission::Network,
+                timeout: Duration::from_secs(10),
+                cancellable: true,
+                local: false,
+                source: "built-in".into(),
+            })));
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let policy = Policy::new(
+            preset("workspace-write").unwrap(),
+            Mode::Default,
+            dir.path(),
+        );
+        let cancel = Cancel::default();
+        let (tx, gate) = approval_channel();
+        let pipe = Pipeline {
+            core: Some((&reg, &policy)),
+            memory: None,
+            scope: None,
+            middleware: &[],
+            approvals: Some(&gate),
+            relay: true,
+            inbox: None,
+            spill_dir: None,
+            session_id: "s-wave-d",
+            cancel: &cancel,
+            orchestrator_root: false,
+            offered: &[],
+        };
+
+        let run_prepare = |name: &str, args: serde_json::Value, reply: Approval| -> (bool, bool) {
+            let mut asked = false;
+            let call = ToolCall {
+                id: "c".into(),
+                name: name.into(),
+                arguments: args.to_string(),
+            };
+            let p = pipe.prepare(&call, &mut |ev| {
+                if let RunEvent::ApprovalNeeded { id, .. } = ev {
+                    asked = true;
+                    assert!(tx.answer(id, reply));
+                }
+            });
+            (asked, p.settled.is_none())
+        };
+
+        // Read-only net_api GET allows session grant, then a second GET runs without prompting,
+        // while POST still forces approval.
+        assert_eq!(
+            run_prepare("net_api", json!({"method": "GET"}), Approval::AllowSession),
+            (true, true)
+        );
+        assert_eq!(
+            run_prepare("net_api", json!({}), Approval::Deny),
+            (false, true)
+        );
+        assert_eq!(
+            run_prepare("net_api", json!({"method": "POST"}), Approval::Deny),
+            (true, false)
+        );
+
+        // Read-only net_zabbix allows session grant, while ack and mutating raw still force approval.
+        assert_eq!(
+            run_prepare(
+                "net_zabbix",
+                json!({"action": "problems"}),
+                Approval::AllowSession
+            ),
+            (true, true)
+        );
+        assert_eq!(
+            run_prepare("net_zabbix", json!({"action": "hosts"}), Approval::Deny),
+            (false, true)
+        );
+        assert_eq!(
+            run_prepare("net_zabbix", json!({"action": "ack"}), Approval::Deny),
+            (true, false)
+        );
+        assert_eq!(
+            run_prepare(
+                "net_zabbix",
+                json!({"action": "raw", "method": "trigger.update"}),
+                Approval::Deny
+            ),
+            (true, false)
+        );
+
+        // Read-only net_snmp allows session grant across get/walk/bulkwalk.
+        assert_eq!(
+            run_prepare(
+                "net_snmp",
+                json!({"action": "walk"}),
+                Approval::AllowSession
+            ),
+            (true, true)
+        );
+        assert_eq!(
+            run_prepare("net_snmp", json!({"action": "bulkwalk"}), Approval::Deny),
+            (false, true)
+        );
     }
 }
 
@@ -1489,6 +2088,194 @@ mod parallel_panic_tests {
                 "erro: ferramenta `healty` não existe; você quis dizer `healthy`?; disponíveis: healthy"
             )
         );
+    }
+
+    struct ProgressTool {
+        spec: ToolSpec,
+        safe: bool,
+    }
+
+    impl Tool for ProgressTool {
+        fn spec(&self) -> &ToolSpec {
+            &self.spec
+        }
+
+        fn action(
+            &self,
+            _args: &Value,
+            _ctx: &CallCtx<'_>,
+        ) -> zerith_tools::Result<Option<Action>> {
+            Ok(None)
+        }
+
+        fn run(
+            &self,
+            args: &Value,
+            _ctx: &CallCtx<'_>,
+            exec: &Exec<'_>,
+        ) -> zerith_tools::Result<String> {
+            let chunk = args["chunk"].as_str().unwrap_or("tick").to_string();
+            exec.host.sink().push(HostEvent::ToolProgress {
+                tool: self.spec.name.clone(),
+                chunk,
+            });
+            Ok("ok".into())
+        }
+
+        fn concurrency_safe(&self, _args: &Value) -> bool {
+            self.safe
+        }
+    }
+
+    #[test]
+    fn tool_progress_correlates_tool_call_id_in_serial_and_parallel_batches() {
+        let mut reg = Registry::empty();
+        reg.register(Box::new(ProgressTool {
+            spec: spec("alpha"),
+            safe: true,
+        }));
+        reg.register(Box::new(ProgressTool {
+            spec: spec("beta"),
+            safe: true,
+        }));
+        reg.register(Box::new(ProgressTool {
+            spec: spec("serial_tool"),
+            safe: false,
+        }));
+        let policy = Policy::new(
+            preset("workspace-write").unwrap(),
+            Mode::Bypass,
+            Path::new("."),
+        );
+        let cancel = Cancel::default();
+        let pipe = Pipeline {
+            core: Some((&reg, &policy)),
+            memory: None,
+            scope: None,
+            middleware: &[],
+            approvals: None,
+            relay: false,
+            inbox: None,
+            spill_dir: None,
+            session_id: "s1",
+            cancel: &cancel,
+            orchestrator_root: false,
+            offered: &[],
+        };
+
+        // 1. Serial batch: two calls to the same tool name correlate to their exact call IDs.
+        let serial_calls = [
+            ToolCall {
+                id: "call_s1".into(),
+                name: "serial_tool".into(),
+                arguments: serde_json::json!({"chunk": "one"}).to_string(),
+            },
+            ToolCall {
+                id: "call_s2".into(),
+                name: "serial_tool".into(),
+                arguments: serde_json::json!({"chunk": "two"}).to_string(),
+            },
+        ];
+        let serial_prep: Vec<Prepared> = serial_calls
+            .iter()
+            .map(|c| pipe.prepare(c, &mut |_| {}))
+            .collect();
+        let mut serial_events = Vec::new();
+        pipe.run_group(&serial_prep, 4, &mut |ev| {
+            if let RunEvent::ToolProgress {
+                tool_call_id,
+                tool,
+                chunk,
+            } = ev
+            {
+                serial_events.push((tool_call_id, tool, chunk));
+            }
+        });
+        assert_eq!(
+            serial_events,
+            vec![
+                (
+                    Some("call_s1".to_string()),
+                    "serial_tool".to_string(),
+                    "one".to_string()
+                ),
+                (
+                    Some("call_s2".to_string()),
+                    "serial_tool".to_string(),
+                    "two".to_string()
+                ),
+            ]
+        );
+
+        // 2. Parallel batch with distinct tool names correlates unambiguously.
+        let parallel_calls = [
+            ToolCall {
+                id: "call_p1".into(),
+                name: "alpha".into(),
+                arguments: serde_json::json!({"chunk": "a"}).to_string(),
+            },
+            ToolCall {
+                id: "call_p2".into(),
+                name: "beta".into(),
+                arguments: serde_json::json!({"chunk": "b"}).to_string(),
+            },
+        ];
+        let parallel_prep: Vec<Prepared> = parallel_calls
+            .iter()
+            .map(|c| pipe.prepare(c, &mut |_| {}))
+            .collect();
+        let mut parallel_events = Vec::new();
+        pipe.run_group(&parallel_prep, 4, &mut |ev| {
+            if let RunEvent::ToolProgress {
+                tool_call_id,
+                tool,
+                chunk,
+            } = ev
+            {
+                parallel_events.push((tool_call_id, tool, chunk));
+            }
+        });
+        assert!(parallel_events.contains(&(
+            Some("call_p1".to_string()),
+            "alpha".to_string(),
+            "a".to_string()
+        )));
+        assert!(parallel_events.contains(&(
+            Some("call_p2".to_string()),
+            "beta".to_string(),
+            "b".to_string()
+        )));
+
+        // 3. Parallel batch with duplicate tool names does not misattribute IDs.
+        let dup_calls = [
+            ToolCall {
+                id: "call_d1".into(),
+                name: "alpha".into(),
+                arguments: serde_json::json!({"chunk": "x"}).to_string(),
+            },
+            ToolCall {
+                id: "call_d2".into(),
+                name: "alpha".into(),
+                arguments: serde_json::json!({"chunk": "y"}).to_string(),
+            },
+        ];
+        let dup_prep: Vec<Prepared> = dup_calls
+            .iter()
+            .map(|c| pipe.prepare(c, &mut |_| {}))
+            .collect();
+        let mut dup_events = Vec::new();
+        pipe.run_group(&dup_prep, 4, &mut |ev| {
+            if let RunEvent::ToolProgress {
+                tool_call_id, tool, ..
+            } = ev
+            {
+                dup_events.push((tool_call_id, tool));
+            }
+        });
+        assert_eq!(dup_events.len(), 2);
+        assert!(dup_events
+            .iter()
+            .all(|(id, tool)| id.is_none() && tool == "alpha"));
     }
 
     #[test]
@@ -2257,5 +3044,159 @@ mod external_tests {
         let replay = crate::compact::replay(&store.recent_messages(&sid, 50).unwrap());
         assert_eq!(replay.len(), 2, "the call and its result stay paired");
         assert_eq!(replay[1].content, marked);
+    }
+
+    #[test]
+    fn disjoint_target_terminal_and_net_connect_calls_batch_safely() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = Policy::new(
+            zerith_security::preset("workspace-write").unwrap(),
+            zerith_security::Mode::Default,
+            dir.path(),
+        );
+        let tools = Registry::new();
+        let pipe = Pipeline {
+            core: Some((&tools, &policy)),
+            memory: None,
+            scope: None,
+            middleware: &[],
+            approvals: None,
+            relay: false,
+            inbox: None,
+            spill_dir: None,
+            session_id: "s",
+            cancel: &Cancel::default(),
+            orchestrator_root: false,
+            offered: &[],
+        };
+        let call = |name: &str, args: Value| ToolCall {
+            id: "1".into(),
+            name: name.into(),
+            arguments: args.to_string(),
+        };
+
+        assert!(pipe.is_safe(&call("read_file", json!({"path": "x.txt"}))));
+        assert!(!pipe.is_safe(&call(
+            "terminal_batch",
+            json!({"id": "term-1", "commands": ["a"]})
+        )));
+
+        // Disjoint terminal_batch + terminal_send + read_file batch together.
+        let disjoint = vec![
+            call("terminal_batch", json!({"id": "term-1", "commands": ["a"]})),
+            call("terminal_send", json!({"id": "term-2", "input": "b"})),
+            call("read_file", json!({"path": "x.txt"})),
+        ];
+        assert_eq!(pipe.plan_batch(&disjoint), 3);
+
+        // Same terminal id creates a barrier before the colliding call.
+        let same_term = vec![
+            call("terminal_batch", json!({"id": "term-1", "commands": ["a"]})),
+            call("terminal_send", json!({"id": "term-1", "input": "b"})),
+        ];
+        assert_eq!(pipe.plan_batch(&same_term), 1);
+
+        // Empty or missing target stays serial.
+        let missing_id = vec![
+            call("terminal_batch", json!({"id": "  ", "commands": ["a"]})),
+            call("terminal_batch", json!({"id": "term-2", "commands": ["b"]})),
+        ];
+        assert_eq!(pipe.plan_batch(&missing_id), 1);
+
+        // Disjoint net_connect calls batch; duplicate host/device splits at barrier.
+        let net_disjoint = vec![
+            call("net_connect", json!({"device": "core-01"})),
+            call("net_connect", json!({"host": "10.0.0.2"})),
+            call("net_connect", json!({"device": "core-01"})),
+        ];
+        assert_eq!(pipe.plan_batch(&net_disjoint), 2);
+    }
+
+    #[test]
+    fn wave_d_net_tools_parallel_safety_classification() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = Policy::new(
+            zerith_security::preset("workspace-write").unwrap(),
+            zerith_security::Mode::Default,
+            dir.path(),
+        );
+        let tools = Registry::new();
+        let pipe = Pipeline {
+            core: Some((&tools, &policy)),
+            memory: None,
+            scope: None,
+            middleware: &[],
+            approvals: None,
+            relay: false,
+            inbox: None,
+            spill_dir: None,
+            session_id: "s-par",
+            cancel: &Cancel::default(),
+            orchestrator_root: false,
+            offered: &[],
+        };
+        let call = |name: &str, args: Value| ToolCall {
+            id: "1".into(),
+            name: name.into(),
+            arguments: args.to_string(),
+        };
+
+        assert!(pipe.is_safe(&call(
+            "net_snmp",
+            json!({"action": "walk", "host": "olt-01"})
+        )));
+        assert!(pipe.is_safe(&call(
+            "net_snmp",
+            json!({"action": "bulkwalk", "host": "olt-02"})
+        )));
+        assert!(pipe.is_safe(&call("net_api", json!({"url": "https://r1/api"}))));
+        assert!(pipe.is_safe(&call(
+            "net_api",
+            json!({"method": "GET", "url": "https://r1/api"})
+        )));
+        assert!(pipe.is_safe(&call(
+            "net_api",
+            json!({"method": "HEAD", "url": "https://r1/api"})
+        )));
+        assert!(!pipe.is_safe(&call(
+            "net_api",
+            json!({"method": "POST", "url": "https://r1/api"})
+        )));
+        assert!(!pipe.is_safe(&call(
+            "net_api",
+            json!({"method": "PUT", "url": "https://r1/api"})
+        )));
+        assert!(!pipe.is_safe(&call(
+            "net_api",
+            json!({"method": "PATCH", "url": "https://r1/api"})
+        )));
+        assert!(!pipe.is_safe(&call(
+            "net_api",
+            json!({"method": "DELETE", "url": "https://r1/api"})
+        )));
+
+        assert!(pipe.is_safe(&call("net_zabbix", json!({"action": "problems"}))));
+        assert!(pipe.is_safe(&call(
+            "net_zabbix",
+            json!({"action": "raw", "method": "host.get"})
+        )));
+        assert!(!pipe.is_safe(&call(
+            "net_zabbix",
+            json!({"action": "ack", "event_id": "1"})
+        )));
+        assert!(!pipe.is_safe(&call(
+            "net_zabbix",
+            json!({"action": "raw", "method": "host.delete"})
+        )));
+
+        // Read-only SNMP + GET API + Zabbix queries batch concurrently; POST acts as barrier.
+        let batch = vec![
+            call("net_snmp", json!({"action": "get", "host": "olt-01"})),
+            call("net_snmp", json!({"action": "bulkwalk", "host": "olt-02"})),
+            call("net_api", json!({"method": "GET", "device": "core-01"})),
+            call("net_zabbix", json!({"action": "problems"})),
+            call("net_api", json!({"method": "POST", "device": "core-01"})),
+        ];
+        assert_eq!(pipe.plan_batch(&batch), 4);
     }
 }

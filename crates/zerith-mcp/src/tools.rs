@@ -21,7 +21,7 @@
 //! (`ask = ["mcp__github__*"]` works like any other rule).
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use zerith_core::Paths;
@@ -56,6 +56,10 @@ pub fn tool_name(server: &str, tool: &str) -> String {
     name
 }
 
+/// Cooldown after an MCP connection/discovery failure so a dead server
+/// does not stall every turn for its full connect timeout.
+const DISCOVERY_FAILURE_COOLDOWN: Duration = Duration::from_secs(60);
+
 /// One configured server and its (possibly absent) live connection.
 struct Server {
     cfg: ServerConfig,
@@ -64,6 +68,8 @@ struct Server {
     /// Cached `tools/list` response so warm registries re-populate fresh `Registry`
     /// instances without extra RPC round-trips or child respawns.
     cached_tools: Mutex<Option<Vec<ToolInfo>>>,
+    /// Negative cache: `(cooldown_until, reason)` after connection/discovery failure.
+    failed_until: Mutex<Option<(Instant, String)>>,
 }
 
 impl Server {
@@ -147,11 +153,33 @@ impl Server {
                 return Ok(list.clone());
             }
         }
-        let tools = self.with(|c| c.tools())?;
-        if let Ok(mut cache) = self.cached_tools.lock() {
-            *cache = Some(tools.clone());
+        if let Ok(mut guard) = self.failed_until.lock() {
+            if let Some((until, reason)) = guard.as_ref() {
+                if Instant::now() < *until {
+                    return Err(McpError::Protocol(format!(
+                        "em cooldown após falha recente: {reason}"
+                    )));
+                }
+                *guard = None;
+            }
         }
-        Ok(tools)
+        match self.with(|c| c.tools()) {
+            Ok(tools) => {
+                if let Ok(mut guard) = self.failed_until.lock() {
+                    *guard = None;
+                }
+                if let Ok(mut cache) = self.cached_tools.lock() {
+                    *cache = Some(tools.clone());
+                }
+                Ok(tools)
+            }
+            Err(e) => {
+                if let Ok(mut guard) = self.failed_until.lock() {
+                    *guard = Some((Instant::now() + DISCOVERY_FAILURE_COOLDOWN, e.to_string()));
+                }
+                Err(e)
+            }
+        }
     }
 }
 
@@ -286,6 +314,7 @@ impl McpRegistry {
                         extra: Extra::default(),
                         client: Mutex::new(None),
                         cached_tools: Mutex::new(None),
+                        failed_until: Mutex::new(None),
                     })
                 })
                 .collect(),
@@ -329,6 +358,7 @@ impl McpRegistry {
                 extra: Extra::default(),
                 client: Mutex::new(None),
                 cached_tools: Mutex::new(None),
+                failed_until: Mutex::new(None),
             }));
         }
     }
@@ -1000,5 +1030,39 @@ mod tests {
         );
         assert_eq!(m[0].raw, "@docs:guia");
         assert!(parse_mentions("sem nada @aqui").is_empty());
+    }
+
+    #[test]
+    fn dead_server_discovery_enters_cooldown_and_allows_retry_after_expiry() {
+        let srv = Server {
+            cfg: ServerConfig {
+                name: "dead".into(),
+                command: None,
+                args: Vec::new(),
+                url: None,
+                timeout_ms: Some(100),
+                auth: None,
+                origin: crate::config::Origin::User,
+            },
+            extra: Extra::default(),
+            client: Mutex::new(None),
+            cached_tools: Mutex::new(None),
+            failed_until: Mutex::new(None),
+        };
+        let first = srv.tools_cached().unwrap_err();
+        assert!(first.to_string().contains("sem command nem url"), "{first}");
+        let second = srv.tools_cached().unwrap_err();
+        assert!(
+            second
+                .to_string()
+                .contains("em cooldown após falha recente"),
+            "{second}"
+        );
+        // Simulate cooldown expiration: the next attempt retries discovery directly.
+        if let Ok(mut g) = srv.failed_until.lock() {
+            *g = Some((Instant::now() - Duration::from_secs(1), "expired".into()));
+        }
+        let third = srv.tools_cached().unwrap_err();
+        assert!(third.to_string().contains("sem command nem url"), "{third}");
     }
 }

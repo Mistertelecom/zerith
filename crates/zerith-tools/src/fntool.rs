@@ -111,6 +111,9 @@ pub(crate) fn extra() -> Vec<Box<dyn Tool>> {
     v.extend(crate::diagnostics::all());
     v.extend(crate::terminal::all());
     v.extend(crate::network::all());
+    v.extend(crate::net_snmp::all());
+    v.extend(crate::net_api::all());
+    v.extend(crate::net_zabbix::all());
     v.extend(crate::workflows::all());
     v.extend(crate::lsp::all());
     v.push(crate::patch::tool());

@@ -1,27 +1,37 @@
-import { Fragment, memo, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
+import { Fragment, memo, useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import { api, jobsApi, learnApi, type LearnedItem } from "../lib/api";
+import { tr, useLang, type Lang } from "../lib/i18n";
 import {
+  Activity,
   AlertTriangle,
+  Bell,
   BookOpen,
   Bot,
   Brain,
   Check,
   ChevronRight,
+  Clock,
+  Code2,
   Copy,
+  Cpu,
   ExternalLink,
+  FileDiff,
   FilePen,
   FileText,
   GitBranch,
   Globe,
+  Image,
   ImageOff,
   Info,
   ListTodo,
   MessageCircleQuestionMark,
+  Network,
   Pencil,
   Search,
   Sparkles,
   Terminal,
   Undo2,
+  Webhook,
   Wrench,
   X,
   type LucideIcon,
@@ -33,8 +43,10 @@ import { DiffLines, TurnChanges, rows as diffRows, type Row as DiffRow } from ".
 export { FileLangBadge };
 import { highlightCode } from "./highlight";
 import {
+  hasUnclosedFence,
   parseBlocks,
   parseBlocksCached,
+  splitMarkdownChunks,
   splitStableMarkdown,
   type Inline,
   type MdBlock,
@@ -50,9 +62,11 @@ function formatLearnedItemText(item: LearnedItem): string {
 /** `/btw`: a pergunta paralela e a resposta, num cartão recolhível que não é
  * mensagem da conversa (nunca volta ao modelo). Aberto quando a resposta chega. */
 function BtwNote(props: { btw: NonNullable<Extract<Block, { kind: "note" }>["btw"]> }) {
+  const lang = useLang();
   const { question, answer, error, model } = props.btw;
   const [open, setOpen] = useState(true);
   const pending = answer == null && error == null;
+  const copyValue = answer ?? error ?? question;
   return (
     <div className={"learned-card btw-card" + (open ? " open" : "")}>
       <div className="learned-head">
@@ -63,7 +77,7 @@ function BtwNote(props: { btw: NonNullable<Extract<Block, { kind: "note" }>["btw
           onClick={() => setOpen((v) => !v)}
         >
           <MessageCircleQuestionMark size={13} strokeWidth={2} className="learned-icon" aria-hidden />
-          <span className="learned-title">Pergunta paralela</span>
+          <span className="learned-title">{tr(lang, "Pergunta paralela", "Side question")}</span>
           <span className="learned-preview" title={question}>
             {question}
           </span>
@@ -75,13 +89,31 @@ function BtwNote(props: { btw: NonNullable<Extract<Block, { kind: "note" }>["btw
       {open ? (
         <div className="learned-body btw-body">
           {pending ? (
-            <span className="btw-pending">pensando…</span>
+            <span className="btw-pending">{tr(lang, "pensando…", "thinking…")}</span>
           ) : error != null ? (
-            <span className="btw-error">Não consegui responder: {error}</span>
+            <span className="btw-error">
+              {tr(lang, "Não consegui responder: ", "Could not answer: ")}
+              {error}
+            </span>
           ) : (
             <Markdown text={answer ?? ""} streaming={false} />
           )}
-          {model ? <span className="btw-meta">{model} · fora da conversa</span> : null}
+          {!pending ? (
+            <div className="btw-foot">
+              {model ? (
+                <span className="btw-meta">
+                  {model} · {tr(lang, "fora da conversa", "off-record")}
+                </span>
+              ) : (
+                <span />
+              )}
+              <CopyButton text={copyValue} label={tr(lang, "Copiar", "Copy")} />
+            </div>
+          ) : model ? (
+            <span className="btw-meta">
+              {model} · {tr(lang, "fora da conversa", "off-record")}
+            </span>
+          ) : null}
         </div>
       ) : null}
     </div>
@@ -500,15 +532,26 @@ function MdImage({ src, alt }: { src: string; alt: string }) {
   );
 }
 
-// First match wins, so web_search is a Globe before "search" makes it a lens.
+// First match wins, so web_search is a Globe before "search" makes it a lens,
+// and task_* maps to ListTodo before /agent|task|delegate/.
 const TOOL_ICONS: [RegExp, LucideIcon][] = [
   [/^skill/, BookOpen],
-  [/todo/, ListTodo],
+  [/^task_|todo/, ListTodo],
+  [/^memory/, Brain],
+  [/^net_diff$/, FileDiff],
+  [/^net_snmp$/, Activity],
+  [/^net_api$/, Webhook],
+  [/^net_zabbix$/, Bell],
+  [/^net_/, Network],
+  [/^execute_code$/, Code2],
+  [/^view_image$/, Image],
+  [/^sleep$/, Clock],
+  [/^process$/, Cpu],
   [/web|fetch|http|url|browse/, Globe],
-  [/bash|shell|exec|command|terminal|powershell/, Terminal],
-  [/grep|glob|search|find/, Search],
+  [/bash|shell|exec|command|terminal_|powershell|remote_shell|monitor/, Terminal],
+  [/grep|glob|search|find|repo_map/, Search],
   [/write|edit|patch|replace|create/, FilePen],
-  [/read|view|cat/, FileText],
+  [/read|view|cat|list_dir|lsp|diagnostics/, FileText],
   [/agent|task|delegate/, Bot],
 ];
 
@@ -518,7 +561,24 @@ export function toolIcon(name: string): LucideIcon {
   return TOOL_ICONS.find(([re]) => re.test(n))?.[1] ?? Wrench;
 }
 
-const ARG_KEYS = ["path", "file_path", "filePath", "pattern", "command", "cmd", "url", "query", "glob", "description", "prompt", "name"];
+const ARG_KEYS = [
+  "pattern",
+  "query",
+  "symbol",
+  "path",
+  "file_path",
+  "filePath",
+  "command",
+  "cmd",
+  "url",
+  "glob",
+  "description",
+  "prompt",
+  "name",
+  "action",
+  "host",
+  "target",
+];
 
 function parseArgs(args: string): unknown {
   try {
@@ -529,8 +589,8 @@ function parseArgs(args: string): unknown {
 }
 
 /** The one argument worth reading in a collapsed row: the path, the command… */
-function argSummary(args: string): string {
-  const v = parseArgs(args) as Record<string, unknown> | null;
+function argSummaryFromParsed(parsed: unknown, args: string): string {
+  const v = parsed as Record<string, unknown> | null;
   if (v && typeof v === "object") {
     const key = ARG_KEYS.find((k) => typeof v[k] === "string");
     const first = key ? v[key] : Object.values(v).find((x) => typeof x === "string");
@@ -865,8 +925,9 @@ function MermaidDiagramBlock({ lang, text }: { lang: string; text: string }) {
   );
 }
 
-function blocks(list: MdBlock[]): ReactNode[] {
+function blocks(list: MdBlock[], deferLastCode = false): ReactNode[] {
   return list.map((b, i) => {
+    const isLast = i === list.length - 1;
     switch (b.t) {
       case "h": {
         const Tag = `h${Math.min(b.level, 4)}` as "h1" | "h2" | "h3" | "h4";
@@ -875,7 +936,9 @@ function blocks(list: MdBlock[]): ReactNode[] {
       case "p":
         return <p key={i}>{inlines(b.c)}</p>;
       case "list": {
-        const items = b.items.map((it, j) => <li key={j}>{blocks(it)}</li>);
+        const items = b.items.map((it, j) => (
+          <li key={j}>{blocks(it, deferLastCode && isLast && j === b.items.length - 1)}</li>
+        ));
         return b.ordered ? (
           <ol key={i} start={b.start}>
             {items}
@@ -884,8 +947,9 @@ function blocks(list: MdBlock[]): ReactNode[] {
           <ul key={i}>{items}</ul>
         );
       }
-      case "code":
-        if (/^(mermaid|topology)$/i.test(b.lang.trim())) {
+      case "code": {
+        const skipHighlight = deferLastCode && isLast;
+        if (!skipHighlight && /^(mermaid|topology)$/i.test(b.lang.trim())) {
           return <MermaidDiagramBlock key={i} lang={b.lang} text={b.text} />;
         }
         return (
@@ -896,13 +960,14 @@ function blocks(list: MdBlock[]): ReactNode[] {
             </div>
             <pre>
               <code>
-                <HighlightedCode lang={b.lang} text={b.text} />
+                {skipHighlight ? b.text : <HighlightedCode lang={b.lang} text={b.text} />}
               </code>
             </pre>
           </div>
         );
+      }
       case "quote":
-        return <blockquote key={i}>{blocks(b.c)}</blockquote>;
+        return <blockquote key={i}>{blocks(b.c, deferLastCode && isLast)}</blockquote>;
       case "table":
         return (
           <div key={i} className="md-table">
@@ -936,9 +1001,20 @@ function blocks(list: MdBlock[]): ReactNode[] {
   });
 }
 
-const StableMarkdown = memo(function StableMarkdown({ text }: { text: string }) {
+const StableMarkdownChunk = memo(function StableMarkdownChunk({ text }: { text: string }) {
   const tree = useMemo(() => parseBlocksCached(text), [text]);
   return <>{blocks(tree)}</>;
+});
+
+const StableMarkdown = memo(function StableMarkdown({ text }: { text: string }) {
+  const chunks = useMemo(() => splitMarkdownChunks(text), [text]);
+  return (
+    <>
+      {chunks.map((chunk, idx) => (
+        <StableMarkdownChunk key={idx} text={chunk} />
+      ))}
+    </>
+  );
 });
 
 function Markdown({ text, streaming, className }: { text: string; streaming: boolean; className?: string }) {
@@ -950,22 +1026,56 @@ function Markdown({ text, streaming, className }: { text: string; streaming: boo
     () => (tail ? parseBlocks(tail) : []),
     [tail],
   );
+  const deferTailCode = useMemo(
+    () => Boolean(streaming && tail && hasUnclosedFence(tail)),
+    [streaming, tail],
+  );
   return (
     <div className={"md" + (streaming ? " streaming" : "") + (className ? " " + className : "")}>
       {stable ? <StableMarkdown text={stable} /> : null}
-      {tailTree.length ? blocks(tailTree) : null}
+      {tailTree.length ? blocks(tailTree, deferTailCode) : null}
     </div>
   );
 }
 
 const STATE_LABEL = { run: "executando", ok: "concluída", fail: "falhou" } as const;
 
-const isShellTool = (name: string) => /^(shell|bash|exec|powershell|terminal_|net_)/.test(name);
+const SHELL_TOOLS = new Set([
+  "shell",
+  "bash",
+  "powershell",
+  "remote_shell",
+  "monitor",
+  "terminal_send",
+  "terminal_open",
+  "terminal_batch",
+  "net_connect",
+  "net_broadcast",
+]);
+const isShellTool = (name: string) => SHELL_TOOLS.has(name);
 const EDIT_TOOLS = new Set(["edit_file", "write_file", "multi_edit", "apply_patch"]);
 const READ_TOOLS = new Set(["read_file", "grep", "glob"]);
+const BATCH_TOOLS = new Set(["terminal_batch", "net_broadcast"]);
+const BURST_READ_TOOLS = new Set([
+  "read_file",
+  "grep",
+  "glob",
+  "list_dir",
+  "repo_map",
+  "lsp",
+  "lsp_definition",
+  "lsp_references",
+  "lsp_hover",
+  "lsp_symbols",
+  "lsp_implementation",
+  "lsp_rename",
+  "diagnostics",
+  "view_image",
+]);
 // ponytail: teto de linhas do diff montado dos argumentos; um write_file enorme
 // mostra só o começo (a caixa já rola). Subir se fizer falta.
 const MAX_DIFF_ROWS = 400;
+const DIFF_CTX_LINES = 3;
 
 /** O comando de uma chamada de shell/terminal: `command`, `input` ou a lista do lote. */
 function commandOf(a: Record<string, unknown> | null): string | null {
@@ -991,30 +1101,119 @@ function commandOf(a: Record<string, unknown> | null): string | null {
 
 const textLines = (s: string) => s.replace(/\n$/, "").split("\n");
 
+/** Real line-level diff using common prefix/suffix trimming + Myers/LCS DP on the changed window. */
+function computeLineDiff(oldLines: string[], newLines: string[]): DiffRow[] {
+  if (oldLines.length === 0) return newLines.map((text) => ({ kind: "add", text }));
+  if (newLines.length === 0) return oldLines.map((text) => ({ kind: "del", text }));
+
+  let prefix = 0;
+  const minLen = Math.min(oldLines.length, newLines.length);
+  while (prefix < minLen && oldLines[prefix] === newLines[prefix]) prefix += 1;
+
+  let suffix = 0;
+  while (
+    suffix < minLen - prefix &&
+    oldLines[oldLines.length - 1 - suffix] === newLines[newLines.length - 1 - suffix]
+  ) {
+    suffix += 1;
+  }
+
+  const out: DiffRow[] = [];
+  if (prefix > 0) {
+    const ctxStart = Math.max(0, prefix - DIFF_CTX_LINES);
+    if (ctxStart > 0) out.push({ kind: "hunk", text: `… ${ctxStart} linha(s) acima` });
+    for (let i = ctxStart; i < prefix; i++) out.push({ kind: "ctx", text: oldLines[i] });
+  }
+
+  const oldMid = oldLines.slice(prefix, oldLines.length - suffix);
+  const newMid = newLines.slice(prefix, newLines.length - suffix);
+  const m = oldMid.length;
+  const n = newMid.length;
+
+  if (m === 0) {
+    for (const text of newMid) out.push({ kind: "add", text });
+  } else if (n === 0) {
+    for (const text of oldMid) out.push({ kind: "del", text });
+  } else if (m * n <= 40_000) {
+    const cols = n + 1;
+    const dp = new Int32Array((m + 1) * cols);
+    for (let i = m - 1; i >= 0; i--) {
+      for (let j = n - 1; j >= 0; j--) {
+        if (oldMid[i] === newMid[j]) {
+          dp[i * cols + j] = dp[(i + 1) * cols + (j + 1)] + 1;
+        } else {
+          const down = dp[(i + 1) * cols + j];
+          const right = dp[i * cols + (j + 1)];
+          dp[i * cols + j] = down >= right ? down : right;
+        }
+      }
+    }
+    let i = 0;
+    let j = 0;
+    while (i < m && j < n) {
+      if (oldMid[i] === newMid[j]) {
+        out.push({ kind: "ctx", text: oldMid[i] });
+        i += 1;
+        j += 1;
+      } else if (dp[(i + 1) * cols + j] >= dp[i * cols + (j + 1)]) {
+        out.push({ kind: "del", text: oldMid[i] });
+        i += 1;
+      } else {
+        out.push({ kind: "add", text: newMid[j] });
+        j += 1;
+      }
+    }
+    while (i < m) out.push({ kind: "del", text: oldMid[i++] });
+    while (j < n) out.push({ kind: "add", text: newMid[j++] });
+  } else {
+    for (const text of oldMid) out.push({ kind: "del", text });
+    for (const text of newMid) out.push({ kind: "add", text });
+  }
+
+  if (suffix > 0) {
+    const ctxEnd = Math.min(suffix, DIFF_CTX_LINES);
+    const sufStart = oldLines.length - suffix;
+    for (let i = 0; i < ctxEnd; i++) out.push({ kind: "ctx", text: oldLines[sufStart + i] });
+    if (suffix > ctxEnd) out.push({ kind: "hunk", text: `… ${suffix - ctxEnd} linha(s) abaixo` });
+  }
+  return out;
+}
+
 /** Diff de uma ferramenta de edição: o unificado da prévia quando vier, senão
  * montado dos argumentos (old_string/new_string, edits, content, patch). */
 function editDiff(
   name: string,
   a: Record<string, unknown> | null,
   preview?: string,
-): { list: DiffRow[]; numbers: boolean } | null {
-  if (preview && /^@@ -\d+/m.test(preview)) return { list: diffRows(preview), numbers: true };
+): { list: DiffRow[]; numbers: boolean; added: number; removed: number } | null {
+  if (preview && /^@@ -\d+/m.test(preview)) {
+    const full = diffRows(preview);
+    let added = 0;
+    let removed = 0;
+    for (const r of full) {
+      if (r.kind === "add") added += 1;
+      else if (r.kind === "del") removed += 1;
+    }
+    return { list: full.slice(0, MAX_DIFF_ROWS), numbers: true, added, removed };
+  }
   if (!a) return null;
   const out: DiffRow[] = [];
-  const pair = (oldS: unknown, newS: unknown) => {
-    if (typeof oldS === "string" && oldS) for (const t of textLines(oldS)) out.push({ kind: "del", text: t });
-    if (typeof newS === "string" && newS) for (const t of textLines(newS)) out.push({ kind: "add", text: t });
+  const appendPair = (oldS: unknown, newS: unknown) => {
+    const oldArr = typeof oldS === "string" && oldS ? textLines(oldS) : [];
+    const newArr = typeof newS === "string" && newS ? textLines(newS) : [];
+    if (oldArr.length === 0 && newArr.length === 0) return;
+    out.push(...computeLineDiff(oldArr, newArr));
   };
-  if (name === "edit_file") pair(a.old_string, a.new_string);
+  if (name === "edit_file") appendPair(a.old_string, a.new_string);
   else if (name === "multi_edit" && Array.isArray(a.edits)) {
     const edits = a.edits as unknown[];
     edits.forEach((e, i) => {
       if (!e || typeof e !== "object") return;
       const ed = e as Record<string, unknown>;
       if (edits.length > 1) out.push({ kind: "hunk", text: `edição ${i + 1}` });
-      pair(ed.old_string, ed.new_string);
+      appendPair(ed.old_string, ed.new_string);
     });
-  } else if (name === "write_file") pair("", a.content);
+  } else if (name === "write_file") appendPair("", a.content);
   else if (name === "apply_patch" && typeof a.patch === "string") {
     for (const t of textLines(a.patch)) {
       if (/^\*\*\* (Begin|End) Patch/.test(t)) continue;
@@ -1024,18 +1223,55 @@ function editDiff(
       else out.push({ kind: "ctx", text: t.slice(1) });
     }
   }
-  return out.length ? { list: out.slice(0, MAX_DIFF_ROWS), numbers: false } : null;
+  if (!out.length) return null;
+  let added = 0;
+  let removed = 0;
+  for (const r of out) {
+    if (r.kind === "add") added += 1;
+    else if (r.kind === "del") removed += 1;
+  }
+  return { list: out.slice(0, MAX_DIFF_ROWS), numbers: false, added, removed };
 }
 
 /** Saída mono rolável (240px). A primeira linha `exit N` do shell vira etiqueta. */
-function ToolOutput({ text, lang, exitTag }: { text: string; lang: string; exitTag: boolean }) {
+function ToolOutput({
+  text,
+  lang,
+  exitTag,
+  streaming = false,
+}: {
+  text: string;
+  lang: string;
+  exitTag: boolean;
+  streaming?: boolean;
+}) {
+  const preRef = useRef<HTMLPreElement>(null);
+  const pinnedRef = useRef(true);
   const m = exitTag ? /^exit (\S+)\r?\n?/.exec(text) : null;
   const rest = m ? text.slice(m[0].length) : text;
+
+  useEffect(() => {
+    const el = preRef.current;
+    if (!el) return;
+    const onScroll = () => {
+      pinnedRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+    };
+    el.addEventListener("scroll", onScroll, { passive: true });
+    return () => el.removeEventListener("scroll", onScroll);
+  }, []);
+
+  useEffect(() => {
+    const el = preRef.current;
+    if (streaming && pinnedRef.current && el) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [rest, streaming]);
+
   return (
     <div className="tool-out-wrap">
       {m ? <span className={"tool-exit " + (m[1] === "0" ? "ok" : "fail")}>exit {m[1]}</span> : null}
       {rest.trim() ? (
-        <pre className="tool-out">
+        <pre ref={preRef} className="tool-out">
           <HighlightedCode lang={lang} text={rest} />
         </pre>
       ) : null}
@@ -1043,8 +1279,180 @@ function ToolOutput({ text, lang, exitTag }: { text: string; lang: string; exitT
   );
 }
 
+function stripCodeFence(raw: string): string {
+  const lines = raw.replace(/\r\n/g, "\n").trim().split("\n");
+  if (lines.length > 0 && /^```[a-zA-Z0-9_-]*\s*$/.test(lines[0].trim())) {
+    lines.shift();
+    if (lines.length > 0 && lines[lines.length - 1].trim() === "```") {
+      lines.pop();
+    }
+  }
+  return lines.join("\n").trim();
+}
+
+interface BatchSection {
+  title: string;
+  body: string;
+  durationMs: string | null;
+  isErr: boolean;
+}
+
+function parseBatchSections(raw: string): { preamble: string; sections: BatchSection[] } | null {
+  const firstHeading = /^### /m.exec(raw);
+  if (!firstHeading) return null;
+  const preamble = raw.slice(0, firstHeading.index).trim();
+  const rest = raw.slice(firstHeading.index);
+  const parts = rest.split(/^### /m).filter((p) => p.length > 0);
+  if (!parts.length) return null;
+
+  const sections: BatchSection[] = parts.map((part) => {
+    const nl = part.indexOf("\n");
+    const rawHeader = (nl >= 0 ? part.slice(0, nl) : part).trim();
+    const rawBody = nl >= 0 ? part.slice(nl + 1) : "";
+    const body = stripCodeFence(rawBody);
+
+    let title = rawHeader;
+    let durationMs: string | null = null;
+    let headerErr = false;
+
+    // Parse `(host · 42 ms)` or `(42ms)` or `(host · ERRO)`
+    const parenMatch = /^(.*?)\s*\(([^)]+)\)\s*$/.exec(rawHeader);
+    if (parenMatch) {
+      const base = parenMatch[1].trim();
+      const segs = parenMatch[2].split(/\s*·\s*/).map((s) => s.trim()).filter(Boolean);
+      const kept: string[] = [];
+      for (const seg of segs) {
+        const msMatch = /^(\d+\s*ms)$/i.exec(seg);
+        if (msMatch) {
+          durationMs = msMatch[1].replace(/\s+/g, "");
+        } else if (/^(erro|error|fail|failed)$/i.test(seg)) {
+          headerErr = true;
+        } else {
+          kept.push(seg);
+        }
+      }
+      title = kept.length ? `${base} (${kept.join(" · ")})` : base;
+    } else {
+      const trailingMs = /^(.*?)\s+(\d+\s*ms)\s*$/i.exec(rawHeader);
+      if (trailingMs) {
+        title = trailingMs[1].trim();
+        durationMs = trailingMs[2].replace(/\s+/g, "");
+      }
+    }
+
+    const bodyErr =
+      /^\[(?:não enviado|cancelado|sessão encerrou|lote interrompido)/im.test(body) ||
+      /^(?:erro:|% Invalid|Error:|syntax error|timed out|failed)/im.test(body);
+
+    return {
+      title: title || rawHeader,
+      body,
+      durationMs,
+      isErr: headerErr || bodyErr,
+    };
+  });
+
+  return { preamble, sections };
+}
+
+function BatchSectionRow({ section, defaultOpen }: { section: BatchSection; defaultOpen: boolean }) {
+  const lang = useLang();
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <div className={"tool-batch-item" + (open ? " open" : "") + (section.isErr ? " err" : "")}>
+      <div className="tool-batch-head-row">
+        <button
+          type="button"
+          className="tool-batch-head"
+          aria-expanded={open}
+          onClick={() => setOpen((v) => !v)}
+        >
+          <ChevronRight size={13} strokeWidth={2} className="chev" />
+          <span
+            className={"tool-batch-status " + (section.isErr ? "err" : "ok")}
+            aria-label={section.isErr ? tr(lang, "Erro", "Error") : tr(lang, "OK", "OK")}
+          >
+            {section.isErr ? <X size={13} strokeWidth={2.25} /> : <Check size={13} strokeWidth={2.25} />}
+          </span>
+          <span className="tool-batch-title" title={section.title}>
+            {section.title}
+          </span>
+          {section.durationMs ? <span className="tool-batch-ms">{section.durationMs}</span> : null}
+        </button>
+        {section.body ? <CopyButton text={section.body} /> : null}
+      </div>
+      {open ? (
+        <div className="tool-batch-body">
+          {section.body ? (
+            <pre className="tool-out">
+              <HighlightedCode lang="net" text={section.body} />
+            </pre>
+          ) : (
+            <span className="tool-batch-preamble">{tr(lang, "(sem saída)", "(no output)")}</span>
+          )}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function NetDiffBody({ out, streaming }: { out: string; streaming: boolean }) {
+  const lang = useLang();
+  const parsed = useMemo(() => {
+    const rbMarker = /^###\s+Rollback[^\n]*$/im.exec(out);
+    const diffPart = (rbMarker ? out.slice(0, rbMarker.index) : out).trim();
+    const rollbackRaw = rbMarker ? out.slice(rbMarker.index + rbMarker[0].length) : "";
+    const rollback = rollbackRaw ? stripCodeFence(rollbackRaw) : "";
+
+    const rowsList: DiffRow[] = [];
+    let summary: string | null = null;
+    for (const line of diffPart.replace(/\r\n/g, "\n").split("\n")) {
+      if (!line.trim()) continue;
+      if (/^##\s+/.test(line)) {
+        summary = line.replace(/^##\s+/, "").trim();
+      } else if (/^\[[+\-~]\s+bloco/i.test(line)) {
+        rowsList.push({ kind: "hunk", text: line });
+      } else if (/^\s{0,2}\+\s/.test(line)) {
+        rowsList.push({ kind: "add", text: line.replace(/^\s{0,2}\+\s/, "") });
+      } else if (/^\s{0,2}-\s/.test(line)) {
+        rowsList.push({ kind: "del", text: line.replace(/^\s{0,2}-\s/, "") });
+      } else {
+        rowsList.push({ kind: "ctx", text: line });
+      }
+    }
+    const hasChanges = rowsList.some((r) => r.kind === "add" || r.kind === "del");
+    return { summary, rowsList, hasChanges, rollback };
+  }, [out]);
+
+  return (
+    <>
+      {parsed.summary ? <p className="tool-batch-preamble">{parsed.summary}</p> : null}
+      {parsed.hasChanges ? (
+        <div className="tool-diff">
+          <DiffLines list={parsed.rowsList.slice(0, MAX_DIFF_ROWS)} numbers={false} />
+        </div>
+      ) : (
+        <ToolOutput text={out} lang="net" exitTag={false} streaming={streaming} />
+      )}
+      {parsed.rollback ? (
+        <div className="tool-rollback">
+          <div className="tool-rollback-head">
+            <span className="tool-rollback-title">
+              {tr(lang, "Rollback sugerido", "Suggested rollback")}
+            </span>
+            <CopyButton text={parsed.rollback} label={tr(lang, "Copiar rollback", "Copy rollback")} />
+          </div>
+          <pre className="tool-out">
+            <HighlightedCode lang="net" text={parsed.rollback} />
+          </pre>
+        </div>
+      ) : null}
+    </>
+  );
+}
+
 /** Corpo aberto de uma ferramenta, conforme o tipo: comando + saída, diff,
- * arquivo realçado pela extensão ou JSON. */
+ * arquivo realçado pela extensão, Python execute_code, lote ou JSON. */
 function ToolBody(props: {
   row: ToolRow;
   argsObj: Record<string, unknown> | null;
@@ -1052,10 +1460,100 @@ function ToolBody(props: {
   path: string | null;
   out: string | undefined;
 }) {
+  const lang = useLang();
   const { row, argsObj, out } = props;
+  const streaming = row.ok === undefined;
+
+  if (row.name === "execute_code") {
+    const code = typeof argsObj?.code === "string" ? argsObj.code : "";
+    const copyVal = out ?? code;
+    return (
+      <div className="tool-detail">
+        {code ? (
+          <pre className="tool-out">
+            <HighlightedCode lang="py" text={code} />
+          </pre>
+        ) : null}
+        {out ? <ToolOutput text={out} lang="" exitTag streaming={streaming} /> : null}
+        {copyVal ? (
+          <div className="tool-detail-actions">
+            {code && out ? <CopyButton text={code} label={tr(lang, "Copiar código", "Copy code")} /> : null}
+            <CopyButton text={copyVal} label={tr(lang, "Copiar", "Copy")} />
+          </div>
+        ) : null}
+      </div>
+    );
+  }
+
+  if (row.name === "view_image" && props.path) {
+    const fileBase = props.path.split(/[\\/]/).pop() ?? props.path;
+    return (
+      <div className="tool-detail">
+        <div className="tool-image-preview">
+          <MdImage src={props.path} alt={fileBase} />
+        </div>
+        {out ? <ToolOutput text={out} lang="" exitTag={false} streaming={streaming} /> : null}
+        <div className="tool-detail-actions">
+          <CopyButton text={out ?? props.path} label={tr(lang, "Copiar", "Copy")} />
+        </div>
+      </div>
+    );
+  }
+
+  if (row.name === "net_diff") {
+    const copyVal = out ?? (props.parsed ? JSON.stringify(props.parsed, null, 2) : row.args);
+    return (
+      <div className="tool-detail">
+        {out ? (
+          <NetDiffBody out={out} streaming={streaming} />
+        ) : props.parsed ? (
+          <pre className="tool-out tool-args">
+            <HighlightedCode lang="json" text={JSON.stringify(props.parsed, null, 2)} />
+          </pre>
+        ) : null}
+        {copyVal ? (
+          <div className="tool-detail-actions">
+            <CopyButton text={copyVal} label={tr(lang, "Copiar", "Copy")} />
+          </div>
+        ) : null}
+      </div>
+    );
+  }
+
+  if (BATCH_TOOLS.has(row.name)) {
+    const cmd = commandOf(argsObj);
+    const batch = out ? parseBatchSections(out) : null;
+    if (batch) {
+      return (
+        <div className="tool-detail">
+          {cmd ? (
+            <div className="tool-cmd">
+              <span className="tool-prompt" aria-hidden>
+                $
+              </span>
+              <code>
+                <HighlightedCode lang="net" text={cmd} />
+              </code>
+            </div>
+          ) : null}
+          {batch.preamble ? <p className="tool-batch-preamble">{batch.preamble}</p> : null}
+          <div className="tool-batch-list">
+            {batch.sections.map((s, idx) => (
+              <BatchSectionRow key={`${idx}-${s.title}`} section={s} defaultOpen={s.isErr || batch.sections.length <= 1} />
+            ))}
+          </div>
+          <div className="tool-detail-actions">
+            <CopyButton text={out ?? cmd ?? row.args} label={tr(lang, "Copiar", "Copy")} />
+          </div>
+        </div>
+      );
+    }
+  }
+
   if (isShellTool(row.name)) {
     const cmd = commandOf(argsObj);
-    const lang = /^(net_|terminal_)/.test(row.name) ? "net" : "sh";
+    const codeLang = /^(net_|terminal_)/.test(row.name) ? "net" : "sh";
+    const copyVal = out ?? cmd ?? row.args;
     return (
       <div className="tool-detail">
         {cmd ? (
@@ -1064,16 +1562,24 @@ function ToolBody(props: {
               $
             </span>
             <code>
-              <HighlightedCode lang={lang} text={cmd} />
+              <HighlightedCode lang={codeLang} text={cmd} />
             </code>
           </div>
         ) : null}
-        {out ? <ToolOutput text={out} lang={lang === "net" ? "net" : ""} exitTag /> : null}
+        {out ? <ToolOutput text={out} lang={codeLang === "net" ? "net" : ""} exitTag streaming={streaming} /> : null}
+        {copyVal ? (
+          <div className="tool-detail-actions">
+            {cmd && out ? <CopyButton text={cmd} label={tr(lang, "Copiar comando", "Copy command")} /> : null}
+            <CopyButton text={copyVal} label={tr(lang, "Copiar", "Copy")} />
+          </div>
+        ) : null}
       </div>
     );
   }
+
   if (EDIT_TOOLS.has(row.name)) {
     const diff = editDiff(row.name, argsObj, row.preview);
+    const copyVal = out ?? (typeof argsObj?.new_string === "string" ? argsObj.new_string : row.args);
     return (
       <div className="tool-detail">
         {diff ? (
@@ -1081,18 +1587,61 @@ function ToolBody(props: {
             <DiffLines list={diff.list} numbers={diff.numbers} />
           </div>
         ) : null}
-        {out && !diff?.numbers ? <ToolOutput text={out} lang="" exitTag={false} /> : null}
+        {out && !diff?.numbers ? <ToolOutput text={out} lang="" exitTag={false} streaming={streaming} /> : null}
+        {copyVal ? (
+          <div className="tool-detail-actions">
+            <CopyButton text={copyVal} label={tr(lang, "Copiar", "Copy")} />
+          </div>
+        ) : null}
       </div>
     );
   }
-  if (READ_TOOLS.has(row.name)) {
+
+  if (READ_TOOLS.has(row.name) || row.name === "lsp" || row.name.startsWith("lsp_")) {
     const base = props.path?.split(/[\\/]/).pop() ?? "";
     const ext = base.includes(".") ? (base.split(".").pop() ?? "") : "";
-    return <div className="tool-detail">{out ? <ToolOutput text={out} lang={ext} exitTag={false} /> : null}</div>;
+    const searchTerm =
+      typeof argsObj?.pattern === "string"
+        ? argsObj.pattern
+        : typeof argsObj?.query === "string"
+          ? argsObj.query
+          : typeof argsObj?.symbol === "string"
+            ? argsObj.symbol
+            : null;
+    const copyVal = out ?? (props.parsed ? JSON.stringify(props.parsed, null, 2) : row.args);
+    return (
+      <div className="tool-detail">
+        {searchTerm || (row.name !== "read_file" && props.path) ? (
+          <div className="tool-subhead">
+            {searchTerm ? (
+              <span>
+                <span className="tool-subhead-key">{tr(lang, "busca:", "query:")} </span>
+                <span className="tool-subhead-val">{searchTerm}</span>
+              </span>
+            ) : null}
+            {row.name !== "read_file" && props.path ? (
+              <span>
+                <span className="tool-subhead-key">{tr(lang, "em:", "in:")} </span>
+                <span className="tool-subhead-val">{props.path}</span>
+              </span>
+            ) : null}
+          </div>
+        ) : null}
+        {out ? <ToolOutput text={out} lang={ext} exitTag={false} streaming={streaming} /> : null}
+        {copyVal ? (
+          <div className="tool-detail-actions">
+            <CopyButton text={copyVal} label={tr(lang, "Copiar", "Copy")} />
+          </div>
+        ) : null}
+      </div>
+    );
   }
+
   const hasArgs =
     props.parsed !== null && typeof props.parsed === "object" && Object.keys(props.parsed).length > 0;
   const outJson = out ? /^\s*[[{]/.test(out) && parseArgs(out) !== null : false;
+  const outLang = outJson ? "json" : row.name.startsWith("net_") ? "net" : "";
+  const copyVal = out ?? (hasArgs ? JSON.stringify(props.parsed, null, 2) : row.args);
   return (
     <div className="tool-detail">
       {hasArgs ? (
@@ -1102,7 +1651,12 @@ function ToolBody(props: {
       ) : !out && row.args ? (
         <pre className="tool-out tool-args">{row.args}</pre>
       ) : null}
-      {out ? <ToolOutput text={out} lang={outJson ? "json" : ""} exitTag={false} /> : null}
+      {out ? <ToolOutput text={out} lang={outLang} exitTag={false} streaming={streaming} /> : null}
+      {copyVal ? (
+        <div className="tool-detail-actions">
+          <CopyButton text={copyVal} label={tr(lang, "Copiar", "Copy")} />
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -1112,15 +1666,19 @@ const FILE_TOOLS = new Set([
   "edit_file",
   "multi_edit",
   "write_file",
+  "apply_patch",
+  "view_image",
   "diagnostics",
   "lsp",
   "lsp_definition",
   "lsp_references",
   "lsp_hover",
   "lsp_symbols",
+  "lsp_implementation",
+  "lsp_rename",
 ]);
 
-function toolActionLabel(name: string): string {
+function toolActionLabel(name: string, lang: Lang): string {
   switch (name) {
     case "read_file":
     case "diagnostics":
@@ -1129,45 +1687,170 @@ function toolActionLabel(name: string): string {
     case "lsp_references":
     case "lsp_hover":
     case "lsp_symbols":
-      return "Analyzed";
+    case "lsp_implementation":
+    case "lsp_rename":
+      return tr(lang, "Analisou", "Analyzed");
+    case "view_image":
+      return tr(lang, "Visualizou", "Viewed");
     case "edit_file":
     case "multi_edit":
-      return "Edited";
+    case "apply_patch":
+      return tr(lang, "Editou", "Edited");
     case "write_file":
-      return "Created";
+      return tr(lang, "Criou", "Created");
     case "grep":
     case "glob":
     case "repo_map":
     case "web_search":
     case "skill_search":
     case "session_search":
-      return "Searched";
+      return tr(lang, "Buscou", "Searched");
+    case "web_fetch":
+      return tr(lang, "Buscou URL", "Fetched");
     case "list_dir":
-      return "Listed";
+      return tr(lang, "Listou", "Listed");
     case "shell":
-      return "Ran";
+    case "bash":
+    case "powershell":
+    case "remote_shell":
+    case "monitor":
+      return tr(lang, "Executou", "Ran");
+    case "execute_code":
+      return tr(lang, "Executou código", "Executed code");
     case "net_connect":
-      return "Connected";
+      return tr(lang, "Conectou", "Connected");
     case "terminal_batch":
     case "net_broadcast":
-      return "Executed";
+      return tr(lang, "Executou em lote", "Batch ran");
+    case "terminal_open":
+      return tr(lang, "Abriu terminal", "Opened terminal");
+    case "terminal_send":
+      return tr(lang, "Enviou comando", "Sent command");
+    case "net_inventory":
+      return tr(lang, "Inventário", "Inventory");
+    case "net_probe":
+      return tr(lang, "Sondagem", "Probed");
+    case "net_path":
+      return tr(lang, "Rota", "Traced");
+    case "net_vpn":
+      return tr(lang, "VPN", "VPN");
+    case "net_transfer":
+      return tr(lang, "Transferiu", "Transferred");
+    case "net_backup":
+      return tr(lang, "Backup", "Backed up");
+    case "net_diff":
+      return tr(lang, "Comparou config", "Config diff");
+    case "net_snmp":
+      return tr(lang, "Consultar SNMP", "SNMP query");
+    case "net_api":
+      return tr(lang, "API de rede", "Network API");
+    case "net_zabbix":
+      return tr(lang, "Consultar Zabbix", "Zabbix query");
     case "agent":
-      return "Delegated";
+      return tr(lang, "Delegou", "Delegated");
+    case "agent_manage":
+      return tr(lang, "Agente", "Agent");
     case "skill":
     case "skill_load":
-      return "Loaded skill";
+      return tr(lang, "Carregou skill", "Loaded skill");
     case "memory":
     case "memory_save":
     case "memory_update":
     case "memory_forget":
     case "memory_recall":
-      return "Memory";
+      return tr(lang, "Memória", "Memory");
+    case "process":
+      return tr(lang, "Processo", "Process");
+    case "sleep":
+      return tr(lang, "Aguardou", "Waited");
+    case "task_create":
+    case "task_update":
+    case "task_get":
+      return tr(lang, "Tarefa", "Task");
+    case "task_list":
+      return tr(lang, "Tarefas", "Tasks");
     default:
       return name;
   }
 }
 
+function toolSubAction(name: string, a: Record<string, unknown> | null, lang: Lang): string | null {
+  const act = typeof a?.action === "string" ? a.action.toLowerCase() : typeof a?.op === "string" ? a.op.toLowerCase() : "";
+  if (name === "memory" || name.startsWith("memory_")) {
+    const k = act || name.replace(/^memory_/, "");
+    if (k === "save" || k === "add") return tr(lang, "salvar", "save");
+    if (k === "search" || k === "recall" || k === "query") return tr(lang, "buscar", "search");
+    if (k === "forget" || k === "delete" || k === "remove") return tr(lang, "esquecer", "forget");
+    if (k === "list") return tr(lang, "listar", "list");
+    if (k === "update") return tr(lang, "atualizar", "update");
+    return k || null;
+  }
+  if (name === "lsp" || name.startsWith("lsp_")) {
+    const k = act || name.replace(/^lsp_/, "");
+    if (k === "definition") return tr(lang, "definição", "definition");
+    if (k === "references") return tr(lang, "referências", "references");
+    if (k === "symbols" || k === "document_symbols" || k === "workspace_symbols") return tr(lang, "símbolos", "symbols");
+    if (k === "hover") return tr(lang, "hover", "hover");
+    if (k === "implementation") return tr(lang, "implementação", "implementation");
+    if (k === "rename") return tr(lang, "renomear", "rename");
+    return k || null;
+  }
+  if (name === "process") {
+    if (act === "list") return tr(lang, "listar", "list");
+    if (act === "output" || act === "read" || act === "log" || act === "poll") return tr(lang, "saída", "output");
+    if (act === "kill" || act === "stop" || act === "terminate") return tr(lang, "encerrar", "kill");
+    return act || null;
+  }
+  if (name === "agent_manage") {
+    if (act === "list") return tr(lang, "listar", "list");
+    if (act === "create") return tr(lang, "criar", "create");
+    if (act === "update") return tr(lang, "atualizar", "update");
+    if (act === "delete" || act === "remove") return tr(lang, "remover", "delete");
+    if (act === "get") return tr(lang, "detalhes", "get");
+    return act || null;
+  }
+  if (name === "net_inventory") {
+    if (act === "list") return tr(lang, "listar", "list");
+    if (act === "get") return tr(lang, "detalhes", "get");
+    if (act === "add" || act === "create") return tr(lang, "adicionar", "add");
+    if (act === "update") return tr(lang, "atualizar", "update");
+    if (act === "remove" || act === "delete") return tr(lang, "remover", "remove");
+    if (act === "discover" || act === "scan") return tr(lang, "descobrir", "discover");
+    return act || null;
+  }
+  if (name === "net_vpn") {
+    if (act === "status") return tr(lang, "status", "status");
+    if (act === "up" || act === "connect") return tr(lang, "conectar", "up");
+    if (act === "down" || act === "disconnect") return tr(lang, "desconectar", "down");
+    if (act === "list" || act === "peers" || act === "tunnels") return tr(lang, "listar", "list");
+    return act || null;
+  }
+  if (name === "net_snmp") {
+    const preset = typeof a?.preset === "string" && a.preset.trim() ? a.preset.trim() : "";
+    return preset || act || null;
+  }
+  if (name === "net_api") {
+    const method = typeof a?.method === "string" && a.method.trim() ? a.method.trim().toUpperCase() : "";
+    return method || (a ? "GET" : null);
+  }
+  if (name === "net_zabbix") {
+    return act || null;
+  }
+  if (name.startsWith("task_")) {
+    const k = name.replace(/^task_/, "");
+    if (k === "create") return tr(lang, "criar", "create");
+    if (k === "update") return tr(lang, "atualizar", "update");
+    if (k === "list") return tr(lang, "listar", "list");
+    if (k === "get") return tr(lang, "detalhes", "get");
+  }
+  return null;
+}
+
 function computeFileLineRange(name: string, argsObj: Record<string, unknown> | null, preview?: string): string | null {
+  if (name === "lsp" || name.startsWith("lsp_")) {
+    const line = typeof argsObj?.line === "number" && argsObj.line >= 1 ? Math.floor(argsObj.line) : null;
+    return line ? `#L${line}` : null;
+  }
   if (name !== "read_file") return null;
   const offset = typeof argsObj?.offset === "number" && argsObj.offset >= 1 ? Math.floor(argsObj.offset) : 1;
   const limit = typeof argsObj?.limit === "number" && argsObj.limit >= 1 ? Math.floor(argsObj.limit) : null;
@@ -1187,36 +1870,141 @@ function computeFileLineRange(name: string, argsObj: Record<string, unknown> | n
   return `#L${offset}`;
 }
 
-function ToolLine({ row, sessionId }: { row: ToolRow; sessionId?: string | null }) {
-  const [open, setOpen] = useState(false);
-  const Icon = toolIcon(row.name);
-  const parsed = parseArgs(row.args);
-  const argsObj = parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : null;
-  let arg = argSummary(row.args);
-  if (row.name === "agent" && argsObj) {
-    const role = typeof argsObj.agent === "string" ? argsObj.agent.trim() : "";
-    const desc = typeof argsObj.description === "string" ? argsObj.description.trim() : "";
-    if (role && desc) arg = `${role}: ${desc}`;
-    else if (desc || role) arg = desc || role;
+function summarizeNetTool(name: string, argsObj: Record<string, unknown>): string | null {
+  const str = (k: string) => (typeof argsObj[k] === "string" && argsObj[k].trim() ? (argsObj[k] as string).trim() : "");
+  if (name === "net_transfer") {
+    const src = str("src") || str("source") || str("local_path");
+    const dst = str("dst") || str("dest") || str("remote_path") || str("host");
+    if (src && dst) return `${src} → ${dst}`;
   }
-  const body = row.preview ?? row.progress ?? (parsed ? JSON.stringify(parsed, null, 2) : row.args);
+  if (name === "net_diff") {
+    const before = str("before") || str("a") || str("host");
+    const after = str("after") || str("b");
+    if (before && after) return `${before} ↔ ${after}`;
+  }
+  if (name === "net_snmp") {
+    const target = str("device") || str("host") || str("target");
+    const what =
+      str("preset") ||
+      str("oid") ||
+      (Array.isArray(argsObj.oids)
+        ? argsObj.oids
+            .filter((o): o is string => typeof o === "string" && o.trim().length > 0)
+            .slice(0, 2)
+            .join(", ")
+        : "");
+    if (target && what) return `${target} · ${what}`;
+    return target || what || null;
+  }
+  if (name === "net_api") {
+    const method = (str("method") || "GET").toUpperCase();
+    const target = str("device") || str("url") || str("base_url") || str("host");
+    const path = str("path") || str("endpoint");
+    const dest = target && path && !target.includes(path) ? `${target} ${path}` : target || path;
+    return dest ? `${method} ${dest}` : method;
+  }
+  if (name === "net_zabbix") {
+    const action = str("action");
+    const target =
+      str("host") ||
+      str("host_filter") ||
+      str("group") ||
+      str("url") ||
+      str("trigger_id") ||
+      str("event_id") ||
+      str("method");
+    if (action && target) return `${action} · ${target}`;
+    return target || action || null;
+  }
+  const host = str("host") || str("device") || str("target") || str("destination") || str("name") || str("group");
+  if (host) return host;
+  if (Array.isArray(argsObj.hosts) && argsObj.hosts.length > 0) {
+    return argsObj.hosts.filter((h): h is string => typeof h === "string").join(", ");
+  }
+  return null;
+}
+
+const ToolLine = memo(function ToolLine({ row, sessionId }: { row: ToolRow; sessionId?: string | null }) {
+  const lang = useLang();
+  const [open, setOpen] = useState(false);
+  const Icon = useMemo(() => toolIcon(row.name), [row.name]);
+  const parsed = useMemo(() => parseArgs(row.args), [row.args]);
+  const argsObj = useMemo(
+    () => (parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : null),
+    [parsed],
+  );
+  const arg = useMemo(() => {
+    if (row.name === "sleep" && argsObj?.seconds != null) {
+      return `${argsObj.seconds}s`;
+    }
+    if (row.name === "execute_code" && argsObj) {
+      const desc = typeof argsObj.description === "string" ? argsObj.description.trim() : "";
+      if (desc) return desc;
+      if (typeof argsObj.code === "string") {
+        const firstLine = argsObj.code
+          .split(/\r?\n/)
+          .map((l) => l.trim())
+          .find((l) => l && !l.startsWith("#"));
+        return firstLine ?? argsObj.code.replace(/\s+/g, " ").trim();
+      }
+    }
+    if (row.name.startsWith("net_") && !isShellTool(row.name) && argsObj) {
+      const netSum = summarizeNetTool(row.name, argsObj);
+      if (netSum) return netSum;
+    }
+    let summary = argSummaryFromParsed(parsed, row.args);
+    if (row.name === "agent" && argsObj) {
+      const role = typeof argsObj.agent === "string" ? argsObj.agent.trim() : "";
+      const desc = typeof argsObj.description === "string" ? argsObj.description.trim() : "";
+      if (role && desc) summary = `${role}: ${desc}`;
+      else if (desc || role) summary = desc || role;
+    }
+    return summary;
+  }, [parsed, argsObj, row.args, row.name]);
+  const rawPath = useMemo(() => {
+    const direct =
+      typeof argsObj?.path === "string"
+        ? argsObj.path
+        : typeof argsObj?.file_path === "string"
+          ? argsObj.file_path
+          : typeof argsObj?.filePath === "string"
+            ? argsObj.filePath
+            : null;
+    if (direct) return direct;
+    if (row.name === "apply_patch" && typeof argsObj?.patch === "string") {
+      const m = /^\*\*\* (?:Update|Add|Delete) File:\s*(.+)$/m.exec(argsObj.patch);
+      if (m) return m[1].trim();
+    }
+    return null;
+  }, [argsObj, row.name]);
+  const isFileTool = FILE_TOOLS.has(row.name) && Boolean(rawPath);
+  const lineRange = useMemo(
+    () => (isFileTool ? computeFileLineRange(row.name, argsObj, row.preview) : null),
+    [isFileTool, row.name, argsObj, row.preview],
+  );
+  const diffStats = useMemo(() => {
+    if (!EDIT_TOOLS.has(row.name)) return null;
+    const d = editDiff(row.name, argsObj, row.preview);
+    if (!d || (d.added === 0 && d.removed === 0)) return null;
+    return { added: d.added, removed: d.removed };
+  }, [row.name, argsObj, row.preview]);
+  const subAction = useMemo(() => toolSubAction(row.name, argsObj, lang), [row.name, argsObj, lang]);
+  const extraSearchTerm = useMemo(() => {
+    if (!isFileTool || !(row.name === "lsp" || row.name.startsWith("lsp_"))) return null;
+    const sym = typeof argsObj?.symbol === "string" ? argsObj.symbol : typeof argsObj?.query === "string" ? argsObj.query : "";
+    return sym.trim() || null;
+  }, [isFileTool, row.name, argsObj]);
+  const body = useMemo(
+    () => row.preview ?? row.progress ?? (parsed ? JSON.stringify(parsed, null, 2) : row.args),
+    [row.preview, row.progress, parsed, row.args],
+  );
   const state = row.ok === undefined ? "run" : row.ok ? "ok" : "fail";
   const liveTail =
     state === "run" && row.progress
       ? row.progress.split(/\r?\n/).slice(-8).join("\n")
       : null;
-  const rawPath =
-    typeof argsObj?.path === "string"
-      ? argsObj.path
-      : typeof argsObj?.file_path === "string"
-        ? argsObj.file_path
-        : typeof argsObj?.filePath === "string"
-          ? argsObj.filePath
-          : null;
-  const isFileTool = FILE_TOOLS.has(row.name) && Boolean(rawPath);
   const fileBase = rawPath ? (rawPath.split(/[\\/]/).pop() ?? rawPath) : "";
-  const lineRange = isFileTool ? computeFileLineRange(row.name, argsObj, row.preview) : null;
-  const label = toolActionLabel(row.name);
+  const label = toolActionLabel(row.name, lang);
   const firstLine = lineRange ? Number(lineRange.match(/\d+/)?.[0]) || undefined : undefined;
   return (
     <div className={`tool ${state}` + (open ? " open" : "")}>
@@ -1228,6 +2016,7 @@ function ToolLine({ row, sessionId }: { row: ToolRow; sessionId?: string | null 
           </span>
         ) : null}
         <span className="tool-name">{label}</span>
+        {subAction ? <span className="tool-sub-pill">{subAction}</span> : null}
         {isFileTool && rawPath ? (
           <span className="tool-file" title={rawPath}>
             <FileLangBadge path={rawPath} />
@@ -1239,7 +2028,18 @@ function ToolLine({ row, sessionId }: { row: ToolRow; sessionId?: string | null 
             {arg}
           </span>
         )}
-        {isFileTool ? <span className="spacer" /> : null}
+        {extraSearchTerm ? (
+          <span className="tool-arg" title={extraSearchTerm}>
+            {extraSearchTerm}
+          </span>
+        ) : null}
+        {isFileTool && !extraSearchTerm ? <span className="spacer" /> : null}
+        {diffStats ? (
+          <span className="tool-diff-stats" aria-label={`+${diffStats.added} -${diffStats.removed}`}>
+            {diffStats.added > 0 ? <span className="tool-stat-add">+{diffStats.added}</span> : null}
+            {diffStats.removed > 0 ? <span className="tool-stat-del">−{diffStats.removed}</span> : null}
+          </span>
+        ) : null}
         <span className="tool-state" role="img" aria-label={STATE_LABEL[state]}>
           {state === "run" ? (
             <span className="spinner" />
@@ -1254,8 +2054,8 @@ function ToolLine({ row, sessionId }: { row: ToolRow; sessionId?: string | null 
       {isFileTool && rawPath ? (
         <button
           className="tool-open"
-          title="Abrir no editor (VS Code)"
-          aria-label={`Abrir ${fileBase} no editor`}
+          title={tr(lang, "Abrir no editor (VS Code)", "Open in editor (VS Code)")}
+          aria-label={tr(lang, `Abrir ${fileBase} no editor`, `Open ${fileBase} in editor`)}
           onClick={() => void api.openInEditor(rawPath, sessionId, firstLine).catch(() => undefined)}
         >
           <ExternalLink size={13} strokeWidth={2} />
@@ -1268,7 +2068,102 @@ function ToolLine({ row, sessionId }: { row: ToolRow; sessionId?: string | null 
       ) : null}
     </div>
   );
+});
+
+type ToolRenderItem =
+  | { kind: "single"; tool: ToolRow; index: number }
+  | { kind: "burst"; items: { tool: ToolRow; index: number }[] };
+
+function groupTools(tools: ToolRow[]): ToolRenderItem[] {
+  const out: ToolRenderItem[] = [];
+  let i = 0;
+  while (i < tools.length) {
+    if (tools[i].ok === true && BURST_READ_TOOLS.has(tools[i].name)) {
+      const run: { tool: ToolRow; index: number }[] = [];
+      while (i < tools.length && tools[i].ok === true && BURST_READ_TOOLS.has(tools[i].name)) {
+        run.push({ tool: tools[i], index: i });
+        i += 1;
+      }
+      if (run.length >= 3) {
+        out.push({ kind: "burst", items: run });
+      } else {
+        for (const r of run) out.push({ kind: "single", tool: r.tool, index: r.index });
+      }
+    } else {
+      out.push({ kind: "single", tool: tools[i], index: i });
+      i += 1;
+    }
+  }
+  return out;
 }
+
+const ToolBurstGroup = memo(function ToolBurstGroup({
+  items,
+  sessionId,
+}: {
+  items: { tool: ToolRow; index: number }[];
+  sessionId?: string | null;
+}) {
+  const lang = useLang();
+  const [open, setOpen] = useState(false);
+  const summary = useMemo(() => {
+    const names: string[] = [];
+    for (const { tool } of items) {
+      const p = parseArgs(tool.args);
+      const o = p && typeof p === "object" ? (p as Record<string, unknown>) : null;
+      const raw =
+        (typeof o?.pattern === "string" && o.pattern) ||
+        (typeof o?.query === "string" && o.query) ||
+        (typeof o?.path === "string" && o.path) ||
+        (typeof o?.file_path === "string" && o.file_path) ||
+        (typeof o?.filePath === "string" && o.filePath) ||
+        "";
+      const short = raw ? (raw.split(/[\\/]/).pop() ?? raw) : tool.name;
+      if (short && !names.includes(short)) names.push(short);
+      if (names.length >= 3) break;
+    }
+    const extra = items.length - names.length;
+    return names.length
+      ? names.join(", ") + (extra > 0 ? ` +${extra}` : "")
+      : "";
+  }, [items]);
+
+  return (
+    <div className={"tool-burst" + (open ? " open" : "")}>
+      <button
+        type="button"
+        className="tool-burst-head"
+        aria-expanded={open}
+        onClick={() => setOpen((v) => !v)}
+      >
+        <span className="tool-icon">
+          <Search size={14} strokeWidth={2} />
+        </span>
+        <span className="tool-name">
+          {tr(lang, `Explorou ${items.length} itens`, `Explored ${items.length} items`)}
+        </span>
+        {summary ? (
+          <span className="tool-arg" title={summary}>
+            {summary}
+          </span>
+        ) : (
+          <span className="spacer" />
+        )}
+        <span className="tool-state" aria-hidden>
+          <Check size={14} strokeWidth={2.25} />
+        </span>
+        <ChevronRight size={14} strokeWidth={2} className="chev" />
+      </button>
+      {open ? (
+        <div className="tool-burst-body">
+          {items.map(({ tool, index }) => (
+            <ToolLine key={`${tool.id}-${index}`} row={tool} sessionId={sessionId} />
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+});
 
 const AssistantBlock = memo(function AssistantBlock(props: {
   block: Block & { kind: "assistant" };
@@ -1277,8 +2172,10 @@ const AssistantBlock = memo(function AssistantBlock(props: {
   /** Resends the last prompt (only on the newest failed answer). */
   onRetry?: () => void;
 }) {
+  const lang = useLang();
   const [showReasoning, setShowReasoning] = useState(false);
   const b = props.block;
+  const toolGroups = useMemo(() => groupTools(b.tools), [b.tools]);
   const thinking = b.streaming && !b.text && b.tools.length === 0;
   return (
     <div className="msg-assistant">
@@ -1302,9 +2199,17 @@ const AssistantBlock = memo(function AssistantBlock(props: {
         ) : null}
         {b.tools.length > 0 ? (
           <div className="tools">
-            {b.tools.map((t, idx) => (
-              <ToolLine key={`${t.id}-${idx}`} row={t} sessionId={props.sessionId} />
-            ))}
+            {toolGroups.map((g, gIdx) =>
+              g.kind === "burst" ? (
+                <ToolBurstGroup
+                  key={`burst-${g.items[0].tool.id}-${g.items[0].index}-${gIdx}`}
+                  items={g.items}
+                  sessionId={props.sessionId}
+                />
+              ) : (
+                <ToolLine key={`${g.tool.id}-${g.index}`} row={g.tool} sessionId={props.sessionId} />
+              ),
+            )}
           </div>
         ) : null}
         {b.text ? (
@@ -1334,7 +2239,7 @@ const AssistantBlock = memo(function AssistantBlock(props: {
         ) : null}
         {b.text && !b.streaming ? (
           <div className="msg-actions">
-            <CopyButton text={b.text} label="Copiar" />
+            <CopyButton text={b.text} label={tr(lang, "Copiar", "Copy")} />
             {props.onBranch && b.stored ? (
               <button
                 className="copy-btn"
@@ -1360,6 +2265,7 @@ const UserRow = memo(function UserRow(props: {
   block: Block & { kind: "user" };
   onEdit?: (id: number, text: string) => void;
 }) {
+  const lang = useLang();
   const b = props.block;
   const onEdit = props.onEdit;
   // Attached images arrive as `![nome](<path>)` lines (Composer).
@@ -1398,8 +2304,9 @@ const UserRow = memo(function UserRow(props: {
           </button>
         ) : null}
       </div>
-      {onEdit && b.id != null ? (
-        <div className="msg-actions">
+      <div className="msg-actions">
+        <CopyButton text={text || b.text} label={tr(lang, "Copiar", "Copy")} />
+        {onEdit && b.id != null ? (
           <button
             className="copy-btn"
             onClick={() => onEdit(b.id!, b.text)}
@@ -1409,13 +2316,32 @@ const UserRow = memo(function UserRow(props: {
             <Pencil size={14} strokeWidth={2} />
             <span>Editar</span>
           </button>
-        </div>
-      ) : null}
+        ) : null}
+      </div>
     </div>
   );
 });
 
-export function Transcript(props: {
+function goalStateLabel(sub: string, lang: Lang): { label: string; tone: string } {
+  switch (sub) {
+    case "start":
+      return { label: tr(lang, "objetivo", "goal"), tone: "accent" };
+    case "continue":
+      return { label: tr(lang, "continuando", "continuing"), tone: "" };
+    case "done":
+      return { label: tr(lang, "concluído", "done"), tone: "ok" };
+    case "blocked":
+      return { label: tr(lang, "bloqueado", "blocked"), tone: "warn" };
+    case "cancelled":
+      return { label: tr(lang, "cancelado", "cancelled"), tone: "" };
+    case "failed":
+      return { label: tr(lang, "falhou", "failed"), tone: "danger" };
+    default:
+      return { label: sub, tone: "" };
+  }
+}
+
+export const Transcript = memo(function Transcript(props: {
   blocks: Block[];
   tail?: React.ReactNode;
   sessionId?: string | null;
@@ -1428,8 +2354,10 @@ export function Transcript(props: {
   /** Above the first block: history paging / load error. */
   head?: React.ReactNode;
 }) {
+  const lang = useLang();
   const box = useRef<HTMLDivElement>(null);
   const pinned = useRef(true);
+  const scrollRafRef = useRef<number | null>(null);
   const [away, setAway] = useState(false);
   const onEdit = props.busy ? undefined : props.onEdit;
   const onBranch = props.busy ? undefined : props.onBranch;
@@ -1449,7 +2377,7 @@ export function Transcript(props: {
       pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
       setAway(!pinned.current);
     };
-    el.addEventListener("scroll", onScroll);
+    el.addEventListener("scroll", onScroll, { passive: true });
     return () => el.removeEventListener("scroll", onScroll);
   }, []);
 
@@ -1461,11 +2389,19 @@ export function Transcript(props: {
 
   // Scroll only the transcript: scrollIntoView would also move every
   // overflow:hidden ancestor (the sheet, the shell) and shift the layout.
-  const toEnd = () => {
-    const el = box.current;
-    if (el && pinned.current) el.scrollTop = el.scrollHeight;
-  };
-  useEffect(toEnd, [props.blocks, props.tail]);
+  // Coalesce multiple calls per frame (blocks delta + ResizeObserver) into one rAF.
+  const toEnd = useCallback(() => {
+    if (!pinned.current || scrollRafRef.current !== null) return;
+    scrollRafRef.current = requestAnimationFrame(() => {
+      scrollRafRef.current = null;
+      const el = box.current;
+      if (el && pinned.current) el.scrollTop = el.scrollHeight;
+    });
+  }, []);
+
+  useEffect(() => {
+    toEnd();
+  }, [props.blocks, props.tail, toEnd]);
 
   // An image that finishes loading grows the stack without a new block;
   // keep the view pinned to the bottom when it was there.
@@ -1474,82 +2410,95 @@ export function Transcript(props: {
     if (!stack) return;
     const ro = new ResizeObserver(toEnd);
     ro.observe(stack);
-    return () => ro.disconnect();
-  }, []);
+    return () => {
+      ro.disconnect();
+      if (scrollRafRef.current !== null) {
+        cancelAnimationFrame(scrollRafRef.current);
+        scrollRafRef.current = null;
+      }
+    };
+  }, [toEnd]);
 
   return (
-    <div className="transcript" ref={box}>
-      <div className="stack">
-        {props.head}
-        {props.blocks.length === 0 && !props.head ? (
-          <div className="convo-empty">
-            <ZerithMark size={32} />
-            <p>Conversa vazia. Escreva abaixo para começar; use / para comandos e @ para citar arquivos.</p>
-          </div>
-        ) : null}
-        {(() => {
-          let aOrd = 0;
-          let uOrd = 0;
-          let nOrd = 0;
-          const rendered = props.blocks.map((b, i) => {
-            // A block the event did not touch keeps its reference, so `memo`
-            // skips it: only the answer being written is re-rendered. Keying
-            // by per-kind ordinal keeps keys stable across streaming→stored
-            // transitions and borrowIds while preventing cross-kind collisions.
-            if (b.kind === "user") {
-              return <UserRow key={`u-${uOrd++}`} block={b} onEdit={onEdit} />;
-            }
-            if (b.kind === "subagent") {
-              return <SubagentCard key={`sub-${b.id}`} block={b} />;
-            }
-            if (b.kind === "note" && b.btw) {
-              return <BtwNote key={`btw-${b.btw.id}`} btw={b.btw} />;
-            }
-            if (b.kind === "note" && b.learned?.length) {
-              return <LearnedNote key={`n-${nOrd++}`} text={b.text} items={b.learned} />;
-            }
-            if (b.kind === "note") {
+    <div className="transcript-wrap">
+      <div className="transcript" ref={box}>
+        <div className="stack">
+          {props.head}
+          {props.blocks.length === 0 && !props.head ? (
+            <div className="convo-empty">
+              <ZerithMark size={32} />
+              <p>Conversa vazia. Escreva abaixo para começar; use / para comandos e @ para citar arquivos.</p>
+            </div>
+          ) : null}
+          {(() => {
+            let aOrd = 0;
+            let uOrd = 0;
+            let nOrd = 0;
+            const rendered = props.blocks.map((b, i) => {
+              // A block the event did not touch keeps its reference, so `memo`
+              // skips it: only the answer being written is re-rendered. Keying
+              // by per-kind ordinal keeps keys stable across streaming→stored
+              // transitions and borrowIds while preventing cross-kind collisions.
+              if (b.kind === "user") {
+                return <UserRow key={`u-${uOrd++}`} block={b} onEdit={onEdit} />;
+              }
+              if (b.kind === "subagent") {
+                return <SubagentCard key={`sub-${b.id}`} block={b} />;
+              }
+              if (b.kind === "note" && b.btw) {
+                return <BtwNote key={`btw-${b.btw.id}`} btw={b.btw} />;
+              }
+              if (b.kind === "note" && b.learned?.length) {
+                return <LearnedNote key={`n-${nOrd++}`} text={b.text} items={b.learned} />;
+              }
+              if (b.kind === "note") {
+                const goalBadge = b.sub ? goalStateLabel(b.sub, lang) : null;
+                return (
+                  <div key={`n-${nOrd++}`} className="msg-note">
+                    <Info size={14} strokeWidth={2} />
+                    {goalBadge ? (
+                      <span className={"badge msg-note-badge" + (goalBadge.tone ? " " + goalBadge.tone : "")}>
+                        {goalBadge.label}
+                      </span>
+                    ) : null}
+                    <Markdown text={b.text} streaming={false} />
+                  </div>
+                );
+              }
               return (
-                <div key={`n-${nOrd++}`} className="msg-note">
-                  <Info size={14} strokeWidth={2} />
-                  <Markdown text={b.text} streaming={false} />
-                </div>
-              );
-            }
-            return (
-              <AssistantBlock
-                key={`a-${aOrd++}`}
-                block={b}
-                sessionId={props.sessionId}
-                onBranch={onBranch}
-                onRetry={i === lastAssistant && b.error ? onRetry : undefined}
-              />
-            );
-          });
-          return (
-            <>
-              {rendered}
-              {/*
-                The answer block is born on the first event, so a slow turn used to
-                look frozen: the dots stand in for it while the turn is running.
-              */}
-              {props.busy && !props.blocks.some((b) => b.kind === "assistant" && b.streaming) ? (
                 <AssistantBlock
-                  key={`a-${aOrd}`}
-                  block={{ kind: "assistant", text: "", reasoning: "", tools: [], streaming: true }}
+                  key={`a-${aOrd++}`}
+                  block={b}
                   sessionId={props.sessionId}
+                  onBranch={onBranch}
+                  onRetry={i === lastAssistant && b.error ? onRetry : undefined}
                 />
-              ) : null}
-            </>
-          );
-        })()}
-        {props.tail}
+              );
+            });
+            return (
+              <>
+                {rendered}
+                {/*
+                  The answer block is born on the first event, so a slow turn used to
+                  look frozen: the dots stand in for it while the turn is running.
+                */}
+                {props.busy && !props.blocks.some((b) => b.kind === "assistant" && b.streaming) ? (
+                  <AssistantBlock
+                    key={`a-${aOrd}`}
+                    block={{ kind: "assistant", text: "", reasoning: "", tools: [], streaming: true }}
+                    sessionId={props.sessionId}
+                  />
+                ) : null}
+              </>
+            );
+          })()}
+          {props.tail}
+        </div>
       </div>
       {away ? (
         <button
           type="button"
-          className="btn btn-sm"
-          style={{ position: "sticky", bottom: 8, marginLeft: "auto", display: "block" }}
+          className="btn btn-sm transcript-end"
           onClick={() => {
             const el = box.current;
             if (!el) return;
@@ -1558,9 +2507,9 @@ export function Transcript(props: {
             el.scrollTop = el.scrollHeight;
           }}
         >
-          Ir para o fim
+          {tr(lang, "Ir para o fim", "Jump to bottom")}
         </button>
       ) : null}
     </div>
   );
-}
+});

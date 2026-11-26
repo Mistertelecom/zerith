@@ -47,6 +47,7 @@ import {
 } from "./lib/api";
 import {
   applyEvent,
+  attachUserMessageId,
   borrowIds,
   emptyTurn,
   finishTurn,
@@ -339,6 +340,8 @@ export default function App() {
   }, [error]);
   // Sessions whose Stop the user pressed: their end is "Interrompido", not a failure.
   const cancelRequestedRef = useRef<Set<string>>(new Set());
+  // User message row ids delivered directly on `done` events (skips history refetch on turn:done).
+  const deliveredUserMsgIdRef = useRef<Map<string, number>>(new Map());
   const workflowsDirtyRef = useRef(false);
   // History of the open conversation: loading, failed (with retry), and how
   // many rows were asked for (`more`: the store may hold older ones).
@@ -666,6 +669,7 @@ export default function App() {
       void api.cancelTurn(id).catch(() => undefined);
       pendingDeltasRef.current.delete(id);
       turnTouchedRef.current.delete(id);
+      deliveredUserMsgIdRef.current.delete(id);
       bumpSessionEpoch(id);
       setTurns((prev) => {
         if (!(id in prev)) return prev;
@@ -709,6 +713,13 @@ export default function App() {
           ),
         );
       }
+      if (event.type === "done" && event.userMessageId != null) {
+        deliveredUserMsgIdRef.current.set(id, event.userMessageId);
+        if (id === selectedRef.current) {
+          const userMsgId = event.userMessageId;
+          setMessages((prev) => attachUserMessageId(prev, userMsgId));
+        }
+      }
       updateTurn(id, (prev) => applyEvent(prev, event));
     });
     const done = onTurnDone((id) => {
@@ -719,28 +730,34 @@ export default function App() {
         setPendingUsage((m) => ({ ...m, [id]: true }));
       }
       const cancelled = cancelRequestedRef.current.delete(id);
+      const deliveredUserId = deliveredUserMsgIdRef.current.get(id);
+      deliveredUserMsgIdRef.current.delete(id);
       updateTurn(id, (prev) => finishTurn(prev, cancelled));
       // The open conversation gets its stored rows back (with their ids, which
       // "Editar" needs); a closed one rereads them when it is opened.
       if (!isSelected) return;
-      void api
-        .sessionMessages(id)
-        .then((list) => {
-          if (id !== selectedRef.current) return;
-          if (
-            epoch !== sessionEpochRef.current[id] ||
-            turnsRef.current[id]?.busy
-          ) {
-            return;
-          }
-          setMessages((prev) => {
-            const stored = [...(turnsRef.current[id]?.blocks ?? [])]
-              .reverse()
-              .find((b) => b.kind === "assistant")?.stored;
-            return borrowIds(prev, list, stored);
-          });
-        })
-        .catch(() => undefined);
+      if (deliveredUserId != null) {
+        setMessages((prev) => attachUserMessageId(prev, deliveredUserId));
+      } else {
+        void api
+          .sessionMessages(id)
+          .then((list) => {
+            if (id !== selectedRef.current) return;
+            if (
+              epoch !== sessionEpochRef.current[id] ||
+              turnsRef.current[id]?.busy
+            ) {
+              return;
+            }
+            setMessages((prev) => {
+              const stored = [...(turnsRef.current[id]?.blocks ?? [])]
+                .reverse()
+                .find((b) => b.kind === "assistant")?.stored;
+              return borrowIds(prev, list, stored);
+            });
+          })
+          .catch(() => undefined);
+      }
       void api
         .sessionUsage(id)
         .then((u) => {
@@ -790,6 +807,7 @@ export default function App() {
     // same way a sent message does, so the stream that follows has a home.
     const wake = onTurnWake((id, text) => {
       flushDeltas();
+      deliveredUserMsgIdRef.current.delete(id);
       bumpSessionEpoch(id);
       if (id === selectedRef.current) {
         const prevBlocks = turnsRef.current[id]?.blocks ?? [];
@@ -1004,6 +1022,7 @@ export default function App() {
       ]);
       bumpSessionEpoch(id);
       cancelRequestedRef.current.delete(id);
+      deliveredUserMsgIdRef.current.delete(id);
       markedBusy = true;
       const busyTurn: TurnState = { ...emptyTurn, busy: true };
       turnsRef.current = { ...turnsRef.current, [id]: busyTurn };
@@ -1131,7 +1150,7 @@ export default function App() {
       setStatus("");
       if (name === "compact") {
         if (!selected) return setStatus("Nada para compactar ainda");
-        if (turn.busy)
+        if (turnsRef.current[selected]?.busy)
           return setStatus("Espere o turno terminar para compactar");
         if (!model) return setStatus("Escolha um modelo antes de compactar");
         const sid = selected;
@@ -1154,14 +1173,16 @@ export default function App() {
         return;
       }
       if (name === "context") {
-        const total = tokenTotal(turn.usage);
+        const total = tokenTotal(
+          (selected ? turnsRef.current[selected]?.usage : null) ?? null,
+        );
         if (!total) return setStatus("Contexto: nenhum turno ainda");
         setStatus(`Contexto: ${total.toLocaleString()} tokens neste turno`);
         return;
       }
       if (name === "rewind") {
         if (!selected) return setStatus("Nada para rebobinar");
-        if (turn.busy)
+        if (turnsRef.current[selected]?.busy)
           return setStatus("Espere o turno terminar para rebobinar");
         const sid = selected;
         const epoch = bumpSessionEpoch(sid);
@@ -1250,7 +1271,7 @@ export default function App() {
       if (name === "skills") return setSettings("Skills");
       if (name === "memory") return setSettings("Memória");
     },
-    [selected, turn.busy, turn.usage, model, mode, note, bumpSessionEpoch, lang],
+    [selected, model, mode, note, bumpSessionEpoch, lang],
   );
 
   const closeSettings = useCallback(() => {
@@ -1706,6 +1727,222 @@ export default function App() {
     [],
   );
 
+  // Stabilized props & callbacks for memoized sibling chrome so 60Hz turn delta
+  // updates do not re-render Sidebar, Composer, BackgroundJobs, or ActiveTerminals.
+  const anyTurnBusy = useMemo(
+    () => Object.values(turns).some((t) => t.busy),
+    [turns],
+  );
+
+  const sessionStatusesRef = useRef<Record<string, "busy" | "waiting">>({});
+  const sessionStatuses = useMemo(() => {
+    const next: Record<string, "busy" | "waiting"> = {};
+    for (const [id, t] of Object.entries(turns)) {
+      if (!t.busy) continue;
+      next[id] = t.approvals.length > 0 || t.question ? "waiting" : "busy";
+    }
+    const prev = sessionStatusesRef.current;
+    const prevKeys = Object.keys(prev);
+    const nextKeys = Object.keys(next);
+    if (
+      prevKeys.length === nextKeys.length &&
+      nextKeys.every((k) => prev[k] === next[k])
+    ) {
+      return prev;
+    }
+    sessionStatusesRef.current = next;
+    return next;
+  }, [turns]);
+
+  const sidebarStatus = useCallback(
+    (id: string) => sessionStatuses[id] ?? null,
+    [sessionStatuses],
+  );
+
+  const handleSelectBotSession = useCallback((sid: string) => {
+    setSelected(sid);
+  }, []);
+
+  const handleCreateBot = useCallback(() => {
+    setBotModal({ open: true, editing: null });
+  }, []);
+
+  const handleEditBot = useCallback((bot: AgentView) => {
+    setBotModal({ open: true, editing: bot });
+  }, []);
+
+  const handleNewBotChat = useCallback(() => {
+    if (activeAgent) {
+      try {
+        const raw = localStorage.getItem("zerith.botSessions");
+        const map = raw ? (JSON.parse(raw) as Record<string, string>) : {};
+        delete map[activeAgent];
+        localStorage.setItem("zerith.botSessions", JSON.stringify(map));
+      } catch {
+        // ignore
+      }
+    }
+    setSelected(null);
+    setMessages([]);
+    draftRef.current?.focus();
+  }, [activeAgent]);
+
+  const handleSelectSession = useCallback((id: string) => {
+    setActiveAgent(null);
+    setSelected(id);
+  }, []);
+
+  const handleNewChat = useCallback(() => {
+    setActiveAgent(null);
+    setSelected(null);
+    setMessages([]);
+    draftRef.current?.focus();
+  }, []);
+
+  const handleTogglePin = useCallback((id: string, pin: boolean) => {
+    void api
+      .setSessionPinned(id, pin)
+      .then(setPinnedSessions)
+      .catch((e) => setStatus(String(e)));
+  }, []);
+
+  const handleRenameSession = useCallback((id: string, title: string) => {
+    void api
+      .renameSession(id, title)
+      .then(() =>
+        setSessions((prev) =>
+          prev.map((s) => (s.id === id ? { ...s, title } : s)),
+        ),
+      )
+      .catch((e) => setStatus(String(e)));
+  }, []);
+
+  const handleArchiveSession = useCallback(
+    (id: string) => {
+      void api
+        .setArchived(id, true)
+        .then(() => {
+          cleanupSessionState(id);
+          sessionsRef.current = sessionsRef.current.filter((s) => s.id !== id);
+          setSessions((prev) => prev.filter((s) => s.id !== id));
+          if (selectedRef.current === id) {
+            setSelected(null);
+            setMessages([]);
+          }
+        })
+        .catch((e) => setStatus(String(e)));
+    },
+    [cleanupSessionState],
+  );
+
+  const handleDeleteSession = useCallback(
+    (id: string) => {
+      const title =
+        sessionsRef.current.find((s) => s.id === id)?.title ||
+        tr(lang, "esta conversa", "this chat");
+      if (
+        !window.confirm(
+          tr(
+            lang,
+            `Excluir "${title}"? Não dá para desfazer.`,
+            `Delete "${title}"? This cannot be undone.`,
+          ),
+        )
+      )
+        return;
+      void api
+        .deleteSession(id)
+        .then(() => {
+          cleanupSessionState(id);
+          sessionsRef.current = sessionsRef.current.filter((s) => s.id !== id);
+          setSessions((prev) => prev.filter((s) => s.id !== id));
+          setPinnedSessions((prev) => prev.filter((x) => x !== id));
+          if (selectedRef.current === id) {
+            setSelected(null);
+            setMessages([]);
+          }
+        })
+        .catch((e) => setStatus(String(e)));
+    },
+    [cleanupSessionState, lang],
+  );
+
+  const handleOpenSettings = useCallback(() => setSettings("Geral"), []);
+  const handleOpenQuotas = useCallback(() => setSettings("Cotas"), []);
+  const handleOpenWorkflows = useCallback(() => setActiveView("workflows"), []);
+  const handleToggleMemory = useCallback(() => {
+    setMemoryPaused((prev) => {
+      const next = !prev;
+      void api.setMemoryPaused(next);
+      return next;
+    });
+  }, []);
+
+  const handleComposerSend = useCallback(() => {
+    void send();
+  }, [send]);
+
+  const handleComposerSteer = useCallback(
+    (t: string) => {
+      void steer(t);
+    },
+    [steer],
+  );
+
+  const handleCancelTurn = useCallback(() => {
+    const sid = selectedRef.current;
+    if (!sid) return;
+    cancelRequestedRef.current.add(sid);
+    void api.cancelTurn(sid).catch(() => undefined);
+  }, []);
+
+  const localizedModes = useMemo(
+    () => MODES.map(([k, v]) => [k, translateText(v, lang)] as const),
+    [lang],
+  );
+
+  const browseFolder = useCallback(() => {
+    void api
+      .pickFolder(folder || null)
+      .then((p) => p && pickFolder(p))
+      .catch((e) => setStatus(String(e)));
+  }, [folder, pickFolder]);
+
+  const revealFolder = useCallback(() => {
+    void api
+      .revealWorkspace(folder)
+      .catch((e) => setStatus(String(e)));
+  }, [folder]);
+
+  const folderNode = useMemo(
+    () => (
+      <FolderPill
+        value={folder}
+        branch={branch}
+        recent={recent}
+        onPick={pickFolder}
+        onBrowse={browseFolder}
+        onReveal={revealFolder}
+      />
+    ),
+    [folder, branch, recent, pickFolder, browseFolder, revealFolder],
+  );
+
+  const handleEditMessage = useCallback(
+    (id: number, text: string) => fork(id - 1, "editada", text),
+    [fork],
+  );
+
+  const handleBranchMessage = useCallback(
+    (id: number) => fork(id, "ramo"),
+    [fork],
+  );
+
+  const handleRetryMessage = useMemo(
+    () => (lastUserText ? () => void send(lastUserText) : undefined),
+    [lastUserText, send],
+  );
+
   if (error && !boot) {
     return (
       <main className="boot">
@@ -1782,111 +2019,23 @@ export default function App() {
           agents={agents}
           activeBot={activeAgent}
           onSelectBot={selectBot}
-          onSelectBotSession={(sid) => setSelected(sid)}
-          onCreateBot={() => setBotModal({ open: true, editing: null })}
-          onEditBot={(bot) => setBotModal({ open: true, editing: bot })}
-          onNewBotChat={() => {
-            if (activeAgent) {
-              try {
-                const raw = localStorage.getItem("zerith.botSessions");
-                const map = raw ? (JSON.parse(raw) as Record<string, string>) : {};
-                delete map[activeAgent];
-                localStorage.setItem("zerith.botSessions", JSON.stringify(map));
-              } catch {
-                // ignore
-              }
-            }
-            setSelected(null);
-            setMessages([]);
-            draftRef.current?.focus();
-          }}
-          onSelect={(id) => {
-            setActiveAgent(null);
-            setSelected(id);
-          }}
-          onNew={() => {
-            setActiveAgent(null);
-            setSelected(null);
-            setMessages([]);
-            draftRef.current?.focus();
-          }}
+          onSelectBotSession={handleSelectBotSession}
+          onCreateBot={handleCreateBot}
+          onEditBot={handleEditBot}
+          onNewBotChat={handleNewBotChat}
+          onSelect={handleSelectSession}
+          onNew={handleNewChat}
           pinned={pinnedSessions}
-          onTogglePin={(id, pin) => {
-            void api
-              .setSessionPinned(id, pin)
-              .then(setPinnedSessions)
-              .catch((e) => setStatus(String(e)));
-          }}
-          onRename={(id, title) => {
-            void api
-              .renameSession(id, title)
-              .then(() =>
-                setSessions((prev) =>
-                  prev.map((s) => (s.id === id ? { ...s, title } : s)),
-                ),
-              )
-              .catch((e) => setStatus(String(e)));
-          }}
-          onArchive={(id) => {
-            void api
-              .setArchived(id, true)
-              .then(() => {
-                cleanupSessionState(id);
-                sessionsRef.current = sessionsRef.current.filter(
-                  (s) => s.id !== id,
-                );
-                setSessions((prev) => prev.filter((s) => s.id !== id));
-                if (selectedRef.current === id) {
-                  setSelected(null);
-                  setMessages([]);
-                }
-              })
-              .catch((e) => setStatus(String(e)));
-          }}
-          onDelete={(id) => {
-            const title =
-              sessionsRef.current.find((s) => s.id === id)?.title ||
-              tr(lang, "esta conversa", "this chat");
-            if (
-              !window.confirm(
-                tr(
-                  lang,
-                  `Excluir "${title}"? Não dá para desfazer.`,
-                  `Delete "${title}"? This cannot be undone.`,
-                ),
-              )
-            )
-              return;
-            void api
-              .deleteSession(id)
-              .then(() => {
-                cleanupSessionState(id);
-                sessionsRef.current = sessionsRef.current.filter(
-                  (s) => s.id !== id,
-                );
-                setSessions((prev) => prev.filter((s) => s.id !== id));
-                setPinnedSessions((prev) => prev.filter((x) => x !== id));
-                if (selectedRef.current === id) {
-                  setSelected(null);
-                  setMessages([]);
-                }
-              })
-              .catch((e) => setStatus(String(e)));
-          }}
-          status={(id) => {
-            const t = turns[id];
-            if (!t?.busy) return null;
-            return t.approvals.length > 0 || t.question ? "waiting" : "busy";
-          }}
-          onSettings={() => setSettings("Geral")}
-          onQuotas={() => setSettings("Cotas")}
-          onWorkflows={() => setActiveView("workflows")}
+          onTogglePin={handleTogglePin}
+          onRename={handleRenameSession}
+          onArchive={handleArchiveSession}
+          onDelete={handleDeleteSession}
+          status={sidebarStatus}
+          onSettings={handleOpenSettings}
+          onQuotas={handleOpenQuotas}
+          onWorkflows={handleOpenWorkflows}
           memoryPaused={memoryPaused}
-          onToggleMemory={() => {
-            const next = !memoryPaused;
-            setMemoryPaused(next);
-            void api.setMemoryPaused(next);
-          }}
+          onToggleMemory={handleToggleMemory}
         />
         <main className="main">
           <header className="topbar">
@@ -1959,11 +2108,11 @@ export default function App() {
             ) : null}
           </header>
           <BackgroundJobs
-            active={Object.values(turns).some((t) => t.busy)}
+            active={anyTurnBusy}
             selected={selected}
             sessions={sessions}
           />
-          <ActiveTerminals active={Object.values(turns).some((t) => t.busy)} />
+          <ActiveTerminals active={anyTurnBusy} />
           <div className="main-body">
             {/* The composer keeps its place in the tree, so the first send from
               the hero does not remount it. */}
@@ -2084,11 +2233,9 @@ export default function App() {
                   tail={tail}
                   sessionId={selected}
                   busy={turn.busy}
-                  onEdit={(id, text) => fork(id - 1, "editada", text)}
-                  onBranch={(id) => fork(id, "ramo")}
-                  onRetry={
-                    lastUserText ? () => void send(lastUserText) : undefined
-                  }
+                  onEdit={handleEditMessage}
+                  onBranch={handleBranchMessage}
+                  onRetry={handleRetryMessage}
                   head={historyHead}
                 />
               )}
@@ -2097,17 +2244,13 @@ export default function App() {
                 textareaRef={draftRef}
                 draft={draft}
                 onDraft={setDraft}
-                onSend={() => void send()}
-                onSteer={(t) => void steer(t)}
+                onSend={handleComposerSend}
+                onSteer={handleComposerSteer}
                 onRun={runCommand}
                 busy={turn.busy}
-                onCancel={() => {
-                  if (!selected) return;
-                  cancelRequestedRef.current.add(selected);
-                  void api.cancelTurn(selected).catch(() => undefined);
-                }}
+                onCancel={handleCancelTurn}
                 mode={mode}
-                modes={MODES.map(([k, v]) => [k, translateText(v, lang)] as const)}
+                modes={localizedModes}
                 onMode={setMode}
                 effort={effort}
                 onEffort={setEffort}
@@ -2124,25 +2267,7 @@ export default function App() {
                 onToggleHidden={toggleHidden}
                 hint={error || status || "/ comandos  ·  @ arquivos"}
                 files={fetchFiles}
-                folder={
-                  <FolderPill
-                    value={folder}
-                    branch={branch}
-                    recent={recent}
-                    onPick={pickFolder}
-                    onBrowse={() =>
-                      void api
-                        .pickFolder(folder || null)
-                        .then((p) => p && pickFolder(p))
-                        .catch((e) => setStatus(String(e)))
-                    }
-                    onReveal={() =>
-                      void api
-                        .revealWorkspace(folder)
-                        .catch((e) => setStatus(String(e)))
-                    }
-                  />
-                }
+                folder={folderNode}
               />
               {hero && !activeBotSpec ? (
                 <div className="hero-grid">

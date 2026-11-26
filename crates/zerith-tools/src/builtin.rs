@@ -38,7 +38,8 @@ impl Tool for Builtin {
     // Read-only and stateless: safe to run side by side.
     fn concurrency_safe(&self, args: &Value) -> bool {
         match self.spec.name.as_str() {
-            "read_file" | "list_dir" | "glob" | "grep" | "repo_map" | "session_search" => true,
+            "read_file" | "view_image" | "list_dir" | "glob" | "grep" | "repo_map"
+            | "session_search" => true,
             // Só a leitura da memória: save/update/forget escrevem.
             "memory" => args["action"] == "recall",
             _ => false,
@@ -197,10 +198,11 @@ pub(crate) fn all() -> Vec<Box<dyn crate::Tool>> {
         ),
         tool(
             "repo_map",
-            "Mapeia a estrutura e assinaturas principais do repositório (funções, structs, traits, classes, interfaces e blocos de roteadores/switches em .cfg/.conf/.rsc) respeitando .gitignore e um orçamento de caracteres.",
+            "Mapeia a estrutura e assinaturas principais do repositório (Rust, TypeScript/JS, Python, Go, C/C++, blocos de rede em .cfg/.conf/.rsc e playbooks Ansible .yml/.yaml) respeitando .gitignore, ranking por proximidade (`focus`) e orçamento de caracteres.",
             json!({"type": "object", "properties": {
                 "path": {"type": "string", "description": "diretório ou arquivo base (padrão: workspace)"},
-                "glob": {"type": "string", "description": "filtro opcional de arquivos (ex.: *.rs, src/**/*.ts, *.cfg)"},
+                "glob": {"type": "string", "description": "filtro opcional de arquivos (ex.: *.rs, src/**/*.ts, *.cfg, *.rsc, *.yml)"},
+                "focus": {"type": "string", "description": "caminho ou termo opcional para priorizar arquivos próximos no topo do mapa (ex.: crates/zerith-tools/src/network.rs ou network)"},
                 "max_chars": {"type": "integer", "description": "orçamento máximo de caracteres (padrão 6000, faixa 500..24000)"},
                 "max_symbols_per_file": {"type": "integer", "description": "máximo de símbolos por arquivo (padrão 25)"}
             }}),
@@ -471,11 +473,19 @@ const READ_LINE_CHARS: usize = 2000;
 const READ_TOTAL_CHARS: usize = 100_000;
 
 fn read_file(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
+    const BINARY_SNIFF_BYTES: usize = 8 * 1024;
     let path = ctx.resolve(str_arg(args, "path")?);
     let raw = std::fs::read(&path)?;
     if raw.starts_with(b"%PDF-") {
         exec.host.note_read(&path);
         return read_pdf(&path, args, &raw);
+    }
+    if raw[..raw.len().min(BINARY_SNIFF_BYTES)].contains(&0) {
+        return Err(ToolError::Failed(format!(
+            "arquivo binário detectado ({}, {} bytes): não pode ser lido como texto (use view_image para imagens)",
+            path.display(),
+            raw.len()
+        )));
     }
     // Legacy pt-BR files are Latin-1/CP1252, not the console's OEM page:
     // decode them the same way multi_edit/edit_file write them back, so an
@@ -541,6 +551,11 @@ fn read_file(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String>
 /// written through (its target replaced), as `fs::write` did.
 pub(crate) fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
     let target = match std::fs::symlink_metadata(path) {
         Ok(m) if m.file_type().is_symlink() => std::fs::canonicalize(path)?,
         _ => path.to_path_buf(),
@@ -549,8 +564,25 @@ pub(crate) fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Res
         .parent()
         .filter(|d| !d.as_os_str().is_empty())
         .unwrap_or(std::path::Path::new("."));
-    let name = target.file_name().unwrap_or_default().to_string_lossy();
-    let tmp = dir.join(format!(".{name}.{}.zerith-tmp", std::process::id()));
+    let raw_name = target.file_name().unwrap_or_default().to_string_lossy();
+    let name = if raw_name.len() > 160 {
+        let mut end = 160;
+        while !raw_name.is_char_boundary(end) {
+            end -= 1;
+        }
+        &raw_name[..end]
+    } else {
+        raw_name.as_ref()
+    };
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = dir.join(format!(
+        ".{name}.{}.{seq}.{nanos}.zerith-tmp",
+        std::process::id()
+    ));
     let result = (|| {
         let mut f = std::fs::OpenOptions::new()
             .write(true)
@@ -589,6 +621,7 @@ fn write_file(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String
     write_atomic(&path, content.as_bytes())?;
     // The model knows what it just wrote; a follow-up edit needs no re-read.
     exec.host.note_read(&path);
+    crate::lsp::notify_save(ctx.workspace, &path);
     let mut msg = format!("{} bytes escritos em {}", content.len(), path.display());
     crate::postcheck::append(&mut msg, &path, pc);
     Ok(msg)
@@ -1272,6 +1305,56 @@ mod path_tests {
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "new");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
+
+    #[test]
+    fn write_atomic_parallel_writes_do_not_collide_on_temp_names() {
+        let scratch = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let dir = tempfile::Builder::new().tempdir_in(scratch).unwrap();
+        let dir_path = dir.path().to_path_buf();
+        std::thread::scope(|s| {
+            for t in 0..8 {
+                let dp = dir_path.clone();
+                s.spawn(move || {
+                    for iter in 0..10 {
+                        let target = dp.join("shared.txt");
+                        let payload = format!("thread-{t}-iter-{iter}");
+                        super::write_atomic(&target, payload.as_bytes()).unwrap();
+                    }
+                });
+            }
+        });
+        assert!(dir_path.join("shared.txt").is_file());
+        assert_eq!(std::fs::read_dir(&dir_path).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn read_file_rejects_binary_files_with_crisp_diagnostic() {
+        use crate::{CallCtx, Registry};
+        use serde_json::json;
+        use zerith_security::{preset, Mode, Policy};
+
+        let scratch = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let dir = tempfile::Builder::new().tempdir_in(scratch).unwrap();
+        let bin = dir.path().join("blob.bin");
+        std::fs::write(&bin, b"\x7fELF\x00\x01\x02\x03binary-noise").unwrap();
+
+        let pol = Policy::new(preset("workspace-write").unwrap(), Mode::Bypass, dir.path());
+        let ctx = CallCtx {
+            workspace: pol.workspace.as_path(),
+            policy: &pol,
+            memory: None,
+            scope: None,
+        };
+        let err = Registry::new()
+            .call("read_file", &json!({"path": "blob.bin"}), &ctx)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("binário"), "{err}");
+        assert!(err.contains("20 bytes"), "{err}");
+        assert!(!err.contains("binary-noise"), "{err}");
+    }
 }
 
 #[cfg(test)]
@@ -1494,6 +1577,172 @@ mod ondav4_tests {
         assert!(out.contains("hostname PE-CORE-01"), "{out}");
         assert!(out.contains("interface GigabitEthernet0/0/0"), "{out}");
         assert!(out.contains("router bgp 65001"), "{out}");
+    }
+
+    #[test]
+    fn repo_map_extracts_go_cpp_routeros_netcfg_and_ansible_yaml() {
+        let dir = scratch();
+        let root = dir.path();
+
+        std::fs::write(
+            root.join("bgp.go"),
+            "package bgp\n\ntype Peer struct {\n\tASN uint32\n}\n\nfunc (p *Peer) Dial(addr string) error {\n\treturn nil\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("parser.cpp"),
+            "namespace net {\nclass PacketParser {\n};\nstatic int parse_frame(const char *buf, int len) {\n    if (len <= 0) {\n        return -1;\n    }\n    return len;\n}\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("edge.rsc"),
+            "# MikroTik export\n/interface bridge\nadd name=br0\n/ip route\nadd dst-address=0.0.0.0/0 gateway=10.0.0.1\n/ip firewall filter\nadd chain=input action=accept\n:global syncBgp do={\n  :local peer \"10.0.0.2\"\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("switch.conf"),
+            "sysname SW-DIST-01\nvlan 100\ninterface Vlanif100\nroute-map RM-OUT permit 10\nip access-list extended ACL-MGMT\nbgp 65100\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("deploy.yml"),
+            "---\n- name: Configure core BGP\n  hosts: core_routers\n  tasks:\n    - name: Push BGP template\n      debug: msg=ok\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("inventory.yaml"),
+            "all:\n  children:\n    routers:\n      hosts:\n        r1:\n",
+        )
+        .unwrap();
+
+        let pol = Policy::new(preset("workspace-write").unwrap(), Mode::Bypass, root);
+        let ctx = CallCtx {
+            workspace: pol.workspace.as_path(),
+            policy: &pol,
+            memory: None,
+            scope: None,
+        };
+        let reg = Registry::new();
+
+        let out = reg.call("repo_map", &json!({}), &ctx).unwrap();
+        // Go
+        assert!(out.contains("bgp.go"), "{out}");
+        assert!(out.contains("type Peer struct"), "{out}");
+        assert!(
+            out.contains("func (p *Peer) Dial(addr string) error"),
+            "{out}"
+        );
+        // C++
+        assert!(out.contains("parser.cpp"), "{out}");
+        assert!(out.contains("namespace net"), "{out}");
+        assert!(out.contains("class PacketParser"), "{out}");
+        assert!(
+            out.contains("static int parse_frame(const char *buf, int len)"),
+            "{out}"
+        );
+        assert!(!out.contains("if (len <= 0)"), "{out}");
+        // RouterOS .rsc
+        assert!(out.contains("edge.rsc"), "{out}");
+        assert!(out.contains("/interface bridge"), "{out}");
+        assert!(out.contains("/ip route"), "{out}");
+        assert!(out.contains("/ip firewall filter"), "{out}");
+        assert!(out.contains(":global syncBgp"), "{out}");
+        assert!(out.contains(":local peer"), "{out}");
+        // Network config .conf
+        assert!(out.contains("switch.conf"), "{out}");
+        assert!(out.contains("sysname SW-DIST-01"), "{out}");
+        assert!(out.contains("vlan 100"), "{out}");
+        assert!(out.contains("route-map RM-OUT permit 10"), "{out}");
+        assert!(out.contains("ip access-list extended ACL-MGMT"), "{out}");
+        assert!(out.contains("bgp 65100"), "{out}");
+        // Ansible YAML
+        assert!(out.contains("deploy.yml"), "{out}");
+        assert!(out.contains("- name: Configure core BGP"), "{out}");
+        assert!(out.contains("hosts: core_routers"), "{out}");
+        assert!(out.contains("- name: Push BGP template"), "{out}");
+        assert!(out.contains("inventory.yaml"), "{out}");
+        assert!(out.contains("all:"), "{out}");
+    }
+
+    #[test]
+    fn repo_map_focus_ranks_same_file_dir_prefix_and_entrypoints_first() {
+        let dir = scratch();
+        let root = dir.path();
+
+        for (rel, body) in [
+            ("crates/tools/src/network.rs", "pub fn connect() {}\n"),
+            ("crates/tools/src/lib.rs", "pub fn tools_init() {}\n"),
+            ("crates/tools/src/zebra.rs", "pub fn zebra_helper() {}\n"),
+            ("crates/tools/src/sub/deep.rs", "pub fn deep_fn() {}\n"),
+            ("crates/runtime/src/lib.rs", "pub fn runtime_init() {}\n"),
+            ("crates/runtime/src/alpha.rs", "pub fn alpha_fn() {}\n"),
+            ("unrelated/aaa.rs", "pub fn aaa_fn() {}\n"),
+            ("unrelated/main.rs", "fn main() {}\n"),
+        ] {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, body).unwrap();
+        }
+
+        let pol = Policy::new(preset("workspace-write").unwrap(), Mode::Bypass, root);
+        let ctx = CallCtx {
+            workspace: pol.workspace.as_path(),
+            policy: &pol,
+            memory: None,
+            scope: None,
+        };
+        let reg = Registry::new();
+
+        // 1. Path focus: exact file > same dir (entrypoint before other) > shared prefix > unrelated (entrypoint before other)
+        let out = reg
+            .call(
+                "repo_map",
+                &json!({"focus": "crates/tools/src/network.rs"}),
+                &ctx,
+            )
+            .unwrap();
+        let pos = |needle: &str| {
+            out.find(needle)
+                .unwrap_or_else(|| panic!("missing {needle} in:\n{out}"))
+        };
+        assert!(
+            pos("crates/tools/src/network.rs") < pos("crates/tools/src/lib.rs"),
+            "{out}"
+        );
+        assert!(
+            pos("crates/tools/src/lib.rs") < pos("crates/tools/src/zebra.rs"),
+            "{out}"
+        );
+        assert!(
+            pos("crates/tools/src/zebra.rs") < pos("crates/tools/src/sub/deep.rs"),
+            "{out}"
+        );
+        assert!(
+            pos("crates/tools/src/sub/deep.rs") < pos("crates/runtime/src/lib.rs"),
+            "{out}"
+        );
+        assert!(
+            pos("crates/runtime/src/lib.rs") < pos("crates/runtime/src/alpha.rs"),
+            "{out}"
+        );
+        assert!(
+            pos("crates/runtime/src/alpha.rs") < pos("unrelated/main.rs"),
+            "{out}"
+        );
+        assert!(pos("unrelated/main.rs") < pos("unrelated/aaa.rs"), "{out}");
+
+        // 2. Keyword focus ("network"): `network.rs` surfaces first even with a tight budget.
+        let out_kw = reg
+            .call(
+                "repo_map",
+                &json!({"focus": "network", "max_chars": 500}),
+                &ctx,
+            )
+            .unwrap();
+        assert!(
+            out_kw.starts_with("crates/tools/src/network.rs\n"),
+            "expected focused file at top:\n{out_kw}"
+        );
     }
 
     #[test]

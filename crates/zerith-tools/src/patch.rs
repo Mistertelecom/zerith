@@ -166,14 +166,15 @@ fn parse(text: &str) -> Result<Vec<Op>> {
     Ok(ops)
 }
 
-/// Where `pat` starts in `lines` at or after `from`: exact, then ignoring
-/// trailing whitespace, then ignoring both ends.
-fn seek(lines: &[String], pat: &[String], from: usize, eof: bool) -> Option<usize> {
+/// All start indices where `pat` matches in `lines` at or after `from` in the
+/// first matching pass: exact, then ignoring trailing whitespace, then ignoring
+/// both ends.
+fn seek_all(lines: &[String], pat: &[String], from: usize, eof: bool) -> Vec<usize> {
     if pat.is_empty() {
-        return Some(if eof { lines.len() } else { from });
+        return vec![if eof { lines.len() } else { from }];
     }
     if pat.len() > lines.len() {
-        return None;
+        return Vec::new();
     }
     let last = lines.len() - pat.len();
     let start = if eof { last.max(from) } else { from };
@@ -183,20 +184,34 @@ fn seek(lines: &[String], pat: &[String], from: usize, eof: bool) -> Option<usiz
         |a, b| a.trim() == b.trim(),
     ];
     for f in eq {
+        let mut hits = Vec::new();
         for i in start..=last {
             if pat.iter().enumerate().all(|(k, p)| f(&lines[i + k], p)) {
-                return Some(i);
+                hits.push(i);
             }
+        }
+        if !hits.is_empty() {
+            return hits;
         }
         if eof && start > from {
             for i in from..start {
                 if pat.iter().enumerate().all(|(k, p)| f(&lines[i + k], p)) {
-                    return Some(i);
+                    hits.push(i);
                 }
+            }
+            if !hits.is_empty() {
+                return hits;
             }
         }
     }
-    None
+    Vec::new()
+}
+
+/// Where `pat` starts in `lines` at or after `from`: exact, then ignoring
+/// trailing whitespace, then ignoring both ends.
+#[cfg(test)]
+fn seek(lines: &[String], pat: &[String], from: usize, eof: bool) -> Option<usize> {
+    seek_all(lines, pat, from, eof).into_iter().next()
 }
 
 fn apply_chunks(path: &str, text: &str, chunks: &[Chunk]) -> Result<String> {
@@ -209,22 +224,46 @@ fn apply_chunks(path: &str, text: &str, chunks: &[Chunk]) -> Result<String> {
     let mut cursor = 0usize;
     for (n, c) in chunks.iter().enumerate() {
         if let Some(a) = &c.anchor {
-            match seek(&lines, std::slice::from_ref(a), cursor, false) {
-                Some(i) => cursor = i,
-                None => {
-                    return Err(ToolError::Failed(format!(
+            let anchor_hits = seek_all(&lines, std::slice::from_ref(a), cursor, false);
+            if anchor_hits.is_empty() {
+                return Err(ToolError::Failed(format!(
                     "{path}: trecho {} não achou a linha de referência `@@ {a}`; nada foi alterado",
                     n + 1
-                )))
-                }
+                )));
             }
+            if c.old.is_empty() && anchor_hits.len() > 1 {
+                let line_nums: Vec<String> = anchor_hits
+                    .iter()
+                    .map(|&idx| (idx + 1).to_string())
+                    .collect();
+                return Err(ToolError::Failed(format!(
+                    "{path}: trecho {} tem linha de referência `@@ {a}` ambígua (linhas {}); inclua mais linhas de contexto. Nada foi alterado",
+                    n + 1,
+                    line_nums.join(", ")
+                )));
+            }
+            cursor = anchor_hits[0];
         }
-        let at = seek(&lines, &c.old, cursor, c.eof).ok_or_else(|| {
-            ToolError::Failed(format!(
-                "{path}: trecho {} não bate com o arquivo (as linhas com - e espaço precisam existir nessa ordem); leia o arquivo de novo. Nada foi alterado",
-                n + 1
-            ))
-        })?;
+        let hits = seek_all(&lines, &c.old, cursor, c.eof);
+        let at = match hits.as_slice() {
+            [] => {
+                return Err(ToolError::Failed(format!(
+                    "{path}: trecho {} não bate com o arquivo (as linhas com - e espaço precisam existir nessa ordem); leia o arquivo de novo. Nada foi alterado",
+                    n + 1
+                )));
+            }
+            [only] => *only,
+            many => {
+                let line_nums: Vec<String> =
+                    many.iter().map(|&idx| (idx + 1).to_string()).collect();
+                return Err(ToolError::Failed(format!(
+                    "{path}: trecho {} é ambíguo e casa em {} locais (linhas {}); inclua mais linhas de contexto. Nada foi alterado",
+                    n + 1,
+                    many.len(),
+                    line_nums.join(", ")
+                )));
+            }
+        };
         lines.splice(at..at + c.old.len(), c.new.iter().cloned());
         cursor = at + c.new.len();
     }
@@ -253,24 +292,52 @@ fn targets(ops: &[Op]) -> Vec<&str> {
     v
 }
 
+fn read_patch_text(p: &std::path::Path) -> Result<(String, bool)> {
+    let raw = std::fs::read(p)
+        .map_err(|e| ToolError::Failed(format!("{}: {e}. Nada foi alterado", p.display())))?;
+    Ok(match String::from_utf8(raw) {
+        Ok(s) => (s, false),
+        Err(e) => (
+            e.into_bytes().into_iter().map(|b| b as char).collect(),
+            true,
+        ),
+    })
+}
+
+fn encode_patch_bytes(p: &std::path::Path, body: String, is_latin1: bool) -> Result<Vec<u8>> {
+    if !is_latin1 {
+        return Ok(body.into_bytes());
+    }
+    let mut bytes = Vec::with_capacity(body.len());
+    for ch in body.chars() {
+        let b = u8::try_from(ch as u32).map_err(|_| {
+            ToolError::Failed(format!(
+                "{}: caractere fora de Latin-1 em arquivo legado. Nada foi alterado",
+                p.display()
+            ))
+        })?;
+        bytes.push(b);
+    }
+    Ok(bytes)
+}
+
 fn run(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
     let ops = parse(str_arg(args, "patch")?)?;
-    // The policy saw only the first path; every other one is checked here.
+    // Every touched path must pass policy, not only the one returned by `action()`.
+    // `Verdict::Ask` was already resolved via `authorize()` + interactive user approval
+    // (or rejected upfront by non-interactive `Registry::call`), so only `Deny` blocks here.
     for t in targets(&ops) {
         let p = ctx.resolve(t);
-        match ctx
+        if let Verdict::Deny(why) = ctx
             .policy
             .check_tool("apply_patch", &Action::Write(p.clone()))
         {
-            Verdict::Allow => {}
-            Verdict::Ask(why) | Verdict::Deny(why) => {
-                return Err(ToolError::Denied(format!("{}: {why}", p.display())))
-            }
+            return Err(ToolError::Denied(format!("{}: {why}", p.display())));
         }
     }
     // Plan everything first; touch the disk only when every file is ready.
     enum Step {
-        Write(PathBuf, String),
+        Write(PathBuf, Vec<u8>),
         Remove(PathBuf),
     }
     let mut plan: Vec<Step> = Vec::new();
@@ -289,7 +356,7 @@ fn run(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
                 let mut body = lines.join("\n");
                 body.push('\n');
                 summary.push(format!("A {path}"));
-                plan.push(Step::Write(p, body));
+                plan.push(Step::Write(p, body.into_bytes()));
             }
             Op::Delete { path } => {
                 let p = ctx.resolve(path);
@@ -306,20 +373,20 @@ fn run(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
             Op::Update { path, to, chunks } => {
                 let p = ctx.resolve(path);
                 exec.host.check_editable(&p)?;
-                let text = std::fs::read_to_string(&p).map_err(|e| {
-                    ToolError::Failed(format!("{}: {e}. Nada foi alterado", p.display()))
-                })?;
+                let (text, is_latin1) = read_patch_text(&p)?;
                 let new = apply_chunks(path, &text, chunks)?;
+                let target = to.as_ref().map_or_else(|| p.clone(), |t| ctx.resolve(t));
+                let bytes = encode_patch_bytes(&target, new, is_latin1)?;
                 match to {
                     Some(t) => {
                         summary.push(format!("R {path} -> {t}"));
-                        moved_from.insert(ctx.resolve(t), p.clone());
-                        plan.push(Step::Write(ctx.resolve(t), new));
+                        moved_from.insert(target.clone(), p.clone());
+                        plan.push(Step::Write(target, bytes));
                         plan.push(Step::Remove(p));
                     }
                     None => {
                         summary.push(format!("M {path}"));
-                        plan.push(Step::Write(p, new));
+                        plan.push(Step::Write(p, bytes));
                     }
                 }
             }
@@ -328,9 +395,10 @@ fn run(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
     // Conteúdo final inválido barra o patch inteiro antes de tocar o disco.
     for s in &plan {
         if let Step::Write(p, body) = s {
-            crate::lint::check(p, body.as_bytes())?;
+            crate::lint::check(p, body)?;
         }
     }
+    exec.host.snapshot_workspace(ctx.workspace);
     for s in &plan {
         let p = match s {
             Step::Write(p, _) | Step::Remove(p) => p,
@@ -348,7 +416,7 @@ fn run(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
                 if let Some(d) = p.parent() {
                     std::fs::create_dir_all(d)?;
                 }
-                write_atomic(&p, body.as_bytes())?;
+                write_atomic(&p, &body)?;
                 exec.host.note_read(&p);
                 checked.push((p, pc));
             }
@@ -357,23 +425,52 @@ fn run(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
     }
     let mut msg = format!("patch aplicado:\n{}", summary.join("\n"));
     for (p, pc) in checked {
+        let mut extras = Vec::new();
+        if let Some(diags) = crate::lsp::warm_diagnostics_for_edit(ctx.workspace, &p) {
+            extras.push(format!("[diagnósticos LSP]\n{diags}"));
+        }
         let block = crate::postcheck::after(&p, pc);
         if !block.is_empty() {
-            msg.push_str(&format!("\n\n{}:\n{block}", p.display()));
+            extras.push(block);
+        }
+        if !extras.is_empty() {
+            msg.push_str(&format!("\n\n{}:\n{}", p.display(), extras.join("\n\n")));
         }
     }
     Ok(msg)
 }
 
-/// The first path the patch touches: what the approval card and the policy
-/// rules see. The rest are checked in `run`.
+/// Evaluates every target path against the policy and returns the most
+/// restrictive path (`Deny` > boundary `Ask` > in-workspace `Ask` > `Allow`),
+/// so files `2..N` in a multi-file patch can never bypass `Ask`, `Deny`, or
+/// sensitive-boundary forced prompts in `authorize()` / `Pipeline::prepare`.
 fn action(args: &Value, ctx: &CallCtx<'_>) -> Result<Option<Action>> {
     let ops = parse(str_arg(args, "patch")?)?;
-    let first = targets(&ops)
-        .first()
-        .map(|t| ctx.resolve(t))
-        .unwrap_or_else(|| PathBuf::from("."));
-    Ok(Some(Action::Write(first)))
+    let mut chosen: Option<(u8, PathBuf)> = None;
+    for t in targets(&ops) {
+        let p = ctx.resolve(t);
+        let rank = match ctx
+            .policy
+            .check_tool("apply_patch", &Action::Write(p.clone()))
+        {
+            Verdict::Deny(_) => 3,
+            Verdict::Ask(_)
+                if !ctx.policy.inside_workspace(&p) || ctx.policy.is_own_control(&p) =>
+            {
+                2
+            }
+            Verdict::Ask(_) => 1,
+            Verdict::Allow => 0,
+        };
+        if chosen.as_ref().is_none_or(|(best, _)| rank > *best) {
+            chosen = Some((rank, p));
+            if rank == 3 {
+                break;
+            }
+        }
+    }
+    let target = chosen.map(|(_, p)| p).unwrap_or_else(|| PathBuf::from("."));
+    Ok(Some(Action::Write(target)))
 }
 
 pub(crate) fn tool() -> Box<dyn Tool> {
@@ -459,5 +556,110 @@ mod tests {
             }],
         );
         assert!(miss.is_err());
+    }
+
+    #[test]
+    fn ambiguous_hunk_is_rejected_with_line_numbers() {
+        let src = "fn a() {\n    return 1;\n}\nfn b() {\n    return 1;\n}\n";
+        let err = apply_chunks(
+            "dup.rs",
+            src,
+            &[Chunk {
+                old: lines("    return 1;"),
+                new: lines("    return 2;"),
+                ..Chunk::default()
+            }],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("ambíguo"), "{err}");
+        assert!(err.contains("2, 5"), "{err}");
+    }
+
+    #[test]
+    fn latin1_file_and_multi_file_policy_check_work() {
+        let scratch = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let dir = tempfile::Builder::new().tempdir_in(scratch).unwrap();
+
+        let legacy = dir.path().join("legacy.txt");
+        std::fs::write(&legacy, b"N\xfamero 1\nlinha 2\n").unwrap();
+
+        let pol = zerith_security::Policy::new(
+            zerith_security::preset("workspace-write").unwrap(),
+            zerith_security::Mode::AcceptEdits,
+            dir.path(),
+        );
+        let reg = crate::Registry::new();
+        let ctx = CallCtx {
+            workspace: pol.workspace.as_path(),
+            policy: &pol,
+            memory: None,
+            scope: None,
+        };
+
+        let patch = "*** Begin Patch\n*** Update File: legacy.txt\n Número 1\n-linha 2\n+linha B\n*** End Patch\n";
+        reg.call("apply_patch", &json!({"patch": patch}), &ctx)
+            .unwrap();
+        assert_eq!(std::fs::read(&legacy).unwrap(), b"N\xfamero 1\nlinha B\n");
+
+        // File 1 inside workspace (Allow in AcceptEdits), file 2 outside workspace (Ask!).
+        let escape_patch = "*** Begin Patch\n*** Add File: inside.txt\n+ok\n*** Add File: ../outside.txt\n+escape\n*** End Patch\n";
+        let (verdict, act) = reg
+            .authorize("apply_patch", &json!({"patch": escape_patch}), &ctx)
+            .unwrap();
+        assert!(matches!(verdict, Verdict::Ask(_)), "{verdict:?}");
+        let Some(Action::Write(flagged)) = act else {
+            panic!("expected Write action");
+        };
+        assert!(
+            flagged.to_string_lossy().contains("outside.txt"),
+            "{}",
+            flagged.display()
+        );
+
+        // Mode::Default: boundary Ask on file 2 must outrank in-workspace Ask on file 1,
+        // and an interactively approved in-workspace patch must succeed in `run_approved()`.
+        let pol_default = zerith_security::Policy::new(
+            zerith_security::preset("workspace-write").unwrap(),
+            zerith_security::Mode::Default,
+            dir.path(),
+        );
+        let ctx_default = CallCtx {
+            workspace: pol_default.workspace.as_path(),
+            policy: &pol_default,
+            memory: None,
+            scope: None,
+        };
+        let (v_def, act_def) = reg
+            .authorize("apply_patch", &json!({"patch": escape_patch}), &ctx_default)
+            .unwrap();
+        assert!(matches!(v_def, Verdict::Ask(_)), "{v_def:?}");
+        let Some(Action::Write(flagged_def)) = act_def else {
+            panic!("expected Write action in Mode::Default");
+        };
+        assert!(
+            flagged_def.to_string_lossy().contains("outside.txt"),
+            "boundary file must win in Mode::Default, got {}",
+            flagged_def.display()
+        );
+
+        let add_ok = "*** Begin Patch\n*** Add File: approved_default.txt\n+ok\n*** End Patch\n";
+        let (v_add, _) = reg
+            .authorize("apply_patch", &json!({"patch": add_ok}), &ctx_default)
+            .unwrap();
+        assert!(matches!(v_add, Verdict::Ask(_)), "{v_add:?}");
+        let cancel = zerith_providers::Cancel::default();
+        reg.run_approved(
+            "apply_patch",
+            &json!({"patch": add_ok}),
+            &ctx_default,
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("approved_default.txt")).unwrap(),
+            "ok\n"
+        );
     }
 }

@@ -4,10 +4,11 @@
 //! rollback is a real answer and not a promise. Installing never executes
 //! anything: it copies files, scans them, and writes a manifest row.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
@@ -85,6 +86,36 @@ static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn manifest_lock() -> MutexGuard<'static, ()> {
     MANIFEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+type PathStamp = Option<(u64, Option<SystemTime>)>;
+type EnabledEntry = (Vec<PathStamp>, Vec<Installed>);
+type EnabledCache = Mutex<HashMap<(PathBuf, Vec<PathBuf>), EnabledEntry>>;
+
+fn enabled_cache() -> &'static EnabledCache {
+    static CACHE: OnceLock<EnabledCache> = OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+fn stat_stamp(path: &Path) -> PathStamp {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.len(), meta.modified().ok()))
+}
+
+fn library_stamp(root: &Path, extra: &[PathBuf]) -> Vec<PathStamp> {
+    let mut stamps = Vec::with_capacity(1 + extra.len() * 2);
+    stamps.push(stat_stamp(&root.join("manifest.json")));
+    for dir in extra {
+        stamps.push(stat_stamp(dir));
+        stamps.push(stat_stamp(&dir.join("SKILL.md")));
+    }
+    stamps
+}
+
+fn invalidate_enabled_cache(root: &Path) {
+    if let Ok(mut cache) = enabled_cache().lock() {
+        cache.retain(|(k_root, _), _| k_root != root);
+    }
 }
 
 /// The skills root, its manifest, and the copies kept for rollback.
@@ -173,6 +204,7 @@ impl Library {
         std::fs::rename(&tmp, &path).inspect_err(|_| {
             let _ = std::fs::remove_file(&tmp);
         })?;
+        invalidate_enabled_cache(&self.root);
         Ok(())
     }
 
@@ -364,6 +396,15 @@ impl Library {
     /// on disk but are absent from this list, which is the whole meaning of
     /// disabling one.
     pub fn enabled(&self) -> Result<Vec<Installed>> {
+        let key = (self.root.clone(), self.extra.clone());
+        let stamp = library_stamp(&self.root, &self.extra);
+        if let Ok(cache) = enabled_cache().lock() {
+            if let Some((cached_stamp, cached_list)) = cache.get(&key) {
+                if *cached_stamp == stamp {
+                    return Ok(cached_list.clone());
+                }
+            }
+        }
         let m = self.manifest()?;
         let mut seen: HashSet<String> = m.skills.iter().map(|s| s.name.clone()).collect();
         let mut out: Vec<Installed> = m
@@ -388,6 +429,9 @@ impl Library {
                 installed_at: 0,
                 previous_dir: None,
             });
+        }
+        if let Ok(mut cache) = enabled_cache().lock() {
+            cache.insert(key, (stamp, out.clone()));
         }
         Ok(out)
     }

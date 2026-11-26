@@ -1,4 +1,5 @@
 import {
+  memo,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -118,7 +119,7 @@ function tokenAt(draft: string, caret: number): Trigger | null {
   return null;
 }
 
-export function Composer(props: {
+export const Composer = memo(function Composer(props: {
   draft: string;
   onDraft: (v: string) => void;
   onSend: () => void;
@@ -911,7 +912,7 @@ export function Composer(props: {
       </div>
     </div>
   );
-}
+});
 
 /** A pill that opens a list above itself. Search filters long lists (models). */
 function PillMenu(props: {

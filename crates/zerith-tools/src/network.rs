@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use regex::Regex;
@@ -23,6 +24,15 @@ pub enum Vendor {
     CiscoNxos,
     CiscoXr,
     HuaweiVrp,
+    HuaweiOlt,
+    ZteOlt,
+    #[serde(rename = "fiberhome_olt")]
+    FiberHomeOlt,
+    Datacom,
+    #[serde(rename = "vyos")]
+    VyOS,
+    AristaEos,
+    Proxmox,
     JuniperJunos,
     MikrotikRouterOs,
     FortinetFortiOs,
@@ -38,6 +48,13 @@ impl Vendor {
             Self::CiscoNxos => "cisco_nxos",
             Self::CiscoXr => "cisco_xr",
             Self::HuaweiVrp => "huawei_vrp",
+            Self::HuaweiOlt => "huawei_olt",
+            Self::ZteOlt => "zte_olt",
+            Self::FiberHomeOlt => "fiberhome_olt",
+            Self::Datacom => "datacom",
+            Self::VyOS => "vyos",
+            Self::AristaEos => "arista_eos",
+            Self::Proxmox => "proxmox",
             Self::JuniperJunos => "juniper_junos",
             Self::MikrotikRouterOs => "mikrotik_router_os",
             Self::FortinetFortiOs => "fortinet_forti_os",
@@ -52,6 +69,17 @@ impl Vendor {
             "nxos" | "cisco_nxos" => Some(Self::CiscoNxos),
             "iosxr" | "xr" | "cisco_xr" | "cisco_iosxr" => Some(Self::CiscoXr),
             "huawei" | "vrp" | "huawei_vrp" => Some(Self::HuaweiVrp),
+            "huawei_olt" | "smartax" | "ma5600" | "ma5600t" | "ma5800" | "olt_huawei" => {
+                Some(Self::HuaweiOlt)
+            }
+            "zte" | "zte_olt" | "zxa10" | "c300" | "c320" | "c600" | "c650" => Some(Self::ZteOlt),
+            "fiberhome" | "fiberhome_olt" | "fiber_home_olt" | "an5516" | "an6000" | "fh_olt" => {
+                Some(Self::FiberHomeOlt)
+            }
+            "datacom" | "dmos" | "dmswitch" | "datacom_dmos" => Some(Self::Datacom),
+            "vyos" | "vy_os" | "vyatta" | "edgeos" => Some(Self::VyOS),
+            "arista" | "eos" | "arista_eos" => Some(Self::AristaEos),
+            "proxmox" | "pve" | "proxmox_ve" => Some(Self::Proxmox),
             "juniper" | "junos" | "juniper_junos" => Some(Self::JuniperJunos),
             "mikrotik" | "routeros" | "mikrotik_router_os" | "mikrotik_routeros" => {
                 Some(Self::MikrotikRouterOs)
@@ -59,7 +87,7 @@ impl Vendor {
             "fortinet" | "fortios" | "fortigate" | "fortinet_forti_os" | "fortinet_fortios" => {
                 Some(Self::FortinetFortiOs)
             }
-            "linux" | "frr" | "vyos" => Some(Self::Linux),
+            "linux" | "frr" => Some(Self::Linux),
             "generic" | "other" => Some(Self::Generic),
             _ => None,
         }
@@ -67,8 +95,17 @@ impl Vendor {
 
     pub fn disable_paging_cmd(self) -> Option<&'static str> {
         match self {
-            Self::CiscoIos | Self::CiscoNxos | Self::CiscoXr => Some("terminal length 0"),
+            Self::CiscoIos
+            | Self::CiscoNxos
+            | Self::CiscoXr
+            | Self::ZteOlt
+            | Self::FiberHomeOlt
+            | Self::AristaEos => Some("terminal length 0"),
             Self::HuaweiVrp => Some("screen-length 0 temporary"),
+            Self::HuaweiOlt => Some("scroll"),
+            Self::Datacom => Some("paginate false"),
+            Self::VyOS => Some("set terminal length 0"),
+            Self::Proxmox => Some("export SYSTEMCTL_PAGER=cat"),
             Self::JuniperJunos => Some("set cli screen-length 0"),
             Self::FortinetFortiOs => Some("config system console\nset output standard\nend"),
             Self::MikrotikRouterOs | Self::Linux | Self::Generic => None,
@@ -174,6 +211,10 @@ pub struct DeviceEntry {
     #[serde(default = "default_baud_rate")]
     pub baud_rate: u32,
     pub secret_ref: Option<String>,
+    #[serde(default)]
+    pub enable_secret_ref: Option<String>,
+    #[serde(default)]
+    pub identity_file: Option<String>,
     pub jump_host: Option<String>,
     pub legacy_ssh: bool,
     pub tags: Vec<String>,
@@ -196,6 +237,8 @@ impl Default for DeviceEntry {
             serial_port: None,
             baud_rate: 9600,
             secret_ref: None,
+            enable_secret_ref: None,
+            identity_file: None,
             jump_host: None,
             legacy_ssh: false,
             tags: Vec::new(),
@@ -327,6 +370,8 @@ pub fn upsert_inventory_device(
     inventory_path: &Path,
     dev: DeviceEntry,
 ) -> std::result::Result<(), String> {
+    static INVENTORY_LOCK: Mutex<()> = Mutex::new(());
+    let _g = INVENTORY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if dev.name.trim().is_empty() {
         return Err("name do dispositivo não pode ficar vazio".into());
     }
@@ -570,6 +615,37 @@ fn login_user(dev: &DeviceEntry, user: &str) -> String {
     }
 }
 
+fn validate_identity_file(raw: &str) -> std::result::Result<String, String> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return Err("identity_file não pode ficar vazio".into());
+    }
+    if t.starts_with('-') {
+        return Err(format!(
+            "identity_file inválido (não pode começar com `-`): {t}"
+        ));
+    }
+    if t.chars().any(|c| {
+        c.is_control() || matches!(c, '"' | '\'' | '`' | '$' | ';' | '&' | '|' | '>' | '<')
+    }) {
+        return Err(format!("identity_file contém caractere inválido: {t}"));
+    }
+    Ok(t.to_string())
+}
+
+fn legacy_ssh_options() -> Vec<String> {
+    vec![
+        "-o".to_string(),
+        "KexAlgorithms=+diffie-hellman-group14-sha1,diffie-hellman-group1-sha1,diffie-hellman-group-exchange-sha1".to_string(),
+        "-o".to_string(),
+        "HostKeyAlgorithms=+ssh-rsa".to_string(),
+        "-o".to_string(),
+        "PubkeyAcceptedAlgorithms=+ssh-rsa".to_string(),
+        "-o".to_string(),
+        "Ciphers=+aes128-cbc,aes256-cbc,3des-cbc".to_string(),
+    ]
+}
+
 /// Builds a strict, flag-injection-free `ssh` invocation for [`DeviceEntry`].
 pub fn build_ssh_command(dev: &DeviceEntry) -> std::result::Result<String, String> {
     validate_ssh_token("host", &dev.host)?;
@@ -595,6 +671,20 @@ pub fn build_ssh_command(dev: &DeviceEntry) -> std::result::Result<String, Strin
         parts.push("-p".to_string());
         parts.push(dev.port.to_string());
     }
+    if let Some(id_file) = dev
+        .identity_file
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let validated = validate_identity_file(id_file)?;
+        parts.push("-i".to_string());
+        if validated.contains(char::is_whitespace) {
+            parts.push(format!("\"{validated}\""));
+        } else {
+            parts.push(validated);
+        }
+    }
     if let Some(jump) = dev
         .jump_host
         .as_deref()
@@ -606,14 +696,7 @@ pub fn build_ssh_command(dev: &DeviceEntry) -> std::result::Result<String, Strin
         parts.push(jump.to_string());
     }
     if dev.legacy_ssh {
-        parts.extend([
-            "-o".to_string(),
-            "KexAlgorithms=+diffie-hellman-group14-sha1,diffie-hellman-group1-sha1".to_string(),
-            "-o".to_string(),
-            "HostKeyAlgorithms=+ssh-rsa".to_string(),
-            "-o".to_string(),
-            "PubkeyAcceptedAlgorithms=+ssh-rsa".to_string(),
-        ]);
+        parts.extend(legacy_ssh_options());
     }
     parts.push(format!("{}@{}", login_user(dev, &user), dev.host.trim()));
     Ok(parts.join(" "))
@@ -710,6 +793,9 @@ fn is_dangerous_segment(low: &str) -> bool {
         "squeeze ",
         "reset saved-configuration",
         "reset saved",
+        "reset-configuration",
+        "reset configuration",
+        "factory-reset",
         "request system reboot",
         "request system halt",
         "request system power-off",
@@ -731,6 +817,15 @@ fn is_dangerous_segment(low: &str) -> bool {
         "dd if=",
         "iptables -f",
         "ifdown ",
+        "board reset",
+        "reset board",
+        "reset system",
+        "erase flash",
+        "qm destroy",
+        "pct destroy",
+        "pvecm delnode",
+        "zpool destroy",
+        "zfs destroy",
     ];
     if PREFIXES
         .iter()
@@ -798,8 +893,8 @@ fn classify_single_segment(vendor: Vendor, seg: &str) -> NetCmdRisk {
         || low.contains(" remove ")
         || low.contains(" delete ")
     {
-        // Exception: `set cli screen-length` is read-only paging control.
-        if !low.starts_with("set cli ") {
+        // Exception: `set cli screen-length` and VyOS `set terminal length` are read-only paging control.
+        if !low.starts_with("set cli ") && !low.starts_with("set terminal ") {
             return NetCmdRisk::Mutation;
         }
     }
@@ -836,7 +931,7 @@ fn classify_single_segment(vendor: Vendor, seg: &str) -> NetCmdRisk {
             }
             NetCmdRisk::Mutation
         }
-        Vendor::Linux => {
+        Vendor::Linux | Vendor::Proxmox => {
             const LINUX_RO: &[&str] = &[
                 "ip addr",
                 "ip -br ",
@@ -858,11 +953,40 @@ fn classify_single_segment(vendor: Vendor, seg: &str) -> NetCmdRisk {
                 "free",
                 "ls ",
                 "cat ",
+                "systemctl status ",
             ];
-            if LINUX_RO
-                .iter()
-                .any(|p| low == p.trim() || low.starts_with(p))
-                && !low.contains('>')
+            const PROXMOX_RO: &[&str] = &[
+                "pvesh get ",
+                "pveversion",
+                "pvecm status",
+                "pvecm nodes",
+                "pvesm status",
+                "pvesm list",
+                "qm list",
+                "qm status ",
+                "qm config ",
+                "qm listsnapshot ",
+                "pct list",
+                "pct status ",
+                "pct config ",
+                "pct listsnapshot ",
+                "zfs list",
+                "zpool status",
+                "zpool list",
+                "ceph status",
+                "ceph -s",
+                "ceph osd tree",
+                "ceph df",
+                "export systemctl_pager=cat",
+            ];
+            if !low.contains('>')
+                && (LINUX_RO
+                    .iter()
+                    .any(|p| low == p.trim() || low.starts_with(p))
+                    || (vendor == Vendor::Proxmox
+                        && PROXMOX_RO
+                            .iter()
+                            .any(|p| low == p.trim() || low.starts_with(p))))
             {
                 return NetCmdRisk::ReadOnly;
             }
@@ -883,11 +1007,15 @@ fn classify_single_segment(vendor: Vendor, seg: &str) -> NetCmdRisk {
                 "mtr ",
                 "dir",
                 "pwd",
+                "scroll",
+                "paginate false",
                 "terminal length ",
                 "terminal width ",
                 "screen-length ",
                 "set cli screen-length",
                 "set cli screen-width",
+                "set terminal length",
+                "set terminal width",
                 "file list ",
                 "request support information",
             ];
@@ -1033,7 +1161,7 @@ pub fn prepare_network_command(
                 ));
             }
         }
-        Vendor::Linux => {
+        Vendor::Linux | Vendor::Proxmox => {
             if low.starts_with("ping ") && !words.iter().any(|w| w.starts_with("-c")) {
                 return Ok((
                     format!("ping -c 4 {}", cmd.trim()[4..].trim_start()),
@@ -1049,9 +1177,17 @@ pub fn prepare_network_command(
                 ));
             }
         }
+        Vendor::VyOS => {
+            if low.starts_with("ping ")
+                && !has("count")
+                && !words.iter().any(|w| w.starts_with("-c"))
+            {
+                return add("count 4");
+            }
+        }
         // Gancho: VRP8/CE aceita `display ... | no-more`, mas o VRP5 não;
         // `screen-length 0 temporary` (disable_paging_cmd) cobre os dois.
-        Vendor::HuaweiVrp => {}
+        Vendor::HuaweiVrp | Vendor::HuaweiOlt => {}
         _ => {}
     }
     Ok((cmd.to_string(), None))
@@ -1063,16 +1199,23 @@ fn has_cli_error(output: &str) -> Option<&'static str> {
         ("% invalid input", "comando inválido"),
         ("% incomplete command", "comando incompleto"),
         ("% ambiguous command", "comando ambíguo"),
+        ("% unknown command", "comando desconhecido"),
+        ("% too many parameters", "parâmetros em excesso (OLT)"),
+        ("% parameter error", "erro de parâmetro (OLT)"),
+        ("% unrecognized command", "comando não reconhecido"),
+        ("% unrecognised command", "comando não reconhecido"),
         (
             "error: unrecognized command",
             "comando não reconhecido (VRP)",
         ),
         ("error: incomplete command", "comando incompleto (VRP)"),
         ("error: wrong parameter", "parâmetro inválido (VRP)"),
+        ("invalid command", "comando inválido"),
         ("syntax error", "erro de sintaxe"),
         ("bad command name", "comando inválido (RouterOS)"),
         ("command parse error", "erro de sintaxe (FortiOS)"),
         ("unknown command", "comando desconhecido"),
+        ("command not found", "comando não encontrado (shell)"),
     ] {
         if low.contains(pat) {
             return Some(label);
@@ -1105,7 +1248,7 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
                 "transport": {"type": "string", "description": "ssh | telnet | serial"},
                 "serial_port": {"type": "string"},
                 "baud_rate": {"type": "integer"},
-                "vendor": {"type": "string"},
+                "vendor": {"type": "string", "description": "cisco_ios|cisco_nxos|cisco_xr|huawei_vrp|huawei_olt|zte_olt|fiberhome_olt|datacom|vyos|arista_eos|proxmox|juniper_junos|mikrotik_router_os|fortinet_forti_os|linux|generic"},
                 "role": {"type": "string"},
                 "jump_host": {"type": "string"},
                 "legacy_ssh": {"type": "boolean"},
@@ -1170,7 +1313,7 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
                 "baud_rate": {"type": "integer", "description": "velocidade da serial (ex.: 9600, 115200), padrão 9600"},
                 "user": {"type": "string"},
                 "port": {"type": "integer", "description": "padrão 22 para SSH, 23 para Telnet"},
-                "vendor": {"type": "string", "description": "cisco_ios|cisco_nxos|cisco_xr|huawei_vrp|juniper_junos|mikrotik_router_os|fortinet_forti_os|linux|generic"},
+                "vendor": {"type": "string", "description": "cisco_ios|cisco_nxos|cisco_xr|huawei_vrp|huawei_olt|zte_olt|fiberhome_olt|datacom|vyos|arista_eos|proxmox|juniper_junos|mikrotik_router_os|fortinet_forti_os|linux|generic"},
                 "role": {"type": "string", "description": "core|border|distribution|access|firewall|lab|server"},
                 "secret_ref": {"type": "string", "description": "chave no cofre (zerith secret set <nome>)"},
                 "password": {"type": "string", "description": "senha direta (vai para o cofre se remember=true)"},
@@ -1217,7 +1360,7 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
             json!({"type": "object", "properties": {
                 "before": {"type": "string", "description": "caminho do arquivo ou texto da configuração anterior"},
                 "after": {"type": "string", "description": "caminho do arquivo ou texto da configuração nova"},
-                "vendor": {"type": "string", "description": "cisco_ios|cisco_nxos|cisco_xr|huawei_vrp|juniper_junos|mikrotik_router_os|fortinet_forti_os|generic (auto-detectado se omitido)"},
+                "vendor": {"type": "string", "description": "cisco_ios|cisco_nxos|cisco_xr|huawei_vrp|huawei_olt|zte_olt|fiberhome_olt|datacom|vyos|arista_eos|proxmox|juniper_junos|mikrotik_router_os|fortinet_forti_os|generic (auto-detectado se omitido)"},
                 "sanitize_secrets": {"type": "boolean", "description": "padrão false; true mascara senhas e chaves"}
             }, "required": ["before", "after"]}),
             "diff hierárquico por bloco e script de rollback pronto para colar",
@@ -1239,7 +1382,8 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
                 "subnet": {"type": "string", "description": "sub-rede CIDR (ex.: 10.0.0.0/28) ou faixa de IPs (ex.: 10.0.0.1-30), até 64 IPs"},
                 "ports": {"type": "array", "items": {"type": "integer"}, "description": "padrão [22, 23, 80, 179, 443, 830, 8006, 8291, 8443, 8728, 8729]"},
                 "timeout_ms": {"type": "integer", "description": "timeout TCP por porta em ms, padrão 1200"},
-                "grab_banner": {"type": "boolean", "description": "lê banner inicial (ex.: SSH-2.0-...), padrão true"},
+                "grab_banner": {"type": "boolean", "description": "lê banner inicial (SSH, HTTP Server, TLS CN), padrão true"},
+                "snmp": {"type": "boolean", "description": "testa também UDP/161 SNMPv2c (sysDescr), padrão false"},
                 "auto_register_client": {"type": "string", "description": "cadastra os hosts que responderem neste cliente do inventário"},
                 "site": {"type": "string", "description": "site para o cadastro"},
                 "vpn": {"type": "string", "description": "túnel WireGuard opcional para vincular aos hosts descobertos"},
@@ -1282,12 +1426,13 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
         make_with(
             "net_backup",
             "Baixa a configuração (`running-config`, `current-configuration`, `/export`...) de terminais abertos \
-             (`id`, `ids` ou `client`), grava em `backups/<cliente>/<equipamento>/latest.cfg` com histórico por data \
-             e compara com o backup anterior (como `net_diff`).",
+             ou do inventário (`id`, `ids`, `device` ou `client`), grava em `backups/<cliente>/<equipamento>/latest.cfg` \
+             com histórico timestamped (`YYYYMMDD-HHMMSS.cfg`) e compara com o backup anterior (como `net_diff`).",
             json!({"type": "object", "properties": {
                 "id": {"type": "string", "description": "ID de um terminal aberto (ex.: term-1)"},
                 "ids": {"type": "array", "items": {"type": "string"}, "description": "lista de terminais abertos para fazer backup em lote"},
-                "client": {"type": "string", "description": "faz backup de todos os terminais abertos deste cliente"},
+                "device": {"type": "string", "description": "nome do dispositivo no inventory.toml (conecta se necessário)"},
+                "client": {"type": "string", "description": "faz backup dos terminais/inventário deste cliente"},
                 "command": {"type": "string", "description": "comando customizado opcional (auto-detectado pelo vendor se omitido)"},
                 "timeout_secs": {"type": "integer", "description": "padrão 45"}
             }}),
@@ -1297,6 +1442,7 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
             false,
             |args, _| {
                 let target = opt_str(args, "id")
+                    .or_else(|| opt_str(args, "device"))
                     .or_else(|| opt_str(args, "client"))
                     .unwrap_or("all");
                 Ok(Some(Action::Shell(format!("net_backup {target}"))))
@@ -1493,6 +1639,8 @@ pub fn ensure_exclusive_wireguard_vpn(
     workspace: &Path,
     global_root: &Path,
 ) -> std::result::Result<String, String> {
+    static VPN_SWITCH_LOCK: Mutex<()> = Mutex::new(());
+    let _g = VPN_SWITCH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let clean = validate_vpn_name(vpn_name)?;
     let profiles = list_wireguard_profiles(workspace, Some(global_root));
     let active = detect_active_wireguard_tunnels();
@@ -1683,6 +1831,12 @@ fn resolve_connect_device(args: &Value, ctx: &CallCtx<'_>) -> Result<DeviceEntry
         if let Some(s) = opt_str(args, "secret_ref") {
             dev.secret_ref = Some(s.to_string());
         }
+        if let Some(es) = opt_str(args, "enable_secret_ref") {
+            dev.enable_secret_ref = Some(es.to_string());
+        }
+        if let Some(id_file) = opt_str(args, "identity_file") {
+            dev.identity_file = Some(id_file.to_string());
+        }
         return Ok(dev);
     }
 
@@ -1727,6 +1881,8 @@ fn resolve_connect_device(args: &Value, ctx: &CallCtx<'_>) -> Result<DeviceEntry
         serial_port: serial_override,
         baud_rate: baud_override.unwrap_or(9600),
         secret_ref: opt_str(args, "secret_ref").map(str::to_string),
+        enable_secret_ref: opt_str(args, "enable_secret_ref").map(str::to_string),
+        identity_file: opt_str(args, "identity_file").map(str::to_string),
         jump_host: opt_str(args, "jump_host").map(str::to_string),
         legacy_ssh: args["legacy_ssh"].as_bool().unwrap_or(false),
         tags: Vec::new(),
@@ -1894,6 +2050,8 @@ fn net_inventory(args: &Value, ctx: &CallCtx<'_>, _: &Exec<'_>) -> Result<String
                 serial_port,
                 baud_rate: args["baud_rate"].as_u64().unwrap_or(9600) as u32,
                 secret_ref,
+                enable_secret_ref: opt_str(args, "enable_secret_ref").map(str::to_string),
+                identity_file: opt_str(args, "identity_file").map(str::to_string),
                 jump_host: opt_str(args, "jump_host").map(str::to_string),
                 legacy_ssh: args["legacy_ssh"].as_bool().unwrap_or(false),
                 tags,
@@ -2611,7 +2769,47 @@ fn load_config_input_checked(raw: &str, ctx: &CallCtx<'_>) -> Result<String> {
 fn detect_config_vendor(before: &str, after: &str) -> Vendor {
     let sample = format!("{before}\n{after}");
     let lower = sample.to_ascii_lowercase();
-    if lower.contains("sysname ")
+    if lower.contains("smartax")
+        || lower.contains("ma5600")
+        || lower.contains("ma5800")
+        || lower.contains("ont-lineprofile")
+        || lower.contains("ont-srvprofile")
+        || lower.contains("dba-profile")
+        || lower.contains("interface gpon ")
+    {
+        Vendor::HuaweiOlt
+    } else if lower.contains("zxa10")
+        || lower.contains("gpon-olt_")
+        || lower.contains("gpon-onu_")
+        || lower.contains("pon-onu-mng ")
+    {
+        Vendor::ZteOlt
+    } else if lower.contains("an5516")
+        || lower.contains("an6000")
+        || lower.contains("fiberhome")
+        || lower.contains("set whitelist phy_addr")
+    {
+        Vendor::FiberHomeOlt
+    } else if lower.contains("dmos")
+        || lower.contains("dmswitch")
+        || lower.contains("datacom")
+        || lower.contains("dot1q vlan ")
+    {
+        Vendor::Datacom
+    } else if lower.contains("pve-cluster")
+        || lower.contains("pveversion")
+        || lower.contains("proxmox")
+    {
+        Vendor::Proxmox
+    } else if lower.contains("vyos")
+        || lower.contains("show configuration commands")
+        || lower.contains("set interfaces ethernet ")
+        || lower.contains("set protocols bgp ")
+    {
+        Vendor::VyOS
+    } else if lower.contains("arista") || lower.contains("transceiver qsfp default-mode") {
+        Vendor::AristaEos
+    } else if lower.contains("sysname ")
         || lower.contains("display current-configuration")
         || lower.contains("screen-length ")
         || lower.contains("\n undo ")
@@ -2621,10 +2819,29 @@ fn detect_config_vendor(before: &str, after: &str) -> Vendor {
     } else if lower.contains("/interface ")
         || lower.contains("/ip route")
         || lower.contains("/routing bgp")
+        || lower.contains("/ip firewall")
     {
         Vendor::MikrotikRouterOs
-    } else if lower.contains("config system ") && lower.contains("\nnext\n") {
+    } else if lower.contains("config system ")
+        || (lower.contains("config ")
+            && (lower.contains("\nnext")
+                || lower.contains("\nend")
+                || lower.contains("    edit ")
+                || lower.contains("  edit ")))
+    {
         Vendor::FortinetFortiOs
+    } else if ((lower.contains("interfaces {")
+        || lower.contains("protocols {")
+        || lower.contains("routing-options {")
+        || lower.contains("security {")
+        || lower.contains("policy-options {")
+        || lower.contains("system {"))
+        && lower.contains('}'))
+        || lower.contains("set interfaces ")
+        || lower.contains("set routing-options ")
+        || lower.contains("set security ")
+    {
+        Vendor::JuniperJunos
     } else {
         Vendor::CiscoIos
     }
@@ -2642,6 +2859,7 @@ fn is_volatile_config_line(trimmed: &str) -> bool {
         || lower.starts_with("building configuration")
         || lower.starts_with("current configuration :")
         || lower.starts_with("version ")
+        || lower.starts_with("/*")
         || matches!(lower.as_str(), "end" | "return" | "quit" | "exit")
 }
 
@@ -2656,6 +2874,8 @@ fn is_stanza_header(trimmed: &str) -> bool {
         "route-policy ",
         "ip access-list ",
         "ipv6 access-list ",
+        "ip prefix-list ",
+        "ipv6 prefix-list ",
         "acl ",
         "line ",
         "bgp ",
@@ -2675,45 +2895,320 @@ fn is_stanza_header(trimmed: &str) -> bool {
     PREFIXES.iter().any(|p| lower.starts_with(p))
 }
 
+fn split_config_tokens_preserving_quotes(line: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    let mut escape = false;
+    for ch in line.chars() {
+        if escape {
+            cur.push(ch);
+            escape = false;
+            continue;
+        }
+        if ch == '\\' && in_quotes {
+            cur.push(ch);
+            escape = true;
+            continue;
+        }
+        if ch == '"' {
+            in_quotes = !in_quotes;
+            cur.push(ch);
+            continue;
+        }
+        if ch.is_whitespace() && !in_quotes {
+            if !cur.is_empty() {
+                tokens.push(std::mem::take(&mut cur));
+            }
+        } else {
+            cur.push(ch);
+        }
+    }
+    if !cur.is_empty() {
+        tokens.push(cur);
+    }
+    tokens
+}
+
+fn is_secret_key_name(low: &str) -> bool {
+    matches!(
+        low,
+        "password"
+            | "passwd"
+            | "secret"
+            | "cipher"
+            | "pre-shared-key"
+            | "preshared-key"
+            | "psk"
+            | "psksecret"
+            | "md5"
+            | "md5-key"
+            | "authentication-key"
+            | "encrypted-password"
+            | "key-string"
+            | "passphrase"
+            | "community"
+            | "auth-key"
+            | "priv-key"
+            | "authentication-password"
+            | "encryption-password"
+            | "private-key"
+            | "secret-key"
+            | "api-key"
+            | "token"
+    )
+}
+
 /// Optional on-demand secret sanitizer (only runs when the user explicitly sets
 /// `sanitize_secrets: true` for sharing reports externally; never enabled by default).
 pub fn sanitize_config_line_on_demand(line: &str) -> String {
-    let tokens: Vec<&str> = line.split_whitespace().collect();
-    if tokens.len() < 2 {
+    let tokens = split_config_tokens_preserving_quotes(line);
+    if tokens.is_empty() {
         return line.to_string();
     }
     let mut out = Vec::with_capacity(tokens.len());
     let mut mask_rest = false;
     let mut skip_type_digit = false;
-    for (i, tok) in tokens.iter().enumerate() {
+    for tok in &tokens {
         if mask_rest {
+            let low = tok.to_ascii_lowercase();
             if skip_type_digit
-                && (tok.len() == 1 && tok.chars().all(|c| c.is_ascii_digit())
-                    || *tok == "cipher"
-                    || *tok == "simple"
-                    || *tok == "encrypted")
+                && ((tok.len() == 1 && tok.chars().all(|c| c.is_ascii_digit()))
+                    || matches!(
+                        low.as_str(),
+                        "cipher" | "simple" | "encrypted" | "enc" | "ascii-text" | "hexadecimal"
+                    ))
             {
-                out.push(*tok);
+                out.push(tok.clone());
                 skip_type_digit = false;
                 continue;
             }
-            out.push("<REDACTED>");
+            out.push("<REDACTED>".to_string());
             break;
         }
+        if let Some((k, v)) = tok.split_once('=') {
+            let k_low = k.trim_start_matches('-').to_ascii_lowercase();
+            if is_secret_key_name(&k_low) && !v.is_empty() {
+                if v.starts_with('"') && v.ends_with('"') && v.len() >= 2 {
+                    out.push(format!("{k}=\"<REDACTED>\""));
+                } else {
+                    out.push(format!("{k}=<REDACTED>"));
+                }
+                continue;
+            }
+        }
         let low = tok.to_ascii_lowercase();
-        if matches!(
-            low.as_str(),
-            "password" | "secret" | "cipher" | "pre-shared-key" | "md5" | "authentication-key"
-        ) || (low == "community" && i > 0 && tokens[0].eq_ignore_ascii_case("snmp-server"))
-        {
-            out.push(*tok);
+        if is_secret_key_name(&low) {
+            out.push(tok.clone());
             mask_rest = true;
             skip_type_digit = true;
         } else {
-            out.push(*tok);
+            out.push(tok.clone());
         }
     }
     out.join(" ")
+}
+
+fn is_ordered_stanza(stanza: &str) -> bool {
+    let low = stanza.to_ascii_lowercase();
+    low.contains("access-list")
+        || low.starts_with("acl ")
+        || low.contains(" acl ")
+        || low.contains("route-map")
+        || low.contains("route-policy")
+        || low.contains("prefix-list")
+        || low.contains("policy-statement")
+        || low.contains("/ip firewall")
+        || low.contains("/ipv6 firewall")
+        || low.contains("config firewall")
+        || low.contains("security policies")
+        || low.contains("policy-based-route")
+}
+
+fn ensure_stanza(
+    order: &mut Vec<String>,
+    map: &mut std::collections::HashMap<String, Vec<String>>,
+    stanza: String,
+) {
+    if let std::collections::hash_map::Entry::Vacant(e) = map.entry(stanza) {
+        order.push(e.key().clone());
+        e.insert(Vec::new());
+    }
+}
+
+fn push_stanza_line(
+    order: &mut Vec<String>,
+    map: &mut std::collections::HashMap<String, Vec<String>>,
+    stanza: &str,
+    line: String,
+    preserve_dups: bool,
+) {
+    if let std::collections::hash_map::Entry::Vacant(e) = map.entry(stanza.to_string()) {
+        order.push(e.key().clone());
+        e.insert(Vec::new());
+    }
+    let entry = map.entry(stanza.to_string()).or_default();
+    if preserve_dups || !entry.contains(&line) {
+        entry.push(line);
+    }
+}
+
+fn parse_junos_stanzas(
+    text: &str,
+) -> (Vec<String>, std::collections::HashMap<String, Vec<String>>) {
+    let mut order = vec!["[global]".to_string()];
+    let mut map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    map.insert("[global]".to_string(), Vec::new());
+    let mut stack: Vec<String> = Vec::new();
+
+    for raw in text.lines() {
+        let trimmed = raw.trim();
+        if trimmed.is_empty()
+            || trimmed.starts_with('#')
+            || trimmed.starts_with("/*")
+            || trimmed.starts_with('*')
+        {
+            continue;
+        }
+        if let Some(header) = trimmed.strip_suffix('{') {
+            let hdr = header.trim();
+            if !hdr.is_empty() {
+                stack.push(hdr.to_string());
+                ensure_stanza(&mut order, &mut map, stack.join(" "));
+            }
+            continue;
+        }
+        if trimmed == "}" || trimmed == "};" {
+            stack.pop();
+            continue;
+        }
+        let clean = trimmed.trim_end_matches(';').trim().to_string();
+        if clean.is_empty() || clean.to_ascii_lowercase().starts_with("version ") {
+            continue;
+        }
+        let stanza = if stack.is_empty() {
+            "[global]".to_string()
+        } else {
+            stack.join(" ")
+        };
+        let ordered = is_ordered_stanza(&stanza);
+        push_stanza_line(&mut order, &mut map, &stanza, clean, ordered);
+    }
+    (order, map)
+}
+
+fn parse_fortios_stanzas(
+    text: &str,
+) -> (Vec<String>, std::collections::HashMap<String, Vec<String>>) {
+    let mut order = vec!["[global]".to_string()];
+    let mut map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    map.insert("[global]".to_string(), Vec::new());
+    let mut stack: Vec<String> = Vec::new();
+
+    for raw in text.lines() {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let low = trimmed.to_ascii_lowercase();
+        if low.starts_with("config ") {
+            stack.push(trimmed.to_string());
+            ensure_stanza(&mut order, &mut map, stack.join(" > "));
+            continue;
+        }
+        if low.starts_with("edit ") {
+            if stack
+                .last()
+                .is_some_and(|s| s.to_ascii_lowercase().starts_with("edit "))
+            {
+                stack.pop();
+            }
+            stack.push(trimmed.to_string());
+            ensure_stanza(&mut order, &mut map, stack.join(" > "));
+            continue;
+        }
+        if low == "next" {
+            if stack
+                .last()
+                .is_some_and(|s| s.to_ascii_lowercase().starts_with("edit "))
+            {
+                stack.pop();
+            }
+            continue;
+        }
+        if low == "end" {
+            while let Some(top) = stack.pop() {
+                if top.to_ascii_lowercase().starts_with("config ") {
+                    break;
+                }
+            }
+            continue;
+        }
+        let stanza = if stack.is_empty() {
+            "[global]".to_string()
+        } else {
+            stack.join(" > ")
+        };
+        let ordered = is_ordered_stanza(&stanza);
+        push_stanza_line(&mut order, &mut map, &stanza, trimmed.to_string(), ordered);
+    }
+    (order, map)
+}
+
+fn join_mikrotik_continuations(text: &str) -> Vec<String> {
+    let mut logical = Vec::new();
+    let mut cur = String::new();
+    for raw in text.lines() {
+        let no_cr = raw.trim_end_matches('\r');
+        let trimmed = no_cr.trim();
+        if cur.is_empty() && (trimmed.is_empty() || trimmed.starts_with('#')) {
+            continue;
+        }
+        if let Some(prefix) = no_cr.strip_suffix('\\') {
+            if cur.is_empty() {
+                cur.push_str(prefix.trim());
+            } else {
+                cur.push(' ');
+                cur.push_str(prefix.trim());
+            }
+        } else if cur.is_empty() {
+            logical.push(trimmed.to_string());
+        } else {
+            cur.push(' ');
+            cur.push_str(trimmed);
+            logical.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        logical.push(cur);
+    }
+    logical
+}
+
+fn parse_mikrotik_stanzas(
+    text: &str,
+) -> (Vec<String>, std::collections::HashMap<String, Vec<String>>) {
+    let mut order = vec!["[global]".to_string()];
+    let mut map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    map.insert("[global]".to_string(), Vec::new());
+    let mut current_stanza = "[global]".to_string();
+
+    for line in join_mikrotik_continuations(text) {
+        if is_volatile_config_line(&line) {
+            continue;
+        }
+        if line.starts_with('/') {
+            current_stanza = line;
+            if !map.contains_key(&current_stanza) {
+                order.push(current_stanza.clone());
+                map.insert(current_stanza.clone(), Vec::new());
+            }
+        } else {
+            let ordered = is_ordered_stanza(&current_stanza);
+            push_stanza_line(&mut order, &mut map, &current_stanza, line, ordered);
+        }
+    }
+    (order, map)
 }
 
 fn parse_config_stanzas(
@@ -2747,17 +3242,87 @@ fn parse_config_stanzas(
             if !indented {
                 current_stanza = "[global]".to_string();
             }
-            let entry = map.entry(current_stanza.clone()).or_default();
-            if !entry.contains(&clean) {
-                entry.push(clean);
-            }
+            let ordered = is_ordered_stanza(&current_stanza);
+            push_stanza_line(&mut order, &mut map, &current_stanza, clean, ordered);
         }
     }
     (order, map)
 }
 
+fn parse_config_stanzas_for_vendor(
+    vendor: Vendor,
+    text: &str,
+) -> (Vec<String>, std::collections::HashMap<String, Vec<String>>) {
+    match vendor {
+        Vendor::JuniperJunos | Vendor::VyOS => parse_junos_stanzas(text),
+        Vendor::FortinetFortiOs => parse_fortios_stanzas(text),
+        Vendor::MikrotikRouterOs => parse_mikrotik_stanzas(text),
+        _ => parse_config_stanzas(text),
+    }
+}
+
+enum LineDiff<'a> {
+    Removed(&'a str),
+    Added(&'a str),
+}
+
+fn diff_lines_ordered<'a>(before: &'a [String], after: &'a [String]) -> Vec<LineDiff<'a>> {
+    let n = before.len();
+    let m = after.len();
+    let mut dp = vec![vec![0usize; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            dp[i][j] = if before[i] == after[j] {
+                dp[i + 1][j + 1] + 1
+            } else {
+                dp[i + 1][j].max(dp[i][j + 1])
+            };
+        }
+    }
+    let mut ops = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < n && j < m {
+        if before[i] == after[j] {
+            i += 1;
+            j += 1;
+        } else if dp[i + 1][j] >= dp[i][j + 1] {
+            ops.push(LineDiff::Removed(&before[i]));
+            i += 1;
+        } else {
+            ops.push(LineDiff::Added(&after[j]));
+            j += 1;
+        }
+    }
+    while i < n {
+        ops.push(LineDiff::Removed(&before[i]));
+        i += 1;
+    }
+    while j < m {
+        ops.push(LineDiff::Added(&after[j]));
+        j += 1;
+    }
+    ops
+}
+
 fn negate_cli_command(vendor: Vendor, cmd: &str) -> String {
-    let neg = if vendor == Vendor::HuaweiVrp {
+    if matches!(vendor, Vendor::JuniperJunos | Vendor::VyOS) {
+        if let Some(rest) = cmd.strip_prefix("set ") {
+            return format!("delete {}", rest.trim());
+        }
+        return format!("delete {}", cmd.trim());
+    }
+    if vendor == Vendor::FortinetFortiOs {
+        let trimmed = cmd.trim();
+        if let Some(rest) = trimmed.strip_prefix("set ") {
+            let key = rest.split_whitespace().next().unwrap_or(rest);
+            return format!("unset {key}");
+        }
+        if let Some(rest) = trimmed.strip_prefix("edit ") {
+            return format!("delete {rest}");
+        }
+        return format!("unset {trimmed}");
+    }
+    let neg = if matches!(vendor, Vendor::HuaweiVrp | Vendor::HuaweiOlt) {
         "undo"
     } else {
         "no"
@@ -2770,6 +3335,195 @@ fn negate_cli_command(vendor: Vendor, cmd: &str) -> String {
     format!("{neg} {cmd}")
 }
 
+fn mikrotik_remove_for_add(stanza: &str, add_line: &str) -> String {
+    let tokens = split_config_tokens_preserving_quotes(add_line);
+    let mut preds = Vec::new();
+    for preferred in [
+        "name=",
+        "comment=",
+        "dst-address=",
+        "src-address=",
+        "address=",
+        "interface=",
+        "network=",
+    ] {
+        if let Some(tok) = tokens.iter().find(|t| t.starts_with(preferred)) {
+            preds.push(tok.clone());
+            if preds.len() >= 2 {
+                break;
+            }
+        }
+    }
+    if preds.is_empty() {
+        for tok in tokens.iter().skip(1) {
+            if tok.contains('=') {
+                preds.push(tok.clone());
+                if preds.len() >= 2 {
+                    break;
+                }
+            }
+        }
+    }
+    let prefix = if stanza == "[global]" { "" } else { stanza };
+    if preds.is_empty() {
+        format!("{prefix} remove [find] # {add_line}")
+            .trim()
+            .to_string()
+    } else {
+        format!("{prefix} remove [find {}]", preds.join(" "))
+            .trim()
+            .to_string()
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RollbackKind {
+    WholeAdded,
+    WholeRemoved,
+    Modified,
+}
+
+fn append_vendor_rollback(
+    vendor: Vendor,
+    (stanza, stanza_disp): (&str, &str),
+    added: &[String],
+    removed: &[String],
+    kind: RollbackKind,
+    fmt_line: &dyn Fn(&str) -> String,
+    out: &mut Vec<String>,
+) {
+    let whole_added = matches!(kind, RollbackKind::WholeAdded);
+    let whole_removed = matches!(kind, RollbackKind::WholeRemoved);
+    match vendor {
+        Vendor::JuniperJunos | Vendor::VyOS => {
+            if whole_added && stanza != "[global]" {
+                out.push(format!("delete {stanza_disp}"));
+                return;
+            }
+            for c in added {
+                let fc = fmt_line(c);
+                if stanza == "[global]" {
+                    out.push(negate_cli_command(vendor, &fc));
+                } else {
+                    out.push(format!("delete {stanza_disp} {fc}"));
+                }
+            }
+            for c in removed {
+                let fc = fmt_line(c);
+                if stanza == "[global]" {
+                    out.push(fc);
+                } else {
+                    out.push(format!("set {stanza_disp} {fc}"));
+                }
+            }
+        }
+        Vendor::FortinetFortiOs => {
+            let parts: Vec<&str> = stanza_disp.split(" > ").collect();
+            if parts.len() == 2
+                && parts[0].to_ascii_lowercase().starts_with("config ")
+                && parts[1].to_ascii_lowercase().starts_with("edit ")
+            {
+                let cfg = parts[0];
+                let edit = parts[1];
+                out.push(cfg.to_string());
+                if whole_added {
+                    let entry = edit.trim_start_matches("edit ").trim();
+                    out.push(format!("  delete {entry}"));
+                } else {
+                    out.push(format!("  {edit}"));
+                    for c in added {
+                        out.push(format!("    {}", negate_cli_command(vendor, &fmt_line(c))));
+                    }
+                    for c in removed {
+                        out.push(format!("    {}", fmt_line(c)));
+                    }
+                    out.push("  next".to_string());
+                }
+                out.push("end".to_string());
+            } else if stanza != "[global]" {
+                out.push(stanza_disp.to_string());
+                for c in added {
+                    out.push(format!("  {}", negate_cli_command(vendor, &fmt_line(c))));
+                }
+                for c in removed {
+                    out.push(format!("  {}", fmt_line(c)));
+                }
+                out.push("end".to_string());
+            } else {
+                for c in added {
+                    out.push(negate_cli_command(vendor, &fmt_line(c)));
+                }
+                for c in removed {
+                    out.push(fmt_line(c));
+                }
+            }
+        }
+        Vendor::MikrotikRouterOs => {
+            for c in added {
+                let fc = fmt_line(c);
+                if fc.starts_with("add ") {
+                    out.push(mikrotik_remove_for_add(stanza_disp, &fc));
+                } else {
+                    out.push(format!("# reverter em {stanza_disp}: {fc}"));
+                }
+            }
+            for c in removed {
+                let fc = fmt_line(c);
+                if stanza == "[global]" {
+                    out.push(fc);
+                } else {
+                    out.push(format!("{stanza_disp} {fc}"));
+                }
+            }
+            let _ = (whole_added, whole_removed);
+        }
+        _ => {
+            let exit_cmd = if matches!(vendor, Vendor::HuaweiVrp | Vendor::HuaweiOlt) {
+                "quit"
+            } else {
+                "exit"
+            };
+            if whole_added {
+                if stanza != "[global]" {
+                    out.push(negate_cli_command(vendor, stanza_disp));
+                } else {
+                    for c in added {
+                        out.push(negate_cli_command(vendor, &fmt_line(c)));
+                    }
+                }
+            } else if whole_removed {
+                if stanza != "[global]" {
+                    out.push(stanza_disp.to_string());
+                    for c in removed {
+                        out.push(format!("  {}", fmt_line(c)));
+                    }
+                    out.push(exit_cmd.to_string());
+                } else {
+                    for c in removed {
+                        out.push(fmt_line(c));
+                    }
+                }
+            } else if stanza != "[global]" {
+                out.push(stanza_disp.to_string());
+                for c in added {
+                    out.push(format!("  {}", negate_cli_command(vendor, &fmt_line(c))));
+                }
+                for c in removed {
+                    out.push(format!("  {}", fmt_line(c)));
+                }
+                out.push(exit_cmd.to_string());
+            } else {
+                for c in added {
+                    out.push(negate_cli_command(vendor, &fmt_line(c)));
+                }
+                for c in removed {
+                    out.push(fmt_line(c));
+                }
+            }
+        }
+    }
+}
+
 pub fn compute_hierarchical_net_diff(
     before: &str,
     after: &str,
@@ -2777,8 +3531,8 @@ pub fn compute_hierarchical_net_diff(
     sanitize_secrets: bool,
 ) -> String {
     let vendor = vendor_override.unwrap_or_else(|| detect_config_vendor(before, after));
-    let (before_order, before_map) = parse_config_stanzas(before);
-    let (after_order, after_map) = parse_config_stanzas(after);
+    let (before_order, before_map) = parse_config_stanzas_for_vendor(vendor, before);
+    let (after_order, after_map) = parse_config_stanzas_for_vendor(vendor, after);
     let fmt_line = |s: &str| {
         if sanitize_secrets {
             sanitize_config_line_on_demand(s)
@@ -2799,11 +3553,6 @@ pub fn compute_hierarchical_net_diff(
     let mut changed_blocks = 0usize;
     let mut total_removed = 0usize;
     let mut total_added = 0usize;
-    let exit_cmd = if vendor == Vendor::HuaweiVrp {
-        "quit"
-    } else {
-        "exit"
-    };
 
     for stanza in &all_stanzas {
         let b_cmds = before_map.get(stanza);
@@ -2818,13 +3567,15 @@ pub fn compute_hierarchical_net_diff(
                     block.push_str(&format!("\n  + {}", fmt_line(c)));
                 }
                 diff_sections.push(block);
-                if stanza != "[global]" {
-                    rollback_lines.push(negate_cli_command(vendor, &stanza_disp));
-                } else {
-                    for c in added_cmds {
-                        rollback_lines.push(negate_cli_command(vendor, &fmt_line(c)));
-                    }
-                }
+                append_vendor_rollback(
+                    vendor,
+                    (stanza, &stanza_disp),
+                    added_cmds,
+                    &[],
+                    RollbackKind::WholeAdded,
+                    &fmt_line,
+                    &mut rollback_lines,
+                );
             }
             (Some(removed_cmds), None) => {
                 changed_blocks += 1;
@@ -2834,53 +3585,85 @@ pub fn compute_hierarchical_net_diff(
                     block.push_str(&format!("\n  - {}", fmt_line(c)));
                 }
                 diff_sections.push(block);
-                if stanza != "[global]" {
-                    rollback_lines.push(stanza_disp);
-                    for c in removed_cmds {
-                        rollback_lines.push(format!("  {}", fmt_line(c)));
-                    }
-                    rollback_lines.push(exit_cmd.to_string());
-                } else {
-                    for c in removed_cmds {
-                        rollback_lines.push(fmt_line(c));
-                    }
-                }
+                append_vendor_rollback(
+                    vendor,
+                    (stanza, &stanza_disp),
+                    &[],
+                    removed_cmds,
+                    RollbackKind::WholeRemoved,
+                    &fmt_line,
+                    &mut rollback_lines,
+                );
             }
             (Some(b_list), Some(a_list)) => {
-                let removed: Vec<&String> = b_list.iter().filter(|c| !a_list.contains(c)).collect();
-                let added: Vec<&String> = a_list.iter().filter(|c| !b_list.contains(c)).collect();
-                if removed.is_empty() && added.is_empty() {
-                    continue;
-                }
-                changed_blocks += 1;
-                total_removed += removed.len();
-                total_added += added.len();
-                let mut block = format!("[~ bloco: {stanza_disp}]");
-                for c in &removed {
-                    block.push_str(&format!("\n  - {}", fmt_line(c)));
-                }
-                for c in &added {
-                    block.push_str(&format!("\n  + {}", fmt_line(c)));
-                }
-                diff_sections.push(block);
-
-                if stanza != "[global]" {
-                    rollback_lines.push(stanza_disp);
-                    for c in &added {
-                        rollback_lines
-                            .push(format!("  {}", negate_cli_command(vendor, &fmt_line(c))));
+                let ordered = is_ordered_stanza(stanza);
+                if ordered {
+                    let ops = diff_lines_ordered(b_list, a_list);
+                    if ops.is_empty() {
+                        continue;
                     }
-                    for c in &removed {
-                        rollback_lines.push(format!("  {}", fmt_line(c)));
+                    changed_blocks += 1;
+                    let mut block = format!("[~ bloco (ordenado): {stanza_disp}]");
+                    let mut removed_vec = Vec::new();
+                    let mut added_vec = Vec::new();
+                    for op in ops {
+                        match op {
+                            LineDiff::Removed(c) => {
+                                total_removed += 1;
+                                removed_vec.push(c.to_string());
+                                block.push_str(&format!("\n  - {}", fmt_line(c)));
+                            }
+                            LineDiff::Added(c) => {
+                                total_added += 1;
+                                added_vec.push(c.to_string());
+                                block.push_str(&format!("\n  + {}", fmt_line(c)));
+                            }
+                        }
                     }
-                    rollback_lines.push(exit_cmd.to_string());
+                    diff_sections.push(block);
+                    append_vendor_rollback(
+                        vendor,
+                        (stanza, &stanza_disp),
+                        &added_vec,
+                        &removed_vec,
+                        RollbackKind::Modified,
+                        &fmt_line,
+                        &mut rollback_lines,
+                    );
                 } else {
-                    for c in &added {
-                        rollback_lines.push(negate_cli_command(vendor, &fmt_line(c)));
+                    let removed: Vec<String> = b_list
+                        .iter()
+                        .filter(|c| !a_list.contains(c))
+                        .cloned()
+                        .collect();
+                    let added: Vec<String> = a_list
+                        .iter()
+                        .filter(|c| !b_list.contains(c))
+                        .cloned()
+                        .collect();
+                    if removed.is_empty() && added.is_empty() {
+                        continue;
                     }
+                    changed_blocks += 1;
+                    total_removed += removed.len();
+                    total_added += added.len();
+                    let mut block = format!("[~ bloco: {stanza_disp}]");
                     for c in &removed {
-                        rollback_lines.push(fmt_line(c));
+                        block.push_str(&format!("\n  - {}", fmt_line(c)));
                     }
+                    for c in &added {
+                        block.push_str(&format!("\n  + {}", fmt_line(c)));
+                    }
+                    diff_sections.push(block);
+                    append_vendor_rollback(
+                        vendor,
+                        (stanza, &stanza_disp),
+                        &added,
+                        &removed,
+                        RollbackKind::Modified,
+                        &fmt_line,
+                        &mut rollback_lines,
+                    );
                 }
             }
             (None, None) => {}
@@ -2929,12 +3712,12 @@ fn port_service_label(port: u16) -> &'static str {
         161 => "SNMP",
         179 => "BGP",
         443 => "HTTPS",
-        830 => "NETCONF",
+        830 => "NETCONF/SSH",
         3389 => "RDP",
         8006 => "Proxmox-VE",
         8080 => "HTTP-Alt",
         8291 => "Winbox",
-        8443 => "HTTPS-Alt",
+        8443 => "HTTPS",
         8728 => "MikroTik-API",
         8729 => "MikroTik-API-SSL",
         _ => "TCP",
@@ -3013,9 +3796,9 @@ pub fn fingerprint_probed_host(
         .collect::<Vec<_>>()
         .join(" ");
 
-    if has_port(8006) {
+    if has_port(8006) || banners.contains("proxmox") || banners.contains("pve-api") {
         return Some((
-            Vendor::Linux,
+            Vendor::Proxmox,
             DeviceRole::Server,
             DeviceTransport::Ssh,
             if has_port(22) { 22 } else { 8006 },
@@ -3048,7 +3831,81 @@ pub fn fingerprint_probed_host(
             vec!["mikrotik".into(), "auto-discovered".into()],
         ));
     }
-    if banners.contains("huawei") || (has_port(830) && !banners.contains("juniper")) {
+    if banners.contains("smartax") || banners.contains("ma5600") || banners.contains("ma5800") {
+        return Some((
+            Vendor::HuaweiOlt,
+            DeviceRole::Access,
+            if has_port(22) {
+                DeviceTransport::Ssh
+            } else {
+                DeviceTransport::Telnet
+            },
+            if has_port(22) { 22 } else { 23 },
+            vec!["huawei_olt".into(), "olt".into(), "auto-discovered".into()],
+        ));
+    }
+    if banners.contains("zxa10") || banners.contains("zte") {
+        return Some((
+            Vendor::ZteOlt,
+            DeviceRole::Access,
+            if has_port(22) {
+                DeviceTransport::Ssh
+            } else {
+                DeviceTransport::Telnet
+            },
+            if has_port(22) { 22 } else { 23 },
+            vec!["zte_olt".into(), "olt".into(), "auto-discovered".into()],
+        ));
+    }
+    if banners.contains("fiberhome") || banners.contains("an5516") || banners.contains("an6000") {
+        return Some((
+            Vendor::FiberHomeOlt,
+            DeviceRole::Access,
+            if has_port(22) {
+                DeviceTransport::Ssh
+            } else {
+                DeviceTransport::Telnet
+            },
+            if has_port(22) { 22 } else { 23 },
+            vec![
+                "fiberhome_olt".into(),
+                "olt".into(),
+                "auto-discovered".into(),
+            ],
+        ));
+    }
+    if banners.contains("datacom") || banners.contains("dmos") || banners.contains("dmswitch") {
+        return Some((
+            Vendor::Datacom,
+            DeviceRole::Distribution,
+            if has_port(22) {
+                DeviceTransport::Ssh
+            } else {
+                DeviceTransport::Telnet
+            },
+            if has_port(22) { 22 } else { 23 },
+            vec!["datacom".into(), "auto-discovered".into()],
+        ));
+    }
+    if banners.contains("vyos") {
+        return Some((
+            Vendor::VyOS,
+            DeviceRole::Border,
+            DeviceTransport::Ssh,
+            22,
+            vec!["vyos".into(), "auto-discovered".into()],
+        ));
+    }
+    if banners.contains("arista") {
+        return Some((
+            Vendor::AristaEos,
+            DeviceRole::Core,
+            DeviceTransport::Ssh,
+            22,
+            vec!["arista".into(), "auto-discovered".into()],
+        ));
+    }
+    if banners.contains("huawei") || banners.contains("vrp") {
         return Some((
             Vendor::HuaweiVrp,
             DeviceRole::Core,
@@ -3059,6 +3916,19 @@ pub fn fingerprint_probed_host(
             },
             if has_port(22) { 22 } else { 23 },
             vec!["huawei".into(), "auto-discovered".into()],
+        ));
+    }
+    if banners.contains("junos") || banners.contains("juniper") {
+        return Some((
+            Vendor::JuniperJunos,
+            DeviceRole::Core,
+            if has_port(22) {
+                DeviceTransport::Ssh
+            } else {
+                DeviceTransport::Telnet
+            },
+            if has_port(22) { 22 } else { 23 },
+            vec!["juniper".into(), "auto-discovered".into()],
         ));
     }
     if banners.contains("cisco") {
@@ -3074,7 +3944,11 @@ pub fn fingerprint_probed_host(
             vec!["cisco".into(), "auto-discovered".into()],
         ));
     }
-    if banners.contains("fortissh") || has_port(8443) {
+    if banners.contains("fortissh")
+        || banners.contains("fortinet")
+        || banners.contains("fortigate")
+        || banners.contains("fortios")
+    {
         return Some((
             Vendor::FortinetFortiOs,
             DeviceRole::Firewall,
@@ -3110,50 +3984,374 @@ pub fn fingerprint_probed_host(
     ))
 }
 
+fn sanitize_banner_text(raw: &[u8]) -> String {
+    String::from_utf8_lossy(raw)
+        .chars()
+        .map(|c| if c.is_control() || c == '|' { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn probe_http_banner(stream: &mut std::net::TcpStream, host: &str) -> String {
+    use std::io::{Read, Write};
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(300)));
+    let req = format!("HEAD / HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    if stream.write_all(req.as_bytes()).is_err() {
+        return String::new();
+    }
+    let mut buf = [0u8; 512];
+    let Ok(n) = stream.read(&mut buf) else {
+        return String::new();
+    };
+    if n == 0 {
+        return String::new();
+    }
+    let text = String::from_utf8_lossy(&buf[..n]);
+    let mut parts = Vec::new();
+    for line in text.lines() {
+        let low = line.to_ascii_lowercase();
+        if low.starts_with("server:")
+            || low.starts_with("www-authenticate:")
+            || low.starts_with("location:")
+        {
+            parts.push(sanitize_banner_text(line.trim().as_bytes()));
+            if parts.len() >= 2 {
+                break;
+            }
+        }
+    }
+    if parts.is_empty() {
+        if let Some(first) = text.lines().next() {
+            return sanitize_banner_text(first.trim().as_bytes());
+        }
+    }
+    parts.join("; ")
+}
+
+fn extract_der_oid_strings(cert_bytes: &[u8], oid_suffix: u8) -> Vec<String> {
+    let needle = [0x06, 0x03, 0x55, 0x04, oid_suffix];
+    let mut found = Vec::new();
+    let mut i = 0;
+    while i + needle.len() + 2 <= cert_bytes.len() {
+        if cert_bytes[i..].starts_with(&needle) {
+            let tag_idx = i + needle.len();
+            let tag = cert_bytes[tag_idx];
+            if matches!(tag, 0x0c | 0x13 | 0x16 | 0x14) {
+                let len = cert_bytes[tag_idx + 1] as usize;
+                let val_start = tag_idx + 2;
+                if len > 0 && len < 128 && val_start + len <= cert_bytes.len() {
+                    let s = sanitize_banner_text(&cert_bytes[val_start..val_start + len]);
+                    if !s.is_empty() {
+                        found.push(s);
+                    }
+                    i = val_start + len;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    found
+}
+
+fn build_tls12_client_hello(host: &str) -> Vec<u8> {
+    let mut body = Vec::with_capacity(128);
+    // ClientHello version TLS 1.2
+    body.extend_from_slice(&[0x03, 0x03]);
+    // 32-byte random
+    body.extend_from_slice(&[0x5a; 32]);
+    // Session ID len = 0
+    body.push(0x00);
+    // Cipher suites (5 suites = 10 bytes)
+    body.extend_from_slice(&[
+        0x00, 0x0a, 0xc0, 0x2f, 0xc0, 0x2b, 0x00, 0x9c, 0x00, 0x2f, 0x00, 0x35,
+    ]);
+    // Compression methods: 1 (null)
+    body.extend_from_slice(&[0x01, 0x00]);
+
+    let mut exts = Vec::new();
+    let host_bytes = host.as_bytes();
+    if host.parse::<std::net::IpAddr>().is_err()
+        && !host_bytes.is_empty()
+        && host_bytes.len() <= 240
+    {
+        let name_len = host_bytes.len() as u16;
+        let list_len = name_len + 3;
+        let ext_len = list_len + 2;
+        exts.extend_from_slice(&[0x00, 0x00]); // server_name
+        exts.extend_from_slice(&ext_len.to_be_bytes());
+        exts.extend_from_slice(&list_len.to_be_bytes());
+        exts.push(0x00); // host_name
+        exts.extend_from_slice(&name_len.to_be_bytes());
+        exts.extend_from_slice(host_bytes);
+    }
+    // supported_groups (secp256r1, secp384r1)
+    exts.extend_from_slice(&[0x00, 0x0a, 0x00, 0x06, 0x00, 0x04, 0x00, 0x17, 0x00, 0x18]);
+    // ec_point_formats (uncompressed)
+    exts.extend_from_slice(&[0x00, 0x0b, 0x00, 0x02, 0x01, 0x00]);
+
+    body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+    body.extend_from_slice(&exts);
+
+    // Handshake header: ClientHello (0x01) + 3-byte len
+    let hs_len = body.len();
+    let mut hs = Vec::with_capacity(hs_len + 9);
+    hs.push(0x16); // Handshake record
+    hs.extend_from_slice(&[0x03, 0x01]);
+    hs.extend_from_slice(&((hs_len + 4) as u16).to_be_bytes());
+    hs.push(0x01); // ClientHello
+    hs.push(((hs_len >> 16) & 0xff) as u8);
+    hs.push(((hs_len >> 8) & 0xff) as u8);
+    hs.push((hs_len & 0xff) as u8);
+    hs.extend_from_slice(&body);
+    hs
+}
+
+fn probe_tls_subject(stream: &mut std::net::TcpStream, host: &str) -> String {
+    use std::io::{Read, Write};
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(350)));
+    let hello = build_tls12_client_hello(host);
+    if stream.write_all(&hello).is_err() {
+        return String::new();
+    }
+    let mut data = Vec::with_capacity(4096);
+    let mut buf = [0u8; 2048];
+    while data.len() < 8192 {
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                data.extend_from_slice(&buf[..n]);
+                if data.windows(5).any(|w| w == [0x06, 0x03, 0x55, 0x04, 0x03])
+                    && data.len() >= 1024
+                {
+                    break;
+                }
+            }
+        }
+    }
+    if data.is_empty() {
+        return String::new();
+    }
+    let cns = extract_der_oid_strings(&data, 0x03);
+    let orgs = extract_der_oid_strings(&data, 0x0a);
+    let mut parts = Vec::new();
+    if let Some(cn) = cns.last() {
+        parts.push(format!("TLS CN={cn}"));
+    }
+    if let Some(org) = orgs.last() {
+        parts.push(format!("O={org}"));
+    }
+    parts.join(" ")
+}
+
+fn probe_snmp_udp(ip: std::net::IpAddr, timeout: Duration) -> (bool, Option<f64>, String) {
+    use std::net::{SocketAddr, UdpSocket};
+    use std::time::Instant;
+
+    const SNMP_GET_SYSDESCR: &[u8] = &[
+        0x30, 0x26, // SEQUENCE
+        0x02, 0x01, 0x01, // version: v2c (1)
+        0x04, 0x06, b'p', b'u', b'b', b'l', b'i', b'c', // community: public
+        0xa0, 0x19, // GetRequest-PDU
+        0x02, 0x01, 0x01, // request-id: 1
+        0x02, 0x01, 0x00, // error-status: 0
+        0x02, 0x01, 0x00, // error-index: 0
+        0x30, 0x0e, // VarBindList
+        0x30, 0x0c, // VarBind
+        0x06, 0x08, 0x2b, 0x06, 0x01, 0x02, 0x01, 0x01, 0x01, 0x00, // 1.3.6.1.2.1.1.1.0
+        0x05, 0x00, // NULL
+    ];
+    let bind_addr = if ip.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+    let Ok(sock) = UdpSocket::bind(bind_addr) else {
+        return (false, None, "udp_bind_err".into());
+    };
+    let _ = sock.set_read_timeout(Some(timeout.min(Duration::from_millis(600))));
+    let started = Instant::now();
+    if sock
+        .send_to(SNMP_GET_SYSDESCR, SocketAddr::new(ip, 161))
+        .is_err()
+    {
+        return (false, None, "send_err".into());
+    }
+    let mut buf = [0u8; 1024];
+    match sock.recv(&mut buf) {
+        Ok(n) if n > 0 && buf[0] == 0x30 => {
+            let rtt = started.elapsed().as_secs_f64() * 1000.0;
+            let oid = [0x06, 0x08, 0x2b, 0x06, 0x01, 0x02, 0x01, 0x01, 0x01, 0x00];
+            let detail = if let Some(pos) = buf[..n].windows(oid.len()).position(|w| w == oid) {
+                let val_idx = pos + oid.len();
+                if val_idx + 2 <= n && buf[val_idx] == 0x04 {
+                    let (len, start) = if buf[val_idx + 1] < 0x80 {
+                        (buf[val_idx + 1] as usize, val_idx + 2)
+                    } else if buf[val_idx + 1] == 0x81 && val_idx + 3 <= n {
+                        (buf[val_idx + 2] as usize, val_idx + 3)
+                    } else {
+                        (0, n)
+                    };
+                    if start + len <= n && len > 0 {
+                        format!(
+                            "SNMPv2c: {}",
+                            sanitize_banner_text(&buf[start..start + len])
+                        )
+                    } else {
+                        "SNMPv2c respondeu (public)".into()
+                    }
+                } else {
+                    "SNMPv2c respondeu (public)".into()
+                }
+            } else {
+                "SNMPv2c respondeu (public)".into()
+            };
+            (true, Some(rtt), detail)
+        }
+        Ok(_) => (false, None, "resposta SNMP inválida".into()),
+        Err(e) => (false, None, format!("UDP/161 {}", e.kind())),
+    }
+}
+
+fn is_server_banner_port(port: u16) -> bool {
+    matches!(port, 21 | 22 | 23 | 25 | 110 | 143 | 587 | 830 | 2222)
+}
+
+fn is_http_probe_port(port: u16) -> bool {
+    matches!(port, 80 | 8080)
+}
+
+fn is_tls_probe_port(port: u16) -> bool {
+    matches!(port, 443 | 8006 | 8443)
+}
+
+fn is_client_first_port(port: u16) -> bool {
+    matches!(
+        port,
+        80 | 443 | 179 | 8006 | 8080 | 8291 | 8443 | 8728 | 8729
+    )
+}
+
 pub fn probe_hosts_tcp(
     hosts: &[String],
     ports: &[u16],
     timeout: Duration,
     grab_banner: bool,
 ) -> Vec<ProbeRow> {
+    probe_hosts_tcp_with_cancel(hosts, ports, timeout, grab_banner, None)
+}
+
+pub fn probe_hosts_tcp_with_cancel(
+    hosts: &[String],
+    ports: &[u16],
+    timeout: Duration,
+    grab_banner: bool,
+    cancel: Option<&zerith_providers::Cancel>,
+) -> Vec<ProbeRow> {
     use std::io::Read;
-    use std::net::{TcpStream, ToSocketAddrs};
+    use std::net::{IpAddr, TcpStream, ToSocketAddrs};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
 
-    let mut rows = Vec::with_capacity(hosts.len() * ports.len());
-    for host in hosts {
-        let host_trimmed = host.trim();
-        if host_trimmed.is_empty() {
-            continue;
+    const MAX_PROBE_WORKERS: usize = 40;
+
+    let host_list: Vec<String> = hosts
+        .iter()
+        .map(|h| h.trim())
+        .filter(|h| !h.is_empty())
+        .map(str::to_string)
+        .collect();
+    if host_list.is_empty() || ports.is_empty() {
+        return Vec::new();
+    }
+
+    // Resolve hostnames concurrently across a capped worker pool.
+    let resolved_ips: Vec<Mutex<Option<IpAddr>>> =
+        (0..host_list.len()).map(|_| Mutex::new(None)).collect();
+    let dns_next = AtomicUsize::new(0);
+    let dns_workers = host_list.len().min(MAX_PROBE_WORKERS);
+    std::thread::scope(|s| {
+        for _ in 0..dns_workers {
+            s.spawn(|| loop {
+                if cancel.is_some_and(zerith_providers::Cancel::is_cancelled) {
+                    break;
+                }
+                let idx = dns_next.fetch_add(1, Ordering::Relaxed);
+                if idx >= host_list.len() {
+                    break;
+                }
+                let ip = (host_list[idx].as_str(), 0u16)
+                    .to_socket_addrs()
+                    .ok()
+                    .and_then(|mut it| it.next())
+                    .map(|sa| sa.ip());
+                if let Ok(mut g) = resolved_ips[idx].lock() {
+                    *g = ip;
+                }
+            });
         }
-        let resolved = (host_trimmed, 0u16)
-            .to_socket_addrs()
-            .ok()
-            .and_then(|mut it| it.next())
-            .map(|sa| sa.ip());
-        let Some(ip) = resolved else {
-            for &port in ports {
-                rows.push(ProbeRow {
-                    host: host_trimmed.to_string(),
-                    resolved_ip: "-".into(),
-                    port,
-                    service: port_service_label(port),
-                    open: false,
-                    rtt_ms: None,
-                    detail: "falha DNS".into(),
-                });
+    });
+
+    // Build flat ordered work items (host_idx, port) and fill DNS failures immediately.
+    let total = host_list.len() * ports.len();
+    let mut rows: Vec<Option<ProbeRow>> = vec![None; total];
+    let mut jobs: Vec<(usize, String, IpAddr, u16)> = Vec::with_capacity(total);
+    for (hi, h_name) in host_list.iter().enumerate() {
+        let ip = resolved_ips[hi].lock().ok().and_then(|g| *g);
+        match ip {
+            Some(ip) => {
+                for (pi, &port) in ports.iter().enumerate() {
+                    let slot = hi * ports.len() + pi;
+                    jobs.push((slot, h_name.clone(), ip, port));
+                }
             }
-            continue;
-        };
-        let ip_str = ip.to_string();
-        let host_rows: Vec<ProbeRow> = std::thread::scope(|s| {
-            let handles: Vec<_> = ports
-                .iter()
-                .copied()
-                .map(|port| {
-                    let h_name = host_trimmed.to_string();
-                    let ip_display = ip_str.clone();
-                    s.spawn(move || {
+            None => {
+                for (pi, &port) in ports.iter().enumerate() {
+                    let slot = hi * ports.len() + pi;
+                    rows[slot] = Some(ProbeRow {
+                        host: h_name.clone(),
+                        resolved_ip: "-".into(),
+                        port,
+                        service: port_service_label(port),
+                        open: false,
+                        rtt_ms: None,
+                        detail: "falha DNS".into(),
+                    });
+                }
+            }
+        }
+    }
+
+    if !jobs.is_empty() && !cancel.is_some_and(zerith_providers::Cancel::is_cancelled) {
+        let job_next = AtomicUsize::new(0);
+        let workers = jobs.len().min(MAX_PROBE_WORKERS);
+        let out_slots: Vec<Mutex<Option<ProbeRow>>> =
+            (0..jobs.len()).map(|_| Mutex::new(None)).collect();
+        std::thread::scope(|s| {
+            for _ in 0..workers {
+                s.spawn(|| loop {
+                    if cancel.is_some_and(zerith_providers::Cancel::is_cancelled) {
+                        break;
+                    }
+                    let k = job_next.fetch_add(1, Ordering::Relaxed);
+                    let Some((_, ref h_name, ip, port)) = jobs.get(k) else {
+                        break;
+                    };
+                    let ip = *ip;
+                    let port = *port;
+                    let ip_display = ip.to_string();
+                    let row = if port == 161 {
+                        let (open, rtt_ms, detail) = probe_snmp_udp(ip, timeout);
+                        ProbeRow {
+                            host: h_name.clone(),
+                            resolved_ip: ip_display,
+                            port,
+                            service: port_service_label(port),
+                            open,
+                            rtt_ms,
+                            detail,
+                        }
+                    } else {
                         let sock = std::net::SocketAddr::new(ip, port);
                         let started = Instant::now();
                         match TcpStream::connect_timeout(&sock, timeout) {
@@ -3161,29 +4359,27 @@ pub fn probe_hosts_tcp(
                                 let rtt = started.elapsed().as_secs_f64() * 1000.0;
                                 let mut banner = String::new();
                                 if grab_banner {
-                                    let _ =
-                                        stream.set_read_timeout(Some(Duration::from_millis(250)));
-                                    let mut buf = [0u8; 128];
-                                    if let Ok(n) = stream.read(&mut buf) {
-                                        if n > 0 {
-                                            banner = String::from_utf8_lossy(&buf[..n])
-                                                .chars()
-                                                .map(|c| {
-                                                    if c.is_control() || c == '|' {
-                                                        ' '
-                                                    } else {
-                                                        c
-                                                    }
-                                                })
-                                                .collect::<String>()
-                                                .split_whitespace()
-                                                .collect::<Vec<_>>()
-                                                .join(" ");
+                                    if is_http_probe_port(port) {
+                                        banner = probe_http_banner(&mut stream, h_name);
+                                    } else if is_tls_probe_port(port) {
+                                        banner = probe_tls_subject(&mut stream, h_name);
+                                    } else if !is_client_first_port(port) {
+                                        let read_wait = if is_server_banner_port(port) {
+                                            Duration::from_millis(250)
+                                        } else {
+                                            Duration::from_millis(50)
+                                        };
+                                        let _ = stream.set_read_timeout(Some(read_wait));
+                                        let mut buf = [0u8; 128];
+                                        if let Ok(n) = stream.read(&mut buf) {
+                                            if n > 0 {
+                                                banner = sanitize_banner_text(&buf[..n]);
+                                            }
                                         }
                                     }
                                 }
                                 ProbeRow {
-                                    host: h_name,
+                                    host: h_name.clone(),
                                     resolved_ip: ip_display,
                                     port,
                                     service: port_service_label(port),
@@ -3197,7 +4393,7 @@ pub fn probe_hosts_tcp(
                                 }
                             }
                             Err(e) => ProbeRow {
-                                host: h_name,
+                                host: h_name.clone(),
                                 resolved_ip: ip_display,
                                 port,
                                 service: port_service_label(port),
@@ -3206,17 +4402,26 @@ pub fn probe_hosts_tcp(
                                 detail: e.kind().to_string(),
                             },
                         }
-                    })
-                })
-                .collect();
-            handles.into_iter().filter_map(|h| h.join().ok()).collect()
+                    };
+                    if let Ok(mut g) = out_slots[k].lock() {
+                        *g = Some(row);
+                    }
+                });
+            }
         });
-        rows.extend(host_rows);
+        for (k, (slot, _, _, _)) in jobs.iter().enumerate() {
+            if let Ok(mut g) = out_slots[k].lock() {
+                if let Some(r) = g.take() {
+                    rows[*slot] = Some(r);
+                }
+            }
+        }
     }
-    rows
+
+    rows.into_iter().flatten().collect()
 }
 
-fn net_probe(args: &Value, _ctx: &CallCtx<'_>, _exec: &Exec<'_>) -> Result<String> {
+fn net_probe(args: &Value, _ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
     let mut hosts = Vec::new();
     if let Some(h) = opt_str(args, "host") {
         for expanded in expand_subnet_or_range(h, 64) {
@@ -3250,7 +4455,7 @@ fn net_probe(args: &Value, _ctx: &CallCtx<'_>, _exec: &Exec<'_>) -> Result<Strin
     }
 
     let default_ports: Vec<u16> = vec![22, 23, 80, 179, 443, 830, 8006, 8291, 8443, 8728, 8729];
-    let ports: Vec<u16> = args
+    let mut ports: Vec<u16> = args
         .get("ports")
         .and_then(Value::as_array)
         .map(|arr| {
@@ -3262,6 +4467,10 @@ fn net_probe(args: &Value, _ctx: &CallCtx<'_>, _exec: &Exec<'_>) -> Result<Strin
         })
         .filter(|v| !v.is_empty())
         .unwrap_or(default_ports);
+    if args["snmp"].as_bool().unwrap_or(false) && !ports.contains(&161) && ports.len() < 32 {
+        ports.push(161);
+    }
+    exec.check()?;
 
     let timeout_ms = args
         .get("timeout_ms")
@@ -3270,12 +4479,14 @@ fn net_probe(args: &Value, _ctx: &CallCtx<'_>, _exec: &Exec<'_>) -> Result<Strin
         .clamp(100, 10_000);
     let grab_banner = args["grab_banner"].as_bool().unwrap_or(true);
 
-    let rows = probe_hosts_tcp(
+    let rows = probe_hosts_tcp_with_cancel(
         &hosts,
         &ports,
         Duration::from_millis(timeout_ms),
         grab_banner,
+        Some(exec.cancel),
     );
+    exec.check()?;
     let open_count = rows.iter().filter(|r| r.open).count();
     let mut out = format!(
         "## Net Probe ({} host(s), {} porta(s) abertas de {} testadas)\n\n| Host | IP Resolvido | Porta | Serviço | Status | RTT (ms) | Banner / Detalhe |\n|---|---|---:|---|---|---:|---|",
@@ -3310,6 +4521,7 @@ fn net_probe(args: &Value, _ctx: &CallCtx<'_>, _exec: &Exec<'_>) -> Result<Strin
         let mut registered = Vec::new();
 
         for h in &hosts {
+            exec.check()?;
             let h_rows: Vec<ProbeRow> = rows.iter().filter(|r| &r.host == h).cloned().collect();
             let Some((vendor, role, transport, port, tags)) = fingerprint_probed_host(&h_rows)
             else {
@@ -3321,6 +4533,11 @@ fn net_probe(args: &Value, _ctx: &CallCtx<'_>, _exec: &Exec<'_>) -> Result<Strin
                 match vendor {
                     Vendor::MikrotikRouterOs => "mk",
                     Vendor::HuaweiVrp => "huawei",
+                    Vendor::HuaweiOlt | Vendor::ZteOlt | Vendor::FiberHomeOlt => "olt",
+                    Vendor::Datacom => "dm",
+                    Vendor::VyOS => "vyos",
+                    Vendor::AristaEos => "arista",
+                    Vendor::Proxmox => "pve",
                     Vendor::CiscoIos => "cisco",
                     Vendor::FortinetFortiOs => "fw",
                     Vendor::Linux => "vm",
@@ -3330,7 +4547,7 @@ fn net_probe(args: &Value, _ctx: &CallCtx<'_>, _exec: &Exec<'_>) -> Result<Strin
             let last_oct = h.rsplit('.').next().unwrap_or(h);
             let auto_name = format!("{prefix}-{last_oct}");
             let default_user = opt_str(args, "user")
-                .unwrap_or(if vendor == Vendor::Linux {
+                .unwrap_or(if matches!(vendor, Vendor::Linux | Vendor::Proxmox) {
                     "root"
                 } else {
                     "admin"
@@ -3369,9 +4586,8 @@ fn net_probe(args: &Value, _ctx: &CallCtx<'_>, _exec: &Exec<'_>) -> Result<Strin
     Ok(out)
 }
 
-fn select_target_terminals(args: &Value) -> Result<Vec<terminal::TerminalSnapshot>> {
-    let active = terminal::list_active_terminals();
-    let explicit_ids: Vec<String> = if let Some(single) = opt_str(args, "id") {
+fn explicit_terminal_ids(args: &Value) -> Vec<String> {
+    if let Some(single) = opt_str(args, "id") {
         vec![single.to_string()]
     } else if let Some(arr) = args.get("ids").and_then(Value::as_array) {
         arr.iter()
@@ -3380,7 +4596,33 @@ fn select_target_terminals(args: &Value) -> Result<Vec<terminal::TerminalSnapsho
             .collect()
     } else {
         Vec::new()
-    };
+    }
+}
+
+fn reopen_explicit_terminals(
+    args: &Value,
+    ctx: &CallCtx<'_>,
+    exec: &Exec<'_>,
+) -> std::collections::HashMap<String, std::result::Result<Option<String>, String>> {
+    let mut outcomes = std::collections::HashMap::new();
+    let explicit_ids = explicit_terminal_ids(args);
+    if explicit_ids.is_empty() {
+        return outcomes;
+    }
+    let active = terminal::list_active_terminals();
+    for req_id in explicit_ids {
+        let is_alive = active.iter().any(|t| t.id == req_id && t.alive);
+        if !is_alive {
+            let res = reopen_if_dropped(&req_id, ctx, exec).map_err(|e| e.to_string());
+            outcomes.insert(req_id, res);
+        }
+    }
+    outcomes
+}
+
+fn select_target_terminals(args: &Value) -> Result<Vec<terminal::TerminalSnapshot>> {
+    let active = terminal::list_active_terminals();
+    let explicit_ids = explicit_terminal_ids(args);
     let client_f = opt_str(args, "client").map(str::to_ascii_lowercase);
     let vendor_f = opt_str(args, "vendor").map(str::to_ascii_lowercase);
 
@@ -3426,52 +4668,184 @@ fn select_target_terminals(args: &Value) -> Result<Vec<terminal::TerminalSnapsho
 
 type BroadcastRow = (terminal::TerminalSnapshot, Result<(String, bool)>, u128);
 
-fn net_broadcast(args: &Value, _ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
+fn terminal_progress_label(snap: &terminal::TerminalSnapshot) -> &str {
+    snap.device
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| snap.host.as_deref().filter(|s| !s.trim().is_empty()))
+        .unwrap_or(&snap.id)
+}
+
+fn emit_terminal_progress<T>(
+    exec: &Exec<'_>,
+    tool: &str,
+    snap: &terminal::TerminalSnapshot,
+    ms: u128,
+    res: &Result<T>,
+) {
+    let label = terminal_progress_label(snap);
+    let line = match res {
+        Ok(_) => format!("[ok] {label} ({ms}ms)\n"),
+        Err(e) => format!("[erro] {label}: {e}\n"),
+    };
+    exec.host.sink().push(crate::HostEvent::ToolProgress {
+        tool: tool.to_string(),
+        chunk: line,
+    });
+}
+
+fn net_broadcast(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
     let command = str_arg(args, "command")?;
-    let targets = select_target_terminals(args)?;
+    let reopen_outcomes = reopen_explicit_terminals(args, ctx, exec);
+    let targets = match select_target_terminals(args) {
+        Ok(t) => t,
+        Err(e) => {
+            let reopen_errs: Vec<String> = reopen_outcomes
+                .iter()
+                .filter_map(|(id, r)| r.as_ref().err().map(|err| format!("{id}: {err}")))
+                .collect();
+            if reopen_errs.is_empty() {
+                return Err(e);
+            }
+            return Err(ToolError::Failed(format!(
+                "{e} (falha ao reabrir: {})",
+                reopen_errs.join("; ")
+            )));
+        }
+    };
     let auto_page = args["auto_page"].as_bool().unwrap_or(true);
-    let timeout_secs = args["timeout_secs"].as_u64().unwrap_or(20).clamp(2, 300);
+    let explicit_timeout = args["timeout_secs"].as_u64();
+    let workspace = ctx.workspace;
+    let policy = ctx.policy;
 
     let results: Vec<BroadcastRow> = std::thread::scope(|s| {
         let handles: Vec<_> = targets
             .into_iter()
             .map(|snap| {
+                let reopen_note = reopen_outcomes
+                    .get(&snap.id)
+                    .and_then(|r| r.as_ref().ok())
+                    .and_then(|o| o.clone());
                 s.spawn(move || {
                     let started = std::time::Instant::now();
-                    let res = terminal::send_session_command(
-                        "net_broadcast",
-                        &snap.id,
-                        Some(command),
-                        None,
-                        true,
-                        None,
-                        Duration::from_secs(timeout_secs),
-                        auto_page,
-                        exec,
-                    );
-                    (snap, res, started.elapsed().as_millis())
+                    let res = (|| -> Result<(String, bool)> {
+                        exec.check()?;
+                        let vendor = snap
+                            .vendor
+                            .as_deref()
+                            .and_then(Vendor::parse)
+                            .unwrap_or_default();
+                        let (prepared, adjusted) = prepare_network_command(vendor, command)
+                            .map_err(|why| {
+                                ToolError::Failed(format!("não enviado pelo Zerith: {why}"))
+                            })?;
+                        let secs = explicit_timeout
+                            .unwrap_or_else(|| slow_command_secs(vendor, &prepared).unwrap_or(20))
+                            .clamp(2, 300);
+                        let mut prefix = reopen_note.unwrap_or_default();
+                        if let Some(adj) = adjusted {
+                            prefix.push_str(&adj);
+                            prefix.push('\n');
+                        }
+                        let mut attempt = terminal::send_session_command_with(
+                            "net_broadcast",
+                            &snap.id,
+                            Some(&prepared),
+                            None,
+                            true,
+                            None,
+                            Duration::from_secs(secs),
+                            auto_page,
+                            true,
+                            exec,
+                        );
+                        if attempt.is_err() {
+                            let thread_ctx = CallCtx {
+                                workspace,
+                                policy,
+                                memory: None,
+                                scope: None,
+                            };
+                            if let Ok(Some(note)) = reopen_if_dropped(&snap.id, &thread_ctx, exec) {
+                                prefix.push_str(&note);
+                                attempt = terminal::send_session_command_with(
+                                    "net_broadcast",
+                                    &snap.id,
+                                    Some(&prepared),
+                                    None,
+                                    true,
+                                    None,
+                                    Duration::from_secs(secs),
+                                    auto_page,
+                                    true,
+                                    exec,
+                                );
+                            }
+                        }
+                        let (out, alive) = attempt?;
+                        Ok((format!("{prefix}{out}"), alive))
+                    })();
+                    let ms = started.elapsed().as_millis();
+                    emit_terminal_progress(exec, "net_broadcast", &snap, ms, &res);
+                    (snap, res, ms)
                 })
             })
             .collect();
         handles.into_iter().filter_map(|h| h.join().ok()).collect()
     });
 
-    let mut sections = Vec::with_capacity(results.len() + 1);
+    let mut sections = Vec::with_capacity(results.len() + 2);
     sections.push(format!(
         "## Net Broadcast (`{command}` em {} host(s) em paralelo)",
         results.len()
     ));
+    let mut summary_lines = Vec::new();
+    let mut ok_count = 0usize;
+    let mut err_count = 0usize;
+
+    for (id, outcome) in &reopen_outcomes {
+        if let Err(err) = outcome {
+            err_count += 1;
+            summary_lines.push(format!("- `[erro]` `{id}`: falha ao reabrir ({err})"));
+            sections.push(format!("### {id} (ERRO)\n{err}"));
+        }
+    }
+
     for (snap, res, ms) in results {
         let title = snap.device.as_deref().unwrap_or(&snap.command);
         let host_label = snap.host.as_deref().unwrap_or("-");
         match res {
-            Ok((out, _alive)) => {
+            Ok((out, alive)) => {
+                if let Some(cli_err) = has_cli_error(&out) {
+                    err_count += 1;
+                    summary_lines.push(format!(
+                        "- `[erro cli]` `{title}` ({} · {host_label} · {ms} ms): {cli_err}",
+                        snap.id
+                    ));
+                } else if !alive {
+                    err_count += 1;
+                    summary_lines.push(format!(
+                        "- `[sessão encerrou]` `{title}` ({} · {host_label} · {ms} ms)",
+                        snap.id
+                    ));
+                } else {
+                    ok_count += 1;
+                    summary_lines.push(format!(
+                        "- `[ok]` `{title}` ({} · {host_label} · {ms} ms)",
+                        snap.id
+                    ));
+                }
                 sections.push(format!(
                     "### {} ({} · {} · {} ms)\n```text\n{}\n```",
                     title, snap.id, host_label, ms, out
                 ));
             }
             Err(e) => {
+                err_count += 1;
+                summary_lines.push(format!(
+                    "- `[erro]` `{title}` ({} · {host_label}): {e}",
+                    snap.id
+                ));
                 sections.push(format!(
                     "### {} ({} · {} · ERRO)\n{}",
                     title, snap.id, host_label, e
@@ -3479,6 +4853,12 @@ fn net_broadcast(args: &Value, _ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<St
             }
         }
     }
+
+    let total = ok_count + err_count;
+    sections.push(format!(
+        "### Resumo ({ok_count} ok, {err_count} erro(s), total {total})\n{}",
+        summary_lines.join("\n")
+    ));
     Ok(sections.join("\n\n"))
 }
 
@@ -3487,11 +4867,19 @@ fn default_backup_command_for_vendor(vendor_str: Option<&str>) -> &'static str {
         .and_then(Vendor::parse)
         .unwrap_or(Vendor::Generic)
     {
-        Vendor::CiscoIos | Vendor::CiscoNxos | Vendor::CiscoXr => "show running-config",
-        Vendor::HuaweiVrp => "display current-configuration",
+        Vendor::CiscoIos
+        | Vendor::CiscoNxos
+        | Vendor::CiscoXr
+        | Vendor::ZteOlt
+        | Vendor::FiberHomeOlt
+        | Vendor::Datacom
+        | Vendor::AristaEos => "show running-config",
+        Vendor::HuaweiVrp | Vendor::HuaweiOlt => "display current-configuration",
         Vendor::JuniperJunos => "show configuration",
+        Vendor::VyOS => "show configuration commands",
         Vendor::MikrotikRouterOs => "/export",
         Vendor::FortinetFortiOs => "show full-configuration",
+        Vendor::Proxmox => "pvesh get /nodes/$(hostname)/status",
         Vendor::Linux => "uname -a && ip -br addr && ip route",
         Vendor::Generic => "show running-config",
     }
@@ -3516,64 +4904,343 @@ fn sanitize_path_component(raw: &str) -> String {
     }
 }
 
+fn format_utc_stamp(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let hh = rem / 3600;
+    let mm = (rem % 3600) / 60;
+    let ss = rem % 60;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = y + i64::from(m <= 2);
+    format!("{y:04}{m:02}{d:02}-{hh:02}{mm:02}{ss:02}")
+}
+
+fn validate_backup_output(cfg_out: &str) -> Result<()> {
+    if cfg_out.trim().is_empty() {
+        return Err(ToolError::Failed(
+            "captura de backup vazia; `latest.cfg` não foi alterado".into(),
+        ));
+    }
+    if let Some(err_kind) = has_cli_error(cfg_out) {
+        return Err(ToolError::Failed(format!(
+            "erro CLI na captura de backup ({err_kind}); `latest.cfg` preservado"
+        )));
+    }
+    if cfg_out.contains(terminal::UNSYNCED_NOTE)
+        || cfg_out.contains("[tempo esgotado")
+        || cfg_out.contains("[sem saída")
+    {
+        return Err(ToolError::Failed(
+            "captura de backup incompleta (timeout/sem prompt); `latest.cfg` preservado".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn write_validated_backup(
+    dir: &Path,
+    cfg_out: &str,
+    vendor: Option<Vendor>,
+) -> std::io::Result<(std::path::PathBuf, std::path::PathBuf, String)> {
+    std::fs::create_dir_all(dir)?;
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let stamp = format_utc_stamp(now_secs);
+    let mut history_path = dir.join(format!("{stamp}.cfg"));
+    if history_path.exists() {
+        for suffix in 2..1000 {
+            let candidate = dir.join(format!("{stamp}-{suffix}.cfg"));
+            if !candidate.exists() {
+                history_path = candidate;
+                break;
+            }
+        }
+    }
+    std::fs::write(&history_path, cfg_out)?;
+
+    let latest_path = dir.join("latest.cfg");
+    let previous = std::fs::read_to_string(&latest_path).ok();
+    if let Some(ref prev_text) = previous {
+        let _ = std::fs::write(dir.join("previous.cfg"), prev_text);
+    }
+    std::fs::write(&latest_path, cfg_out)?;
+
+    let diff_summary = match previous {
+        Some(prev_text) => compute_hierarchical_net_diff(&prev_text, cfg_out, vendor, false),
+        None => "Primeiro backup registrado para este equipamento (sem versão anterior para diff)."
+            .into(),
+    };
+    Ok((latest_path, history_path, diff_summary))
+}
+
+fn backup_one_terminal(
+    snap: &terminal::TerminalSnapshot,
+    custom_cmd: Option<&str>,
+    timeout_secs: u64,
+    ctx: &CallCtx<'_>,
+    exec: &Exec<'_>,
+) -> Result<String> {
+    exec.check()?;
+    let started = std::time::Instant::now();
+    let res = backup_one_terminal_inner(snap, custom_cmd, timeout_secs, ctx, exec);
+    emit_terminal_progress(
+        exec,
+        "net_backup",
+        snap,
+        started.elapsed().as_millis(),
+        &res,
+    );
+    res
+}
+
+fn backup_one_terminal_inner(
+    snap: &terminal::TerminalSnapshot,
+    custom_cmd: Option<&str>,
+    timeout_secs: u64,
+    ctx: &CallCtx<'_>,
+    exec: &Exec<'_>,
+) -> Result<String> {
+    exec.check()?;
+    if !snap.alive {
+        let _ = reopen_if_dropped(&snap.id, ctx, exec);
+    }
+    let cmd =
+        custom_cmd.unwrap_or_else(|| default_backup_command_for_vendor(snap.vendor.as_deref()));
+    let (cfg_out, _alive) = terminal::send_session_command_with(
+        "net_backup",
+        &snap.id,
+        Some(cmd),
+        None,
+        true,
+        None,
+        Duration::from_secs(timeout_secs),
+        true,
+        true,
+        exec,
+    )?;
+    validate_backup_output(&cfg_out)?;
+
+    let client_dir = sanitize_path_component(snap.client.as_deref().unwrap_or("geral"));
+    let dev_raw = snap
+        .device
+        .as_deref()
+        .and_then(|d| d.rsplit('/').next())
+        .or(snap.host.as_deref())
+        .unwrap_or(&snap.id);
+    let dev_dir = sanitize_path_component(dev_raw);
+    let dir = ctx
+        .workspace
+        .join("backups")
+        .join(&client_dir)
+        .join(&dev_dir);
+    let vendor = snap.vendor.as_deref().and_then(Vendor::parse);
+    let (latest_path, history_path, diff_summary) = write_validated_backup(&dir, &cfg_out, vendor)?;
+
+    Ok(format!(
+        "### Backup `{}` ({})\n- **Arquivo salvo:** `{}` ({} bytes)\n- **Histórico:** `{}`\n\n{}",
+        snap.device.as_deref().unwrap_or(&snap.id),
+        cmd,
+        latest_path.display(),
+        cfg_out.len(),
+        history_path.display(),
+        diff_summary
+    ))
+}
+
+fn connect_inventory_device_for_backup(
+    dev: &DeviceEntry,
+    ctx: &CallCtx<'_>,
+    exec: &Exec<'_>,
+) -> Result<terminal::TerminalSnapshot> {
+    let mut connect_args = json!({
+        "device": dev.display_qualified_name(),
+        "auto_vpn": true,
+        "disable_paging": true,
+    });
+    if let Some(c) = dev.client.as_deref().filter(|s| !s.trim().is_empty()) {
+        connect_args["client"] = json!(c);
+    }
+    let out = net_connect(&connect_args, ctx, exec)?;
+    let term_id = out
+        .lines()
+        .find_map(|l| {
+            l.split_whitespace()
+                .next()
+                .filter(|w| w.starts_with("term-"))
+        })
+        .ok_or_else(|| ToolError::Failed("net_connect não retornou ID de terminal".into()))?;
+    terminal::list_active_terminals()
+        .into_iter()
+        .find(|t| t.id == term_id && t.alive)
+        .ok_or_else(|| {
+            ToolError::Failed(format!(
+                "sessão `{term_id}` encerrada logo após conectar a `{}`",
+                dev.display_qualified_name()
+            ))
+        })
+}
+
+fn snapshot_matches_device(snap: &terminal::TerminalSnapshot, dev: &DeviceEntry) -> bool {
+    if !snap.alive {
+        return false;
+    }
+    let qual = dev.display_qualified_name().to_ascii_lowercase();
+    let name_low = dev.name.trim().to_ascii_lowercase();
+    let host_target = dev
+        .serial_port
+        .as_deref()
+        .unwrap_or(&dev.host)
+        .trim()
+        .to_ascii_lowercase();
+    if let Some(s_dev) = snap.device.as_deref() {
+        let s_low = s_dev.trim().to_ascii_lowercase();
+        if s_low == qual || s_low == name_low {
+            return true;
+        }
+    }
+    if let Some(s_host) = snap.host.as_deref() {
+        if !host_target.is_empty() && s_host.trim().eq_ignore_ascii_case(&host_target) {
+            return true;
+        }
+    }
+    false
+}
+
 fn net_backup(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
-    let targets = select_target_terminals(args)?;
+    let _ = reopen_explicit_terminals(args, ctx, exec);
     let custom_cmd = opt_str(args, "command");
     let timeout_secs = args["timeout_secs"].as_u64().unwrap_or(45).clamp(5, 300);
-    let mut reports = Vec::with_capacity(targets.len());
+    let explicit_ids = explicit_terminal_ids(args);
+    let mut pre_errors: Vec<String> = Vec::new();
 
-    for snap in targets {
-        let cmd =
-            custom_cmd.unwrap_or_else(|| default_backup_command_for_vendor(snap.vendor.as_deref()));
-        let (cfg_out, _alive) = terminal::send_session_command(
-            "net_backup",
-            &snap.id,
-            Some(cmd),
-            None,
-            true,
-            None,
-            Duration::from_secs(timeout_secs),
-            true,
-            exec,
-        )?;
-        let client_dir = sanitize_path_component(snap.client.as_deref().unwrap_or("geral"));
-        let dev_raw = snap
-            .device
-            .as_deref()
-            .and_then(|d| d.rsplit('/').next())
-            .or(snap.host.as_deref())
-            .unwrap_or(&snap.id);
-        let dev_dir = sanitize_path_component(dev_raw);
-        let dir = ctx
-            .workspace
-            .join("backups")
-            .join(&client_dir)
-            .join(&dev_dir);
-        std::fs::create_dir_all(&dir)?;
-
-        let latest_path = dir.join("latest.cfg");
-        let previous = std::fs::read_to_string(&latest_path).ok();
-        if let Some(ref prev_text) = previous {
-            let _ = std::fs::write(dir.join("previous.cfg"), prev_text);
+    let targets: Vec<terminal::TerminalSnapshot> = if !explicit_ids.is_empty() {
+        select_target_terminals(args)?
+    } else if let Some(device_name) = opt_str(args, "device") {
+        let root = zerith_core::Paths::resolve().root().to_path_buf();
+        let client_f = opt_str(args, "client");
+        let inv = load_inventory(ctx.workspace, Some(&root)).map_err(ToolError::Failed)?;
+        let dev = find_inventory_device(&inv, device_name, client_f).map_err(ToolError::Failed)?;
+        let active = terminal::list_active_terminals();
+        if let Some(existing) = active
+            .into_iter()
+            .find(|t| snapshot_matches_device(t, &dev))
+        {
+            vec![existing]
+        } else {
+            vec![connect_inventory_device_for_backup(&dev, ctx, exec)?]
         }
-        std::fs::write(&latest_path, &cfg_out)?;
-
-        let vendor = snap.vendor.as_deref().and_then(Vendor::parse);
-        let diff_summary = match previous {
-            Some(prev_text) => compute_hierarchical_net_diff(&prev_text, &cfg_out, vendor, false),
-            None => {
-                "Primeiro backup registrado para este equipamento (sem versão anterior para diff)."
-                    .into()
+    } else if let Some(client_name) = opt_str(args, "client") {
+        let client_low = client_name.to_ascii_lowercase();
+        let mut selected: Vec<terminal::TerminalSnapshot> = terminal::list_active_terminals()
+            .into_iter()
+            .filter(|t| {
+                t.alive
+                    && t.client
+                        .as_deref()
+                        .is_some_and(|c| c.to_ascii_lowercase().contains(&client_low))
+            })
+            .collect();
+        let root = zerith_core::Paths::resolve().root().to_path_buf();
+        if let Ok(inv) = load_inventory(ctx.workspace, Some(&root)) {
+            for dev in inv.into_iter().filter(|d| {
+                d.client
+                    .as_deref()
+                    .is_some_and(|c| c.to_ascii_lowercase().contains(&client_low))
+            }) {
+                exec.check()?;
+                if selected.iter().any(|t| snapshot_matches_device(t, &dev)) {
+                    continue;
+                }
+                match connect_inventory_device_for_backup(&dev, ctx, exec) {
+                    Ok(snap) => selected.push(snap),
+                    Err(e) => pre_errors.push(format!(
+                        "### Backup `{}` (ERRO ao conectar)\n{}",
+                        dev.display_qualified_name(),
+                        e
+                    )),
+                }
             }
-        };
-        reports.push(format!(
-            "### Backup `{}` ({})\n- **Arquivo salvo:** `{}` ({} bytes)\n\n{}",
-            snap.device.as_deref().unwrap_or(&snap.id),
-            cmd,
-            latest_path.display(),
-            cfg_out.len(),
-            diff_summary
-        ));
+        }
+        if selected.is_empty() {
+            if !pre_errors.is_empty() {
+                return Ok(pre_errors.join("\n\n---\n\n"));
+            }
+            return Err(ToolError::Failed(format!(
+                "nenhum terminal ativo ou dispositivo no inventário encontrado para o cliente `{client_name}`"
+            )));
+        }
+        selected
+    } else {
+        select_target_terminals(args)?
+    };
+
+    if targets.len() <= 1 && pre_errors.is_empty() {
+        let mut reports = Vec::with_capacity(targets.len());
+        for snap in &targets {
+            reports.push(backup_one_terminal(
+                snap,
+                custom_cmd,
+                timeout_secs,
+                ctx,
+                exec,
+            )?);
+        }
+        return Ok(reports.join("\n\n---\n\n"));
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let next = AtomicUsize::new(0);
+    let workers = targets.len().clamp(1, 16);
+    let slots: Vec<Mutex<Option<Result<String>>>> =
+        (0..targets.len()).map(|_| Mutex::new(None)).collect();
+    let workspace = ctx.workspace;
+    let policy = ctx.policy;
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(|| {
+                let thread_ctx = CallCtx {
+                    workspace,
+                    policy,
+                    memory: None,
+                    scope: None,
+                };
+                loop {
+                    if exec.cancel.is_cancelled() {
+                        break;
+                    }
+                    let idx = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(snap) = targets.get(idx) else { break };
+                    let res =
+                        backup_one_terminal(snap, custom_cmd, timeout_secs, &thread_ctx, exec);
+                    if let Ok(mut g) = slots[idx].lock() {
+                        *g = Some(res);
+                    }
+                }
+            });
+        }
+    });
+    exec.check()?;
+    let mut reports = pre_errors;
+    for (idx, slot) in slots.into_iter().enumerate() {
+        if let Some(res) = slot.into_inner().ok().flatten() {
+            match res {
+                Ok(report) => reports.push(report),
+                Err(e) => {
+                    let label = targets[idx].device.as_deref().unwrap_or(&targets[idx].id);
+                    reports.push(format!("### Backup `{label}` (ERRO)\n{e}"));
+                }
+            }
+        }
     }
     Ok(reports.join("\n\n---\n\n"))
 }
@@ -3662,11 +5329,128 @@ fn serial_ports(_args: &Value, _ctx: &CallCtx<'_>, _exec: &Exec<'_>) -> Result<S
     Ok(lines.join("\n"))
 }
 
-pub fn build_scp_args(
+const SCP_ASKPASS_ENV: &str = "ZERITH_SCP_PASSWORD";
+
+struct AskPassScript(std::path::PathBuf);
+
+impl AskPassScript {
+    fn create() -> std::io::Result<Self> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let (ext, body) = if cfg!(windows) {
+            (
+                "cmd",
+                format!(
+                    "@echo off\r\nsetlocal EnableDelayedExpansion\r\necho(!{SCP_ASKPASS_ENV}!\r\n"
+                ),
+            )
+        } else {
+            (
+                "sh",
+                format!("#!/bin/sh\nprintf '%s\\n' \"${{{SCP_ASKPASS_ENV}}}\"\n"),
+            )
+        };
+        let path = std::env::temp_dir().join(format!(
+            "zerith-scp-askpass-{}-{n}.{ext}",
+            std::process::id()
+        ));
+        std::fs::write(&path, body)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(Self(path))
+    }
+
+    fn apply_env(&self, cmd: &mut std::process::Command, password: &str) {
+        cmd.env("SSH_ASKPASS", &self.0)
+            .env("SSH_ASKPASS_REQUIRE", "force")
+            .env(SCP_ASKPASS_ENV, password);
+        if std::env::var_os("DISPLAY").is_none() {
+            cmd.env("DISPLAY", ":0");
+        }
+    }
+}
+
+impl Drop for AskPassScript {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn run_command_cancellable(
+    cmd: &mut std::process::Command,
+    exec: &Exec<'_>,
+) -> std::result::Result<std::process::Output, ToolError> {
+    use std::io::Read;
+    use std::process::Stdio;
+    exec.check()?;
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(ToolError::Io)?;
+    let mut out_pipe = child.stdout.take();
+    let mut err_pipe = child.stderr.take();
+    let out_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(ref mut r) = out_pipe {
+            let _ = r.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let err_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(ref mut r) = err_pipe {
+            let _ = r.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let status = loop {
+        if exec.cancel.is_cancelled() {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = out_handle.join();
+            let _ = err_handle.join();
+            return Err(ToolError::Cancelled);
+        }
+        if std::time::Instant::now() >= exec.deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = out_handle.join();
+            let _ = err_handle.join();
+            return Err(ToolError::Timeout(exec.timeout));
+        }
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = out_handle.join();
+                let _ = err_handle.join();
+                return Err(ToolError::Io(e));
+            }
+        }
+    };
+    let stdout = out_handle.join().unwrap_or_default();
+    let stderr = err_handle.join().unwrap_or_default();
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn build_scp_args_with(
     dev: &DeviceEntry,
     direction: &str,
     local_path: &Path,
     remote_path: &str,
+    batch_mode: bool,
+    legacy_scp: bool,
 ) -> std::result::Result<Vec<String>, String> {
     validate_ssh_token("host", &dev.host)?;
     let user = if dev.user.trim().is_empty() {
@@ -3682,16 +5466,33 @@ pub fn build_scp_args(
         return Err("remote_path inválido".into());
     }
 
-    let mut args = vec![
-        "-r".to_string(),
+    let mut args = vec!["-r".to_string()];
+    if legacy_scp {
+        args.push("-O".to_string());
+    }
+    args.extend([
         "-o".to_string(),
         "StrictHostKeyChecking=accept-new".to_string(),
         "-o".to_string(),
         "ConnectTimeout=15".to_string(),
-    ];
+    ]);
+    if batch_mode {
+        args.push("-o".to_string());
+        args.push("BatchMode=yes".to_string());
+    }
     if dev.port != 22 && dev.port != 0 {
         args.push("-P".to_string());
         args.push(dev.port.to_string());
+    }
+    if let Some(id_file) = dev
+        .identity_file
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let validated = validate_identity_file(id_file)?;
+        args.push("-i".to_string());
+        args.push(validated);
     }
     if let Some(jump) = dev
         .jump_host
@@ -3704,14 +5505,7 @@ pub fn build_scp_args(
         args.push(jump.to_string());
     }
     if dev.legacy_ssh {
-        args.extend([
-            "-o".to_string(),
-            "KexAlgorithms=+diffie-hellman-group14-sha1,diffie-hellman-group1-sha1".to_string(),
-            "-o".to_string(),
-            "HostKeyAlgorithms=+ssh-rsa".to_string(),
-            "-o".to_string(),
-            "PubkeyAcceptedAlgorithms=+ssh-rsa".to_string(),
-        ]);
+        args.extend(legacy_ssh_options());
     }
     let remote_spec = format!("{user}@{}:{rem_trimmed}", dev.host.trim());
     let local_str = local_path.to_string_lossy().into_owned();
@@ -3730,6 +5524,48 @@ pub fn build_scp_args(
             "direction inválido `{other}` (use `upload` ou `download`)"
         )),
     }
+}
+
+pub fn build_scp_args(
+    dev: &DeviceEntry,
+    direction: &str,
+    local_path: &Path,
+    remote_path: &str,
+) -> std::result::Result<Vec<String>, String> {
+    build_scp_args_with(dev, direction, local_path, remote_path, false, false)
+}
+
+fn should_retry_scp_legacy_protocol(stderr: &str) -> bool {
+    let low = stderr.to_ascii_lowercase();
+    low.contains("subsystem request failed")
+        || low.contains("connection closed")
+        || low.contains("sftp-server")
+        || low.contains("protocol error")
+        || low.contains("received message too long")
+}
+
+fn scp_rejected_legacy_flag(stderr: &str) -> bool {
+    let low = stderr.to_ascii_lowercase();
+    low.contains("unknown option")
+        || low.contains("illegal option")
+        || low.contains("invalid option")
+        || low.contains("bad option")
+}
+
+fn run_scp_once(
+    scp_args: &[String],
+    askpass: Option<(&AskPassScript, &str)>,
+    exec: &Exec<'_>,
+) -> Result<std::process::Output> {
+    let mut cmd = std::process::Command::new("scp");
+    cmd.args(scp_args);
+    if let Some((script, pw)) = askpass {
+        script.apply_env(&mut cmd, pw);
+    }
+    run_command_cancellable(&mut cmd, exec).map_err(|e| match e {
+        ToolError::Cancelled | ToolError::Timeout(_) => e,
+        other => ToolError::Failed(format!("falha ao executar `scp`: {other}")),
+    })
 }
 
 fn net_transfer(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
@@ -3793,13 +5629,55 @@ fn net_transfer(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<Stri
         )));
     }
 
-    let scp_args = build_scp_args(&dev, direction, &local_path, remote_raw)
+    let password: Option<String> = if let Some(pw) = opt_str(args, "password") {
+        Some(pw.to_string())
+    } else if let Some(secret_name) = dev.secret_ref.as_deref() {
+        let val = zerith_core::secrets::get_secret(secret_name).map_err(|e| {
+            ToolError::Failed(format!(
+                "segredo `{secret_name}` não encontrado no cofre ({e}); peça: zerith secret set {secret_name}"
+            ))
+        })?;
+        Some(val)
+    } else {
+        None
+    };
+
+    let askpass = match password.as_deref() {
+        Some(_) => Some(AskPassScript::create().map_err(|e| {
+            ToolError::Failed(format!(
+                "falha ao preparar askpass temporário para `scp`: {e}"
+            ))
+        })?),
+        None => None,
+    };
+    let batch_mode = password.is_none();
+    let ask_ref = askpass.as_ref().zip(password.as_deref());
+
+    let scp_args = build_scp_args_with(&dev, direction, &local_path, remote_raw, batch_mode, false)
         .map_err(ToolError::BadArguments)?;
     let started = std::time::Instant::now();
-    let out = std::process::Command::new("scp")
-        .args(&scp_args)
-        .output()
-        .map_err(|e| ToolError::Failed(format!("falha ao executar `scp`: {e}")))?;
+    let mut out = run_scp_once(&scp_args, ask_ref, exec)?;
+    let mut used_legacy_scp = false;
+    if !out.status.success() {
+        let first_stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        if should_retry_scp_legacy_protocol(&first_stderr) {
+            let legacy_args =
+                build_scp_args_with(&dev, direction, &local_path, remote_raw, batch_mode, true)
+                    .map_err(ToolError::BadArguments)?;
+            let retry_out = run_scp_once(&legacy_args, ask_ref, exec)?;
+            if retry_out.status.success() {
+                out = retry_out;
+                used_legacy_scp = true;
+            } else {
+                let retry_stderr = String::from_utf8_lossy(&retry_out.stderr)
+                    .trim()
+                    .to_string();
+                if !scp_rejected_legacy_flag(&retry_stderr) {
+                    out = retry_out;
+                }
+            }
+        }
+    }
     let elapsed_ms = started.elapsed().as_millis();
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
@@ -3814,8 +5692,13 @@ fn net_transfer(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<Stri
         )));
     }
     let size_bytes = std::fs::metadata(&local_path).map(|m| m.len()).unwrap_or(0);
+    let legacy_note = if used_legacy_scp {
+        "\n- **Protocolo:** SCP legado (`-O`, fallback após erro SFTP)"
+    } else {
+        ""
+    };
     Ok(format!(
-        "{vpn_note}## Net Transfer ({})\n- **Dispositivo:** `{}` ({})\n- **Local:** `{}` ({} bytes)\n- **Remoto:** `{}`\n- **Tempo:** {} ms",
+        "{vpn_note}## Net Transfer ({})\n- **Dispositivo:** `{}` ({})\n- **Local:** `{}` ({} bytes)\n- **Remoto:** `{}`{legacy_note}\n- **Tempo:** {} ms",
         direction.to_ascii_uppercase(),
         dev.display_qualified_name(),
         dev.host,
@@ -3888,56 +5771,230 @@ pub fn compute_rtt_jitter_stats(sent: usize, samples_ms: &[f64]) -> RttStats {
     }
 }
 
-fn ping_with_df_mtu(host: &str, total_ip_mtu: u16) -> bool {
-    let payload = total_ip_mtu.saturating_sub(28);
-    let payload_str = payload.to_string();
-    let out = if cfg!(windows) {
-        std::process::Command::new("ping")
-            .args(["-n", "1", "-w", "900", "-f", "-l", &payload_str, host])
-            .output()
-    } else if cfg!(target_os = "macos") {
-        std::process::Command::new("ping")
-            .args(["-c", "1", "-W", "900", "-D", "-s", &payload_str, host])
-            .output()
-    } else {
-        std::process::Command::new("ping")
-            .args(["-c", "1", "-W", "1", "-M", "do", "-s", &payload_str, host])
-            .output()
-    };
-    let Ok(res) = out else {
-        return false;
-    };
-    if !res.status.success() {
-        return false;
-    }
-    let stdout = String::from_utf8_lossy(&res.stdout).to_ascii_lowercase();
-    !stdout.contains("fragment")
-        && !stdout.contains("100% loss")
-        && !stdout.contains("100% packet loss")
-}
+pub fn parse_ping_output(stdout: &str, expected_count: usize) -> Option<RttStats> {
+    static SAMPLE_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static LOSS_UNIX_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static LOSS_WIN_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static SUMMARY_UNIX_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static SUMMARY_WIN_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
 
-fn discover_path_mtu(host: &str) -> Option<(u16, &'static str)> {
-    const CANDIDATES: &[(u16, &str)] = &[
-        (1500, "Ethernet Padrão (1500) — sem encapsulamento redutor"),
-        (1492, "PPPoE (1492) — overhead de 8 bytes PPPoE"),
-        (1472, "VLAN / MPLS / QinQ (1472)"),
-        (
-            1420,
-            "WireGuard VPN Padrão (1420) — overhead de 80 bytes WireGuard",
-        ),
-        (1400, "IPsec / L2TP / VXLAN (1400)"),
-        (1360, "GRE + IPsec / MPLS Duplo (1360)"),
-        (1280, "IPv6 Mínimo / Túnel Restrito (1280)"),
-    ];
-    for &(mtu, label) in CANDIDATES {
-        if ping_with_df_mtu(host, mtu) {
-            return Some((mtu, label));
+    let sample_re = SAMPLE_RE.get_or_init(|| {
+        Regex::new(r"(?i)(?:time|tempo)\s*([=<])\s*([0-9]+(?:[.,][0-9]+)?)\s*ms").unwrap()
+    });
+    let loss_unix_re = LOSS_UNIX_RE.get_or_init(|| {
+        Regex::new(r"(?i)(\d+)\s+packets transmitted,\s+(\d+)\s+(?:packets\s+)?received,\s+([0-9]+(?:[.,][0-9]+)?)%\s+packet loss").unwrap()
+    });
+    let loss_win_re = LOSS_WIN_RE.get_or_init(|| {
+        Regex::new(r"(?i)(?:Sent|Enviados)\s*=\s*(\d+),\s*(?:Received|Recebidos)\s*=\s*(\d+),\s*(?:Lost|Perdidos)\s*=\s*\d+\s*\(\s*([0-9]+(?:[.,][0-9]+)?)%").unwrap()
+    });
+    let summary_unix_re = SUMMARY_UNIX_RE.get_or_init(|| {
+        Regex::new(r"(?i)(?:rtt|round-trip)\s+min/avg/max(?:/(?:mdev|stddev))?\s*=\s*([0-9]+(?:[.,][0-9]+)?)/([0-9]+(?:[.,][0-9]+)?)/([0-9]+(?:[.,][0-9]+)?)(?:/([0-9]+(?:[.,][0-9]+)?))?\s*ms").unwrap()
+    });
+    let summary_win_re =
+        SUMMARY_WIN_RE.get_or_init(|| Regex::new(r"(?i)M[íi]nimo|Minimum").unwrap());
+    let _ = summary_win_re;
+
+    let parse_num = |s: &str| -> Option<f64> { s.replace(',', ".").parse::<f64>().ok() };
+
+    let mut samples = Vec::new();
+    for cap in sample_re.captures_iter(stdout) {
+        let op = cap.get(1).map(|m| m.as_str()).unwrap_or("=");
+        if let Some(val) = cap.get(2).and_then(|m| parse_num(m.as_str())) {
+            samples.push(if op == "<" && val <= 1.0 { 0.5 } else { val });
         }
     }
-    None
+
+    let (sent, received, loss_pct_opt) = if let Some(c) = loss_unix_re.captures(stdout) {
+        (
+            c.get(1)
+                .and_then(|m| m.as_str().parse::<usize>().ok())
+                .unwrap_or(expected_count),
+            c.get(2)
+                .and_then(|m| m.as_str().parse::<usize>().ok())
+                .unwrap_or(samples.len()),
+            c.get(3).and_then(|m| parse_num(m.as_str())),
+        )
+    } else if let Some(c) = loss_win_re.captures(stdout) {
+        (
+            c.get(1)
+                .and_then(|m| m.as_str().parse::<usize>().ok())
+                .unwrap_or(expected_count),
+            c.get(2)
+                .and_then(|m| m.as_str().parse::<usize>().ok())
+                .unwrap_or(samples.len()),
+            c.get(3).and_then(|m| parse_num(m.as_str())),
+        )
+    } else {
+        (expected_count.max(samples.len()), samples.len(), None)
+    };
+
+    static WIN_RTT_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let win_rtt_re = WIN_RTT_RE.get_or_init(|| {
+        Regex::new(r"(?i)(?:Minimum|M[íi]nimo)\s*=\s*([0-9]+(?:[.,][0-9]+)?)\s*ms,\s*(?:Maximum|M[áa]ximo)\s*=\s*([0-9]+(?:[.,][0-9]+)?)\s*ms,\s*(?:Average|M[ée]dia)\s*=\s*([0-9]+(?:[.,][0-9]+)?)\s*ms").unwrap()
+    });
+
+    let summary_rtt = if let Some(c) = summary_unix_re.captures(stdout) {
+        Some((
+            c.get(1).and_then(|m| parse_num(m.as_str()))?,
+            c.get(3).and_then(|m| parse_num(m.as_str()))?,
+            c.get(2).and_then(|m| parse_num(m.as_str()))?,
+            c.get(4).and_then(|m| parse_num(m.as_str())),
+        ))
+    } else if let Some(c) = win_rtt_re.captures(stdout) {
+        Some((
+            c.get(1).and_then(|m| parse_num(m.as_str()))?,
+            c.get(2).and_then(|m| parse_num(m.as_str()))?,
+            c.get(3).and_then(|m| parse_num(m.as_str()))?,
+            None,
+        ))
+    } else {
+        None
+    };
+
+    if received == 0 && samples.is_empty() && summary_rtt.is_none() {
+        return None;
+    }
+
+    let loss_pct = loss_pct_opt.unwrap_or_else(|| {
+        if sent == 0 {
+            0.0
+        } else {
+            ((sent.saturating_sub(received)) as f64 / sent as f64) * 100.0
+        }
+    });
+
+    if !samples.is_empty() {
+        let mut stats = compute_rtt_jitter_stats(sent, &samples);
+        stats.received = received.max(samples.len());
+        stats.loss_pct = loss_pct;
+        if let Some((min_s, max_s, avg_s, mdev_s)) = summary_rtt {
+            stats.min_ms = min_s;
+            stats.max_ms = max_s;
+            stats.avg_ms = avg_s;
+            if stats.jitter_ms == 0.0 {
+                if let Some(j) = mdev_s {
+                    stats.jitter_ms = j;
+                }
+            }
+        }
+        return Some(stats);
+    }
+
+    summary_rtt.map(|(min_ms, max_ms, avg_ms, mdev_opt)| RttStats {
+        sent,
+        received,
+        loss_pct,
+        min_ms,
+        avg_ms,
+        max_ms,
+        jitter_ms: mdev_opt.unwrap_or_else(|| {
+            if received > 1 {
+                (max_ms - min_ms) / 2.0
+            } else {
+                0.0
+            }
+        }),
+    })
 }
 
-fn net_path(args: &Value, ctx: &CallCtx<'_>, _exec: &Exec<'_>) -> Result<String> {
+fn measure_icmp_rtt(host: &str, count: usize, exec: &Exec<'_>) -> Result<Option<RttStats>> {
+    let count_str = count.to_string();
+    let mut cmd = std::process::Command::new("ping");
+    if cfg!(windows) {
+        cmd.args(["-n", &count_str, "-w", "1200", host]);
+    } else if cfg!(target_os = "macos") {
+        cmd.args(["-c", &count_str, "-i", "0.2", "-W", "1200", host]);
+    } else {
+        cmd.args(["-c", &count_str, "-i", "0.2", "-W", "1", host]);
+    }
+    let out = match run_command_cancellable(&mut cmd, exec) {
+        Ok(o) => o,
+        Err(ToolError::Cancelled) => return Err(ToolError::Cancelled),
+        Err(ToolError::Timeout(_)) | Err(_) => return Ok(None),
+    };
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Ok(parse_ping_output(&text, count).filter(|s| s.received > 0))
+}
+
+fn ping_with_df_mtu(host: &str, total_ip_mtu: u16, exec: &Exec<'_>) -> Result<bool> {
+    exec.check()?;
+    let payload = total_ip_mtu.saturating_sub(28);
+    let payload_str = payload.to_string();
+    let mut cmd = std::process::Command::new("ping");
+    if cfg!(windows) {
+        cmd.args(["-n", "1", "-w", "900", "-f", "-l", &payload_str, host]);
+    } else if cfg!(target_os = "macos") {
+        cmd.args(["-c", "1", "-W", "900", "-D", "-s", &payload_str, host]);
+    } else {
+        cmd.args(["-c", "1", "-W", "1", "-M", "do", "-s", &payload_str, host]);
+    }
+    let res = match run_command_cancellable(&mut cmd, exec) {
+        Ok(r) => r,
+        Err(ToolError::Cancelled) => return Err(ToolError::Cancelled),
+        Err(_) => return Ok(false),
+    };
+    if !res.status.success() {
+        return Ok(false);
+    }
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&res.stdout),
+        String::from_utf8_lossy(&res.stderr)
+    )
+    .to_ascii_lowercase();
+    Ok(!combined.contains("fragment")
+        && !combined.contains("frag needed")
+        && !combined.contains("too long")
+        && !combined.contains("100% loss")
+        && !combined.contains("100% packet loss")
+        && !combined.contains("100.0% packet loss")
+        && !combined.contains("100% de perda"))
+}
+
+pub fn binary_search_mtu<F>(mut probe: F) -> Result<Option<u16>>
+where
+    F: FnMut(u16) -> Result<bool>,
+{
+    if !probe(1280)? {
+        return Ok(None);
+    }
+    if probe(1500)? {
+        return Ok(Some(1500));
+    }
+    let mut lo: u16 = 1280;
+    let mut hi: u16 = 1499;
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if probe(mid)? {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    Ok(Some(lo))
+}
+
+fn mtu_profile_label(mtu: u16) -> &'static str {
+    match mtu {
+        1500 => "Ethernet Padrão (1500) — sem encapsulamento redutor",
+        1492 => "PPPoE (1492) — overhead de 8 bytes PPPoE",
+        1450..=1499 => "VLAN / MPLS / QinQ / PPPoE",
+        1420..=1449 => "WireGuard VPN / Túnel (1420–1449)",
+        1400..=1419 => "IPsec / L2TP / VXLAN (1400–1419)",
+        _ => "GRE + IPsec / Túnel Restrito (1280–1399)",
+    }
+}
+
+fn discover_path_mtu(host: &str, exec: &Exec<'_>) -> Result<Option<(u16, &'static str)>> {
+    Ok(binary_search_mtu(|mtu| ping_with_df_mtu(host, mtu, exec))?
+        .map(|mtu| (mtu, mtu_profile_label(mtu))))
+}
+
+fn net_path(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
     use std::net::{TcpStream, ToSocketAddrs};
     use std::time::Instant;
 
@@ -3963,34 +6020,45 @@ fn net_path(args: &Value, ctx: &CallCtx<'_>, _exec: &Exec<'_>) -> Result<String>
     let discover_mtu = args["discover_mtu"].as_bool().unwrap_or(true);
     let run_trace = args["traceroute"].as_bool().unwrap_or(false);
 
-    // 1. Measure multi-sample RTT & Jitter via TCP connect probes
-    let mut samples_ms = Vec::with_capacity(count);
-    if let Some(addr) = (target_host.as_str(), target_port)
-        .to_socket_addrs()
-        .ok()
-        .and_then(|mut it| it.next())
-    {
-        for i in 0..count {
-            let started = Instant::now();
-            if TcpStream::connect_timeout(&addr, Duration::from_millis(1500)).is_ok() {
-                samples_ms.push(started.elapsed().as_secs_f64() * 1000.0);
-            }
-            if i + 1 < count {
-                std::thread::sleep(Duration::from_millis(60));
+    // 1. Measure RTT, loss & jitter via ICMP ping first; fall back to TCP connect if ICMP fails/is blocked.
+    exec.check()?;
+    let icmp_stats = measure_icmp_rtt(&target_host, count, exec)?;
+    let (proto_label, stats) = if let Some(icmp) = icmp_stats {
+        ("ICMP".to_string(), icmp)
+    } else {
+        let mut samples_ms = Vec::with_capacity(count);
+        if let Some(addr) = (target_host.as_str(), target_port)
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut it| it.next())
+        {
+            for i in 0..count {
+                exec.check()?;
+                let started = Instant::now();
+                if TcpStream::connect_timeout(&addr, Duration::from_millis(1500)).is_ok() {
+                    samples_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+                }
+                if i + 1 < count {
+                    std::thread::sleep(Duration::from_millis(60));
+                }
             }
         }
-    }
-    let stats = compute_rtt_jitter_stats(count, &samples_ms);
+        (
+            format!("TCP/{target_port} — fallback ICMP indisponível"),
+            compute_rtt_jitter_stats(count, &samples_ms),
+        )
+    };
 
     let mut lines = vec![format!("## Net Path Diagnostics — `{label_prefix}`")];
     lines.push(format!(
-        "- **Latência & Jitter (TCP/{target_port}):** enviados={}, recebidos={}, perda=`{:.0}%` · min=`{:.1} ms` · avg=`{:.1} ms` · max=`{:.1} ms` · **jitter=`{:.1} ms`**",
+        "- **Latência & Jitter ({proto_label}):** enviados={}, recebidos={}, perda=`{:.0}%` · min=`{:.1} ms` · avg=`{:.1} ms` · max=`{:.1} ms` · **jitter=`{:.1} ms`**",
         stats.sent, stats.received, stats.loss_pct, stats.min_ms, stats.avg_ms, stats.max_ms, stats.jitter_ms
     ));
 
-    // 2. Automatic Path MTU Discovery (Don't-Fragment ICMP)
+    // 2. Automatic Path MTU Discovery (Binary Search 1280..=1500 with Don't-Fragment ICMP)
     if discover_mtu {
-        match discover_path_mtu(&target_host) {
+        exec.check()?;
+        match discover_path_mtu(&target_host, exec)? {
             Some((mtu, profile)) => {
                 let mss = mtu.saturating_sub(40);
                 lines.push(format!(
@@ -4007,16 +6075,17 @@ fn net_path(args: &Value, ctx: &CallCtx<'_>, _exec: &Exec<'_>) -> Result<String>
 
     // 3. Optional Traceroute
     if run_trace {
-        let trace_out = if cfg!(windows) {
-            std::process::Command::new("tracert")
-                .args(["-d", "-h", "15", "-w", "800", &target_host])
-                .output()
+        exec.check()?;
+        let mut cmd = if cfg!(windows) {
+            let mut c = std::process::Command::new("tracert");
+            c.args(["-d", "-h", "15", "-w", "800", &target_host]);
+            c
         } else {
-            std::process::Command::new("traceroute")
-                .args(["-n", "-m", "15", "-w", "1", &target_host])
-                .output()
+            let mut c = std::process::Command::new("traceroute");
+            c.args(["-n", "-m", "15", "-w", "1", &target_host]);
+            c
         };
-        if let Ok(out) = trace_out {
+        if let Ok(out) = run_command_cancellable(&mut cmd, exec) {
             let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
             if !text.is_empty() {
                 lines.push(format!("\n### Traceroute\n```text\n{text}\n```"));
@@ -5293,7 +7362,7 @@ Endpoint = vpn.telecomsul.com.br:51820
             },
         ];
         let (vendor, role, transport, port, tags) = fingerprint_probed_host(&pve_rows).unwrap();
-        assert_eq!(vendor, Vendor::Linux);
+        assert_eq!(vendor, Vendor::Proxmox);
         assert_eq!(role, DeviceRole::Server);
         assert_eq!(transport, DeviceTransport::Ssh);
         assert_eq!(port, 22);
@@ -5438,5 +7507,592 @@ Endpoint = vpn.telecomsul.com.br:51820
             ),
             Err(ToolError::Denied(_))
         ));
+    }
+
+    #[test]
+    fn emit_terminal_progress_formats_ok_and_err_lines_to_live_sink() {
+        use std::sync::{Arc, Mutex};
+
+        let host = crate::Host::default();
+        let captured = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+        let captured_cb = Arc::clone(&captured);
+        host.sink().set_live(Some(Arc::new(move |ev| {
+            if let crate::HostEvent::ToolProgress { tool, chunk } = ev {
+                captured_cb.lock().unwrap().push((tool, chunk));
+            }
+        })));
+
+        let cancel = zerith_providers::Cancel::default();
+        let exec = Exec {
+            cancel: &cancel,
+            deadline: std::time::Instant::now() + Duration::from_secs(5),
+            timeout: Duration::from_secs(5),
+            host: &host,
+        };
+
+        let snap_dev = terminal::TerminalSnapshot {
+            id: "term-1".into(),
+            command: "ssh admin@10.0.0.1".into(),
+            vendor: Some("mikrotik_router_os".into()),
+            device: Some("core-01".into()),
+            host: Some("10.0.0.1".into()),
+            role: Some("core".into()),
+            client: Some("TelecomSul".into()),
+            vpn: None,
+            transport: Some("ssh".into()),
+            alive: true,
+            busy: false,
+            idle_secs: 0,
+        };
+        let snap_host_only = terminal::TerminalSnapshot {
+            id: "term-2".into(),
+            command: "ssh admin@10.0.0.2".into(),
+            vendor: None,
+            device: None,
+            host: Some("edge-02".into()),
+            role: None,
+            client: None,
+            vpn: None,
+            transport: None,
+            alive: true,
+            busy: false,
+            idle_secs: 0,
+        };
+
+        emit_terminal_progress(
+            &exec,
+            "net_broadcast",
+            &snap_dev,
+            142,
+            &Ok::<(), ToolError>(()),
+        );
+        emit_terminal_progress(
+            &exec,
+            "net_backup",
+            &snap_host_only,
+            500,
+            &Err::<(), ToolError>(ToolError::Failed("timeout".into())),
+        );
+        host.sink().set_live(None);
+
+        let lines = captured.lock().unwrap().clone();
+        assert_eq!(
+            lines,
+            vec![
+                (
+                    "net_broadcast".to_string(),
+                    "[ok] core-01 (142ms)\n".to_string()
+                ),
+                (
+                    "net_backup".to_string(),
+                    "[erro] edge-02: timeout\n".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn net_path_parses_linux_english_and_windows_ptbr_ping_outputs() {
+        let linux_out = "\
+PING 10.0.0.1 (10.0.0.1) 56(84) bytes of data.
+64 bytes from 10.0.0.1: icmp_seq=1 ttl=64 time=10.0 ms
+64 bytes from 10.0.0.1: icmp_seq=2 ttl=64 time=14.0 ms
+64 bytes from 10.0.0.1: icmp_seq=3 ttl=64 time=12.0 ms
+
+--- 10.0.0.1 ping statistics ---
+4 packets transmitted, 3 received, 25% packet loss, time 3005ms
+rtt min/avg/max/mdev = 10.000/12.000/14.000/1.632 ms
+";
+        let s1 = parse_ping_output(linux_out, 4).expect("linux stats");
+        assert_eq!(s1.sent, 4);
+        assert_eq!(s1.received, 3);
+        assert!((s1.loss_pct - 25.0).abs() < 0.01);
+        assert!((s1.min_ms - 10.0).abs() < 0.01);
+        assert!((s1.avg_ms - 12.0).abs() < 0.01);
+        assert!((s1.max_ms - 14.0).abs() < 0.01);
+        assert!((s1.jitter_ms - 3.0).abs() < 0.01);
+
+        let win_ptbr = "\
+Disparando 10.0.0.1 com 32 bytes de dados:
+Resposta de 10.0.0.1: bytes=32 tempo=8ms TTL=64
+Resposta de 10.0.0.1: bytes=32 tempo<1ms TTL=64
+Resposta de 10.0.0.1: bytes=32 tempo=12ms TTL=64
+Resposta de 10.0.0.1: bytes=32 tempo=10ms TTL=64
+
+Estatísticas do Ping para 10.0.0.1:
+    Pacotes: Enviados = 4, Recebidos = 4, Perdidos = 0 (0% de perda),
+Aproximar um número redondo de vezes em milissegundos:
+    Mínimo = 0ms, Máximo = 12ms, Média = 7ms
+";
+        let s2 = parse_ping_output(win_ptbr, 4).expect("pt-br stats");
+        assert_eq!(s2.sent, 4);
+        assert_eq!(s2.received, 4);
+        assert!((s2.loss_pct - 0.0).abs() < 0.01);
+        assert!((s2.min_ms - 0.0).abs() < 0.01);
+        assert!((s2.max_ms - 12.0).abs() < 0.01);
+        assert!((s2.avg_ms - 7.0).abs() < 0.01);
+
+        let win_en = "\
+Packets: Sent = 4, Received = 2, Lost = 2 (50% loss),
+Approximate round trip times in milli-seconds:
+    Minimum = 20ms, Maximum = 30ms, Average = 25ms
+";
+        let s3 = parse_ping_output(win_en, 4).expect("win-en stats");
+        assert_eq!(s3.sent, 4);
+        assert_eq!(s3.received, 2);
+        assert!((s3.loss_pct - 50.0).abs() < 0.01);
+        assert!((s3.min_ms - 20.0).abs() < 0.01);
+        assert!((s3.max_ms - 30.0).abs() < 0.01);
+        assert!((s3.avg_ms - 25.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn mtu_binary_search_finds_exact_boundary() {
+        assert_eq!(
+            binary_search_mtu(|mtu| Ok(mtu <= 1500)).unwrap(),
+            Some(1500)
+        );
+        assert_eq!(
+            binary_search_mtu(|mtu| Ok(mtu <= 1492)).unwrap(),
+            Some(1492)
+        );
+        assert_eq!(
+            binary_search_mtu(|mtu| Ok(mtu <= 1420)).unwrap(),
+            Some(1420)
+        );
+        assert_eq!(
+            binary_search_mtu(|mtu| Ok(mtu <= 1387)).unwrap(),
+            Some(1387)
+        );
+        assert_eq!(
+            binary_search_mtu(|mtu| Ok(mtu <= 1280)).unwrap(),
+            Some(1280)
+        );
+        assert_eq!(binary_search_mtu(|_| Ok(false)).unwrap(), None);
+    }
+
+    #[test]
+    fn net_diff_preserves_acl_order_and_emits_vendor_rollbacks_and_redacts_kv() {
+        // 1. Reordered ACL lines MUST produce a diff instead of empty no-op
+        let acl_before = "\
+ip access-list extended EDGE-IN
+ 10 permit tcp any any eq 443
+ 20 deny ip any any
+";
+        let acl_after = "\
+ip access-list extended EDGE-IN
+ 20 deny ip any any
+ 10 permit tcp any any eq 443
+";
+        let acl_diff =
+            compute_hierarchical_net_diff(acl_before, acl_after, Some(Vendor::CiscoIos), false);
+        assert!(
+            acl_diff.contains("bloco (ordenado): ip access-list extended EDGE-IN"),
+            "{acl_diff}"
+        );
+        assert!(
+            acl_diff.contains("- 10 permit tcp any any eq 443"),
+            "{acl_diff}"
+        );
+        assert!(
+            acl_diff.contains("+ 10 permit tcp any any eq 443"),
+            "{acl_diff}"
+        );
+
+        // 2. Junos rollback uses `delete` / `set`
+        let junos_before = "\
+interfaces {
+    ge-0/0/0 {
+        unit 0 {
+            family inet {
+                address 10.0.0.1/30;
+            }
+        }
+    }
+}
+";
+        let junos_after = "\
+interfaces {
+    ge-0/0/0 {
+        unit 0 {
+            family inet {
+                address 10.0.0.1/30;
+                address 10.0.0.2/30;
+            }
+        }
+    }
+}
+";
+        let j_diff = compute_hierarchical_net_diff(junos_before, junos_after, None, false);
+        assert!(j_diff.contains("vendor: juniper_junos"), "{j_diff}");
+        assert!(
+            j_diff.contains("delete interfaces ge-0/0/0 unit 0 family inet address 10.0.0.2/30"),
+            "{j_diff}"
+        );
+
+        // 3. FortiOS rollback uses `unset` / `delete`
+        let forti_before = "\
+config system interface
+    edit port1
+        set ip 10.0.0.1 255.255.255.0
+    next
+end
+";
+        let forti_after = "\
+config system interface
+    edit port1
+        set ip 10.0.0.1 255.255.255.0
+        set allowaccess ping https
+    next
+end
+";
+        let f_diff = compute_hierarchical_net_diff(forti_before, forti_after, None, false);
+        assert!(f_diff.contains("vendor: fortinet_forti_os"), "{f_diff}");
+        assert!(f_diff.contains("unset allowaccess"), "{f_diff}");
+        assert!(!f_diff.contains("no set "), "{f_diff}");
+
+        // 4. MikroTik RouterOS rollback uses `/section remove [find ...]` and NEVER `no add` / `no set`
+        let ros_before = "\
+/ip firewall filter
+add chain=input action=accept protocol=icmp comment=\"allow-ping\"
+";
+        let ros_after = "\
+/ip firewall filter
+add chain=input action=accept protocol=icmp comment=\"allow-ping\"
+add chain=forward action=drop comment=\"drop-all\"
+";
+        let r_diff = compute_hierarchical_net_diff(ros_before, ros_after, None, false);
+        assert!(r_diff.contains("vendor: mikrotik_router_os"), "{r_diff}");
+        assert!(
+            r_diff.contains("/ip firewall filter remove [find comment=\"drop-all\"]"),
+            "{r_diff}"
+        );
+        assert!(!r_diff.contains("no add"), "{r_diff}");
+        assert!(!r_diff.contains("no set"), "{r_diff}");
+
+        // 5. Key=value and quoted secret redaction
+        assert_eq!(
+            sanitize_config_line_on_demand(
+                "add name=peer1 password=SuperSecret123 secret=\"My Secret\""
+            ),
+            "add name=peer1 password=<REDACTED> secret=\"<REDACTED>\""
+        );
+        assert_eq!(
+            sanitize_config_line_on_demand("set psksecret ENC abcdef123456"),
+            "set psksecret ENC <REDACTED>"
+        );
+        assert_eq!(
+            sanitize_config_line_on_demand("set community=private-ro pre-shared-key MyPSK"),
+            "set community=<REDACTED> pre-shared-key <REDACTED>"
+        );
+    }
+
+    #[test]
+    fn net_probe_does_not_infer_vendor_from_ports_830_or_8443_alone() {
+        let row_830 = vec![ProbeRow {
+            host: "10.0.0.5".into(),
+            resolved_ip: "10.0.0.5".into(),
+            port: 830,
+            service: port_service_label(830),
+            open: true,
+            rtt_ms: Some(1.0),
+            detail: "conectado".into(),
+        }];
+        assert_eq!(port_service_label(830), "NETCONF/SSH");
+        let (v_830, ..) = fingerprint_probed_host(&row_830).unwrap();
+        assert_eq!(v_830, Vendor::Generic);
+
+        let row_8443 = vec![ProbeRow {
+            host: "10.0.0.6".into(),
+            resolved_ip: "10.0.0.6".into(),
+            port: 8443,
+            service: port_service_label(8443),
+            open: true,
+            rtt_ms: Some(1.0),
+            detail: "conectado".into(),
+        }];
+        assert_eq!(port_service_label(8443), "HTTPS");
+        let (v_8443, ..) = fingerprint_probed_host(&row_8443).unwrap();
+        assert_eq!(v_8443, Vendor::Generic);
+
+        // With TLS Subject evidence it SHOULD detect FortiOS
+        let row_8443_forti = vec![ProbeRow {
+            host: "10.0.0.6".into(),
+            resolved_ip: "10.0.0.6".into(),
+            port: 8443,
+            service: port_service_label(8443),
+            open: true,
+            rtt_ms: Some(1.0),
+            detail: "TLS CN=FortiGate O=Fortinet".into(),
+        }];
+        let (v_forti, ..) = fingerprint_probed_host(&row_8443_forti).unwrap();
+        assert_eq!(v_forti, Vendor::FortinetFortiOs);
+    }
+
+    #[test]
+    fn backup_validation_preserves_latest_and_writes_timestamped_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let bdir = dir.path().join("backups/client/core-01");
+        let (latest, hist1, _) =
+            write_validated_backup(&bdir, "hostname CORE-01\n!\n", Some(Vendor::CiscoIos)).unwrap();
+        assert!(latest.exists());
+        assert!(hist1.exists());
+        assert_ne!(latest, hist1);
+
+        // Failed / empty / CLI-error / timeout outputs must fail validation and never touch latest.cfg
+        assert!(validate_backup_output("").is_err());
+        assert!(validate_backup_output("% Invalid input detected at '^' marker.").is_err());
+        assert!(validate_backup_output("[tempo esgotado esperando prompt]").is_err());
+        assert_eq!(
+            std::fs::read_to_string(&latest).unwrap(),
+            "hostname CORE-01\n!\n"
+        );
+    }
+
+    #[test]
+    fn legacy_ssh_and_scp_include_cbc_kex_identity_file_batch_and_legacy_flag() {
+        let dev = DeviceEntry {
+            name: "olt-01".into(),
+            host: "10.0.0.8".into(),
+            user: "admin".into(),
+            identity_file: Some("/home/ops/.ssh/id_olt".into()),
+            enable_secret_ref: Some("olt-enable".into()),
+            legacy_ssh: true,
+            ..Default::default()
+        };
+        let ssh = build_ssh_command(&dev).unwrap();
+        assert!(ssh.contains("-i /home/ops/.ssh/id_olt"), "{ssh}");
+        assert!(ssh.contains("diffie-hellman-group-exchange-sha1"), "{ssh}");
+        assert!(ssh.contains("aes128-cbc,aes256-cbc,3des-cbc"), "{ssh}");
+
+        let scp =
+            build_scp_args_with(&dev, "download", Path::new("/tmp/x"), "/cfg", true, true).unwrap();
+        assert!(scp.contains(&"-O".to_string()));
+        assert!(scp.contains(&"BatchMode=yes".to_string()));
+        assert!(scp.contains(&"-i".to_string()));
+        assert!(scp.contains(&"/home/ops/.ssh/id_olt".to_string()));
+        assert!(scp.iter().any(|a| a.contains("aes128-cbc")));
+        assert!(scp
+            .iter()
+            .any(|a| a.contains("diffie-hellman-group-exchange-sha1")));
+        assert_eq!(dev.enable_secret_ref.as_deref(), Some("olt-enable"));
+    }
+
+    #[test]
+    fn isp_noc_vendors_parse_serialize_paging_backup_risk_and_detection() {
+        let cases = [
+            (
+                Vendor::HuaweiOlt,
+                "huawei_olt",
+                &["huawei_olt", "smartax", "ma5600t", "ma5800"][..],
+                Some("scroll"),
+                "display current-configuration",
+            ),
+            (
+                Vendor::ZteOlt,
+                "zte_olt",
+                &["zte", "zte_olt", "zxa10", "c320", "c600"][..],
+                Some("terminal length 0"),
+                "show running-config",
+            ),
+            (
+                Vendor::FiberHomeOlt,
+                "fiberhome_olt",
+                &["fiberhome", "fiberhome_olt", "an5516", "an6000"][..],
+                Some("terminal length 0"),
+                "show running-config",
+            ),
+            (
+                Vendor::Datacom,
+                "datacom",
+                &["datacom", "dmos", "dmswitch"][..],
+                Some("paginate false"),
+                "show running-config",
+            ),
+            (
+                Vendor::VyOS,
+                "vyos",
+                &["vyos", "vyatta"][..],
+                Some("set terminal length 0"),
+                "show configuration commands",
+            ),
+            (
+                Vendor::AristaEos,
+                "arista_eos",
+                &["arista", "eos", "arista_eos"][..],
+                Some("terminal length 0"),
+                "show running-config",
+            ),
+            (
+                Vendor::Proxmox,
+                "proxmox",
+                &["proxmox", "pve", "proxmox_ve"][..],
+                Some("export SYSTEMCTL_PAGER=cat"),
+                "pvesh get /nodes/$(hostname)/status",
+            ),
+        ];
+
+        for (vendor, canon, aliases, paging, backup_cmd) in cases {
+            assert_eq!(vendor.as_str(), canon);
+            for a in aliases {
+                assert_eq!(Vendor::parse(a), Some(vendor), "alias {a}");
+            }
+            assert_eq!(vendor.disable_paging_cmd(), paging, "{canon}");
+            assert_eq!(
+                default_backup_command_for_vendor(Some(canon)),
+                backup_cmd,
+                "{canon}"
+            );
+            // Round-trip serde matches canonical `as_str()`
+            let json_val = serde_json::to_string(&vendor).unwrap();
+            assert_eq!(json_val, format!("\"{canon}\""), "{canon}");
+            let back: Vendor = serde_json::from_str(&json_val).unwrap();
+            assert_eq!(back, vendor);
+        }
+
+        // Risk classification per vendor
+        assert_eq!(
+            classify_network_command(Vendor::HuaweiOlt, "scroll"),
+            NetCmdRisk::ReadOnly
+        );
+        assert_eq!(
+            classify_network_command(Vendor::HuaweiOlt, "display ont info 0 all"),
+            NetCmdRisk::ReadOnly
+        );
+        assert_eq!(
+            classify_network_command(Vendor::HuaweiOlt, "board reset 0/1"),
+            NetCmdRisk::Dangerous
+        );
+        assert_eq!(
+            classify_network_command(Vendor::Datacom, "paginate false"),
+            NetCmdRisk::ReadOnly
+        );
+        assert_eq!(
+            classify_network_command(Vendor::VyOS, "set terminal length 0"),
+            NetCmdRisk::ReadOnly
+        );
+        assert_eq!(
+            classify_network_command(
+                Vendor::VyOS,
+                "set interfaces ethernet eth0 address 10.0.0.1/24"
+            ),
+            NetCmdRisk::Mutation
+        );
+        assert_eq!(
+            classify_network_command(Vendor::Proxmox, "qm list"),
+            NetCmdRisk::ReadOnly
+        );
+        assert_eq!(
+            classify_network_command(Vendor::Proxmox, "pct config 101"),
+            NetCmdRisk::ReadOnly
+        );
+        assert_eq!(
+            classify_network_command(Vendor::Proxmox, "pvesh get /nodes/pve01/status"),
+            NetCmdRisk::ReadOnly
+        );
+        assert_eq!(
+            classify_network_command(Vendor::Proxmox, "qm stop 101"),
+            NetCmdRisk::Mutation
+        );
+        assert_eq!(
+            classify_network_command(Vendor::Proxmox, "qm destroy 101"),
+            NetCmdRisk::Dangerous
+        );
+        assert_eq!(
+            classify_network_command(Vendor::Proxmox, "pct destroy 101"),
+            NetCmdRisk::Dangerous
+        );
+
+        // Config detection + vendor rollback negation
+        assert_eq!(
+            detect_config_vendor("sysname OLT-01\nont-lineprofile gpon profile-id 1", ""),
+            Vendor::HuaweiOlt
+        );
+        assert_eq!(
+            detect_config_vendor("interface gpon-olt_1/2/1\n  onu 1 type ZTE-F660", ""),
+            Vendor::ZteOlt
+        );
+        assert_eq!(
+            detect_config_vendor("AN5516-04\nset whitelist phy_addr add ...", ""),
+            Vendor::FiberHomeOlt
+        );
+        assert_eq!(
+            detect_config_vendor("DmOS 5.2\ndot1q vlan 100", ""),
+            Vendor::Datacom
+        );
+        assert_eq!(
+            detect_config_vendor("set interfaces ethernet eth0 description WAN", ""),
+            Vendor::VyOS
+        );
+        assert_eq!(
+            detect_config_vendor("! Arista DCS-7050SX\ninterface Ethernet1", ""),
+            Vendor::AristaEos
+        );
+        assert_eq!(
+            negate_cli_command(Vendor::HuaweiOlt, "ont add 0 1 sn-auth 4857"),
+            "undo ont add 0 1 sn-auth 4857"
+        );
+        assert_eq!(
+            negate_cli_command(Vendor::VyOS, "set protocols bgp 65001 neighbor 10.0.0.2"),
+            "delete protocols bgp 65001 neighbor 10.0.0.2"
+        );
+
+        // Prepare commands for VyOS & Proxmox
+        assert_eq!(
+            prepare_network_command(Vendor::VyOS, "ping 10.0.0.1")
+                .unwrap()
+                .0,
+            "ping 10.0.0.1 count 4"
+        );
+        assert_eq!(
+            prepare_network_command(Vendor::Proxmox, "ping 10.0.0.1")
+                .unwrap()
+                .0,
+            "ping -c 4 10.0.0.1"
+        );
+
+        // Banner fingerprinting for new vendors
+        let row = |banner: &str| {
+            vec![ProbeRow {
+                host: "10.0.0.50".into(),
+                resolved_ip: "10.0.0.50".into(),
+                port: 22,
+                service: "SSH",
+                open: true,
+                rtt_ms: Some(1.0),
+                detail: banner.into(),
+            }]
+        };
+        assert_eq!(
+            fingerprint_probed_host(&row("SmartAX MA5800-X7"))
+                .unwrap()
+                .0,
+            Vendor::HuaweiOlt
+        );
+        assert_eq!(
+            fingerprint_probed_host(&row("ZXA10 C320")).unwrap().0,
+            Vendor::ZteOlt
+        );
+        assert_eq!(
+            fingerprint_probed_host(&row("FiberHome AN6000")).unwrap().0,
+            Vendor::FiberHomeOlt
+        );
+        assert_eq!(
+            fingerprint_probed_host(&row("Datacom DmOS SSH")).unwrap().0,
+            Vendor::Datacom
+        );
+        assert_eq!(
+            fingerprint_probed_host(&row("VyOS 1.4")).unwrap().0,
+            Vendor::VyOS
+        );
+        assert_eq!(
+            fingerprint_probed_host(&row("Arista EOS")).unwrap().0,
+            Vendor::AristaEos
+        );
+
+        // CLI error detection for OLT/Datacom/shell
+        assert!(has_cli_error("% Unknown command, the error locates at '^'").is_some());
+        assert!(has_cli_error("% Parameter error").is_some());
+        assert!(has_cli_error("bash: pvesh: command not found").is_some());
     }
 }

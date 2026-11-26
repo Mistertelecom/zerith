@@ -24,7 +24,7 @@ use zerith_security::jail::{Jail, Jailed};
 use zerith_security::Policy;
 
 use crate::builtin::shell_command;
-use crate::fntool::{make, str_arg};
+use crate::fntool::str_arg;
 use crate::{Permission, Result, Tool, ToolError};
 
 /// Jobs alive at once, per registry.
@@ -717,40 +717,71 @@ fn pump(r: Option<Box<dyn Read + Send>>, out: &Arc<Mutex<Output>>) -> Reader {
     Reader { done, handle }
 }
 
+struct ProcessTool {
+    spec: crate::ToolSpec,
+}
+
+impl Tool for ProcessTool {
+    fn spec(&self) -> &crate::ToolSpec {
+        &self.spec
+    }
+
+    fn action(
+        &self,
+        _args: &Value,
+        _ctx: &crate::CallCtx<'_>,
+    ) -> Result<Option<zerith_security::Action>> {
+        Ok(None)
+    }
+
+    fn run(&self, a: &Value, _ctx: &crate::CallCtx<'_>, e: &crate::Exec<'_>) -> Result<String> {
+        match a["action"].as_str().unwrap_or("") {
+            "output" => e.host.jobs().read(str_arg(a, "id")?),
+            "kill" => e.host.jobs().kill(str_arg(a, "id")?),
+            "list" => e.host.jobs().list(),
+            other => Err(ToolError::BadArguments(format!(
+                "action precisa ser output, kill ou list, não {other:?}"
+            ))),
+        }
+    }
+
+    fn concurrency_safe(&self, args: &Value) -> bool {
+        matches!(args["action"].as_str(), Some("list" | "output"))
+    }
+}
+
 /// `process` and its old names. Concept after Hermes `process` (MIT,
 /// tools/process_tool.py) and Claude Code's background-shell tools.
 pub(crate) fn all() -> Vec<Box<dyn Tool>> {
     vec![
-        make(
-            "process",
-            "Jobs em segundo plano (shell run_in_background e monitor). action \"output\": a saída nova desde a última leitura e se terminou; \"kill\": encerra o job e o que ele iniciou; \"list\": os jobs desta conversa. Um job que termina sozinho já te avisa (código de saída e últimas linhas): não fique consultando.",
-            json!({"type": "object", "properties": {
-                "action": {"type": "string", "enum": ["output", "kill", "list"]},
-                "id": {"type": "string", "description": "id do job (job-N); não precisa para list"}
-            }, "required": ["action"]}),
-            "estado e saída nova do job, confirmação, ou a lista de jobs",
-            Permission::Shell,
-            10,
-            false,
-            |a, _, e| match a["action"].as_str().unwrap_or("") {
-                "output" => e.host.jobs().read(str_arg(a, "id")?),
-                "kill" => e.host.jobs().kill(str_arg(a, "id")?),
-                "list" => e.host.jobs().list(),
-                other => Err(ToolError::BadArguments(format!(
-                    "action precisa ser output, kill ou list, não {other:?}"
-                ))),
+        Box::new(ProcessTool {
+            spec: crate::ToolSpec {
+                name: "process".into(),
+                description: "Jobs em segundo plano (shell run_in_background e monitor). action \"output\": a saída nova desde a última leitura e se terminou; \"kill\": encerra o job e o que ele iniciou; \"list\": os jobs desta conversa. Um job que termina sozinho já te avisa (código de saída e últimas linhas): não fique consultando.".into(),
+                parameters: json!({"type": "object", "properties": {
+                    "action": {"type": "string", "enum": ["output", "kill", "list"]},
+                    "id": {"type": "string", "description": "id do job (job-N); não precisa para list"}
+                }, "required": ["action"]}),
+                returns: "estado e saída nova do job, confirmação, ou a lista de jobs",
+                permission: Permission::Shell,
+                timeout: Duration::from_secs(10),
+                cancellable: true,
+                local: true,
+                source: "built-in".into(),
             },
-        ),
+        }),
         // The old names still run (workflows, agent `tools:`, saved rules and
         // conversations name them) but are not offered to the model.
         alias(
             "shell_output",
             Permission::Read,
+            true,
             |a, _, e| e.host.jobs().read(str_arg(a, "id")?),
         ),
         alias(
             "shell_kill",
             Permission::Shell,
+            false,
             |a, _, e| e.host.jobs().kill(str_arg(a, "id")?),
         ),
         monitor_tool(),
@@ -758,7 +789,12 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
 }
 
 /// An unlisted old name of `process` (source [`crate::ALIAS_SOURCE`]).
-fn alias(name: &str, permission: Permission, run: crate::fntool::RunFn) -> Box<dyn Tool> {
+fn alias(
+    name: &str,
+    permission: Permission,
+    safe: bool,
+    run: crate::fntool::RunFn,
+) -> Box<dyn Tool> {
     Box::new(crate::fntool::FnTool {
         spec: crate::ToolSpec {
             name: name.into(),
@@ -773,7 +809,7 @@ fn alias(name: &str, permission: Permission, run: crate::fntool::RunFn) -> Box<d
         },
         action: |_, _| Ok(None),
         run,
-        safe: false,
+        safe,
     })
 }
 

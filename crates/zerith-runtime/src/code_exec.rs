@@ -5,7 +5,7 @@
 //! Concept and limits after Hermes Agent's `execute_code` (MIT): a script
 //! talks to the host over a loopback socket guarded by a random token, each
 //! call it makes goes through the host's full tool path, 5-minute deadline,
-//! 50 tool calls, 50 KB of stdout. No code copied.
+//! 64 tool calls, 50 KB of stdout. No code copied.
 //!
 //! Every call the script makes enters [`Pipeline`] exactly like a model call:
 //! middleware and hooks, permission rules, the approval prompt, then output
@@ -13,7 +13,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -26,7 +26,7 @@ use crate::pipeline::Pipeline;
 use crate::RunEvent;
 
 /// Tool calls one script may make.
-pub const MAX_CALLS: usize = 50;
+pub const MAX_CALLS: usize = 64;
 /// Longest a script may run.
 pub const TIMEOUT: Duration = Duration::from_secs(300);
 /// Bytes of stdout kept (head and tail).
@@ -41,6 +41,11 @@ const ALLOWED: &[&str] = &[
     "grep",
     "write_file",
     "edit_file",
+    "multi_edit",
+    "apply_patch",
+    "repo_map",
+    "diagnostics",
+    "lsp",
     "shell",
     "web_fetch",
     "web_search",
@@ -48,6 +53,14 @@ const ALLOWED: &[&str] = &[
     "net_probe",
     "net_path",
     "net_diff",
+    "net_connect",
+    "net_vpn",
+    "net_backup",
+    "net_broadcast",
+    "net_transfer",
+    "net_snmp",
+    "net_api",
+    "net_zabbix",
     "terminal_open",
     "terminal_send",
     "terminal_batch",
@@ -143,12 +156,32 @@ fn token() -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-fn python() -> &'static str {
+fn system_python() -> &'static str {
     if cfg!(windows) {
         "python"
     } else {
         "python3"
     }
+}
+
+/// Prefers a project-local `.venv` interpreter when present, falling back to
+/// the system `python` / `python3`.
+fn resolve_python(workspace: &Path) -> PathBuf {
+    let candidates: &[&[&str]] = if cfg!(windows) {
+        &[&[".venv", "Scripts", "python.exe"]]
+    } else {
+        &[&[".venv", "bin", "python"], &[".venv", "bin", "python3"]]
+    };
+    for parts in candidates {
+        let mut p = workspace.to_path_buf();
+        for seg in *parts {
+            p.push(seg);
+        }
+        if p.is_file() {
+            return p;
+        }
+    }
+    PathBuf::from(system_python())
 }
 
 /// Head and tail of `s` within [`MAX_STDOUT`] bytes, on char boundaries.
@@ -176,6 +209,7 @@ fn clip(s: &str) -> String {
 /// calls through `pipe` on this thread (approvals and middleware need it).
 pub(crate) fn run(
     pipe: &Pipeline<'_>,
+    parent_call_id: &str,
     workspace: &Path,
     code: &str,
     cancel: &Cancel,
@@ -212,8 +246,9 @@ pub(crate) fn run(
         return fail(format!("erro: não gravou o script: {e}"));
     }
 
+    let py = resolve_python(workspace);
     let jail = zerith_security::jail::Jail::for_policy(pipe.policy());
-    let mut cmd = Command::new(python());
+    let mut cmd = Command::new(&py);
     cmd.arg("-I").arg(&boot).current_dir(workspace);
     let mut cmd = jail.wrap(cmd);
     cmd.stdin(Stdio::null())
@@ -223,7 +258,10 @@ pub(crate) fn run(
         Ok(c) => c,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&dir);
-            return fail(format!("erro: não iniciou o Python ({}): {e}", python()));
+            return fail(format!(
+                "erro: não iniciou o Python ({}): {e}",
+                py.display()
+            ));
         }
     };
 
@@ -251,29 +289,48 @@ pub(crate) fn run(
                     format!("tempo esgotado ({}s)", TIMEOUT.as_secs())
                 });
             }
-            if let Ok(req) = rx.recv_timeout(Duration::from_millis(50)) {
-                let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
-                let res = if n > MAX_CALLS {
-                    (
-                        false,
-                        format!("limite de {MAX_CALLS} chamadas por script atingido"),
-                    )
-                } else if !ALLOWED.contains(&req.tool.as_str()) {
-                    (
-                        false,
-                        format!("`{}` não pode ser chamada de dentro de um script", req.tool),
-                    )
-                } else {
-                    served += 1;
-                    serve(pipe, &req.tool, req.args, n, on_event)
-                };
-                let _ = req.reply.send(res);
+            if let Ok(first) = rx.recv_timeout(Duration::from_millis(50)) {
+                let mut queued = vec![first];
+                while queued.len() < MAX_CALLS {
+                    match rx.try_recv() {
+                        Ok(req) => queued.push(req),
+                        Err(_) => break,
+                    }
+                }
+                let mut valid: Vec<(ToolCall, mpsc::Sender<(bool, String)>)> = Vec::new();
+                for req in queued {
+                    let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    if n > MAX_CALLS {
+                        let _ = req.reply.send((
+                            false,
+                            format!("limite de {MAX_CALLS} chamadas por script atingido"),
+                        ));
+                    } else if !ALLOWED.contains(&req.tool.as_str()) {
+                        let _ = req.reply.send((
+                            false,
+                            format!("`{}` não pode ser chamada de dentro de um script", req.tool),
+                        ));
+                    } else {
+                        served += 1;
+                        valid.push((
+                            ToolCall {
+                                id: format!("exec-{n}"),
+                                name: req.tool,
+                                arguments: req.args.to_string(),
+                            },
+                            req.reply,
+                        ));
+                    }
+                }
+                serve_batch(pipe, parent_call_id, valid, on_event);
             }
             if let Ok(Some(st)) = child.child.try_wait() {
                 break Ok(st);
             }
         };
-        // Unblock the accept loop and the reader threads.
+        // Drop `rx` before joining `accept` so any in-flight connection handler
+        // waiting on `rrx.recv()` unblocks cleanly instead of stalling shutdown.
+        drop(rx);
         stop.store(true, Ordering::SeqCst);
         let _ = TcpStream::connect(("127.0.0.1", port));
         let _ = accept.join();
@@ -318,31 +375,113 @@ pub(crate) fn run(
     }
 }
 
-/// One tool call from the script, through the model's own path.
-fn serve(
+/// Dispatches one or more queued script tool calls through [`Pipeline`],
+/// running consecutive `concurrency_safe` / disjoint-target calls concurrently
+/// via [`Pipeline::run_group`] while keeping `prepare`, `finish`, and
+/// `on_event` safely on the turn thread.
+fn serve_batch(
     pipe: &Pipeline<'_>,
-    tool: &str,
-    args: Value,
-    n: usize,
+    parent_call_id: &str,
+    batch: Vec<(ToolCall, mpsc::Sender<(bool, String)>)>,
     on_event: &mut dyn FnMut(RunEvent),
-) -> (bool, String) {
-    let call = ToolCall {
-        id: format!("exec-{n}"),
-        name: tool.to_string(),
-        arguments: args.to_string(),
-    };
-    on_event(RunEvent::ToolProgress {
-        tool: "execute_code".into(),
-        chunk: format!("→ {tool}\n"),
+) {
+    if batch.is_empty() {
+        return;
+    }
+    let parent_id = (!parent_call_id.is_empty()).then(|| parent_call_id.to_string());
+    let mut offset = 0usize;
+    while offset < batch.len() {
+        let calls_slice: Vec<ToolCall> = batch[offset..].iter().map(|(c, _)| c.clone()).collect();
+        let chunk_len = pipe.plan_batch(&calls_slice).max(1).min(calls_slice.len());
+        let chunk_ids: Vec<String> = calls_slice[..chunk_len]
+            .iter()
+            .map(|c| c.id.clone())
+            .collect();
+
+        for call in &calls_slice[..chunk_len] {
+            on_event(RunEvent::ToolProgress {
+                tool_call_id: parent_id.clone(),
+                tool: "execute_code".into(),
+                chunk: format!("→ {}\n", call.name),
+            });
+        }
+
+        let mut forward = |mut ev: RunEvent| {
+            if let RunEvent::ToolProgress {
+                ref mut tool_call_id,
+                ..
+            } = ev
+            {
+                if parent_id.is_some()
+                    && (tool_call_id.is_none()
+                        || tool_call_id
+                            .as_deref()
+                            .is_some_and(|id| chunk_ids.iter().any(|c| c == id)))
+                {
+                    *tool_call_id = parent_id.clone();
+                }
+            }
+            on_event(ev);
+        };
+
+        let mut prepared = Vec::with_capacity(chunk_len);
+        for call in &calls_slice[..chunk_len] {
+            prepared.push(pipe.prepare(call, &mut forward));
+        }
+        let ran = pipe.run_group(&prepared, chunk_len.min(16), &mut forward);
+        for (idx, p) in prepared.into_iter().enumerate() {
+            let ran_one = ran.get(idx).and_then(|r| r.clone());
+            let (outcome, _) = pipe.finish(p, ran_one);
+            // The script parses the page or the search JSON: it gets the bare text.
+            // ponytail: what the script prints back reaches the model unmarked; mark
+            // execute_code's output when a script read the web, if that shows up.
+            let output = crate::pipeline::strip_external(&outcome.output).to_string();
+            let _ = batch[offset + idx].1.send((outcome.ok, output));
+        }
+        offset += chunk_len;
+    }
+}
+
+fn handle_connection(mut stream: TcpStream, token: &str, tx: &mpsc::Sender<Request>) {
+    stream.set_nonblocking(false).ok();
+    stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
+    let mut line = String::new();
+    let mut reader = BufReader::new(match stream.try_clone() {
+        Ok(s) => s,
+        Err(_) => return,
     });
-    let p = pipe.prepare(&call, on_event);
-    let ran = pipe.run_group(std::slice::from_ref(&p), 1, on_event);
-    let (outcome, _) = pipe.finish(p, ran.into_iter().next().flatten());
-    // The script parses the page or the search JSON: it gets the bare text.
-    // ponytail: what the script prints back reaches the model unmarked; mark
-    // execute_code's output when a script read the web, if that shows up.
-    let output = crate::pipeline::strip_external(&outcome.output).to_string();
-    (outcome.ok, output)
+    if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
+        // The wake-up connection from `run`, or junk.
+        return;
+    }
+    let req: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
+    // Constant-time token check: another local process must not drive
+    // the session's tools.
+    let given = req["token"].as_str().unwrap_or("").as_bytes();
+    let ok_token = given.len() == token.len()
+        && given
+            .iter()
+            .zip(token.as_bytes())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0;
+    if !ok_token {
+        let _ = stream.write_all("{\"ok\":false,\"output\":\"token inválido\"}\n".as_bytes());
+        return;
+    }
+    let (rtx, rrx) = mpsc::channel();
+    let sent = tx.send(Request {
+        tool: req["tool"].as_str().unwrap_or("").to_string(),
+        args: req.get("args").cloned().unwrap_or(json!({})),
+        reply: rtx,
+    });
+    if sent.is_err() {
+        return;
+    }
+    // The turn thread may wait on the person (approval): no read timeout.
+    let (ok, output) = rrx.recv().unwrap_or((false, "cancelado".into()));
+    let body = json!({"ok": ok, "output": output}).to_string();
+    let _ = stream.write_all(body.as_bytes());
+    let _ = stream.write_all(b"\n");
 }
 
 fn accept_loop(
@@ -352,56 +491,23 @@ fn accept_loop(
     deadline: Instant,
     stop: &AtomicBool,
 ) {
-    while Instant::now() < deadline && !stop.load(Ordering::SeqCst) {
-        let stream = match listener.accept() {
-            Ok((s, _)) => s,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(10));
-                continue;
+    std::thread::scope(|s| {
+        while Instant::now() < deadline && !stop.load(Ordering::SeqCst) {
+            let stream = match listener.accept() {
+                Ok((s, _)) => s,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(_) => break,
+            };
+            if stop.load(Ordering::SeqCst) {
+                break;
             }
-            Err(_) => return,
-        };
-        stream.set_nonblocking(false).ok();
-        stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
-        let mut line = String::new();
-        let mut reader = BufReader::new(match stream.try_clone() {
-            Ok(s) => s,
-            Err(_) => continue,
-        });
-        if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
-            // The wake-up connection from `run`, or junk.
-            continue;
+            let tx = tx.clone();
+            s.spawn(move || handle_connection(stream, token, &tx));
         }
-        let req: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
-        let mut stream = stream;
-        // Constant-time token check: another local process must not drive
-        // the session's tools.
-        let given = req["token"].as_str().unwrap_or("").as_bytes();
-        let ok_token = given.len() == token.len()
-            && given
-                .iter()
-                .zip(token.as_bytes())
-                .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-                == 0;
-        if !ok_token {
-            let _ = stream.write_all("{\"ok\":false,\"output\":\"token inválido\"}\n".as_bytes());
-            continue;
-        }
-        let (rtx, rrx) = mpsc::channel();
-        let sent = tx.send(Request {
-            tool: req["tool"].as_str().unwrap_or("").to_string(),
-            args: req.get("args").cloned().unwrap_or(json!({})),
-            reply: rtx,
-        });
-        if sent.is_err() {
-            return;
-        }
-        // The turn thread may wait on the person (approval): no read timeout.
-        let (ok, output) = rrx.recv().unwrap_or((false, "cancelado".into()));
-        let body = json!({"ok": ok, "output": output}).to_string();
-        let _ = stream.write_all(body.as_bytes());
-        let _ = stream.write_all(b"\n");
-    }
+    });
 }
 
 fn read_all(r: Option<impl Read>) -> String {
@@ -463,5 +569,101 @@ mod tests {
         assert!(c.len() < MAX_STDOUT + 200);
         assert_eq!(token().len(), 32);
         assert_ne!(token(), token());
+    }
+
+    #[test]
+    fn allowed_tools_include_wave_d_and_code_tools_with_64_call_cap() {
+        assert_eq!(MAX_CALLS, 64);
+        let expected = [
+            "net_connect",
+            "net_vpn",
+            "net_backup",
+            "net_broadcast",
+            "net_transfer",
+            "net_snmp",
+            "net_api",
+            "net_zabbix",
+            "multi_edit",
+            "apply_patch",
+            "repo_map",
+            "diagnostics",
+            "lsp",
+        ];
+        let generated = stub(12345, "tok");
+        for tool in expected {
+            assert!(ALLOWED.contains(&tool), "missing {tool} in ALLOWED");
+            assert!(
+                generated.contains(&format!("def {tool}(**kw):")),
+                "missing stub for {tool}"
+            );
+        }
+        assert!(!ALLOWED.contains(&"agent"));
+        assert!(!ALLOWED.contains(&"execute_code"));
+    }
+
+    #[test]
+    fn resolve_python_prefers_workspace_venv_and_falls_back_to_system() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(resolve_python(dir.path()), PathBuf::from(system_python()));
+
+        let venv_py = if cfg!(windows) {
+            dir.path().join(".venv").join("Scripts").join("python.exe")
+        } else {
+            dir.path().join(".venv").join("bin").join("python")
+        };
+        std::fs::create_dir_all(venv_py.parent().unwrap()).unwrap();
+        std::fs::write(&venv_py, b"").unwrap();
+        assert_eq!(resolve_python(dir.path()), venv_py);
+    }
+
+    #[test]
+    fn accept_loop_handles_concurrent_requests_without_blocking() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = mpsc::channel();
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                accept_loop(
+                    &listener,
+                    "certo",
+                    tx,
+                    Instant::now() + Duration::from_secs(5),
+                    &stop,
+                )
+            });
+
+            let mut c1 = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            let mut c2 = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            c1.write_all(
+                b"{\"token\":\"certo\",\"tool\":\"net_snmp\",\"args\":{\"host\":\"r1\"}}\n",
+            )
+            .unwrap();
+            c2.write_all(
+                b"{\"token\":\"certo\",\"tool\":\"net_snmp\",\"args\":{\"host\":\"r2\"}}\n",
+            )
+            .unwrap();
+
+            // Both requests must arrive before we answer either one.
+            let r1 = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let r2 = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let _ = r1
+                .reply
+                .send((true, format!("ok:{}", r1.args["host"].as_str().unwrap())));
+            let _ = r2
+                .reply
+                .send((true, format!("ok:{}", r2.args["host"].as_str().unwrap())));
+
+            let mut s1 = String::new();
+            let mut s2 = String::new();
+            BufReader::new(c1).read_line(&mut s1).unwrap();
+            BufReader::new(c2).read_line(&mut s2).unwrap();
+            assert!(s1.contains("ok:r1"), "{s1}");
+            assert!(s2.contains("ok:r2"), "{s2}");
+
+            stop.store(true, Ordering::SeqCst);
+            let _ = TcpStream::connect(("127.0.0.1", port));
+        });
     }
 }

@@ -1,7 +1,7 @@
 // Background shell jobs (`shell run_in_background`) still running, with a Stop
 // button each. A job outlives its turn (a GUI script keeps its window after the
 // answer), so the strip polls while one exists, not only while a turn runs.
-import { useCallback, useEffect, useState } from "react";
+import { memo, useCallback, useEffect, useState } from "react";
 import { ChevronRight, CircleStop, SquareTerminal } from "lucide-react";
 import { jobsApi, type BackgroundJob, type Session } from "../lib/api";
 
@@ -11,7 +11,7 @@ function ago(secs: number): string {
   return `há ${Math.floor(secs / 3600)} h`;
 }
 
-export function BackgroundJobs({
+export const BackgroundJobs = memo(function BackgroundJobs({
   active,
   selected,
   sessions,
@@ -114,4 +114,4 @@ export function BackgroundJobs({
       })}
     </section>
   );
-}
+});

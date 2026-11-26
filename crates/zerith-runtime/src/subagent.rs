@@ -1284,7 +1284,11 @@ pub(crate) fn flush(
             }),
             HostEvent::Tasks => tasks = true,
             HostEvent::ToolProgress { tool, chunk } => {
-                on_event(RunEvent::ToolProgress { tool, chunk });
+                on_event(RunEvent::ToolProgress {
+                    tool_call_id: None,
+                    tool,
+                    chunk,
+                });
             }
         }
     }

@@ -34,7 +34,7 @@ struct Plan {
     command: String,
 }
 
-fn args_of(args: &Value, ctx: &CallCtx<'_>) -> Result<(Plan, Vec<String>)> {
+fn args_of(args: &Value, ctx: &CallCtx<'_>) -> Result<(Vec<Plan>, Vec<String>)> {
     let files: Vec<String> = args["files"]
         .as_array()
         .map(|a| {
@@ -48,11 +48,39 @@ fn args_of(args: &Value, ctx: &CallCtx<'_>) -> Result<(Plan, Vec<String>)> {
     let start = opt_str(args, "path")
         .map(|p| ctx.resolve(p))
         .unwrap_or_else(|| ctx.workspace.to_path_buf());
-    Ok((plan(&start, &files, opt_str(args, "command"))?, files))
+    Ok((plans(&start, &files, opt_str(args, "command"))?, files))
 }
 
-/// Walks up from `start` to the nearest project marker; `command` overrides.
-fn plan(start: &Path, files: &[String], command: Option<&str>) -> Result<Plan> {
+fn is_skipped_monorepo_dir(name: &str) -> bool {
+    matches!(
+        name,
+        ".git"
+            | "target"
+            | "node_modules"
+            | "dist"
+            | "build"
+            | ".next"
+            | ".venv"
+            | "venv"
+            | "__pycache__"
+            | ".cargo"
+            | ".tox"
+            | ".mypy_cache"
+            | ".ruff_cache"
+    )
+}
+
+fn is_cargo_workspace_root(dir: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(dir.join("Cargo.toml")) else {
+        return false;
+    };
+    text.parse::<toml::Table>()
+        .is_ok_and(|t| t.contains_key("workspace"))
+}
+
+/// Detects ALL project stacks in `start` + monorepo subdirectories, or walks
+/// up from `start` to the nearest enclosing project root(s); `command` overrides.
+fn plans(start: &Path, files: &[String], command: Option<&str>) -> Result<Vec<Plan>> {
     let start = if start.is_file() {
         start.parent().unwrap_or(start)
     } else {
@@ -70,52 +98,140 @@ fn plan(start: &Path, files: &[String], command: Option<&str>) -> Result<Plan> {
         command,
     };
     if let Some(c) = command {
-        return Ok(at(c, c.into()));
+        return Ok(vec![at(c, c.into())]);
     }
-    for dir in start.ancestors() {
-        if let Some(p) = detect(dir, files) {
-            return Ok(p);
+
+    let mut found = Vec::new();
+    let mut cargo_ws_roots: Vec<PathBuf> = Vec::new();
+
+    // 1. Check `start` itself (including loose `.py` files at `start`).
+    let root_plans = detect_all(start, files, true, &cargo_ws_roots);
+    if start.join("Cargo.toml").is_file() && is_cargo_workspace_root(start) {
+        cargo_ws_roots.push(start.to_path_buf());
+    }
+    found.extend(root_plans);
+
+    // 2. Scan monorepo subdirectories under `start` for additional subprojects.
+    let walker = walkdir::WalkDir::new(start)
+        .min_depth(1)
+        .max_depth(4)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_entry(|e| {
+            e.file_type().is_dir() && !e.file_name().to_str().is_some_and(is_skipped_monorepo_dir)
+        });
+    for entry in walker.flatten() {
+        let dir = entry.path();
+        let sub_plans = detect_all(dir, files, false, &cargo_ws_roots);
+        if dir.join("Cargo.toml").is_file() && is_cargo_workspace_root(dir) {
+            cargo_ws_roots.push(dir.to_path_buf());
+        }
+        found.extend(sub_plans);
+    }
+
+    if !found.is_empty() {
+        return Ok(found);
+    }
+
+    // 3. `start` is inside a project directory (e.g. `src/`): walk up to the nearest root.
+    for dir in start.ancestors().skip(1) {
+        let up = detect_all(dir, files, true, &cargo_ws_roots);
+        if !up.is_empty() {
+            return Ok(up);
         }
     }
+
     if files.iter().any(|f| f.ends_with(".py")) {
         let (label, command) = python(files);
-        return Ok(at(label, command));
+        return Ok(vec![at(label, command)]);
     }
     Err(ToolError::BadArguments(format!(
-        "nenhum projeto reconhecido (Cargo.toml, tsconfig.json, go.mod, pyproject.toml, package.json com lint/typecheck) subindo de {}; passe `command` com o verificador",
+        "nenhum projeto reconhecido (Cargo.toml, tsconfig.json, go.mod, pyproject.toml, requirements.txt, package.json com lint/typecheck) perto de {}; passe `command` com o verificador",
         start.display()
     )))
 }
 
-fn detect(dir: &Path, files: &[String]) -> Option<Plan> {
+#[cfg(test)]
+fn plan(start: &Path, files: &[String], command: Option<&str>) -> Result<Plan> {
+    plans(start, files, command)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| ToolError::Failed("nenhum plano detectado".into()))
+}
+
+fn detect_all(
+    dir: &Path,
+    files: &[String],
+    include_loose_py: bool,
+    cargo_ws_roots: &[PathBuf],
+) -> Vec<Plan> {
     let has = |f: &str| dir.join(f).is_file();
-    let (label, command) = if has("Cargo.toml") {
-        (
-            "cargo check",
-            "cargo check --all-targets --message-format=short --quiet".to_string(),
-        )
-    } else if has("tsconfig.json") {
-        (
+    let mut out = Vec::new();
+    let push = |out: &mut Vec<Plan>, label: &str, command: String| {
+        out.push(Plan {
+            dir: dir.to_path_buf(),
+            label: label.into(),
+            command,
+        });
+    };
+
+    if has("Cargo.toml") {
+        let covered_by_ws = cargo_ws_roots
+            .iter()
+            .any(|ws| dir.starts_with(ws) && dir != ws)
+            && !is_cargo_workspace_root(dir);
+        if !covered_by_ws {
+            push(
+                &mut out,
+                "cargo check",
+                "cargo check --all-targets --message-format=short --quiet".to_string(),
+            );
+        }
+    }
+
+    let has_tsconfig = has("tsconfig.json");
+    if has_tsconfig {
+        push(
+            &mut out,
             "tsc",
             "npx --no-install tsc --noEmit --pretty false -p .".to_string(),
-        )
-    } else if has("go.mod") {
-        ("go vet", "go vet ./...".to_string())
-    } else if has("pyproject.toml") || has("setup.py") || has_py(dir) {
-        python(files)
-    } else {
-        let pkg: Value =
-            serde_json::from_slice(&std::fs::read(dir.join("package.json")).ok()?).ok()?;
-        let script = ["typecheck", "lint"]
-            .into_iter()
-            .find(|s| pkg["scripts"][s].is_string())?;
-        ("npm run", format!("npm run -s {script}"))
-    };
-    Some(Plan {
-        dir: dir.to_path_buf(),
-        label: label.into(),
-        command,
-    })
+        );
+    }
+
+    if has("package.json") {
+        if let Ok(raw) = std::fs::read(dir.join("package.json")) {
+            if let Ok(pkg) = serde_json::from_slice::<Value>(&raw) {
+                let candidates: &[&str] = if has_tsconfig {
+                    &["lint"]
+                } else {
+                    &["typecheck", "lint"]
+                };
+                if let Some(script) = candidates.iter().find(|&&s| pkg["scripts"][s].is_string()) {
+                    push(&mut out, "npm run", format!("npm run -s {script}"));
+                }
+            }
+        }
+    }
+
+    if has("go.mod") {
+        push(&mut out, "go vet", "go vet ./...".to_string());
+    }
+
+    if has("pyproject.toml")
+        || has("setup.py")
+        || has("requirements.txt")
+        || (include_loose_py && has_py(dir))
+    {
+        let scoped: Vec<String> = files
+            .iter()
+            .filter(|f| Path::new(f).starts_with(dir))
+            .cloned()
+            .collect();
+        let (label, command) = python(&scoped);
+        push(&mut out, label, command);
+    }
+
+    out
 }
 
 fn has_py(dir: &Path) -> bool {
@@ -240,42 +356,62 @@ fn count(n: usize, one: &str) -> String {
     format!("{n} {one}{}", if n == 1 { "" } else { "s" })
 }
 
-fn report(
-    out: &str,
+struct PlanRun<'a> {
+    plan: &'a Plan,
+    out: String,
     ok: bool,
-    plan: &Plan,
-    ws: &Path,
-    files: &[String],
-    secs: f64,
-) -> Result<String> {
-    let all = parse(out);
-    if !ok && !all.iter().any(|d| !d.warn) {
-        // Failed without one parseable error (missing tool, bad manifest,
-        // linker): the raw tail is the only diagnosis there is.
-        let raw: Vec<&str> = out.lines().collect();
-        let tail = raw[raw.len().saturating_sub(40)..].join("\n");
-        return Err(ToolError::Failed(format!(
-            "o verificador falhou sem erro reconhecível (`{}` em {}); confira o comando ou passe `command`:\n{tail}",
-            plan.command,
-            plan.dir.display()
-        )));
-    }
+}
+
+fn report_many(runs: &[PlanRun<'_>], ws: &Path, files: &[String], secs: f64) -> Result<String> {
     let wanted: Vec<String> = files.iter().map(|f| rel(f, ws, ws)).collect();
     let mut seen = HashSet::new();
     let mut lines: Vec<(bool, String)> = Vec::new();
     let mut elsewhere = 0;
-    for d in &all {
-        let file = rel(&d.file, &plan.dir, ws);
-        if !wanted.is_empty() && !wanted.contains(&file) {
-            elsewhere += 1;
+    let mut labels: Vec<String> = Vec::new();
+    let mut unparseable_failures: Vec<(&Plan, String)> = Vec::new();
+    let mut any_ok_or_parsed = false;
+
+    for r in runs {
+        if !labels.contains(&r.plan.label) {
+            labels.push(r.plan.label.clone());
+        }
+        let parsed = parse(&r.out);
+        if !r.ok && !parsed.iter().any(|d| !d.warn) {
+            let raw: Vec<&str> = r.out.lines().collect();
+            let tail = raw[raw.len().saturating_sub(40)..].join("\n");
+            unparseable_failures.push((r.plan, tail));
             continue;
         }
-        let sev = if d.warn { "aviso" } else { "erro" };
-        let text = format!("{file}:{}:{}: {sev}: {}", d.line, d.col, d.msg);
-        if seen.insert(text.clone()) {
-            lines.push((d.warn, text));
+        any_ok_or_parsed = true;
+        for d in &parsed {
+            let file = rel(&d.file, &r.plan.dir, ws);
+            if !wanted.is_empty() && !wanted.contains(&file) {
+                elsewhere += 1;
+                continue;
+            }
+            let sev = if d.warn { "aviso" } else { "erro" };
+            let text = format!("{file}:{}:{}: {sev}: {}", d.line, d.col, d.msg);
+            if seen.insert(text.clone()) {
+                lines.push((d.warn, text));
+            }
         }
     }
+
+    if !any_ok_or_parsed && !unparseable_failures.is_empty() {
+        let details = unparseable_failures
+            .iter()
+            .map(|(p, tail)| {
+                format!(
+                    "o verificador falhou sem erro reconhecível (`{}` em {}); confira o comando ou passe `command`:\n{tail}",
+                    p.command,
+                    p.dir.display()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        return Err(ToolError::Failed(details));
+    }
+
     // Errors first, each group in the checker's order.
     lines.sort_by_key(|(warn, _)| *warn);
     let errors = lines.iter().filter(|(w, _)| !w).count();
@@ -283,7 +419,7 @@ fn report(
         "{}, {} ({}, {secs:.1} s)",
         count(errors, "erro"),
         count(lines.len() - errors, "aviso"),
-        plan.label
+        labels.join(" + ")
     );
     for (_, l) in lines.iter().take(MAX_LINES) {
         text.push('\n');
@@ -298,50 +434,94 @@ fn report(
     if elsewhere > 0 {
         text.push_str(&format!("\n({elsewhere} diagnósticos em outros arquivos)"));
     }
+    for (p, tail) in unparseable_failures {
+        let dir_rel = p
+            .dir
+            .strip_prefix(ws)
+            .unwrap_or(&p.dir)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let dir_shown = if dir_rel.is_empty() { "." } else { &dir_rel };
+        let first_err = tail.lines().last().unwrap_or("").trim();
+        text.push_str(&format!(
+            "\n(verificador `{}` em {dir_shown} não rodou: {first_err})",
+            p.label
+        ));
+    }
     Ok(text)
 }
 
+#[cfg(test)]
+fn report(
+    out: &str,
+    ok: bool,
+    plan: &Plan,
+    ws: &Path,
+    files: &[String],
+    secs: f64,
+) -> Result<String> {
+    report_many(
+        &[PlanRun {
+            plan,
+            out: out.to_string(),
+            ok,
+        }],
+        ws,
+        files,
+        secs,
+    )
+}
+
 fn action(args: &Value, ctx: &CallCtx<'_>) -> Result<Option<Action>> {
-    Ok(Some(Action::Shell(args_of(args, ctx)?.0.command)))
+    let (plans, _) = args_of(args, ctx)?;
+    let combined = plans
+        .iter()
+        .map(|p| p.command.as_str())
+        .collect::<Vec<_>>()
+        .join(" && ");
+    Ok(Some(Action::Shell(combined)))
 }
 
 fn run(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
-    let (plan, files) = args_of(args, ctx)?;
+    let (plans, files) = args_of(args, ctx)?;
     let custom_cmd = args["command"].as_str().is_some();
-    let shell_args = json!({"command": plan.command, "timeout_secs": exec.deadline.saturating_duration_since(Instant::now()).as_secs().max(1)});
-    let sub = CallCtx {
-        workspace: &plan.dir,
-        policy: ctx.policy,
-        memory: None,
-        scope: None,
-    };
     let started = Instant::now();
-    // Auto-detected checkers (`cargo check`, `tsc --noEmit`, `go vet`, `ruff`,
-    // `py_compile`) are read-only verification commands and must not trigger an
-    // expensive shadow-git snapshot.
-    let res = if custom_cmd {
-        let shell = crate::builtin::all()
-            .into_iter()
-            .find(|t| t.spec().name == "shell")
-            .ok_or_else(|| ToolError::Failed("ferramenta shell ausente".into()))?;
-        shell.run(&shell_args, &sub, exec)
-    } else {
-        crate::builtin::shell_without_snapshot(&shell_args, &sub, exec)
-    };
-    let out = match res {
-        Ok(t) => t,
-        Err(ToolError::Failed(t)) if t.starts_with("exit ") => t,
-        Err(e) => return Err(e),
-    };
+    let mut runs = Vec::with_capacity(plans.len());
+
+    for plan in &plans {
+        exec.check()?;
+        let shell_args = json!({
+            "command": plan.command,
+            "timeout_secs": exec.deadline.saturating_duration_since(Instant::now()).as_secs().max(1)
+        });
+        let sub = CallCtx {
+            workspace: &plan.dir,
+            policy: ctx.policy,
+            memory: None,
+            scope: None,
+        };
+        // Auto-detected checkers (`cargo check`, `tsc --noEmit`, `go vet`, `ruff`,
+        // `py_compile`) are read-only verification commands and must not trigger an
+        // expensive shadow-git snapshot.
+        let res = if custom_cmd {
+            let shell = crate::builtin::all()
+                .into_iter()
+                .find(|t| t.spec().name == "shell")
+                .ok_or_else(|| ToolError::Failed("ferramenta shell ausente".into()))?;
+            shell.run(&shell_args, &sub, exec)
+        } else {
+            crate::builtin::shell_without_snapshot(&shell_args, &sub, exec)
+        };
+        let out = match res {
+            Ok(t) => t,
+            Err(ToolError::Failed(t)) if t.starts_with("exit ") => t,
+            Err(e) => return Err(e),
+        };
+        let ok = out.starts_with("exit 0\n");
+        runs.push(PlanRun { plan, out, ok });
+    }
     let secs = started.elapsed().as_secs_f64();
-    report(
-        &out,
-        out.starts_with("exit 0\n"),
-        &plan,
-        ctx.workspace,
-        &files,
-        secs,
-    )
+    report_many(&runs, ctx.workspace, &files, secs)
 }
 
 pub(crate) fn all() -> Vec<Box<dyn Tool>> {
@@ -356,7 +536,7 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
         "contagem no topo (\"3 erros, 2 avisos (cargo check, 4.1 s)\") e uma linha arquivo:linha:coluna: erro|aviso: mensagem por diagnóstico",
         Permission::Shell,
         300,
-        false,
+        true,
         action,
         run,
     )]
@@ -549,5 +729,87 @@ src\\main.rs:2:18: error[E0308]: mismatched types: expected `u32`, found `&str`\
             0,
             "auto-detected diagnostics must not snapshot the workspace"
         );
+    }
+
+    #[test]
+    fn detects_all_monorepo_stacks_and_subprojects() {
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-scratch");
+        std::fs::create_dir_all(&base).unwrap();
+        let tmp = tempfile::Builder::new().tempdir_in(base).unwrap();
+        let root = tmp.path();
+
+        // Root is a Cargo workspace + root package.json (no scripts), plus subprojects.
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/core\"]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("crates/core")).unwrap();
+        std::fs::write(
+            root.join("crates/core/Cargo.toml"),
+            "[package]\nname = \"core\"\n",
+        )
+        .unwrap();
+
+        std::fs::create_dir_all(root.join("apps/web/src")).unwrap();
+        std::fs::write(root.join("apps/web/tsconfig.json"), "{}").unwrap();
+        std::fs::write(
+            root.join("apps/web/package.json"),
+            r#"{"scripts": {"lint": "eslint ."}}"#,
+        )
+        .unwrap();
+
+        std::fs::create_dir_all(root.join("services/worker")).unwrap();
+        std::fs::write(root.join("services/worker/requirements.txt"), "fastapi\n").unwrap();
+
+        std::fs::create_dir_all(root.join("services/gateway")).unwrap();
+        std::fs::write(root.join("services/gateway/go.mod"), "module gw\n").unwrap();
+
+        // Inside node_modules should always be skipped.
+        std::fs::create_dir_all(root.join("apps/web/node_modules/pkg")).unwrap();
+        std::fs::write(root.join("apps/web/node_modules/pkg/tsconfig.json"), "{}").unwrap();
+
+        let all_plans = plans(root, &[], None).unwrap();
+        let pairs: Vec<(&str, PathBuf)> = all_plans
+            .iter()
+            .map(|p| (p.label.as_str(), p.dir.clone()))
+            .collect();
+
+        // Cargo workspace root once (member crate skipped), plus tsc, npm run lint, python, go vet.
+        assert!(
+            pairs.contains(&("cargo check", root.to_path_buf())),
+            "{pairs:?}"
+        );
+        assert!(
+            !pairs.contains(&("cargo check", root.join("crates/core"))),
+            "workspace member Cargo.toml should not duplicate root workspace check: {pairs:?}"
+        );
+        assert!(pairs.contains(&("tsc", root.join("apps/web"))), "{pairs:?}");
+        assert!(
+            pairs.contains(&("npm run", root.join("apps/web"))),
+            "{pairs:?}"
+        );
+        assert!(
+            pairs.contains(&("go vet", root.join("services/gateway"))),
+            "{pairs:?}"
+        );
+        assert!(
+            all_plans
+                .iter()
+                .any(|p| p.dir == root.join("services/worker")
+                    && matches!(p.label.as_str(), "ruff" | "compileall")),
+            "{pairs:?}"
+        );
+        assert!(
+            !pairs
+                .iter()
+                .any(|(_, d)| d.to_string_lossy().contains("node_modules")),
+            "{pairs:?}"
+        );
+
+        // Targeting a file inside a subproject detects all stacks of that subproject.
+        let web_plans = plans(&root.join("apps/web/src"), &[], None).unwrap();
+        assert_eq!(web_plans.len(), 2, "{web_plans:?}");
+        assert_eq!(web_plans[0].dir, root.join("apps/web"));
     }
 }

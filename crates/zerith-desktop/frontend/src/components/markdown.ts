@@ -233,6 +233,24 @@ export function parseBlocksCached(src: string): MdBlock[] {
   return parsed;
 }
 
+function scanFence(line: string, fenceChar: string, fenceLen: number): [string, number] {
+  if (fenceChar) {
+    const t = line.trim();
+    if (t.length >= fenceLen && t[0] === fenceChar && /^(`+|~+)$/.test(t)) {
+      return ["", 0];
+    }
+    return [fenceChar, fenceLen];
+  }
+  const fence = FENCE.exec(line);
+  return fence ? [fence[1][0], fence[1].length] : ["", 0];
+}
+
+function isTopLevelBoundary(lines: string[], i: number): boolean {
+  if (lines[i].trim() || i + 1 >= lines.length) return false;
+  const next = lines[i + 1];
+  return Boolean(next.trim()) && !/^\s/.test(next) && !QUOTE.test(next) && !ITEM.test(next);
+}
+
 /** Splits streaming Markdown into a finished top-level prefix (`stable`) and
  * the trailing active block (`tail`), only breaking on blank lines outside
  * open code fences or nested list continuations. */
@@ -244,28 +262,9 @@ export function splitStableMarkdown(src: string): { stable: string; tail: string
   let splitLine = -1;
 
   for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (fenceChar) {
-      const t = line.trim();
-      if (t.length >= fenceLen && t[0] === fenceChar && /^(`+|~+)$/.test(t)) {
-        fenceChar = "";
-        fenceLen = 0;
-      }
-      continue;
-    }
-    const fence = FENCE.exec(line);
-    if (fence) {
-      fenceChar = fence[1][0];
-      fenceLen = fence[1].length;
-      continue;
-    }
-    // Split after a blank line only when the next non-blank line starts at column 0
-    // and is not a loose continuation item (`- b` after `- a`) or quote continuation.
-    if (!line.trim() && i + 1 < lines.length) {
-      const next = lines[i + 1];
-      if (next.trim() && !/^\s/.test(next) && !QUOTE.test(next) && !ITEM.test(next)) {
-        splitLine = i + 1;
-      }
+    [fenceChar, fenceLen] = scanFence(lines[i], fenceChar, fenceLen);
+    if (!fenceChar && isTopLevelBoundary(lines, i)) {
+      splitLine = i + 1;
     }
   }
 
@@ -274,4 +273,41 @@ export function splitStableMarkdown(src: string): { stable: string; tail: string
     stable: lines.slice(0, splitLine).join("\n"),
     tail: lines.slice(splitLine).join("\n"),
   };
+}
+
+/** Splits completed Markdown into independent top-level chunks so appending new
+ * paragraphs keeps earlier chunk strings identical for LRU caching and memo. */
+export function splitMarkdownChunks(src: string): string[] {
+  if (!src) return [];
+  const norm = src.replace(/\r\n?/g, "\n");
+  const lines = norm.split("\n");
+  let fenceChar = "";
+  let fenceLen = 0;
+  let start = 0;
+  const chunks: string[] = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    [fenceChar, fenceLen] = scanFence(lines[i], fenceChar, fenceLen);
+    if (!fenceChar && isTopLevelBoundary(lines, i)) {
+      const chunk = lines.slice(start, i + 1).join("\n");
+      if (chunk.trim()) chunks.push(chunk);
+      start = i + 1;
+    }
+  }
+  const rest = lines.slice(start).join("\n");
+  if (rest.trim()) chunks.push(rest);
+  return chunks;
+}
+
+/** Returns true when `src` ends inside an unclosed triple-backtick or
+ * triple-tilde code fence (used to defer highlighting while streaming). */
+export function hasUnclosedFence(src: string): boolean {
+  if (!src) return false;
+  const lines = src.replace(/\r\n?/g, "\n").split("\n");
+  let fenceChar = "";
+  let fenceLen = 0;
+  for (let i = 0; i < lines.length; i++) {
+    [fenceChar, fenceLen] = scanFence(lines[i], fenceChar, fenceLen);
+  }
+  return fenceChar !== "";
 }

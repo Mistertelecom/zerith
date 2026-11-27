@@ -193,16 +193,44 @@ impl Library {
     /// Creates a skill the model wrote: staged, scanned, installed **disabled**.
     /// Nothing is left behind on a refusal.
     pub fn create_ai_skill(&self, new: &NewSkill, session: &str) -> Result<Created> {
+        self.upsert_ai_skill(new, session, false)
+    }
+
+    /// Creates or (when `overwrite` is true) updates a skill written by the model.
+    /// Never overwrites user/catalog/plugin skills: only an existing `ai-created:`
+    /// skill can be replaced, and the replacement is always staged & scanned first
+    /// before replacing and installed **disabled** for user review.
+    pub fn upsert_ai_skill(
+        &self,
+        new: &NewSkill,
+        session: &str,
+        overwrite: bool,
+    ) -> Result<Created> {
         validate(new)?;
-        // Free name, in the manifest and on disk.
-        if self.manifest()?.skills.iter().any(|s| s.name == new.name)
-            || self.root().join(&new.name).exists()
-        {
-            return refuse(format!(
-                "já existe uma skill chamada {:?}; escolha outro nome (as suas não são alteradas)",
-                new.name
-            ));
-        }
+        let existing = self
+            .manifest()?
+            .skills
+            .into_iter()
+            .find(|s| s.name == new.name);
+        let dir_exists = self.root().join(&new.name).exists();
+        let replacing_ai = match (&existing, dir_exists) {
+            (Some(s), _) if overwrite && s.source.starts_with(AI_SOURCE) => true,
+            (Some(_), _) | (None, true) => {
+                let msg = if overwrite {
+                    format!(
+                        "{:?} já existe e não foi criada pela IA; só a pessoa pode alterar skills dela",
+                        new.name
+                    )
+                } else {
+                    format!(
+                        "já existe uma skill chamada {:?}; escolha outro nome ou use overwrite=true se ela foi criada pela IA",
+                        new.name
+                    )
+                };
+                return refuse(msg);
+            }
+            (None, false) => false,
+        };
         let stage = tempfile_dir(self.root(), &new.name)?;
         let result = (|| -> Result<Created> {
             std::fs::write(stage.join("SKILL.md"), render(new))?;
@@ -233,6 +261,9 @@ impl Library {
                 .filter(|f| f.severity >= Severity::Warn)
                 .map(|f| f.message.clone())
                 .collect();
+            if replacing_ai {
+                self.remove(&new.name)?;
+            }
             let row = self.install_with_status(
                 &stage,
                 &format!("{AI_SOURCE}{session}"),

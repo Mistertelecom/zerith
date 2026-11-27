@@ -1477,6 +1477,13 @@ fn turn_body(
                     if let Some(msg) = image_message(&outcome.output) {
                         images.push(msg);
                     }
+                } else if outcome.ok
+                    && call.name == "browser"
+                    && p_args(&call.arguments)["action"].as_str() == Some("screenshot")
+                {
+                    if let Some(msg) = outcome.output.lines().next().and_then(image_message) {
+                        images.push(msg);
+                    }
                 }
                 // "Read TASK.md and do it": the request names no subject, so
                 // the skill ranking at the start found nothing. The first

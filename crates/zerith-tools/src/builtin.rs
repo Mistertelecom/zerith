@@ -12,6 +12,8 @@ use crate::{CallCtx, Exec, Permission, Result, Tool, ToolError, ToolSpec};
 mod edit;
 mod search;
 
+pub(crate) use edit::reindent_replacement;
+
 use edit::{edit_file, multi_edit};
 use search::{glob, grep, list_dir, repo_map};
 
@@ -214,7 +216,7 @@ pub(crate) fn all() -> Vec<Box<dyn crate::Tool>> {
         ),
         tool(
             "shell",
-            "Executa um comando no shell dentro do workspace: bash (Git Bash no Windows, quando instalado; senão cmd), sh nos demais. Programa que não termina sozinho (janela gráfica, servidor, `python -m http.server`) precisa de run_in_background: em primeiro plano ele é encerrado no timeout e a janela fecha junto.",
+            "Executa um comando no shell dentro do workspace: bash (Git Bash no Windows, quando instalado; senão cmd), sh nos demais. Programa que não termina sozinho (janela gráfica, servidor, `python -m http.server`) precisa de run_in_background: em primeiro plano ele é encerrado no timeout e a janela fecha junto. Em testes de GUI (Tkinter/PyQt/etc.), use timeout_secs curto (20-30s), mocke diálogos modais (ex.: messagebox) e evite esconder stdout atrás de `| tail`.",
             json!({"type": "object", "properties": {
                 "command": {"type": "string"},
                 "timeout_secs": {"type": "integer", "description": "padrão 120, máximo 600"},
@@ -499,8 +501,13 @@ fn read_file(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String>
     let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
     exec.host.note_read(&path);
     let offset = args["offset"].as_u64().unwrap_or(1).max(1) as usize;
-    let limit = args["limit"].as_u64().unwrap_or(2000) as usize;
+    let limit = args["limit"].as_u64().unwrap_or(2000).max(1) as usize;
     let total = text.lines().count();
+    if total > 0 && offset > total {
+        return Ok(format!(
+            "[offset {offset} além do fim do arquivo ({total} linhas)]\n"
+        ));
+    }
     if lossy {
         eprintln!(
             "zerith: {} não está em UTF-8, lido como Latin-1",
@@ -621,8 +628,12 @@ fn write_file(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String
     write_atomic(&path, content.as_bytes())?;
     // The model knows what it just wrote; a follow-up edit needs no re-read.
     exec.host.note_read(&path);
-    crate::lsp::notify_save(ctx.workspace, &path);
     let mut msg = format!("{} bytes escritos em {}", content.len(), path.display());
+    if let Some(diags) = crate::lsp::warm_diagnostics_for_edit(ctx.workspace, &path) {
+        msg.push_str(&format!("\n\n[diagnósticos LSP]\n{diags}"));
+    } else {
+        crate::lsp::notify_save(ctx.workspace, &path);
+    }
     crate::postcheck::append(&mut msg, &path, pc);
     Ok(msg)
 }
@@ -665,9 +676,15 @@ pub fn shell_command(cmd: &str) -> Command {
         c.env("PATH", path_with(std::env::var_os("PATH"), &dir));
     }
     // Output goes to a model and a <pre>, not a terminal: color codes are noise.
+    // Unbuffered UTF-8 Python + non-interactive git/pip prevent silent 8 KB
+    // pipe buffering, CP1252 crashes on Windows, and hidden terminal prompts.
     c.env("NO_COLOR", "1")
         .env("CARGO_TERM_COLOR", "never")
-        .env("FORCE_COLOR", "0");
+        .env("FORCE_COLOR", "0")
+        .env("PYTHONUNBUFFERED", "1")
+        .env("PYTHONUTF8", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("PIP_NO_INPUT", "1");
     c
 }
 
@@ -743,12 +760,14 @@ fn shell_exec(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>, snapshot: bool) 
     // in `zerith policy` and `docs/sandbox.md`.
     let mut jailed = jail.spawn_wrapped(command)?;
     let child = &mut jailed.child;
+    let started = std::time::Instant::now();
+    let last_activity_ms = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     // Pipes are drained on threads: a child that fills a pipe buffer would
     // otherwise block forever while we wait for it to exit.
     let drain = |r: Option<Box<dyn Read + Send>>, sink: crate::EventSink| {
         let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (fill, finished) = (buf.clone(), done.clone());
+        let (fill, finished, activity) = (buf.clone(), done.clone(), last_activity_ms.clone());
         std::thread::spawn(move || {
             let mut chunk = [0u8; 8192];
             let mut pending = Vec::new();
@@ -758,6 +777,10 @@ fn shell_exec(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>, snapshot: bool) 
                     if n == 0 {
                         break;
                     }
+                    activity.store(
+                        started.elapsed().as_millis() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                     {
                         let mut v = fill.lock().unwrap_or_else(|e| e.into_inner());
                         // ponytail: 8 MB per stream is a log's worth; a runaway
@@ -792,18 +815,20 @@ fn shell_exec(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>, snapshot: bool) 
     };
     let sink = exec.host.sink();
     let (out, out_done) = drain(child.stdout.take().map(|s| Box::new(s) as _), sink.clone());
-    let (err, err_done) = drain(child.stderr.take().map(|s| Box::new(s) as _), sink);
+    let (err, err_done) = drain(child.stderr.take().map(|s| Box::new(s) as _), sink.clone());
     let text_of = |b: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>| {
         let v = b.lock().unwrap_or_else(|e| e.into_inner());
         decode(&v)
     };
+    let mut last_heartbeat = started;
     let status = loop {
         if let Some(s) = child.try_wait()? {
             break s;
         }
+        let now = std::time::Instant::now();
         let stop = if exec.cancel.is_cancelled() {
             Some(ToolError::Cancelled)
-        } else if std::time::Instant::now() >= deadline {
+        } else if now >= deadline {
             Some(ToolError::Timeout(Duration::from_secs(secs)))
         } else {
             None
@@ -815,12 +840,25 @@ fn shell_exec(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>, snapshot: bool) 
             std::thread::sleep(Duration::from_millis(150));
             return Err(match e {
                 ToolError::Timeout(d) => ToolError::Failed(format!(
-                    "tempo esgotado após {}s: o comando e o que ele iniciou foram encerrados.\nDICA: Se o comando abre uma janela gráfica (GUI) ou servidor contínuo, NÃO repita em primeiro plano — execute UMA ÚNICA VEZ com run_in_background: true.\n--- stdout (parcial)\n{}\n--- stderr (parcial)\n{}",
+                    "tempo esgotado após {}s: o comando e o que ele iniciou foram encerrados.\nDICA: Se o comando abre uma janela gráfica (GUI) ou servidor contínuo, NÃO repita em primeiro plano — execute UMA ÚNICA VEZ com run_in_background: true. Se for um teste de GUI (ex.: Tkinter/PyQt), verifique diálogos modais bloqueantes (como messagebox.showerror) e remova pipes como `| tail` para enxergar onde travou.\n--- stdout (parcial)\n{}\n--- stderr (parcial)\n{}",
                     d.as_secs(),
                     text_of(&out),
                     text_of(&err)
                 )),
                 other => other,
+            });
+        }
+        // Emit a quiet heartbeat every 15s of silence so long/blocked commands
+        // (e.g. GUI modal dialogs or `| tail` buffering stdout) never look frozen.
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let last_io_ms = last_activity_ms.load(std::sync::atomic::Ordering::Relaxed);
+        if elapsed_ms.saturating_sub(last_io_ms) >= 15_000
+            && last_heartbeat.elapsed() >= Duration::from_secs(15)
+        {
+            last_heartbeat = now;
+            sink.push(crate::HostEvent::ToolProgress {
+                tool: "shell".into(),
+                chunk: format!("[executando há {}s sem nova saída…]\n", elapsed_ms / 1000),
             });
         }
         std::thread::sleep(Duration::from_millis(20));

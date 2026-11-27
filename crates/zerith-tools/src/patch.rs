@@ -113,8 +113,7 @@ fn parse(text: &str) -> Result<Vec<Op>> {
                     if started {
                         chunks.push(std::mem::take(&mut cur));
                     }
-                    let a = l.trim_start_matches('@').trim();
-                    cur.anchor = (!a.is_empty()).then(|| a.to_string());
+                    cur.anchor = parse_hunk_anchor(l);
                     started = true;
                 } else if let Some(r) = l.strip_prefix('-') {
                     cur.old.push(r.into());
@@ -166,24 +165,49 @@ fn parse(text: &str) -> Result<Vec<Op>> {
     Ok(ops)
 }
 
+/// Extracts the optional anchor text from a `@@` hunk header.
+/// Supports both Codex-style (`@@ fn foo()`) and standard unified-diff headers
+/// (`@@ -42,7 +42,9 @@` or `@@ -42,7 +42,9 @@ fn foo()`), so models emitting
+/// unified diff line ranges never fail trying to match `"-42,7 +42,9 @@"` as code.
+fn parse_hunk_anchor(line: &str) -> Option<String> {
+    let rest = line.trim_start_matches('@').trim();
+    if rest.is_empty() {
+        return None;
+    }
+    if rest.starts_with('-') {
+        if let Some((range, tail)) = rest.split_once("@@") {
+            let mut parts = range.split_whitespace();
+            let looks_like_range = parts.next().is_some_and(|p| p.starts_with('-'))
+                && parts.next().is_some_and(|p| p.starts_with('+'))
+                && parts.next().is_none();
+            if looks_like_range {
+                let t = tail.trim();
+                return (!t.is_empty()).then(|| t.to_string());
+            }
+        }
+    }
+    Some(rest.to_string())
+}
+
 /// All start indices where `pat` matches in `lines` at or after `from` in the
 /// first matching pass: exact, then ignoring trailing whitespace, then ignoring
-/// both ends.
-fn seek_all(lines: &[String], pat: &[String], from: usize, eof: bool) -> Vec<usize> {
+/// both ends. Returns `(indices, trimmed_both_ends)`.
+fn seek_all(lines: &[String], pat: &[String], from: usize, eof: bool) -> (Vec<usize>, bool) {
     if pat.is_empty() {
-        return vec![if eof { lines.len() } else { from }];
+        return (vec![if eof { lines.len() } else { from }], false);
     }
     if pat.len() > lines.len() {
-        return Vec::new();
+        return (Vec::new(), false);
     }
     let last = lines.len() - pat.len();
     let start = if eof { last.max(from) } else { from };
-    let eq: [fn(&str, &str) -> bool; 3] = [
-        |a, b| a == b,
-        |a, b| a.trim_end() == b.trim_end(),
-        |a, b| a.trim() == b.trim(),
+    type LineEq = fn(&str, &str) -> bool;
+    let eq: [(LineEq, bool); 3] = [
+        (|a, b| a == b, false),
+        (|a, b| a.trim_end() == b.trim_end(), false),
+        (|a, b| a.trim() == b.trim(), true),
     ];
-    for f in eq {
+    for (f, fuzzy_indent) in eq {
         let mut hits = Vec::new();
         for i in start..=last {
             if pat.iter().enumerate().all(|(k, p)| f(&lines[i + k], p)) {
@@ -191,7 +215,7 @@ fn seek_all(lines: &[String], pat: &[String], from: usize, eof: bool) -> Vec<usi
             }
         }
         if !hits.is_empty() {
-            return hits;
+            return (hits, fuzzy_indent);
         }
         if eof && start > from {
             for i in from..start {
@@ -200,18 +224,50 @@ fn seek_all(lines: &[String], pat: &[String], from: usize, eof: bool) -> Vec<usi
                 }
             }
             if !hits.is_empty() {
-                return hits;
+                return (hits, fuzzy_indent);
             }
         }
     }
-    Vec::new()
+    (Vec::new(), false)
 }
 
 /// Where `pat` starts in `lines` at or after `from`: exact, then ignoring
 /// trailing whitespace, then ignoring both ends.
 #[cfg(test)]
 fn seek(lines: &[String], pat: &[String], from: usize, eof: bool) -> Option<usize> {
-    seek_all(lines, pat, from, eof).into_iter().next()
+    seek_all(lines, pat, from, eof).0.into_iter().next()
+}
+
+fn closest_lines_hint(lines: &[String], pat: &[String]) -> String {
+    let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let first = pat
+        .iter()
+        .map(|s| norm(s))
+        .find(|s| !s.is_empty())
+        .unwrap_or_default();
+    if first.is_empty() {
+        return String::new();
+    }
+    let words: Vec<&str> = first.split(' ').collect();
+    let mut scored: Vec<(usize, usize)> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(i, l)| {
+            let n = norm(l);
+            let hits = words.iter().filter(|w| n.contains(*w)).count();
+            (hits * 2 >= words.len()).then_some((hits, i))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    if scored.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\nlinhas mais parecidas:");
+    for &(_, idx) in scored.iter().take(3) {
+        let preview: String = lines[idx].chars().take(180).collect();
+        out.push_str(&format!("\n{}\t{preview}", idx + 1));
+    }
+    out
 }
 
 fn apply_chunks(path: &str, text: &str, chunks: &[Chunk]) -> Result<String> {
@@ -224,10 +280,11 @@ fn apply_chunks(path: &str, text: &str, chunks: &[Chunk]) -> Result<String> {
     let mut cursor = 0usize;
     for (n, c) in chunks.iter().enumerate() {
         if let Some(a) = &c.anchor {
-            let anchor_hits = seek_all(&lines, std::slice::from_ref(a), cursor, false);
+            let (anchor_hits, _) = seek_all(&lines, std::slice::from_ref(a), cursor, false);
             if anchor_hits.is_empty() {
+                let hint = closest_lines_hint(&lines, std::slice::from_ref(a));
                 return Err(ToolError::Failed(format!(
-                    "{path}: trecho {} não achou a linha de referência `@@ {a}`; nada foi alterado",
+                    "{path}: trecho {} não achou a linha de referência `@@ {a}`; nada foi alterado{hint}",
                     n + 1
                 )));
             }
@@ -244,11 +301,12 @@ fn apply_chunks(path: &str, text: &str, chunks: &[Chunk]) -> Result<String> {
             }
             cursor = anchor_hits[0];
         }
-        let hits = seek_all(&lines, &c.old, cursor, c.eof);
+        let (hits, fuzzy_indent) = seek_all(&lines, &c.old, cursor, c.eof);
         let at = match hits.as_slice() {
             [] => {
+                let hint = closest_lines_hint(&lines, &c.old);
                 return Err(ToolError::Failed(format!(
-                    "{path}: trecho {} não bate com o arquivo (as linhas com - e espaço precisam existir nessa ordem); leia o arquivo de novo. Nada foi alterado",
+                    "{path}: trecho {} não bate com o arquivo (as linhas com - e espaço precisam existir nessa ordem); leia o arquivo de novo. Nada foi alterado{hint}",
                     n + 1
                 )));
             }
@@ -264,7 +322,22 @@ fn apply_chunks(path: &str, text: &str, chunks: &[Chunk]) -> Result<String> {
                 )));
             }
         };
-        lines.splice(at..at + c.old.len(), c.new.iter().cloned());
+        let replacement: Vec<String> = if fuzzy_indent && !c.old.is_empty() {
+            let matched = lines[at..at + c.old.len()].join("\n");
+            let old_joined = c.old.join("\n");
+            let new_joined = c.new.join("\n");
+            if c.new.is_empty() {
+                Vec::new()
+            } else {
+                crate::builtin::reindent_replacement(&matched, &old_joined, &new_joined)
+                    .split('\n')
+                    .map(String::from)
+                    .collect()
+            }
+        } else {
+            c.new.clone()
+        };
+        lines.splice(at..at + c.old.len(), replacement);
         cursor = at + c.new.len();
     }
     let nl = if crlf { "\r\n" } else { "\n" };
@@ -661,5 +734,40 @@ mod tests {
             std::fs::read_to_string(dir.path().join("approved_default.txt")).unwrap(),
             "ok\n"
         );
+    }
+
+    #[test]
+    fn unified_diff_hunk_headers_and_fuzzy_reindent_work_cleanly() {
+        assert_eq!(parse_hunk_anchor("@@ -10,3 +10,4 @@"), None);
+        assert_eq!(
+            parse_hunk_anchor("@@ -10,3 +10,4 @@ def greet():"),
+            Some("def greet():".into())
+        );
+        assert_eq!(parse_hunk_anchor("@@ fn main()"), Some("fn main()".into()));
+
+        let src = "def run():\n    if ready:\n        x = 1\n        return x\n";
+        let patch = "*** Begin Patch\n*** Update File: app.py\n@@ -2,3 +2,4 @@ def run():\n if ready:\n-    x = 1\n+    x = 2\n+    print(x)\n     return x\n*** End Patch\n";
+        let ops = parse(patch).unwrap();
+        let Op::Update { chunks, .. } = &ops[0] else {
+            panic!("expected Update");
+        };
+        let out = apply_chunks("app.py", src, chunks).unwrap();
+        assert_eq!(
+            out,
+            "def run():\n    if ready:\n        x = 2\n        print(x)\n        return x\n"
+        );
+    }
+
+    #[test]
+    fn failed_patch_includes_closest_line_hint() {
+        let src = "def compute():\n    total = value * 2\n    return total\n";
+        let patch = "*** Begin Patch\n*** Update File: app.py\n@@\n-    total = value * 999\n+    total = value * 3\n*** End Patch\n";
+        let ops = parse(patch).unwrap();
+        let Op::Update { chunks, .. } = &ops[0] else {
+            panic!("expected Update");
+        };
+        let err = apply_chunks("app.py", src, chunks).unwrap_err().to_string();
+        assert!(err.contains("linhas mais parecidas:"), "{err}");
+        assert!(err.contains("2\t    total = value * 2"), "{err}");
     }
 }

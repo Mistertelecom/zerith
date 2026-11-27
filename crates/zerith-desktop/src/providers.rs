@@ -200,6 +200,10 @@ pub struct AccountForm {
     pub base_url: Option<String>,
     #[serde(default)]
     pub protocol: Option<String>,
+    /// Curated list of model IDs shown in Chat & Delegation for this account.
+    /// `None` keeps the previously saved list; `Some(vec![])` resets to default.
+    #[serde(default)]
+    pub enabled_models: Option<Vec<String>>,
 }
 
 fn trimmed(v: &Option<String>) -> Option<String> {
@@ -207,6 +211,17 @@ fn trimmed(v: &Option<String>) -> Option<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
+}
+
+fn normalize_models(list: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(list.len());
+    for item in list {
+        let id = item.trim();
+        if !id.is_empty() && !out.iter().any(|existing: &String| existing == id) {
+            out.push(id.to_string());
+        }
+    }
+    out
 }
 
 #[tauri::command]
@@ -247,6 +262,10 @@ pub async fn account_save(
             .map(str::trim)
             .filter(|m| !m.is_empty())
             .map(str::to_string),
+        enabled_models: match &form.enabled_models {
+            Some(list) => normalize_models(list),
+            None => previous.enabled_models.clone(),
+        },
         enabled: form.enabled,
         api_key_ref: previous.api_key_ref.clone().or(Some(id.clone())),
         label: trimmed(&form.label).or(previous.label.clone()),
@@ -278,9 +297,14 @@ pub async fn account_test(state: tauri::State<'_, AppState>, form: AccountForm) 
     if provider.is_empty() {
         return Err("Informe o provedor da conta".into());
     }
+    let saved = wire::configured_accounts(&root)
+        .into_iter()
+        .find(|a| a.id == form.id.trim());
     let mut cfg = ProviderConfig::new(ProviderKind::parse(&provider));
     cfg.name = provider;
-    if let Some(u) = trimmed(&form.base_url) {
+    if let Some(u) =
+        trimmed(&form.base_url).or_else(|| saved.as_ref().and_then(|s| s.base_url.clone()))
+    {
         if !(u.starts_with("http://") || u.starts_with("https://")) {
             return Err("URL precisa começar com http:// ou https://".into());
         }
@@ -289,14 +313,20 @@ pub async fn account_test(state: tauri::State<'_, AppState>, form: AccountForm) 
     match form.protocol.as_deref().map(str::trim) {
         Some("anthropic") => cfg.protocol = Protocol::Anthropic,
         Some("openai") => cfg.protocol = Protocol::OpenAi,
-        _ => {}
+        _ => match saved.as_ref().and_then(|s| s.protocol) {
+            Some(zerith_core::settings::WireProtocol::Anthropic) => {
+                cfg.protocol = Protocol::Anthropic;
+            }
+            Some(zerith_core::settings::WireProtocol::OpenAi) => {
+                cfg.protocol = Protocol::OpenAi;
+            }
+            None => {}
+        },
     }
     cfg.api_key = trimmed(&form.key).or_else(|| {
-        let saved = wire::configured_accounts(&root)
-            .into_iter()
-            .find(|a| a.id == form.id.trim())?;
-        let key_ref = saved.api_key_ref.unwrap_or(saved.id);
-        zerith_core::secrets::get_secret(&key_ref)
+        let saved = saved.as_ref()?;
+        let key_ref = saved.api_key_ref.as_deref().unwrap_or(&saved.id);
+        zerith_core::secrets::get_secret(key_ref)
             .ok()
             .filter(|k| !k.trim().is_empty())
     });
@@ -580,5 +610,25 @@ mod tests {
         assert_eq!(cfg_empty.api_key, None);
         assert_eq!(typed_empty, None);
         assert!(!ProviderView::of(&cfg_empty).has_key);
+    }
+
+    #[test]
+    fn normalize_models_trims_skips_empty_and_dedups_preserving_order() {
+        let got = normalize_models(&[
+            " anthropic/claude-sonnet-4.5 ".into(),
+            "".into(),
+            "   ".into(),
+            "microsoft/microsoft-decision-1.1".into(),
+            "anthropic/claude-sonnet-4.5".into(),
+            "openai/gpt-5.4".into(),
+        ]);
+        assert_eq!(
+            got,
+            vec![
+                "anthropic/claude-sonnet-4.5".to_string(),
+                "microsoft/microsoft-decision-1.1".to_string(),
+                "openai/gpt-5.4".to_string(),
+            ]
+        );
     }
 }

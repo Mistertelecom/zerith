@@ -44,9 +44,10 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
 Suporta motor híbrido (`engine`): `auto` (padrão: usa Cloudflare Kitesurf para páginas públicas quando configurado e Chromium local para IPs de LAN/CGNAT/localhost ou como fallback automático), `kitesurf` (motor leve Wasm/Blitz) ou `chromium` (Edge/Chrome local com perfil persistente). \
 Fluxo: navigate {url} → snapshot (título, texto visível e lista numerada de elementos [n]) → click/type com ref=n → snapshot de novo para ver o resultado. \
 Login em painel (OLT, roteador, firewall): type o usuário e use fill_secret {ref do campo de senha, secret} para a senha; nunca peça a senha ao usuário nem a escreva com type. \
-screenshot devolve uma linha Markdown ![screenshot](caminho) para mostrar ao usuário.",
+screenshot salva o PNG, anexa a imagem automaticamente para você inspecionar visualmente e devolve uma linha Markdown ![screenshot](caminho) para mostrar ao usuário. \
+console lista erros/avisos de console JavaScript e exceções não tratadas capturadas desde o último navigate.",
         json!({"type": "object", "properties": {
-            "action": {"type": "string", "enum": ["navigate", "snapshot", "click", "type", "fill_secret", "press", "eval", "screenshot", "back", "close"]},
+            "action": {"type": "string", "enum": ["navigate", "snapshot", "click", "type", "fill_secret", "press", "eval", "screenshot", "console", "back", "close"]},
             "secret": {"type": "string", "description": "fill_secret: nome do segredo no cofre do sistema (zerith secret set <nome>) ou nome de um equipamento do inventário com secret_ref; o valor é digitado no campo de senha sem passar por você"},
             "engine": {"type": "string", "enum": ["auto", "kitesurf", "chromium"], "description": "motor CDP: auto (Kitesurf na web pública com fallback Chromium; Chromium direto em LAN/CGNAT/localhost), kitesurf ou chromium"},
             "url": {"type": "string", "description": "navigate: endereço http(s)"},
@@ -78,7 +79,7 @@ fn label(args: &Value) -> Result<String> {
         "fill_secret" => format!("{} no campo ref {}", str_arg(args, "secret")?, args["ref"]),
         "press" => str_arg(args, "key")?.into(),
         "eval" => str_arg(args, "expression")?.chars().take(200).collect(),
-        "snapshot" | "screenshot" | "back" | "close" => String::new(),
+        "snapshot" | "screenshot" | "console" | "back" | "close" => String::new(),
         other => return Err(bad_action(other)),
     };
     Ok(format!("navegador {action} {detail}")
@@ -88,7 +89,7 @@ fn label(args: &Value) -> Result<String> {
 
 fn bad_action(a: &str) -> ToolError {
     ToolError::BadArguments(format!(
-        "ação desconhecida: {a}; use navigate, snapshot, click, type, fill_secret, press, eval, screenshot, back ou close"
+        "ação desconhecida: {a}; use navigate, snapshot, click, type, fill_secret, press, eval, screenshot, console, back ou close"
     ))
 }
 
@@ -376,6 +377,7 @@ fn act(c: &mut Cdp, action: &str, args: &Value, root: &Path, exec: &Exec<'_>) ->
     match action {
         "navigate" => {
             let url = nav_url(str_arg(args, "url")?)?;
+            c.console_errors.clear();
             let r = c.call("Page.navigate", json!({ "url": url }), exec)?;
             if let Some(e) = r["errorText"].as_str().filter(|e| !e.is_empty()) {
                 return Err(ToolError::Failed(format!("não abriu {url}: {e}")));
@@ -531,12 +533,27 @@ fn act(c: &mut Cdp, action: &str, args: &Value, root: &Path, exec: &Exec<'_>) ->
                 .map_or(0, |d| d.as_millis());
             let path = dir.join(format!("{ms}.png"));
             std::fs::write(&path, &png)?;
+            let kb = png.len().div_ceil(1024);
+            let shown = path.display().to_string().replace('\\', "/");
             Ok(format!(
-                "Captura salva em {} ({} KB).\n{}\nCole a linha Markdown acima na resposta para o usuário ver a imagem.",
+                "{} png, {kb} KB: ![imagem](<{shown}>)\nCaptura salva em {} ({kb} KB).\n{}\nCole a linha Markdown acima na resposta para o usuário ver a imagem.",
+                crate::IMAGE_MARKER,
                 path.display(),
-                png.len().div_ceil(1024),
                 md_image(&path)
             ))
+        }
+        "console" => {
+            // Pump pending CDP events briefly so recent console errors land in `console_errors`.
+            let _ = c.eval("void 0", exec);
+            if c.console_errors.is_empty() {
+                Ok("Nenhum erro ou aviso de console capturado nesta página.".into())
+            } else {
+                Ok(format!(
+                    "{} evento(s) de console:\n{}",
+                    c.console_errors.len(),
+                    c.console_errors.join("\n")
+                ))
+            }
         }
         "back" => {
             c.eval("history.back()", exec)?;
@@ -870,10 +887,12 @@ fn attach_kitesurf<'a>(
             frame: String::new(),
             id: 0,
             seen: Vec::new(),
+            console_errors: Vec::new(),
         };
         // Kitesurf implements a streamlined CDP subset; tolerate missing
-        // frame-tree metadata on stateless isolates.
+        // frame-tree metadata or Runtime domain on stateless isolates.
         let _ = c.call("Page.enable", json!({}), exec);
+        let _ = c.call("Runtime.enable", json!({}), exec);
         if let Ok(tree) = c.call("Page.getFrameTree", json!({}), exec) {
             c.frame = tree["frameTree"]["frame"]["id"]
                 .as_str()
@@ -923,8 +942,10 @@ fn attach_chromium<'a>(
             frame: String::new(),
             id: 0,
             seen: Vec::new(),
+            console_errors: Vec::new(),
         };
         c.call("Page.enable", json!({}), exec)?;
+        let _ = c.call("Runtime.enable", json!({}), exec);
         let tree = c.call("Page.getFrameTree", json!({}), exec)?;
         c.frame = tree["frameTree"]["frame"]["id"]
             .as_str()
@@ -969,6 +990,57 @@ struct Cdp {
     id: u64,
     /// Main-frame `Page.*` events since the action started.
     seen: Vec<String>,
+    /// Console errors/warnings and uncaught exceptions captured since `navigate`.
+    console_errors: Vec<String>,
+}
+
+fn format_cdp_console_event(method: &str, params: &Value) -> Option<String> {
+    match method {
+        "Runtime.exceptionThrown" => {
+            let det = &params["exceptionDetails"];
+            let msg = det["exception"]["description"]
+                .as_str()
+                .or_else(|| det["text"].as_str())
+                .unwrap_or("exceção não tratada");
+            let loc = det["url"]
+                .as_str()
+                .filter(|u| !u.is_empty())
+                .map(|u| {
+                    let line = det["lineNumber"].as_u64().map(|n| n + 1).unwrap_or(1);
+                    format!(" ({u}:{line})")
+                })
+                .unwrap_or_default();
+            Some(format!("[exception] {msg}{loc}"))
+        }
+        "Runtime.consoleAPICalled" => {
+            let kind = params["type"].as_str()?;
+            if !matches!(kind, "error" | "warning" | "assert") {
+                return None;
+            }
+            let text = params["args"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|a| {
+                            a["value"]
+                                .as_str()
+                                .map(str::to_string)
+                                .or_else(|| a["description"].as_str().map(str::to_string))
+                                .or_else(|| (!a["value"].is_null()).then(|| a["value"].to_string()))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_default();
+            let text = text.trim();
+            if text.is_empty() {
+                None
+            } else {
+                Some(format!("[console.{kind}] {text}"))
+            }
+        }
+        _ => None,
+    }
 }
 
 impl Cdp {
@@ -994,6 +1066,13 @@ impl Cdp {
         let v: Value = serde_json::from_str(&text)?;
         if let Some(m) = v["method"].as_str() {
             let p = &v["params"];
+            if let Some(entry) = format_cdp_console_event(m, p) {
+                let capped: String = entry.chars().take(400).collect();
+                self.console_errors.push(capped);
+                if self.console_errors.len() > 40 {
+                    self.console_errors.remove(0);
+                }
+            }
             if self.frame.is_empty()
                 || p["frameId"]
                     .as_str()
@@ -1461,5 +1540,42 @@ mod tests {
             ("::1".into(), 8787, "/cdp".into())
         );
         assert!(parse_cdp_endpoint("").is_err());
+    }
+
+    #[test]
+    fn format_cdp_console_event_captures_errors_warnings_and_exceptions_only() {
+        let err = format_cdp_console_event(
+            "Runtime.consoleAPICalled",
+            &json!({
+                "type": "error",
+                "args": [{"value": "Uncaught"}, {"description": "TypeError: x is undefined"}]
+            }),
+        );
+        assert_eq!(
+            err.as_deref(),
+            Some("[console.error] Uncaught TypeError: x is undefined")
+        );
+
+        let info = format_cdp_console_event(
+            "Runtime.consoleAPICalled",
+            &json!({"type": "log", "args": [{"value": "hello"}]}),
+        );
+        assert!(info.is_none());
+
+        let exc = format_cdp_console_event(
+            "Runtime.exceptionThrown",
+            &json!({
+                "exceptionDetails": {
+                    "text": "Uncaught",
+                    "url": "http://localhost:5183/src/App.tsx",
+                    "lineNumber": 41,
+                    "exception": {"description": "ReferenceError: foo is not defined"}
+                }
+            }),
+        );
+        assert_eq!(
+            exc.as_deref(),
+            Some("[exception] ReferenceError: foo is not defined (http://localhost:5183/src/App.tsx:42)")
+        );
     }
 }

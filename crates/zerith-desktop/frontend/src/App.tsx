@@ -59,6 +59,7 @@ import type { SettingsTab } from "./components/Settings";
 import { Composer, type CommandName } from "./components/Composer";
 import { Logo, ZerithMark } from "./components/ui";
 import { catalogEntry, NOT_CHAT } from "./lib/catalog";
+import { resolveAccountModelIds } from "./lib/accountModels";
 import { titleOf } from "./lib/title";
 import { TitleBar, type AppView } from "./components/TitleBar";
 import { BotEmblem, emblemForAgent } from "./components/BotEmblem";
@@ -1297,19 +1298,8 @@ export default function App() {
       if (!a.enabled) continue;
       const name =
         a.label || catalogEntry(a.oauth_tool || a.provider)?.name || a.id;
-      // An account that publishes its list is the authority: a model it no
-      // longer serves (Antigravity retired Gemini 4 Hydrogen) is not offered,
-      // not even as its saved default.
-      const live = liveModels[a.id];
-      const ids = [
-        ...(live ? [] : [a.default_model]),
-        ...(live ?? catalogEntry(a.oauth_tool || a.provider)?.models ?? []).map(
-          (m) => m.id,
-        ),
-      ];
-      for (const m of [...new Set(ids)].filter(
-        (m): m is string => !!m && !NOT_CHAT.test(m),
-      ))
+      const ids = resolveAccountModelIds(a, { live: liveModels[a.id] });
+      for (const m of ids)
         out.push({ value: a.id + ":" + m, label: name + " · " + m });
     }
     for (const p of boot.providers)

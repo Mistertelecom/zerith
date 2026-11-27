@@ -40,6 +40,7 @@ import {
   type Routing,
 } from "../lib/api";
 import { catalogEntry } from "../lib/catalog";
+import { resolveAccountModelIds } from "../lib/accountModels";
 import { Card, EmptyState, Logo } from "./ui";
 
 type Key =
@@ -175,16 +176,24 @@ function buildGroups(
     const pvs = providers.filter(
       (pv) => pv.account_id === a.id || pv.name === a.provider,
     );
-    const ids = [
-      a.default_model,
-      ...pvs.flatMap((pv) => [pv.default_model, ...pv.known_models]),
-    ];
+    const extraIds = pvs.flatMap((pv) => [
+      pv.default_model,
+      ...pv.known_models,
+    ]);
+    const ids = resolveAccountModelIds(a, { extraIds });
+    const names = new Map(
+      (catalogEntry(cat)?.models ?? []).map((m) => [m.id, m.name] as const),
+    );
     return {
       key: "a:" + a.id,
       logo: cat,
       title: a.label || a.id,
       sub: nameOf(presets, cat),
-      options: options(ids, cat, (m) => `${a.id}:${m}`),
+      options: ids.map((m) => ({
+        spec: `${a.id}:${m}`,
+        model: m,
+        name: names.get(m) ?? m,
+      })),
     };
   });
   const fromProviders = providers

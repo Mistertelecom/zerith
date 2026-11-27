@@ -427,12 +427,16 @@ fn connect_account(
 ) -> Result<String, String> {
     zerith_core::secrets::save_oauth(&zerith_core::secrets::Configured, account, cred)
         .map_err(|e| e.to_string())?;
+    let previous = configured_accounts(root)
+        .into_iter()
+        .find(|a| a.id == account)
+        .unwrap_or_default();
     let acc = settings::AccountEntry {
         id: account.to_string(),
         provider: oauth_provider(tool).to_string(),
         auth: AuthModeSettings::Oauth,
         oauth_tool: Some(tool.as_str().to_string()),
-        ..Default::default()
+        ..previous
     };
     save_account(root, &acc, None)?;
     let minutes = (cred.expires_at - zerith_providers::oauth::now_secs()).max(0) / 60;

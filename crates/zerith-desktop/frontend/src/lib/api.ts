@@ -180,6 +180,8 @@ export interface Account {
   protocol: string | null;
   base_url: string | null;
   default_model: string | null;
+  /** Curated whitelist of model IDs shown in Chat & Delegation (empty = provider defaults). */
+  enabled_models?: string[];
   api_key_ref: string | null;
   priority: number;
   enabled: boolean;
@@ -201,6 +203,8 @@ export interface AccountForm {
   label?: string | null;
   base_url?: string | null;
   protocol?: "openai" | "anthropic" | null;
+  /** Optional whitelist of visible models; omitted = keep saved, [] = reset to defaults. */
+  enabled_models?: string[];
 }
 
 export interface Routing {

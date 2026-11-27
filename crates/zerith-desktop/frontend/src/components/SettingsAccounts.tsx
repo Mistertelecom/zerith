@@ -1,5 +1,5 @@
 // Accounts, plan quotas and usage tabs of the settings screen (loaded on demand).
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   api,
   type Account,
@@ -24,6 +24,7 @@ import {
   Globe,
   HardDrive,
   KeyRound,
+  ListChecks,
   ListOrdered,
   LogIn,
   Pencil,
@@ -43,6 +44,10 @@ import {
   type CatalogEntry,
   NOT_CHAT,
 } from "../lib/catalog";
+import {
+  mergeModelChoices,
+  normalizeModelList,
+} from "../lib/accountModels";
 import { Card, EmptyState, Logo, Stat, Switch, Field, ProbeResult } from "./ui";
 import { fmt, compact, nameOf, host, isOauth } from "./settingsFmt";
 import { CostCard } from "./SessionCost";
@@ -107,6 +112,7 @@ const accountForm = (a: Account): AccountForm => ({
     a.protocol === "anthropic" || a.protocol === "openai"
       ? a.protocol
       : undefined,
+  enabled_models: normalizeModelList(a.enabled_models ?? []),
 });
 
 const AUTH: Record<CatalogAuth, { label: string; icon: LucideIcon }> = {
@@ -228,6 +234,7 @@ export function AccountsTab(p: {
   const [sheet, setSheet] = useState<{
     entry: CatalogEntry;
     edit?: Account;
+    focusModels?: boolean;
   } | null>(null);
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<Filter>("all");
@@ -243,7 +250,8 @@ export function AccountsTab(p: {
       passes(e, filter) &&
       (!q || (e.name + " " + e.id + " " + e.baseUrl).toLowerCase().includes(q)),
   );
-  const edit = (a: Account) => setSheet({ entry: entryFor(a), edit: a });
+  const edit = (a: Account, focusModels = false) =>
+    setSheet({ entry: entryFor(a), edit: a, focusModels });
 
   // The pill reads the cofre, so it refreshes whenever the list changes
   // (a login just landed, an account was saved).
@@ -310,6 +318,17 @@ export function AccountsTab(p: {
                         <>
                           <span className="sep">·</span>
                           <span className="mono">{a.default_model}</span>
+                        </>
+                      ) : null}
+                      {a.enabled_models?.length ? (
+                        <>
+                          <span className="sep">·</span>
+                          <span title="Somente estes modelos aparecem no chat e em Delegação">
+                            {a.enabled_models.length}{" "}
+                            {a.enabled_models.length === 1
+                              ? "modelo no chat"
+                              : "modelos no chat"}
+                          </span>
                         </>
                       ) : null}
                       {a.window_hours !== WINDOW_H ? (
@@ -397,6 +416,16 @@ export function AccountsTab(p: {
                     }
                   />
                   <span className="item-actions">
+                    <button
+                      className={
+                        "icon-btn sm" + (a.enabled_models?.length ? " on" : "")
+                      }
+                      title="Escolher modelos visíveis no chat"
+                      aria-label={"Modelos de " + a.id}
+                      onClick={() => edit(a, true)}
+                    >
+                      <ListChecks size={14} strokeWidth={2} />
+                    </button>
                     <button
                       className="icon-btn sm"
                       title="Editar conta"
@@ -568,9 +597,16 @@ export function AccountsTab(p: {
 
       {sheet ? (
         <ConnectSheet
-          key={sheet.entry.id + "/" + (sheet.edit?.id ?? "")}
+          key={
+            sheet.entry.id +
+            "/" +
+            (sheet.edit?.id ?? "") +
+            "/" +
+            (sheet.focusModels ? "m" : "e")
+          }
           entry={sheet.entry}
           edit={sheet.edit}
+          focusModels={sheet.focusModels}
           accounts={p.accounts}
           presets={p.presets}
           oauth={oauth}
@@ -579,7 +615,7 @@ export function AccountsTab(p: {
           onImport={p.onImport}
           onImportPasted={p.onImportPasted}
           onImport9={p.onImport9}
-          onEdit={edit}
+          onEdit={(a) => edit(a)}
           onClose={() => setSheet(null)}
         />
       ) : null}
@@ -594,6 +630,7 @@ const OTHER = "__outro";
 function ConnectSheet(p: {
   entry: CatalogEntry;
   edit?: Account;
+  focusModels?: boolean;
   accounts: Account[];
   presets: Preset[];
   oauth: Record<string, OAuthState>;
@@ -607,8 +644,9 @@ function ConnectSheet(p: {
 }) {
   const e = p.entry;
   const custom = !CATALOG.includes(e);
-  const models = e.models ?? [];
+  const models = useMemo(() => e.models ?? [], [e.models]);
   const ref = useRef<HTMLDialogElement>(null);
+  const modelsSearchRef = useRef<HTMLInputElement>(null);
   // only used by the "other subscription" block
   const [pasted, setPasted] = useState("");
   const [form, setForm] = useState<AccountForm>(() =>
@@ -630,23 +668,180 @@ function ConnectSheet(p: {
           label: custom ? null : e.name,
           base_url: e.baseUrl,
           protocol: e.protocol === "anthropic" ? "anthropic" : "openai",
+          enabled_models: [],
         },
   );
+  const [liveIds, setLiveIds] = useState<string[]>([]);
+  const [fetchingModels, setFetchingModels] = useState(false);
+  const [modelsStatus, setModelsStatus] = useState<{
+    ok: boolean;
+    text: string;
+  } | null>(null);
+  const [modelQuery, setModelQuery] = useState("");
+  const [modelTab, setModelTab] = useState<"all" | "selected">("all");
+  const [showNonChat, setShowNonChat] = useState(false);
+  const [customModel, setCustomModel] = useState("");
   const [other, setOther] = useState(
     () =>
-      !!form.default_model && !models.some((m) => m.id === form.default_model),
+      !!form.default_model &&
+      !models.some((m) => m.id === form.default_model) &&
+      !(form.enabled_models ?? []).includes(form.default_model),
   );
-  const set = (patch: Partial<AccountForm>) =>
-    setForm((f) => ({ ...f, ...patch }));
+  const set = useCallback(
+    (patch: Partial<AccountForm>) => setForm((f) => ({ ...f, ...patch })),
+    [],
+  );
   const close = () => ref.current?.close();
   const [probe, setProbe] = useState<ProbeView | null>(null);
   const [testing, setTesting] = useState(false);
+
+  const tool = e.oauthTool ?? p.edit?.oauth_tool ?? null;
+  const oauthNew = e.auth === "oauth" && !p.edit;
+  const oauthEdit = !!p.edit && isOauth(p.edit);
+
+  const selectedModels = useMemo(
+    () => normalizeModelList(form.enabled_models ?? []),
+    [form.enabled_models],
+  );
+  const selectedSet = useMemo(() => new Set(selectedModels), [selectedModels]);
+
+  const allChoices = useMemo(
+    () =>
+      mergeModelChoices({
+        liveIds,
+        catalogModels: models,
+        selectedIds: selectedModels,
+        defaultModel: form.default_model,
+      }),
+    [liveIds, models, selectedModels, form.default_model],
+  );
+
+  // Options for the default-model <select>: selected models first, then catalogue/live
+  // capped so a 400+ OpenRouter list stays snappy inside a native <select>.
+  const defaultSelectChoices = useMemo(() => {
+    const out = [
+      ...allChoices.filter((c) => selectedSet.has(c.id)),
+      ...allChoices.filter(
+        (c) => !selectedSet.has(c.id) && !NOT_CHAT.test(c.id),
+      ),
+    ];
+    return out.slice(0, 120);
+  }, [allChoices, selectedSet]);
+
+  const nonChatCount = useMemo(
+    () =>
+      allChoices.filter(
+        (c) => NOT_CHAT.test(c.id) && !selectedSet.has(c.id),
+      ).length,
+    [allChoices, selectedSet],
+  );
+
+  const filteredChoices = useMemo(() => {
+    const q = modelQuery.trim().toLowerCase();
+    const base = allChoices.filter((c) => {
+      if (modelTab === "selected") return selectedSet.has(c.id);
+      if (!showNonChat && !selectedSet.has(c.id) && NOT_CHAT.test(c.id))
+        return false;
+      return true;
+    });
+    const matched = q
+      ? base.filter(
+          (c) =>
+            c.id.toLowerCase().includes(q) || c.name.toLowerCase().includes(q),
+        )
+      : base;
+    // Without a search query, float checked models to the top so the user sees
+    // their active whitelist right away; while searching, keep API order (newest first).
+    if (!q && modelTab === "all" && selectedSet.size > 0) {
+      return [
+        ...matched.filter((c) => selectedSet.has(c.id)),
+        ...matched.filter((c) => !selectedSet.has(c.id)),
+      ];
+    }
+    return matched;
+  }, [allChoices, modelQuery, modelTab, showNonChat, selectedSet]);
+
+  const toggleModel = (id: string) => {
+    const next = selectedSet.has(id)
+      ? selectedModels.filter((x) => x !== id)
+      : [...selectedModels, id];
+    set({ enabled_models: next });
+  };
+
+  const addCustomModel = () => {
+    const id = customModel.trim();
+    if (!id) return;
+    if (!selectedSet.has(id)) {
+      set({ enabled_models: [...selectedModels, id] });
+    }
+    setCustomModel("");
+  };
+
+  const fetchLiveModels = useCallback(
+    async (snapshot: AccountForm) => {
+      setFetchingModels(true);
+      setModelsStatus(null);
+      try {
+        if (oauthEdit && p.edit) {
+          const list = await api.accountModels(p.edit.id);
+          const ids = normalizeModelList(list.map((m) => m.id));
+          if (ids.length) {
+            setLiveIds(ids);
+            setModelsStatus({
+              ok: true,
+              text: `${ids.length} modelos carregados da conta.`,
+            });
+          } else {
+            setModelsStatus({
+              ok: true,
+              text: "Esta conta não publica lista remota; marque dos sugeridos ou adicione um ID.",
+            });
+          }
+        } else {
+          const res = await api.accountTest(snapshot);
+          const ids = normalizeModelList(res.models ?? []);
+          if (res.ok && ids.length) {
+            setLiveIds(ids);
+            setModelsStatus({
+              ok: true,
+              text: `${ids.length} modelos carregados da API (${res.latency_ms} ms).`,
+            });
+          } else if (res.ok) {
+            setModelsStatus({
+              ok: true,
+              text: "Conexão OK, mas o provedor não retornou lista em /models.",
+            });
+          } else {
+            setModelsStatus({
+              ok: false,
+              text: res.detail || `Falha ao listar modelos (HTTP ${res.status}).`,
+            });
+          }
+        }
+      } catch (err) {
+        setModelsStatus({ ok: false, text: String(err) });
+      } finally {
+        setFetchingModels(false);
+      }
+    },
+    [oauthEdit, p.edit],
+  );
+
   // the real request the router would make: endpoint + protocol + key (typed or in the cofre)
   const test = async () => {
     setTesting(true);
     setProbe(null);
     try {
-      setProbe(await api.accountTest(form));
+      const res = await api.accountTest(form);
+      setProbe(res);
+      if (res.ok && res.models.length) {
+        const ids = normalizeModelList(res.models);
+        setLiveIds(ids);
+        setModelsStatus({
+          ok: true,
+          text: `${ids.length} modelos carregados da API (${res.latency_ms} ms).`,
+        });
+      }
     } catch (err) {
       setProbe({
         ok: false,
@@ -660,14 +855,21 @@ function ConnectSheet(p: {
     }
   };
 
+  const didAutoFetch = useRef(false);
   useEffect(() => {
     const d = ref.current;
     if (d && !d.open) d.showModal();
-    d?.querySelector<HTMLElement>("[data-first]")?.focus();
-  }, []);
+    if (p.focusModels) {
+      modelsSearchRef.current?.focus();
+      if (!didAutoFetch.current && p.edit) {
+        didAutoFetch.current = true;
+        void fetchLiveModels(accountForm(p.edit));
+      }
+    } else {
+      d?.querySelector<HTMLElement>("[data-first]")?.focus();
+    }
+  }, [p.focusModels, p.edit, fetchLiveModels]);
 
-  const tool = e.oauthTool ?? p.edit?.oauth_tool ?? null;
-  const oauthNew = e.auth === "oauth" && !p.edit;
   const linked =
     custom || p.edit ? [] : p.accounts.filter((a) => entryOf(a) === e);
   const url = (form.base_url ?? "").trim();
@@ -688,16 +890,22 @@ function ConnectSheet(p: {
   const save = async () => {
     setSaving(true);
     setSaveErr(false);
-    const ok = await p.onSave(form);
+    const ok = await p.onSave({
+      ...form,
+      enabled_models: selectedModels,
+    });
     setSaving(false);
     if (ok) close();
     else setSaveErr(true);
   };
 
+  const MAX_RENDER = 120;
+  const visibleChoices = filteredChoices.slice(0, MAX_RENDER);
+
   return (
     <dialog
       ref={ref}
-      className="sheet"
+      className={"sheet" + (oauthNew ? "" : " sheet-wide")}
       aria-label={(p.edit ? "Editar " : "Conectar ") + e.name}
       onClose={p.onClose}
       // Esc closes this dialog only, not the settings behind it.
@@ -899,26 +1107,35 @@ function ConnectSheet(p: {
               ) : null}
               <label className="field">
                 <span className="field-label">Modelo padrão</span>
-                {models.length ? (
+                {defaultSelectChoices.length ? (
                   <select
                     className="select"
                     value={other ? OTHER : (form.default_model ?? "")}
                     onChange={(ev) => {
                       const v = ev.target.value;
                       setOther(v === OTHER);
-                      if (v !== OTHER) set({ default_model: v });
+                      if (v !== OTHER) {
+                        const nextPatch: Partial<AccountForm> = {
+                          default_model: v,
+                        };
+                        // If a whitelist is active, keep the chosen default visible in chat too.
+                        if (v && selectedModels.length > 0 && !selectedSet.has(v)) {
+                          nextPatch.enabled_models = [v, ...selectedModels];
+                        }
+                        set(nextPatch);
+                      }
                     }}
                   >
                     <option value="">Padrão do provedor</option>
-                    {models.map((m) => (
+                    {defaultSelectChoices.map((m) => (
                       <option key={m.id} value={m.id}>
-                        {m.name}
+                        {m.name === m.id ? m.id : `${m.name} (${m.id})`}
                       </option>
                     ))}
                     <option value={OTHER}>Outro…</option>
                   </select>
                 ) : null}
-                {!models.length || other ? (
+                {!defaultSelectChoices.length || other ? (
                   <input
                     className="mono"
                     value={form.default_model ?? ""}
@@ -927,6 +1144,203 @@ function ConnectSheet(p: {
                   />
                 ) : null}
               </label>
+
+              <section
+                className="model-picker"
+                aria-label="Modelos visíveis no chat"
+              >
+                <div className="model-picker-head">
+                  <div className="model-picker-title">
+                    <span className="field-label">Modelos no chat</span>
+                    <span
+                      className={
+                        "badge" + (selectedModels.length > 0 ? " ok" : "")
+                      }
+                    >
+                      {selectedModels.length > 0
+                        ? `${selectedModels.length} ${selectedModels.length === 1 ? "ativo" : "ativos"}`
+                        : "Padrão do catálogo"}
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    className="btn btn-sm"
+                    disabled={
+                      fetchingModels ||
+                      (!oauthEdit && (!form.provider.trim() || !urlOk))
+                    }
+                    onClick={() => void fetchLiveModels(form)}
+                    title="Busca a lista atualizada direto do endpoint /models do provedor"
+                  >
+                    {fetchingModels ? (
+                      <span className="spinner" aria-label="Carregando modelos" />
+                    ) : (
+                      <RefreshCw size={13} strokeWidth={2} />
+                    )}
+                    Atualizar da API
+                  </button>
+                </div>
+
+                <p className="field-hint">
+                  {selectedModels.length > 0
+                    ? "Somente os modelos marcados abaixo aparecem no chat e em Delegação."
+                    : "Nenhum filtro ativo — o chat usa as sugestões padrão. Marque só os modelos que quiser usar."}
+                </p>
+
+                {modelsStatus ? (
+                  <div
+                    className={
+                      "model-picker-status" + (modelsStatus.ok ? " ok" : " bad")
+                    }
+                    role="status"
+                  >
+                    {modelsStatus.text}
+                  </div>
+                ) : null}
+
+                <div className="model-picker-bar">
+                  <label className="model-picker-search">
+                    <Search size={14} strokeWidth={2} />
+                    <input
+                      ref={modelsSearchRef}
+                      data-models-search
+                      className="input"
+                      type="search"
+                      value={modelQuery}
+                      placeholder="Buscar modelo (ex.: claude, gpt, decision)…"
+                      aria-label="Buscar modelo"
+                      onChange={(ev) => setModelQuery(ev.target.value)}
+                    />
+                  </label>
+                  <div
+                    className="model-picker-tabs"
+                    role="group"
+                    aria-label="Filtrar lista de modelos"
+                  >
+                    <button
+                      type="button"
+                      className={
+                        "model-picker-tab" + (modelTab === "all" ? " on" : "")
+                      }
+                      aria-pressed={modelTab === "all"}
+                      onClick={() => setModelTab("all")}
+                    >
+                      Todos ({allChoices.length - (showNonChat ? 0 : nonChatCount)})
+                    </button>
+                    <button
+                      type="button"
+                      className={
+                        "model-picker-tab" +
+                        (modelTab === "selected" ? " on" : "")
+                      }
+                      aria-pressed={modelTab === "selected"}
+                      onClick={() => setModelTab("selected")}
+                    >
+                      Ativos ({selectedModels.length})
+                    </button>
+                  </div>
+                </div>
+
+                <div className="model-picker-list" role="list">
+                  {visibleChoices.length === 0 ? (
+                    <div className="model-picker-empty">
+                      {modelTab === "selected"
+                        ? "Nenhum modelo marcado ainda. Alterne para Todos ou adicione um ID abaixo."
+                        : "Nenhum modelo bate com a busca. Você pode adicionar o ID manualmente abaixo."}
+                    </div>
+                  ) : (
+                    <>
+                      {visibleChoices.map((c) => {
+                        const checked = selectedSet.has(c.id);
+                        const isDef = c.id === (form.default_model ?? "").trim();
+                        return (
+                          <label
+                            key={c.id}
+                            className={"model-pick-row" + (checked ? " on" : "")}
+                            role="listitem"
+                          >
+                            <input
+                              type="checkbox"
+                              checked={checked}
+                              onChange={() => toggleModel(c.id)}
+                            />
+                            <span className="model-pick-text">
+                              <span className="model-pick-id mono">{c.id}</span>
+                              {c.name !== c.id ? (
+                                <span className="model-pick-name">{c.name}</span>
+                              ) : null}
+                            </span>
+                            {isDef ? <span className="badge">padrão</span> : null}
+                            {c.fromApi ? (
+                              <span
+                                className="model-pick-api"
+                                title="Listado ao vivo pela API"
+                              >
+                                API
+                              </span>
+                            ) : null}
+                          </label>
+                        );
+                      })}
+                      {filteredChoices.length > MAX_RENDER ? (
+                        <div className="model-picker-more">
+                          Mostrando {MAX_RENDER} de {filteredChoices.length} —
+                          refine na busca para achar outros modelos.
+                        </div>
+                      ) : null}
+                    </>
+                  )}
+                </div>
+
+                <div className="model-picker-foot">
+                  <div className="model-picker-add">
+                    <input
+                      className="input mono"
+                      value={customModel}
+                      placeholder="Adicionar ID manual (ex.: openai/gpt-5.4)"
+                      aria-label="Adicionar ID de modelo manualmente"
+                      onChange={(ev) => setCustomModel(ev.target.value)}
+                      onKeyDown={(ev) => {
+                        if (ev.key === "Enter") {
+                          ev.preventDefault();
+                          addCustomModel();
+                        }
+                      }}
+                    />
+                    <button
+                      type="button"
+                      className="btn btn-sm"
+                      disabled={!customModel.trim()}
+                      onClick={addCustomModel}
+                    >
+                      <Plus size={13} strokeWidth={2} /> Adicionar
+                    </button>
+                  </div>
+                  <div className="model-picker-actions">
+                    {nonChatCount > 0 && modelTab === "all" ? (
+                      <button
+                        type="button"
+                        className="btn btn-ghost btn-sm"
+                        onClick={() => setShowNonChat((v) => !v)}
+                      >
+                        {showNonChat
+                          ? "Ocultar utilitários"
+                          : `+ ${nonChatCount} utilitários`}
+                      </button>
+                    ) : null}
+                    {selectedModels.length > 0 ? (
+                      <button
+                        type="button"
+                        className="btn btn-ghost btn-sm"
+                        onClick={() => set({ enabled_models: [] })}
+                        title="Remove o filtro e volta a exibir as sugestões padrão do catálogo"
+                      >
+                        Usar padrão
+                      </button>
+                    ) : null}
+                  </div>
+                </div>
+              </section>
               <details className="sheet-adv" open={custom || undefined}>
                 <summary>
                   <ChevronRight size={14} strokeWidth={2} /> Avançado

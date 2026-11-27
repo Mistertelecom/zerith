@@ -25,13 +25,34 @@ pub(super) fn list_dir(args: &Value, ctx: &CallCtx<'_>, _: &Exec<'_>) -> Result<
     Ok(names.join("\n"))
 }
 
-/// Directories nobody wants searched: build output and VCS internals.
+/// Directories nobody wants searched: build output, caches, virtualenvs, and VCS internals.
 fn skipped(e: &walkdir::DirEntry) -> bool {
     e.depth() > 0
         && e.file_type().is_dir()
         && matches!(
             e.file_name().to_str(),
-            Some(".git" | "target" | "node_modules" | "dist" | ".next" | "build")
+            Some(
+                ".git"
+                    | "target"
+                    | "node_modules"
+                    | "dist"
+                    | ".next"
+                    | ".nuxt"
+                    | ".svelte-kit"
+                    | ".turbo"
+                    | "build"
+                    | "out"
+                    | "coverage"
+                    | ".venv"
+                    | "venv"
+                    | "__pycache__"
+                    | ".mypy_cache"
+                    | ".ruff_cache"
+                    | ".pytest_cache"
+                    | ".gradle"
+                    | "bin"
+                    | "obj"
+            )
         )
 }
 
@@ -214,11 +235,13 @@ fn read_searchable_text(path: &Path) -> Option<String> {
 
 pub(super) fn glob(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
     let pattern = str_arg(args, "pattern")?.replace('\\', "/");
+    let bare_name = !pattern.contains('/');
     let base = ctx.resolve(args["path"].as_str().unwrap_or("."));
     let mut hits = Vec::new();
     for item in walk(&base, exec) {
-        let (rel, _) = item?;
-        if glob_match(&pattern, &rel, true) {
+        let (rel, entry) = item?;
+        let name = entry.file_name().to_string_lossy();
+        if glob_match(&pattern, &rel, true) || (bare_name && glob_match(&pattern, &name, true)) {
             hits.push(rel);
             if hits.len() >= MAX_MATCHES {
                 hits.push(format!("[parado em {MAX_MATCHES} resultados]"));
@@ -235,13 +258,17 @@ pub(super) fn glob(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<S
 fn rg_available() -> bool {
     static RG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *RG.get_or_init(|| {
-        Command::new("rg")
-            .arg("--version")
+        let mut cmd = Command::new("rg");
+        cmd.arg("--version")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
+            .stderr(Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        cmd.status().is_ok_and(|s| s.success())
     })
 }
 
@@ -293,6 +320,11 @@ fn try_rg_grep(
         }
     }
     cmd.arg("--").arg(raw).arg(".");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -694,9 +726,10 @@ fn scan_file(
 fn is_mappable_ext(rel: &str) -> bool {
     let lower = rel.to_ascii_lowercase();
     [
-        ".rs", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".go", ".c", ".h", ".cpp",
-        ".cc", ".cxx", ".hpp", ".hh", ".hxx", ".java", ".kt", ".rb", ".sh", ".sql", ".cfg",
-        ".conf", ".rsc", ".ios", ".vrp", ".junos", ".yml", ".yaml",
+        ".rs", ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".vue", ".svelte",
+        ".py", ".go", ".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx", ".java", ".kt",
+        ".cs", ".php", ".swift", ".dart", ".zig", ".rb", ".sh", ".sql", ".cfg", ".conf", ".rsc",
+        ".ios", ".vrp", ".junos", ".yml", ".yaml",
     ]
     .iter()
     .any(|ext| lower.ends_with(ext))
@@ -884,6 +917,7 @@ fn is_symbol_line(rel: &str, trimmed: &str, indent: usize) -> bool {
         "pub(crate) async fn ",
         "pub(crate) const fn ",
         "pub(super) fn ",
+        "pub(super) async fn ",
         "fn ",
         "async fn ",
         "const fn ",
@@ -906,11 +940,14 @@ fn is_symbol_line(rel: &str, trimmed: &str, indent: usize) -> bool {
         "pub(crate) mod ",
         "pub type ",
         "pub(crate) type ",
+        "pub const ",
+        "pub static ",
         "macro_rules! ",
         "export function ",
         "export async function ",
         "export default function ",
         "export default async function ",
+        "export default ",
         "function ",
         "async function ",
         "export class ",
@@ -923,6 +960,34 @@ fn is_symbol_line(rel: &str, trimmed: &str, indent: usize) -> bool {
         "export type ",
         "export enum ",
         "export const ",
+        "export let ",
+        "declare function ",
+        "declare class ",
+        "declare interface ",
+        "declare type ",
+        "public class ",
+        "public abstract class ",
+        "public final class ",
+        "public interface ",
+        "public record ",
+        "public enum ",
+        "public struct ",
+        "public static ",
+        "public async ",
+        "public sealed ",
+        "internal class ",
+        "internal interface ",
+        "internal struct ",
+        "internal record ",
+        "sealed class ",
+        "sealed interface ",
+        "data class ",
+        "object ",
+        "namespace ",
+        "fun ",
+        "suspend fun ",
+        "override fun ",
+        "private fun ",
         "def ",
         "async def ",
         "func ",
@@ -973,11 +1038,19 @@ fn is_entrypoint_file(norm_path: &str) -> bool {
             | "index.jsx"
             | "app.tsx"
             | "app.ts"
+            | "app.vue"
+            | "main.ts"
+            | "main.tsx"
+            | "server.ts"
+            | "server.js"
             | "__init__.py"
             | "main.py"
             | "main.go"
             | "main.c"
             | "main.cpp"
+            | "main.java"
+            | "main.kt"
+            | "program.cs"
     )
 }
 
@@ -1164,5 +1237,47 @@ mod tests {
             parse_rg_content_line_ctx("a-12-b.txt:3:x-9-y", false, None),
             Some(("a-12-b.txt".to_string(), "3", ':', "x-9-y"))
         );
+    }
+
+    #[test]
+    fn repo_map_extracts_java_kotlin_csharp_and_ts_symbols() {
+        let cs =
+            "namespace Demo;\npublic class RouterService {\n    public async Task Sync() {}\n}\n";
+        let cs_syms = extract_file_symbols("Services/RouterService.cs", cs, 10);
+        assert!(
+            cs_syms.iter().any(|(_, s)| s.starts_with("namespace Demo")),
+            "{cs_syms:?}"
+        );
+        assert!(
+            cs_syms
+                .iter()
+                .any(|(_, s)| s.starts_with("public class RouterService")),
+            "{cs_syms:?}"
+        );
+        assert!(
+            cs_syms
+                .iter()
+                .any(|(_, s)| s.starts_with("public async Task Sync")),
+            "{cs_syms:?}"
+        );
+
+        let kt = "data class Node(val id: String)\nsuspend fun fetchNodes(): List<Node> {\n}\n";
+        let kt_syms = extract_file_symbols("src/Node.kt", kt, 10);
+        assert!(
+            kt_syms
+                .iter()
+                .any(|(_, s)| s.starts_with("data class Node")),
+            "{kt_syms:?}"
+        );
+        assert!(
+            kt_syms
+                .iter()
+                .any(|(_, s)| s.starts_with("suspend fun fetchNodes")),
+            "{kt_syms:?}"
+        );
+
+        assert!(is_mappable_ext("Program.cs"));
+        assert!(is_mappable_ext("App.vue"));
+        assert!(is_mappable_ext("App.svelte"));
     }
 }

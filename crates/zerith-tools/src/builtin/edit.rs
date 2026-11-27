@@ -45,10 +45,12 @@ pub(super) fn edit_file(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Res
         let raw_new = str_arg(args, "new_string")?;
         return match find_unique_whitespace_span(&text, str_arg(args, "old_string")?) {
             WhitespaceFallback::Applied(start, end) => {
+                let reindented =
+                    reindent_replacement(&text[start..end], str_arg(args, "old_string")?, raw_new);
                 let rep = if text.contains("\r\n") {
-                    crlf(raw_new)
+                    crlf(&reindented)
                 } else {
-                    raw_new.to_string()
+                    reindented
                 };
                 let mut buf = text;
                 buf.replace_range(start..end, &rep);
@@ -97,8 +99,8 @@ pub(super) fn edit_file(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Res
     }
 }
 
-/// The miss, plus the file lines closest to `old`'s first line, so the model
-/// can copy the real text instead of guessing again.
+/// The miss, plus a short snippet around the file line closest to `old`'s
+/// first non-empty line, so the model can copy the real text immediately.
 fn not_found(buf: &str, old: &str, path: &std::path::Path) -> String {
     let mut msg = format!("old_string não encontrado em {}", path.display());
     let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -107,24 +109,100 @@ fn not_found(buf: &str, old: &str, path: &std::path::Path) -> String {
         return msg;
     }
     let words: Vec<&str> = first.split(' ').collect();
-    let mut scored: Vec<(usize, usize, &str)> = buf
-        .lines()
+    let lines: Vec<&str> = buf.lines().collect();
+    let mut scored: Vec<(usize, usize)> = lines
+        .iter()
         .enumerate()
         .filter_map(|(i, l)| {
             let n = norm(l);
             let hits = words.iter().filter(|w| n.contains(*w)).count();
-            (hits * 2 >= words.len()).then_some((hits, i + 1, l))
+            (hits * 2 >= words.len()).then_some((hits, i))
         })
         .collect();
     scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
     if !scored.is_empty() {
-        msg.push_str("\nlinhas mais parecidas (releia com read_file e copie o texto exato):");
-        for (_, n, l) in scored.iter().take(3) {
-            let l: String = l.chars().take(200).collect();
-            msg.push_str(&format!("\n{n}\t{l}"));
+        msg.push_str("\nlinhas mais parecidas (releia com read_file ou copie o trecho exato):");
+        let mut shown = std::collections::HashSet::new();
+        for (rank, &(_, idx)) in scored.iter().take(3).enumerate() {
+            let from = if rank == 0 {
+                idx.saturating_sub(1)
+            } else {
+                idx
+            };
+            let to = if rank == 0 {
+                (idx + 1).min(lines.len().saturating_sub(1))
+            } else {
+                idx
+            };
+            for (j, line) in lines.iter().enumerate().take(to + 1).skip(from) {
+                if shown.insert(j) {
+                    let l: String = line.chars().take(200).collect();
+                    msg.push_str(&format!("\n{}\t{l}", j + 1));
+                }
+            }
         }
     }
     msg
+}
+
+fn leading_ws(line: &str) -> &str {
+    let n = line
+        .bytes()
+        .take_while(|&b| b == b' ' || b == b'\t')
+        .count();
+    &line[..n]
+}
+
+/// Adjusts `raw_new`'s indentation to match the indentation actually found in
+/// `matched_slice` when a whitespace-normalized fallback matched `raw_old` at
+/// a different indent level (prevents corrupting Python/YAML/Rust indentation).
+pub(crate) fn reindent_replacement(matched_slice: &str, raw_old: &str, raw_new: &str) -> String {
+    let actual_indent = matched_slice
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .map(leading_ws)
+        .unwrap_or("");
+    let old_indent = raw_old
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .map(leading_ws)
+        .unwrap_or("");
+    let new_indent = raw_new
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .map(leading_ws)
+        .unwrap_or("");
+    // Only re-indent when `old` and `new` share the same shifted indent frame
+    // (e.g. model copied a block at 4 spaces instead of 8). If the model
+    // already wrote `new` with the file's real indentation (or intentionally
+    // changed the base indentation relative to `old`), keep `raw_new` verbatim.
+    if actual_indent == old_indent || new_indent != old_indent {
+        return raw_new.to_string();
+    }
+    let normalized = raw_new.replace("\r\n", "\n");
+    let had_trailing_nl = normalized.ends_with('\n');
+    let adjusted: Vec<String> = normalized
+        .lines()
+        .map(|line| {
+            if line.trim().is_empty() {
+                return String::new();
+            }
+            if let Some(extra) = actual_indent.strip_prefix(old_indent) {
+                format!("{extra}{line}")
+            } else if let Some(excess) = old_indent.strip_prefix(actual_indent) {
+                line.strip_prefix(excess).unwrap_or(line).to_string()
+            } else if let Some(rest) = line.strip_prefix(old_indent) {
+                format!("{actual_indent}{rest}")
+            } else {
+                format!("{actual_indent}{}", line.trim_start_matches([' ', '\t']))
+            }
+        })
+        .collect();
+    let mut out = adjusted.join("\n");
+    if had_trailing_nl {
+        out.push('\n');
+    }
+    out
 }
 
 #[derive(Clone, Copy)]
@@ -223,10 +301,11 @@ pub(super) fn multi_edit(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Re
         } else if !replace_all {
             match find_unique_whitespace_span(&buf, raw_old) {
                 WhitespaceFallback::Applied(start, end) => {
+                    let reindented = reindent_replacement(&buf[start..end], raw_old, raw_new);
                     let rep = if has_crlf {
-                        crlf(raw_new)
+                        crlf(&reindented)
                     } else {
-                        raw_new.to_string()
+                        reindented
                     };
                     buf.replace_range(start..end, &rep);
                     applied_count += 1;
@@ -277,4 +356,52 @@ pub(super) fn multi_edit(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Re
     }
     crate::postcheck::append(&mut msg, &path, pc);
     Ok(msg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reindent_replacement_preserves_python_indentation_on_under_indent() {
+        let matched = "        if ok:\n            return 1";
+        let old = "    if ok:\n        return 1";
+        let new = "    if ok:\n        log('yes')\n        return 2";
+        assert_eq!(
+            reindent_replacement(matched, old, new),
+            "        if ok:\n            log('yes')\n            return 2"
+        );
+    }
+
+    #[test]
+    fn reindent_replacement_handles_over_indent_and_tabs() {
+        let matched = "\tval = compute()\n\treturn val";
+        let old = "    val = compute()\n    return val";
+        let new = "    val = compute() + 1\n    return val";
+        assert_eq!(
+            reindent_replacement(matched, old, new),
+            "\tval = compute() + 1\n\treturn val"
+        );
+
+        let matched2 = "  x = 1";
+        let old2 = "      x = 1";
+        let new2 = "      x = 2\n        y = 3";
+        assert_eq!(
+            reindent_replacement(matched2, old2, new2),
+            "  x = 2\n    y = 3"
+        );
+    }
+
+    #[test]
+    fn not_found_includes_surrounding_context_around_closest_line() {
+        let file = "def alpha():\n    x = compute_value(1)\n    return x\n";
+        let msg = not_found(
+            file,
+            "    x = compute_value(99)",
+            std::path::Path::new("a.py"),
+        );
+        assert!(msg.contains("1\tdef alpha():"), "{msg}");
+        assert!(msg.contains("2\t    x = compute_value(1)"), "{msg}");
+        assert!(msg.contains("3\t    return x"), "{msg}");
+    }
 }

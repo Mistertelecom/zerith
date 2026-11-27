@@ -17,10 +17,14 @@ use serde::{Deserialize, Serialize};
 /// Repositories named by the spec. The list is data, not a claim that all of
 /// them are compatible: compatibility is decided by the SKILL.md scan.
 pub const SOURCES: &[&str] = &[
-    "mattpocock/skills",
     "obra/superpowers",
     "anthropics/skills",
+    "nextlevelbuilder/ui-ux-pro-max-skill",
+    "pbakaus/impeccable",
     "vercel-labs/agent-skills",
+    "jakubkrehel/skills",
+    "VoltAgent/awesome-agent-skills",
+    "mattpocock/skills",
     "github/awesome-copilot",
     "ComposioHQ/awesome-claude-skills",
     "openai/skills",

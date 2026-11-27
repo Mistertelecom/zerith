@@ -1,7 +1,7 @@
 {
   "name": "zerith-dev",
-  "version": "0.4.13",
-  "description": "Programação: a IA lê a falha do GitHub Actions com o gh, reproduz localmente, corrige, faz push e acompanha o CI até ficar verde.",
+  "version": "0.4.14",
+  "description": "Engenharia de software e interfaces gráficas: debug sistemático, criação e auditoria visual de UIs Web e Desktop, revisão de código, verificação real e CI no loop com gh.",
   "author": {
     "name": "Joao Pedro Mota (Mistertelecom)"
   },

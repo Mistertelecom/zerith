@@ -70,8 +70,15 @@ impl Language {
     pub fn server_candidates(self) -> &'static [(&'static str, &'static [&'static str])] {
         match self {
             Self::Rust => &[("rust-analyzer", &[])],
-            Self::TypeScript => &[("typescript-language-server", &["--stdio"])],
-            Self::Python => &[("pyright-langserver", &["--stdio"]), ("pylsp", &[])],
+            Self::TypeScript => &[
+                ("typescript-language-server", &["--stdio"]),
+                ("vtsls", &["--stdio"]),
+            ],
+            Self::Python => &[
+                ("basedpyright-langserver", &["--stdio"]),
+                ("pyright-langserver", &["--stdio"]),
+                ("pylsp", &[]),
+            ],
             Self::Go => &[("gopls", &[])],
             Self::Cpp => &[("clangd", &[])],
         }
@@ -267,6 +274,42 @@ impl Drop for LspSession {
     }
 }
 
+/// Resolves an LSP server binary in workspace/ancestor `node_modules/.bin`
+/// first, then across `PATH`, including `.cmd`/`.bat`/`.exe` shims on Windows
+/// (Rust's `Command::new("typescript-language-server")` only searches `.exe`
+/// and fails on npm's `.cmd` shims unless given the resolved path).
+fn resolve_server_program(workspace: &Path, bin: &str) -> Option<PathBuf> {
+    let probe_dir = |dir: &Path| -> Option<PathBuf> {
+        #[cfg(windows)]
+        let exts = [".exe", ".cmd", ".bat", ""];
+        #[cfg(not(windows))]
+        let exts = [""];
+        for ext in exts {
+            let candidate = dir.join(format!("{bin}{ext}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        None
+    };
+
+    for anc in workspace.ancestors().take(4) {
+        let local_bin = anc.join("node_modules").join(".bin");
+        if let Some(hit) = probe_dir(&local_bin) {
+            return Some(hit);
+        }
+    }
+
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            if let Some(hit) = probe_dir(&dir) {
+                return Some(hit);
+            }
+        }
+    }
+    None
+}
+
 impl LspSession {
     fn is_alive(&self) -> bool {
         self._child
@@ -292,14 +335,20 @@ impl LspSession {
     fn spawn(workspace: &Path, lang: Language) -> std::result::Result<Arc<Self>, String> {
         let mut spawned: Option<(Child, &str)> = None;
         for &(bin, args) in lang.server_candidates() {
-            if let Ok(child) = Command::new(bin)
-                .args(args)
+            let program =
+                resolve_server_program(workspace, bin).unwrap_or_else(|| PathBuf::from(bin));
+            let mut cmd = Command::new(&program);
+            cmd.args(args)
                 .current_dir(workspace)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()
+                .stderr(Stdio::null());
+            #[cfg(windows)]
             {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+            }
+            if let Ok(child) = cmd.spawn() {
                 spawned = Some((child, bin));
                 break;
             }
@@ -1600,5 +1649,23 @@ mod tests {
             dir.path(),
         );
         assert!(check_rename_target_policy(&pol_plan, &primary, &primary).is_err());
+    }
+
+    #[test]
+    fn resolve_server_program_finds_local_node_modules_shim_in_ancestor() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin_dir = dir.path().join("node_modules").join(".bin");
+        let sub = dir.path().join("apps").join("web");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::create_dir_all(&sub).unwrap();
+        let shim_name = if cfg!(windows) {
+            "fake-ts-lsp.cmd"
+        } else {
+            "fake-ts-lsp"
+        };
+        let shim = bin_dir.join(shim_name);
+        std::fs::write(&shim, "").unwrap();
+        let found = resolve_server_program(&sub, "fake-ts-lsp");
+        assert_eq!(found.as_deref(), Some(shim.as_path()));
     }
 }

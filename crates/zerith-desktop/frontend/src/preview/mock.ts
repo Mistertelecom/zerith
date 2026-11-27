@@ -149,27 +149,53 @@ const presets = [
 }));
 
 const accounts = [
-  ["claude-assinatura", "anthropic", "oauth", "claude-code", 0, true, null],
-  ["codex", "codex", "oauth", "codex", 1, true, null],
-  ["antigravity", "antigravity", "oauth", "antigravity", 1, true, null],
-  ["deepseek-trabalho", "deepseek", "api-key", null, 2, true, 2000000],
-  ["openrouter-backup", "openrouter", "api-key", null, 5, false, null],
-].map(([id, provider, auth, oauth_tool, priority, enabled, quota]) => ({
-  id,
-  provider,
-  auth,
-  oauth_tool,
-  label: null,
-  protocol: null,
-  base_url: null,
-  default_model: null,
-  api_key_ref: null,
-  priority,
-  enabled,
-  quota_tokens: quota,
-  quota_requests: null,
-  window_hours: 5,
-}));
+  ["claude-assinatura", "anthropic", "oauth", "claude-code", 0, true, null, []],
+  ["codex", "codex", "oauth", "codex", 1, true, null, []],
+  ["antigravity", "antigravity", "oauth", "antigravity", 1, true, null, []],
+  ["deepseek-trabalho", "deepseek", "api-key", null, 2, true, 2000000, []],
+  [
+    "openrouter-backup",
+    "openrouter",
+    "api-key",
+    null,
+    5,
+    true,
+    null,
+    [
+      "anthropic/claude-sonnet-4.6",
+      "microsoft/microsoft-decision-1.1",
+      "openai/gpt-5.4",
+    ],
+  ],
+].map(
+  ([
+    id,
+    provider,
+    auth,
+    oauth_tool,
+    priority,
+    enabled,
+    quota,
+    enabled_models,
+  ]) => ({
+    id,
+    provider,
+    auth,
+    oauth_tool,
+    label: null,
+    protocol: null,
+    base_url: null,
+    default_model:
+      id === "openrouter-backup" ? "anthropic/claude-sonnet-4.6" : null,
+    enabled_models,
+    api_key_ref: null,
+    priority,
+    enabled,
+    quota_tokens: quota,
+    quota_requests: null,
+    window_hours: 5,
+  }),
+);
 
 const usage = {
   accounts: [
@@ -845,14 +871,31 @@ export function installMock(theme: string) {
           return presets;
         case "accounts":
           return accounts;
-        case "account_test":
+        case "account_test": {
+          const f = (a.form as Record<string, unknown>) ?? {};
+          const prov = String(f.provider ?? "");
           return {
             ok: true,
             status: 200,
-            latency_ms: 212,
-            models: ["llama-3.3-70b-versatile", "qwen-qwq-32b"],
+            latency_ms: 184,
+            models:
+              prov === "openrouter"
+                ? [
+                    "openai/gpt-5.4",
+                    "openai/gpt-5.4-mini",
+                    "anthropic/claude-sonnet-4.6",
+                    "anthropic/claude-opus-4.6",
+                    "microsoft/microsoft-decision-1.1",
+                    "google/gemini-3.1-pro",
+                    "deepseek/deepseek-v3.2",
+                    "qwen/qwen3-coder-480b",
+                    "meta-llama/llama-4-maverick:free",
+                    "openai/text-embedding-3-large",
+                  ]
+                : ["llama-3.3-70b-versatile", "qwen-qwq-32b"],
             detail: "",
           };
+        }
         case "account_save": {
           // the core upserts by id and answers with the fresh list
           const f = a.form as Record<string, unknown>;
@@ -870,6 +913,9 @@ export function installMock(theme: string) {
             base_url: (f.base_url as string | null) || prev.base_url,
             protocol: (f.protocol as string | null) ?? prev.protocol,
             default_model: (f.default_model as string | null) || null,
+            enabled_models: Array.isArray(f.enabled_models)
+              ? (f.enabled_models as string[])
+              : (prev.enabled_models ?? []),
             priority: f.priority as number,
             enabled: f.enabled as boolean,
             quota_tokens: f.quota_tokens as number | null,

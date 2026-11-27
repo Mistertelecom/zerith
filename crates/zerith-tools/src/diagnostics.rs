@@ -191,11 +191,14 @@ fn detect_all(
 
     let has_tsconfig = has("tsconfig.json");
     if has_tsconfig {
-        push(
-            &mut out,
-            "tsc",
-            "npx --no-install tsc --noEmit --pretty false -p .".to_string(),
-        );
+        let local_tsc = dir.join("node_modules").join(".bin").join("tsc");
+        let local_tsc_cmd = dir.join("node_modules").join(".bin").join("tsc.cmd");
+        let cmd = if local_tsc.is_file() || local_tsc_cmd.is_file() {
+            "./node_modules/.bin/tsc --noEmit --pretty false -p .".to_string()
+        } else {
+            "npx --no-install tsc --noEmit --pretty false -p .".to_string()
+        };
+        push(&mut out, "tsc", cmd);
     }
 
     if has("package.json") {
@@ -217,6 +220,14 @@ fn detect_all(
         push(&mut out, "go vet", "go vet ./...".to_string());
     }
 
+    if has_ext(dir, "csproj") || has_ext(dir, "sln") {
+        push(
+            &mut out,
+            "dotnet build",
+            "dotnet build --no-restore -v quiet -nologo".to_string(),
+        );
+    }
+
     if has("pyproject.toml")
         || has("setup.py")
         || has("requirements.txt")
@@ -234,11 +245,19 @@ fn detect_all(
     out
 }
 
-fn has_py(dir: &Path) -> bool {
+fn has_ext(dir: &Path, wanted: &str) -> bool {
     std::fs::read_dir(dir).is_ok_and(|rd| {
-        rd.flatten()
-            .any(|e| e.path().extension().is_some_and(|x| x == "py"))
+        rd.flatten().any(|e| {
+            e.path()
+                .extension()
+                .and_then(|x| x.to_str())
+                .is_some_and(|x| x.eq_ignore_ascii_case(wanted))
+        })
     })
+}
+
+fn has_py(dir: &Path) -> bool {
+    has_ext(dir, "py")
 }
 
 fn python(files: &[String]) -> (&'static str, String) {
@@ -259,7 +278,9 @@ fn python(files: &[String]) -> (&'static str, String) {
     } else {
         (
             "compileall",
-            format!("{py} -m compileall -q -x \"(\\.git|venv|node_modules|site-packages)\" ."),
+            format!(
+                "{py} -m compileall -q -x \"(\\.git|\\.venv|venv|node_modules|site-packages)\" ."
+            ),
         )
     }
 }
@@ -275,17 +296,27 @@ fn on_path(name: &str) -> bool {
 /// (cargo short, go vet, ruff concise, eslint unix, mypy), `file(line,col):`
 /// (tsc) and Python's `File "x", line N` + `XxxError: msg`.
 fn parse(out: &str) -> Vec<Diag> {
-    let loc =
-        Regex::new(r"^(?:vet: )?((?:[A-Za-z]:)?[^:(\s][^:(]*?):(\d+):(?:(\d+):)?\s+(.+)$").unwrap();
-    let tsc = Regex::new(r"^(.+?)\((\d+),(\d+)\): (error|warning) (.+)$").unwrap();
+    let loc = Regex::new(r"^\s*(?:vet: )?((?:[A-Za-z]:)?[^:(\s][^:(]*?):(\d+):(?:(\d+):)?\s+(.+)$")
+        .unwrap();
+    let tsc = Regex::new(r"^\s*(.+?)\((\d+),(\d+)\): (error|warning) (.+)$").unwrap();
     let kind = Regex::new(r"(?i)^(error|warning|note|help)(?:\[([^\]]+)\])?:\s*(.*)$").unwrap();
     let py_at = Regex::new(r#"^\s*File "(.+)", line (\d+)"#).unwrap();
     let py_err = Regex::new(r"^(\w*(?:Error|Warning)): (.+)$").unwrap();
+    let py_sorry = Regex::new(r"^Sorry:\s+(\w*Error):\s+(.+)\s+\((.+),\s+line\s+(\d+)\)$").unwrap();
     let num = |s: Option<regex::Match>| s.and_then(|m| m.as_str().parse().ok()).unwrap_or(1);
     let mut v = Vec::new();
     let mut py: Option<(String, u32)> = None;
     for line in out.lines().map(str::trim_end) {
-        if let Some(c) = tsc.captures(line) {
+        if let Some(c) = py_sorry.captures(line) {
+            v.push(Diag {
+                file: c[3].into(),
+                line: num(c.get(4)),
+                col: 1,
+                warn: false,
+                msg: format!("{}: {}", &c[1], &c[2]),
+            });
+            py = None;
+        } else if let Some(c) = tsc.captures(line) {
             v.push(Diag {
                 file: c[1].into(),
                 line: num(c.get(2)),
@@ -346,10 +377,27 @@ fn rel(file: &str, dir: &Path, ws: &Path) -> String {
             .find(|c| c.exists())
             .unwrap_or_else(|| dir.join(p))
     };
-    abs.strip_prefix(ws)
-        .unwrap_or(&abs)
+    let abs_norm = abs.to_string_lossy().replace('\\', "/");
+    let ws_norm = ws
         .to_string_lossy()
         .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_string();
+    if !ws_norm.is_empty() {
+        let prefix_match = if cfg!(windows) {
+            abs_norm.len() > ws_norm.len()
+                && abs_norm[..ws_norm.len()].eq_ignore_ascii_case(&ws_norm)
+                && abs_norm.as_bytes()[ws_norm.len()] == b'/'
+        } else {
+            abs_norm.len() > ws_norm.len()
+                && abs_norm.starts_with(&ws_norm)
+                && abs_norm.as_bytes()[ws_norm.len()] == b'/'
+        };
+        if prefix_match {
+            return abs_norm[ws_norm.len() + 1..].to_string();
+        }
+    }
+    abs_norm
 }
 
 fn count(n: usize, one: &str) -> String {
@@ -811,5 +859,37 @@ src\\main.rs:2:18: error[E0308]: mismatched types: expected `u32`, found `&str`\
         let web_plans = plans(&root.join("apps/web/src"), &[], None).unwrap();
         assert_eq!(web_plans.len(), 2, "{web_plans:?}");
         assert_eq!(web_plans[0].dir, root.join("apps/web"));
+    }
+
+    #[test]
+    fn parse_handles_python_compileall_sorry_format() {
+        let out = "*** Error compiling './app.py'...\nSorry: IndentationError: expected an indented block (app.py, line 14)\n";
+        let got = parse(out);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].file, "app.py");
+        assert_eq!(got[0].line, 14);
+        assert!(!got[0].warn);
+        assert!(got[0].msg.contains("IndentationError"), "{:?}", got[0]);
+    }
+
+    #[test]
+    fn detects_dotnet_project_and_parses_indented_msbuild_errors() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("App.csproj"), "<Project />").unwrap();
+        let p = plan(d.path(), &[], None).unwrap();
+        assert_eq!(p.label, "dotnet build");
+        assert!(
+            p.command.contains("dotnet build --no-restore"),
+            "{}",
+            p.command
+        );
+
+        let out = "  Program.cs(12,9): error CS0103: The name 'foo' does not exist\n";
+        let got = parse(out);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].file, "Program.cs");
+        assert_eq!(got[0].line, 12);
+        assert_eq!(got[0].col, 9);
+        assert!(!got[0].warn);
     }
 }

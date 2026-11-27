@@ -19,11 +19,28 @@ use std::path::{Path, PathBuf};
 /// package.json scripts / Makefile targets that verify.
 const TARGETS: &[&str] = &["test", "tests", "lint", "typecheck", "check", "build"];
 
-/// The project's verification commands, from the files at `root`.
-pub(crate) fn project_commands(root: &Path) -> Vec<Vec<String>> {
-    let mut out: Vec<String> = Vec::new();
-    let has = |f: &str| root.join(f).is_file();
-    let read = |f: &str| std::fs::read_to_string(root.join(f)).unwrap_or_default();
+fn is_skipped_dir(name: &str) -> bool {
+    matches!(
+        name,
+        ".git"
+            | "target"
+            | "node_modules"
+            | "dist"
+            | "build"
+            | ".next"
+            | ".venv"
+            | "venv"
+            | "__pycache__"
+            | ".cargo"
+            | ".tox"
+            | ".mypy_cache"
+            | ".ruff_cache"
+    )
+}
+
+fn collect_commands_at(dir: &Path, out: &mut Vec<String>) {
+    let has = |f: &str| dir.join(f).is_file();
+    let read = |f: &str| std::fs::read_to_string(dir.join(f)).unwrap_or_default();
     if has("Cargo.toml") {
         out.extend(
             [
@@ -62,17 +79,33 @@ pub(crate) fn project_commands(root: &Path) -> Vec<Vec<String>> {
                 }
             }
         }
+        out.extend(
+            [
+                "npx vitest",
+                "vitest",
+                "npx jest",
+                "jest",
+                "node --test",
+                "npx vite build",
+                "vite build",
+            ]
+            .map(String::from),
+        );
         if has("tsconfig.json") {
             out.push("npx tsc".into());
             out.push("tsc".into());
         }
     }
     let pyproject = read("pyproject.toml");
+    let has_py_files = std::fs::read_dir(dir).is_ok_and(|rd| {
+        rd.flatten()
+            .any(|e| e.path().extension().is_some_and(|x| x == "py"))
+    });
+    let has_py_manifest = has("pyproject.toml") || has("setup.py") || has("requirements.txt");
     if has("pytest.ini")
         || pyproject.contains("[tool.pytest")
         || has("conftest.py")
-        || root.join("tests").is_dir()
-            && (has("setup.py") || has("pyproject.toml") || has("requirements.txt"))
+        || (dir.join("tests").is_dir() && (has_py_manifest || has_py_files))
     {
         out.extend(
             [
@@ -80,15 +113,19 @@ pub(crate) fn project_commands(root: &Path) -> Vec<Vec<String>> {
                 "python -m pytest",
                 "python3 -m pytest",
                 "py -m pytest",
+                "uv run pytest",
+                "poetry run pytest",
             ]
             .map(String::from),
         );
     }
-    if has("pyproject.toml") || has("setup.py") || has("requirements.txt") {
+    if has_py_manifest || has_py_files {
         out.extend(
             [
                 "python -m unittest",
                 "python3 -m unittest",
+                "python -m py_compile",
+                "python3 -m py_compile",
                 "ruff check",
                 "mypy",
             ]
@@ -97,6 +134,17 @@ pub(crate) fn project_commands(root: &Path) -> Vec<Vec<String>> {
     }
     if has("go.mod") {
         out.extend(["go test", "go build", "go vet"].map(String::from));
+    }
+    let has_dotnet = std::fs::read_dir(dir).is_ok_and(|rd| {
+        rd.flatten().any(|e| {
+            e.path()
+                .extension()
+                .and_then(|x| x.to_str())
+                .is_some_and(|x| x.eq_ignore_ascii_case("csproj") || x.eq_ignore_ascii_case("sln"))
+        })
+    });
+    if has_dotnet {
+        out.extend(["dotnet test", "dotnet build"].map(String::from));
     }
     if has("pom.xml") {
         out.extend(["mvn test", "mvn verify", "mvn package"].map(String::from));
@@ -122,6 +170,37 @@ pub(crate) fn project_commands(root: &Path) -> Vec<Vec<String>> {
     if has("scripts/run_tests.sh") {
         out.push("scripts/run_tests.sh".into());
     }
+}
+
+fn scan_subprojects(dir: &Path, depth: usize, out: &mut Vec<String>) {
+    if depth == 0 {
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut subdirs: Vec<PathBuf> = rd
+        .flatten()
+        .filter(|e| {
+            e.file_type().is_ok_and(|t| t.is_dir())
+                && !e.file_name().to_str().is_some_and(is_skipped_dir)
+        })
+        .map(|e| e.path())
+        .collect();
+    subdirs.sort();
+    for sub in subdirs {
+        collect_commands_at(&sub, out);
+        scan_subprojects(&sub, depth - 1, out);
+    }
+}
+
+/// The project's verification commands, from the files at `root` and monorepo
+/// subprojects up to depth 3 (so frontend `npm run build` / `tsc` or nested
+/// Python packages inside a Rust workspace are recognized too).
+pub(crate) fn project_commands(root: &Path) -> Vec<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    collect_commands_at(root, &mut out);
+    scan_subprojects(root, 3, &mut out);
     let mut seen = Vec::new();
     for c in out {
         let toks = tokens(&c);
@@ -318,25 +397,37 @@ const INTERPRETERS: &[&str] = &[
     "go",
 ];
 
-/// A test file by its name, or one of `edited`.
-fn is_target(arg: &str, edited: &[String]) -> bool {
+/// A test file by its name (always verifiable), or one of `edited` (when no
+/// project command list exists).
+fn is_test_file(arg: &str) -> bool {
     let a = arg.replace('\\', "/");
     let name = a.rsplit('/').next().unwrap_or(&a).to_ascii_lowercase();
     name.starts_with("test_")
         || name.contains("_test.")
         || name.contains(".test.")
         || name.contains(".spec.")
+        || name.contains(".check.")
         || a.split('/')
             .any(|p| matches!(p, "tests" | "test" | "__tests__" | "spec"))
-        || edited.iter().any(|e| {
-            let e = e.replace('\\', "/");
-            e == a || e.ends_with(&format!("/{a}")) || a.ends_with(&format!("/{e}"))
-        })
 }
 
-/// Whether `line` (exit status `exit`) checked the code: a project command
-/// or, when the project has none, a script that is a test file or one the
-/// turn edited.
+fn is_target(arg: &str, edited: &[String], allow_edited: bool) -> bool {
+    if is_test_file(arg) {
+        return true;
+    }
+    if !allow_edited {
+        return false;
+    }
+    let a = arg.replace('\\', "/");
+    edited.iter().any(|e| {
+        let e = e.replace('\\', "/");
+        e == a || e.ends_with(&format!("/{a}")) || a.ends_with(&format!("/{e}"))
+    })
+}
+
+/// Whether `line` (exit status `exit`) checked the code: a project command,
+/// a direct execution of a test script (`tests/test_x.py`, `foo.check.ts`), or
+/// — when the project declares no commands — a script the turn edited.
 pub(crate) fn is_verification(
     line: &str,
     exit: i64,
@@ -346,6 +437,7 @@ pub(crate) fn is_verification(
     if exit != 0 {
         return false;
     }
+    let allow_edited = project.is_empty();
     let segs = segments(line);
     segs.iter().enumerate().any(|(i, s)| {
         if !attributable(&segs, i, exit) {
@@ -358,11 +450,8 @@ pub(crate) fn is_verification(
         {
             return true;
         }
-        if !project.is_empty() {
-            return false;
-        }
         let Some(first) = t.first() else { return false };
-        if is_target(first, edited) {
+        if is_target(first, edited, allow_edited) {
             return true;
         }
         if INTERPRETERS.contains(&first.as_str()) {
@@ -376,7 +465,7 @@ pub(crate) fn is_verification(
                 return true;
             }
             if let Some(script) = rest.iter().find(|a| !a.starts_with('-')) {
-                return is_target(script, edited);
+                return is_target(script, edited, allow_edited);
             }
         }
         false
@@ -477,5 +566,54 @@ mod tests {
         let sub = d.path().join("rascunho");
         std::fs::create_dir_all(&sub).unwrap();
         assert_eq!(project_root(&sub), None);
+    }
+
+    #[test]
+    fn monorepo_subprojects_and_direct_test_scripts_count_as_verification() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        let fe = d.path().join("crates/app/frontend");
+        std::fs::create_dir_all(&fe).unwrap();
+        std::fs::write(
+            fe.join("package.json"),
+            r#"{"scripts":{"build":"vite build","lint":"eslint ."}}"#,
+        )
+        .unwrap();
+        std::fs::write(fe.join("tsconfig.json"), "{}").unwrap();
+
+        let p = project_commands(d.path());
+        assert!(is_verification("cargo test -p zerith-core", 0, &p, &[]));
+        assert!(is_verification(
+            "cd crates/app/frontend && npm run build",
+            0,
+            &p,
+            &[]
+        ));
+        assert!(is_verification(
+            "cd crates/app/frontend && tsc --noEmit",
+            0,
+            &p,
+            &[]
+        ));
+        // Direct test files count even when a project manifest is present.
+        assert!(is_verification(
+            "node --experimental-strip-types src/lib/accountModels.check.ts",
+            0,
+            &p,
+            &[]
+        ));
+        assert!(is_verification(
+            "python tests/test_parks_gui.py",
+            0,
+            &p,
+            &[]
+        ));
+        // Still rejects piped test runs (pipe hides exit status).
+        assert!(!is_verification(
+            "python tests/test_parks_gui.py | tail -25",
+            0,
+            &p,
+            &[]
+        ));
     }
 }

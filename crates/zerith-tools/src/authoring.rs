@@ -105,7 +105,8 @@ pub fn tools(ctx: Authoring) -> Vec<Box<dyn Tool>> {
                     "references": {"type": "array", "description": "arquivos de apoio de texto, para não encher o corpo", "items": {"type": "object", "properties": {
                         "path": {"type": "string", "description": "references/<arquivo>.md (ou templates/, assets/)"},
                         "content": {"type": "string"}
-                    }, "required": ["path", "content"]}}
+                    }, "required": ["path", "content"]}},
+                    "overwrite": {"type": "boolean", "description": "se true, atualiza uma skill já criada pela própria IA (nunca altera skills do usuário)"}
                 }, "required": ["name", "description", "instructions"]}),
             ),
         ),
@@ -121,7 +122,8 @@ pub fn tools(ctx: Authoring) -> Vec<Box<dyn Tool>> {
                     "tools": {"type": "array", "items": {"type": "string"}, "description": "só ferramentas que você já tem; padrão: somente leitura"},
                     "model": {"type": "string"},
                     "max_turns": {"type": "integer", "description": "1 a 100"},
-                    "permission_mode": {"type": "string", "description": "igual ou mais restrito que o seu; nunca bypassPermissions"}
+                    "permission_mode": {"type": "string", "description": "igual ou mais restrito que o seu; nunca bypassPermissions"},
+                    "overwrite": {"type": "boolean", "description": "se true, atualiza um agente já criado pela própria IA (nunca altera agentes do usuário)"}
                 }, "required": ["name", "description", "instructions"]}),
             ),
         ),
@@ -164,7 +166,17 @@ impl Tool for Kind {
         let paths = &self.ctx.paths;
         match self.op {
             Op::CreateSkill => {
-                reject_unknown(args, &["name", "description", "instructions", "references"])?;
+                reject_unknown(
+                    args,
+                    &[
+                        "name",
+                        "description",
+                        "instructions",
+                        "references",
+                        "overwrite",
+                    ],
+                )?;
+                let overwrite = args["overwrite"].as_bool().unwrap_or(false);
                 let files = args["references"]
                     .as_array()
                     .map(|a| {
@@ -187,10 +199,11 @@ impl Tool for Kind {
                 let lib =
                     Library::open(paths.skills()).map_err(|e| ToolError::Failed(e.to_string()))?;
                 let made = lib
-                    .create_ai_skill(&new, &session)
+                    .upsert_ai_skill(&new, &session, overwrite)
                     .map_err(|e| ToolError::Failed(e.to_string()))?;
+                let verb = if overwrite { "atualizada" } else { "criada" };
                 let mut out = format!(
-                    "Skill {:?} criada com {} arquivo(s), DESATIVADA. Peça à pessoa para abrir Skills, revisar e ativar; até lá ela não está disponível.",
+                    "Skill {:?} {verb} com {} arquivo(s), DESATIVADA. Peça à pessoa para abrir Skills, revisar e ativar; até lá ela não está disponível.",
                     made.name, made.files
                 );
                 for n in &made.notes {
@@ -209,8 +222,10 @@ impl Tool for Kind {
                         "model",
                         "max_turns",
                         "permission_mode",
+                        "overwrite",
                     ],
                 )?;
+                let overwrite = args["overwrite"].as_bool().unwrap_or(false);
                 let new = NewAgent {
                     name: str_arg(args, "name")?.to_string(),
                     description: str_arg(args, "description")?.to_string(),
@@ -232,15 +247,17 @@ impl Tool for Kind {
                     tools: &have,
                     mode: &self.ctx.mode,
                 };
-                let file = agents_write::create_ai_agent(
+                let file = agents_write::upsert_ai_agent(
                     paths,
                     self.ctx.project_dir.as_deref(),
                     &new,
                     &creator,
+                    overwrite,
                 )
                 .map_err(ToolError::Failed)?;
+                let verb = if overwrite { "atualizado" } else { "criado" };
                 Ok(format!(
-                    "Agente {:?} criado em {}, DESATIVADO. Peça à pessoa para abrir Agentes, revisar e ativar.",
+                    "Agente {:?} {verb} em {}, DESATIVADO. Peça à pessoa para abrir Agentes, revisar e ativar.",
                     new.name,
                     file.display()
                 ))

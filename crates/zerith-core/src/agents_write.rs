@@ -201,17 +201,47 @@ pub fn create_ai_agent(
     new: &NewAgent,
     creator: &Creator<'_>,
 ) -> Result<PathBuf, String> {
+    upsert_ai_agent(paths, project_dir, new, creator, false)
+}
+
+/// Writes or (when `overwrite` is true) updates a model-made agent in the user's
+/// agents folder, always **disabled** for user review. Never replaces a user,
+/// project, or plugin agent.
+pub fn upsert_ai_agent(
+    paths: &Paths,
+    project_dir: Option<&Path>,
+    new: &NewAgent,
+    creator: &Creator<'_>,
+    overwrite: bool,
+) -> Result<PathBuf, String> {
     let tools = validate_new(new, creator)?;
     let file = paths.agents().join(format!("{}.md", new.name));
-    let taken = agents::list_all(paths, project_dir)
+    let other_layer_taken = agents::list_all(paths, project_dir)
         .iter()
-        .any(|a| a.name == new.name)
-        || file.exists();
-    if taken {
+        .any(|a| a.name == new.name && a.layer != "user");
+    if other_layer_taken {
         return Err(format!(
-            "já existe um agente chamado {:?}; escolha outro nome (os seus não são alterados)",
+            "já existe um agente chamado {:?} fora da pasta do usuário; escolha outro nome",
             new.name
         ));
+    }
+    if file.exists() {
+        let can_replace =
+            overwrite && agents::load_file(&file, "user").is_some_and(|def| def.created_by_ai);
+        if !can_replace {
+            let msg = if overwrite {
+                format!(
+                    "{:?} não foi criado pela IA; só a pessoa pode alterar agentes dela",
+                    new.name
+                )
+            } else {
+                format!(
+                    "já existe um agente chamado {:?}; escolha outro nome ou use overwrite=true se ele foi criado pela IA",
+                    new.name
+                )
+            };
+            return Err(msg);
+        }
     }
     std::fs::create_dir_all(paths.agents()).map_err(|e| e.to_string())?;
     write_atomic(&file, &render(new, &tools))?;
@@ -454,5 +484,35 @@ mod tests {
             .filter(|e| e.path().extension().is_some_and(|x| x == "tmp"))
             .count();
         assert_eq!(leftovers, 0);
+    }
+
+    #[test]
+    fn upsert_ai_agent_overwrites_ai_created_only_and_never_user_agents() {
+        let (p, _r) = paths();
+        let mut a = agent("meu-ia");
+        create_ai_agent(&p, None, &a, &creator()).unwrap();
+        set_disabled(&p, "meu-ia", false).unwrap();
+
+        a.description = "Versão revisada pela IA".into();
+        upsert_ai_agent(&p, None, &a, &creator(), true).unwrap();
+        let updated = agents::list_all(&p, None)
+            .into_iter()
+            .find(|x| x.name == "meu-ia")
+            .unwrap();
+        assert_eq!(updated.description, "Versão revisada pela IA");
+        assert!(
+            updated.disabled,
+            "updated AI agent must return to disabled for review"
+        );
+
+        // User-authored agent must never be overwritten even with overwrite=true.
+        std::fs::write(
+            p.agents().join("manual.md"),
+            "---\nname: manual\ndescription: feito pela pessoa\n---\ninstruções\n",
+        )
+        .unwrap();
+        let mut u = agent("manual");
+        u.description = "tentativa da IA".into();
+        assert!(upsert_ai_agent(&p, None, &u, &creator(), true).is_err());
     }
 }

@@ -331,6 +331,10 @@ pub struct AccountEntry {
     pub base_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
+    /// Optional whitelist of model IDs shown in the chat & delegation pickers
+    /// for this account. Empty = keep catalogue / provider defaults.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enabled_models: Vec<String>,
     /// Name of the keyring entry holding the key. Never the key itself.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key_ref: Option<String>,
@@ -356,6 +360,7 @@ impl Default for AccountEntry {
             protocol: None,
             base_url: None,
             default_model: None,
+            enabled_models: Vec::new(),
             api_key_ref: None,
             priority: 0,
             enabled: true,
@@ -1880,6 +1885,32 @@ provider = "openai"
         let text = toml::to_string(&acc).unwrap();
         assert!(!text.contains("auth"));
         assert!(!text.contains("oauth_tool"));
+        assert!(!text.contains("enabled_models"));
+    }
+
+    #[test]
+    fn account_enabled_models_round_trip_toml_and_omit_when_empty() {
+        let mut settings = Settings::default();
+        settings.accounts.push(AccountEntry {
+            id: "openrouter".into(),
+            provider: "openrouter".into(),
+            default_model: Some("anthropic/claude-sonnet-4.5".into()),
+            enabled_models: vec![
+                "anthropic/claude-sonnet-4.5".into(),
+                "microsoft/microsoft-decision-1.1".into(),
+            ],
+            ..Default::default()
+        });
+        let text = toml::to_string(&settings).unwrap();
+        assert!(text.contains("enabled_models"), "{text}");
+        let back: Settings = toml::from_str(&text).unwrap();
+        assert_eq!(
+            back.accounts[0].enabled_models,
+            vec![
+                "anthropic/claude-sonnet-4.5".to_string(),
+                "microsoft/microsoft-decision-1.1".to_string(),
+            ]
+        );
     }
 
     /// The default `[learning]` is not written, so old files stay byte-identical.

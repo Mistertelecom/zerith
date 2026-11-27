@@ -70,7 +70,7 @@ pub fn spill(
     let skip_end = lines.saturating_sub(tail_lines);
     let range_note = if skip_start <= skip_end {
         format!(
-            "linhas {skip_start}–{skip_end} omitidas; use read_file com offset={skip_start} e limit=200 ou grep"
+            "linhas {skip_start}–{skip_end} omitidas; use read_file com offset/limit (ex.: offset={skip_start} limit=200) ou grep"
         )
     } else {
         "meio omitido; use read_file com offset/limit ou grep".to_string()
@@ -369,7 +369,9 @@ pub(crate) mod tests {
         assert!(path.is_file());
         assert!(shown.contains("600 linhas"), "{shown}");
         assert!(
-            shown.contains("linhas ") && shown.contains("omitidas; use read_file com offset="),
+            shown.contains("linhas ")
+                && shown.contains("omitidas; use read_file com offset/limit")
+                && shown.contains("offset="),
             "{shown}"
         );
     }

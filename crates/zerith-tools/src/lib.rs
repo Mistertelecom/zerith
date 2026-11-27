@@ -153,6 +153,7 @@ impl CallCtx<'_> {
 
 /// Translates Git-Bash/MSYS2 Unix-style paths (`/tmp/...`, `/c/...`) to native
 /// Windows paths using `temp_dir` for `/tmp`.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn normalize_msys_path(p: &str, temp_dir: &Path) -> Option<PathBuf> {
     let trimmed = p.trim();
     if trimmed == "/tmp" || trimmed == "/tmp/" {

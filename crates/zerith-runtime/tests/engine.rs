@@ -806,28 +806,56 @@ fn cancelling_mid_batch_stops_every_call_and_keeps_the_history_paired() {
 
 // ---- spill -----------------------------------------------------------------
 
-fn big_file(dir: &Path) {
+struct BigDump {
+    spec: ToolSpec,
+    body: String,
+}
+
+impl Tool for BigDump {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+    fn action(&self, _: &Value, _: &CallCtx<'_>) -> zerith_tools::Result<Option<Action>> {
+        Ok(None)
+    }
+    fn run(&self, _: &Value, _: &CallCtx<'_>, _: &Exec<'_>) -> zerith_tools::Result<String> {
+        Ok(self.body.clone())
+    }
+}
+
+fn big_dump_registry() -> Registry {
     let body: String = (1..=2000)
         .map(|i| format!("linha numero {i:05}\n"))
         .collect();
     assert!(body.len() > 30_000);
-    std::fs::write(dir.join("big.txt"), body).unwrap();
+    let mut reg = Registry::new();
+    reg.register(Box::new(BigDump {
+        spec: ToolSpec {
+            name: "big_dump".into(),
+            description: "dumps >30 KB output to test spill and truncation".into(),
+            parameters: json!({"type": "object"}),
+            returns: "large text dump",
+            permission: Permission::Read,
+            timeout: Duration::from_secs(10),
+            cancellable: true,
+            local: true,
+            source: "test".into(),
+        },
+        body,
+    }));
+    reg
 }
 
 #[test]
 fn a_big_output_spills_to_a_file_the_model_can_read_back_without_asking() {
     let ws = tmp();
     let spill_root = tmp();
-    big_file(ws.path());
-    let reg = Registry::new();
+    let reg = big_dump_registry();
     let pol = policy(ws.path());
     let store = Store::open_in_memory().unwrap();
     let sid = session(&store);
 
-    let fake = serve(vec![
-        calls(&[("c1", "read_file", json!({"path": "big.txt"}))]),
-        text("li"),
-    ]);
+    let fake = serve(vec![calls(&[("c1", "big_dump", json!({}))]), text("li")]);
     run_agent_turn(
         &store,
         &client(&fake.url, None),
@@ -934,14 +962,10 @@ fn a_big_output_spills_to_a_file_the_model_can_read_back_without_asking() {
 #[test]
 fn without_a_spill_dir_the_output_is_truncated_as_before() {
     let ws = tmp();
-    big_file(ws.path());
-    let (reg, pol) = (Registry::new(), policy(ws.path()));
+    let (reg, pol) = (big_dump_registry(), policy(ws.path()));
     let store = Store::open_in_memory().unwrap();
     let sid = session(&store);
-    let fake = serve(vec![
-        calls(&[("c1", "read_file", json!({"path": "big.txt"}))]),
-        text("li"),
-    ]);
+    let fake = serve(vec![calls(&[("c1", "big_dump", json!({}))]), text("li")]);
     run_agent_turn(
         &store,
         &client(&fake.url, None),

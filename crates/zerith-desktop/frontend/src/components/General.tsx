@@ -5,6 +5,7 @@ import { Card, Row, Segmented, Switch } from "./ui";
 import { UpdateRow } from "./Update";
 
 import { LANG_OPTIONS, setLang, translateText, tr, useLang, type Lang } from "../lib/i18n";
+import { setToolsView, useToolsView, type ToolsView } from "../lib/uiPrefs";
 
 const THEMES = [
   ["dark", "Escuro"],
@@ -98,6 +99,7 @@ export function GeneralTab(props: GeneralProps) {
 
   const limit = limits.find((l) => l.name === props.profile);
   const lang = useLang();
+  const toolsView = useToolsView();
 
   const copy = useCallback(() => {
     setBusy(true);
@@ -167,6 +169,24 @@ export function GeneralTab(props: GeneralProps) {
             label={tr(lang, "Movimento reduzido", "Reduced motion")}
             checked={props.reduceMotion}
             onChange={props.onReduceMotion}
+          />
+        </Row>
+        <Row
+          label={tr(lang, "Ferramentas no chat", "Tools in chat")}
+          hint={tr(
+            lang,
+            "Compacto agrupa chamadas numa gaveta colapsável estilo Antigravity; Detalhado mostra cada linha aberta.",
+            "Compact groups tool calls into an Antigravity-style collapsible drawer; Detailed shows every row inline.",
+          )}
+        >
+          <Segmented
+            label={tr(lang, "Ferramentas no chat", "Tools in chat")}
+            value={toolsView}
+            options={[
+              ["compact", tr(lang, "Compacto", "Compact")],
+              ["detailed", tr(lang, "Detalhado", "Detailed")],
+            ] as const}
+            onPick={(v) => setToolsView(v as ToolsView)}
           />
         </Row>
       </Card>

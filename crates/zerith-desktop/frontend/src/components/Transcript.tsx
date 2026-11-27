@@ -1,6 +1,7 @@
 import { Fragment, memo, useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
-import { api, jobsApi, learnApi, type LearnedItem } from "../lib/api";
+import { api, jobsApi, learnApi, type LearnedItem, type Todo } from "../lib/api";
 import { tr, useLang, type Lang } from "../lib/i18n";
+import { useToolsView } from "../lib/uiPrefs";
 import {
   Activity,
   AlertTriangle,
@@ -9,7 +10,9 @@ import {
   Bot,
   Brain,
   Check,
+  CheckCircle2,
   ChevronRight,
+  Circle,
   Clock,
   Code2,
   Copy,
@@ -23,8 +26,11 @@ import {
   Image,
   ImageOff,
   Info,
+  LayoutGrid,
   ListTodo,
+  Loader2,
   MessageCircleQuestionMark,
+  MinusCircle,
   Network,
   Pencil,
   Search,
@@ -34,6 +40,7 @@ import {
   Webhook,
   Wrench,
   X,
+  XCircle,
   type LucideIcon,
 } from "lucide-react";
 import type { Block, ToolRow } from "../lib/turn";
@@ -284,13 +291,6 @@ function LearnedNote(props: { text: string; items: LearnedItem[] }) {
   );
 }
 
-const SUBAGENT_STATE_LABEL: Record<string, string> = {
-  running: "Executando",
-  done: "Concluído",
-  failed: "Falhou",
-  cancelled: "Cancelado",
-};
-
 function shortSubagentModel(raw: string): string {
   const idx = raw.indexOf(":");
   return idx > 0 ? raw.slice(idx + 1) : raw;
@@ -305,7 +305,10 @@ function splitSubagentName(raw: string): { role: string; title: string } {
   };
 }
 
-function SubagentCard({ block }: { block: Extract<Block, { kind: "subagent" }> }) {
+type SubagentBlock = Extract<Block, { kind: "subagent" }>;
+
+const SubagentRowItem = memo(function SubagentRowItem({ block }: { block: SubagentBlock }) {
+  const lang = useLang();
   const [open, setOpen] = useState(false);
   const [stopping, setStopping] = useState(false);
   const { role, title } = splitSubagentName(block.name);
@@ -318,41 +321,39 @@ function SubagentCard({ block }: { block: Extract<Block, { kind: "subagent" }> }
       : "done";
   const hasDetails = block.steps.length > 0 || Boolean(block.summary);
   const modelLabel = block.model ? shortSubagentModel(block.model) : "";
-  const statusLabel = SUBAGENT_STATE_LABEL[block.state] ?? block.state;
+  const displayName = title || role;
 
   return (
-    <div className={`subagent-card ${st}` + (open ? " open" : "")}>
-      <div className="subagent-row">
+    <div className={`subagent-item ${st}` + (open ? " open" : "")}>
+      <div className="subagent-item-row">
         <button
           type="button"
-          className="subagent-head"
+          className="subagent-item-head"
           disabled={!hasDetails}
           aria-expanded={hasDetails ? open : undefined}
           onClick={() => hasDetails && setOpen((v) => !v)}
         >
-          <span className={`subagent-icon ${st}`} aria-hidden>
-            {st === "running" ? (
-              <span className="spinner" />
-            ) : st === "done" ? (
-              <Check size={14} strokeWidth={2.25} />
-            ) : st === "failed" ? (
-              <AlertTriangle size={14} strokeWidth={2} />
-            ) : (
-              <X size={14} strokeWidth={2.25} />
-            )}
+          <span className={`subagent-item-icon ${st}`} aria-hidden>
+            <LayoutGrid size={13} strokeWidth={1.85} />
           </span>
-          <span className="subagent-role">{role}</span>
-          <span className="subagent-title" title={title}>
-            {title}
+          {role && role !== "agente" && title ? (
+            <span className="subagent-item-role">{role}</span>
+          ) : null}
+          <span className="subagent-item-name" title={block.name}>
+            {displayName}
           </span>
           {modelLabel ? (
-            <span className="subagent-model" title={block.model}>
+            <span className="subagent-item-model" title={block.model}>
               {modelLabel}
             </span>
           ) : null}
-          <span className={`subagent-status ${st}`}>{statusLabel}</span>
+          {st === "failed" ? (
+            <span className="subagent-item-err">{tr(lang, "falhou", "failed")}</span>
+          ) : st === "cancelled" ? (
+            <span className="subagent-item-muted">{tr(lang, "cancelado", "cancelled")}</span>
+          ) : null}
           {hasDetails ? (
-            <ChevronRight size={14} strokeWidth={2} className="chev" />
+            <ChevronRight size={13} strokeWidth={2} className="chev" />
           ) : null}
         </button>
         {st === "running" ? (
@@ -360,21 +361,27 @@ function SubagentCard({ block }: { block: Extract<Block, { kind: "subagent" }> }
             type="button"
             className="subagent-stop"
             disabled={stopping}
-            title="Parar este subagente; o que ele já fez volta para a conversa"
+            title={tr(
+              lang,
+              "Parar este subagente; o que ele já fez volta para a conversa",
+              "Stop this subagent; work done so far returns to the chat",
+            )}
             onClick={() => {
               setStopping(true);
               void jobsApi.stopSubagent(block.id).catch(() => setStopping(false));
             }}
           >
-            {stopping ? "Parando..." : "Parar"}
+            {stopping ? tr(lang, "Parando…", "Stopping…") : tr(lang, "Parar", "Stop")}
           </button>
         ) : null}
       </div>
       {st === "running" && block.summary && !open ? (
-        <div className="subagent-live">{block.summary}</div>
+        <div className="subagent-item-live" title={block.summary}>
+          {block.summary}
+        </div>
       ) : null}
       {open && hasDetails ? (
-        <div className="subagent-body">
+        <div className="subagent-item-body">
           {block.steps.length > 0 ? (
             <>
               <ul className="subagent-steps">
@@ -397,7 +404,79 @@ function SubagentCard({ block }: { block: Extract<Block, { kind: "subagent" }> }
       ) : null}
     </div>
   );
-}
+});
+
+const SubagentGroup = memo(function SubagentGroup({ blocks }: { blocks: SubagentBlock[] }) {
+  const lang = useLang();
+  const runningCount = useMemo(
+    () => blocks.filter((b) => b.state === "running").length,
+    [blocks],
+  );
+  const failedCount = useMemo(
+    () => blocks.filter((b) => b.state === "failed").length,
+    [blocks],
+  );
+  const hasRunning = runningCount > 0;
+  const [userOpen, setUserOpen] = useState<boolean | null>(null);
+  const prevRunningRef = useRef(hasRunning);
+
+  useEffect(() => {
+    if (prevRunningRef.current !== hasRunning) {
+      prevRunningRef.current = hasRunning;
+      setUserOpen(null);
+    }
+  }, [hasRunning]);
+
+  const open = userOpen ?? hasRunning;
+  const count = blocks.length;
+  const heading = hasRunning
+    ? count === 1
+      ? tr(lang, "Subagente em andamento", "Subagent in progress")
+      : tr(lang, `Iniciou ${count} subagentes`, `Started ${count} subagents`)
+    : count === 1
+      ? failedCount > 0
+        ? tr(lang, "Subagente falhou", "Subagent failed")
+        : tr(lang, "Concluiu 1 subagente", "Finished 1 subagent")
+      : tr(lang, `Concluiu ${count} subagentes`, `Finished ${count} subagents`);
+
+  return (
+    <div
+      className={
+        "subagent-group" +
+        (open ? " open" : "") +
+        (hasRunning ? " live" : "")
+      }
+    >
+      <button
+        type="button"
+        className="subagent-group-head"
+        aria-expanded={open}
+        onClick={() => setUserOpen(!open)}
+      >
+        {hasRunning ? <span className="activity-live-dot" aria-hidden /> : null}
+        <span className="subagent-group-title">{heading}</span>
+        {failedCount > 0 && count > 1 ? (
+          <span className="activity-fail-pill">
+            <AlertTriangle size={12} strokeWidth={2} aria-hidden />
+            <span>
+              {failedCount === 1
+                ? tr(lang, "1 erro", "1 error")
+                : tr(lang, `${failedCount} erros`, `${failedCount} errors`)}
+            </span>
+          </span>
+        ) : null}
+        <ChevronRight size={14} strokeWidth={2} className="chev" />
+      </button>
+      {open ? (
+        <div className="subagent-group-body">
+          {blocks.map((block) => (
+            <SubagentRowItem key={block.id} block={block} />
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+});
 
 const isWeb = (src: string) => /^(https?:|data:)/i.test(src);
 const USER_IMG = /^!\[([^\]\n]*)\]\(<([^>\n]+)>\)\s*$/gm;
@@ -1763,6 +1842,8 @@ function toolActionLabel(name: string, lang: Lang): string {
       return tr(lang, "Processo", "Process");
     case "sleep":
       return tr(lang, "Aguardou", "Waited");
+    case "task_plan":
+      return tr(lang, "Planejou etapas", "Updated steps");
     case "task_create":
     case "task_update":
     case "task_get":
@@ -1838,6 +1919,7 @@ function toolSubAction(name: string, a: Record<string, unknown> | null, lang: La
   }
   if (name.startsWith("task_")) {
     const k = name.replace(/^task_/, "");
+    if (k === "plan") return tr(lang, "etapas", "steps");
     if (k === "create") return tr(lang, "criar", "create");
     if (k === "update") return tr(lang, "atualizar", "update");
     if (k === "list") return tr(lang, "listar", "list");
@@ -2165,39 +2247,488 @@ const ToolBurstGroup = memo(function ToolBurstGroup({
   );
 });
 
-const AssistantBlock = memo(function AssistantBlock(props: {
-  block: Block & { kind: "assistant" };
-  sessionId?: string | null;
-  onBranch?: (id: number) => void;
-  /** Resends the last prompt (only on the newest failed answer). */
-  onRetry?: () => void;
+const TASK_NOISE_TOOLS = new Set(["task_plan", "task_create", "task_update"]);
+const READ_SUMMARY_TOOLS = new Set([
+  ...BURST_READ_TOOLS,
+  "web_search",
+  "web_fetch",
+  "skill",
+  "skill_load",
+  "skill_search",
+  "session_search",
+]);
+const CMD_SUMMARY_TOOLS = new Set([
+  "shell",
+  "bash",
+  "powershell",
+  "remote_shell",
+  "monitor",
+  "terminal_open",
+  "terminal_send",
+  "terminal_batch",
+  "execute_code",
+  "process",
+]);
+const AGENT_SUMMARY_TOOLS = new Set(["agent", "agent_manage"]);
+
+function formatElapsed(ms: number): string {
+  const safe = Math.max(0, ms);
+  if (safe < 1000) return "< 1s";
+  const totalSec = Math.floor(safe / 1000);
+  if (totalSec < 60) return `${totalSec}s`;
+  const mins = Math.floor(totalSec / 60);
+  const secs = totalSec % 60;
+  return secs === 0 ? `${mins}m` : `${mins}m ${secs}s`;
+}
+
+function shortToolTarget(row: ToolRow): string {
+  const parsed = parseArgs(row.args);
+  const o = parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : null;
+  const rawPath =
+    (typeof o?.path === "string" && o.path) ||
+    (typeof o?.file_path === "string" && o.file_path) ||
+    (typeof o?.filePath === "string" && o.filePath) ||
+    "";
+  if (rawPath) {
+    return rawPath.split(/[\\/]/).pop() ?? rawPath;
+  }
+  const arg = argSummaryFromParsed(parsed, row.args).trim();
+  return arg.length > 42 ? arg.slice(0, 41) + "…" : arg;
+}
+
+interface ToolsSummary {
+  totalCount: number;
+  categoryText: string;
+  added: number;
+  removed: number;
+  failedTools: { tool: ToolRow; index: number }[];
+  activeToolLabel: string | null;
+  liveLine: string | null;
+}
+
+function summarizeTools(tools: ToolRow[], hasSteps: boolean, lang: Lang): ToolsSummary {
+  const failedTools: { tool: ToolRow; index: number }[] = [];
+  let added = 0;
+  let removed = 0;
+
+  for (let i = 0; i < tools.length; i++) {
+    const t = tools[i];
+    if (t.ok === false) failedTools.push({ tool: t, index: i });
+    if (EDIT_TOOLS.has(t.name)) {
+      const p = parseArgs(t.args);
+      const o = p && typeof p === "object" ? (p as Record<string, unknown>) : null;
+      const d = editDiff(t.name, o, t.preview);
+      if (d) {
+        added += d.added;
+        removed += d.removed;
+      }
+    }
+  }
+
+  const filtered = hasSteps ? tools.filter((t) => !TASK_NOISE_TOOLS.has(t.name)) : tools;
+  const counted = filtered.length > 0 ? filtered : tools;
+
+  let reads = 0;
+  let edits = 0;
+  let commands = 0;
+  let network = 0;
+  let agents = 0;
+  let other = 0;
+
+  for (const t of counted) {
+    if (EDIT_TOOLS.has(t.name)) edits += 1;
+    else if (t.name.startsWith("net_")) network += 1;
+    else if (CMD_SUMMARY_TOOLS.has(t.name)) commands += 1;
+    else if (READ_SUMMARY_TOOLS.has(t.name)) reads += 1;
+    else if (AGENT_SUMMARY_TOOLS.has(t.name)) agents += 1;
+    else other += 1;
+  }
+
+  const parts: string[] = [];
+  if (reads > 0) parts.push(reads === 1 ? tr(lang, "1 leitura", "1 read") : tr(lang, `${reads} leituras`, `${reads} reads`));
+  if (edits > 0) parts.push(edits === 1 ? tr(lang, "1 edição", "1 edit") : tr(lang, `${edits} edições`, `${edits} edits`));
+  if (commands > 0) parts.push(commands === 1 ? tr(lang, "1 comando", "1 command") : tr(lang, `${commands} comandos`, `${commands} commands`));
+  if (network > 0) parts.push(network === 1 ? tr(lang, "1 rede", "1 network op") : tr(lang, `${network} rede`, `${network} network ops`));
+  if (agents > 0) parts.push(agents === 1 ? tr(lang, "1 agente", "1 agent") : tr(lang, `${agents} agentes`, `${agents} agents`));
+  if (other > 0) parts.push(other === 1 ? tr(lang, "1 outra", "1 other") : tr(lang, `${other} outras`, `${other} other`));
+
+  const runningTool = [...tools].reverse().find((t) => t.ok === undefined) ?? null;
+  const latestTool = runningTool ?? (counted.length > 0 ? counted[counted.length - 1] : null);
+  let activeToolLabel: string | null = null;
+  if (latestTool) {
+    const verb = toolActionLabel(latestTool.name, lang);
+    const target = shortToolTarget(latestTool);
+    activeToolLabel = target ? `${verb} ${target}` : verb;
+  }
+
+  let liveLine: string | null = null;
+  if (runningTool?.progress) {
+    const lines = runningTool.progress
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter(Boolean);
+    if (lines.length > 0) {
+      liveLine = lines[lines.length - 1];
+    }
+  }
+
+  return {
+    totalCount: counted.length,
+    categoryText: parts.join(", "),
+    added,
+    removed,
+    failedTools,
+    activeToolLabel,
+    liveLine,
+  };
+}
+
+const STEP_RING_R = 5.5;
+const STEP_RING_C = 2 * Math.PI * STEP_RING_R;
+
+function StepRing({ completed, total }: { completed: number; total: number }) {
+  const ratio = total > 0 ? Math.min(1, Math.max(0, completed / total)) : 0;
+  const allDone = total > 0 && completed >= total;
+  const dashOffset = STEP_RING_C * (1 - ratio);
+  return (
+    <svg
+      width={14}
+      height={14}
+      viewBox="0 0 14 14"
+      className="steps-ring"
+      aria-hidden="true"
+    >
+      <circle
+        cx={7}
+        cy={7}
+        r={STEP_RING_R}
+        fill="none"
+        stroke="var(--line-strong)"
+        strokeWidth={1.75}
+      />
+      <circle
+        cx={7}
+        cy={7}
+        r={STEP_RING_R}
+        fill="none"
+        stroke={allDone ? "var(--ok-text)" : "var(--accent)"}
+        strokeWidth={1.75}
+        strokeLinecap="round"
+        strokeDasharray={STEP_RING_C}
+        strokeDashoffset={dashOffset}
+        transform="rotate(-90 7 7)"
+        className="steps-ring-progress"
+      />
+    </svg>
+  );
+}
+
+const StepsCardBody = memo(function StepsCardBody({ tasks }: { tasks: Todo[] }) {
+  return (
+    <div className="steps-card" role="list">
+      {tasks.map((t) => {
+        const desc = (t.description ?? "").trim();
+        const kind =
+          t.status === "in_progress"
+            ? "in_progress"
+            : t.status === "pending"
+              ? "pending"
+              : desc === "[failed]"
+                ? "failed"
+                : desc === "[skipped]"
+                  ? "skipped"
+                  : "completed";
+        return (
+          <div key={t.id} className={`step-row ${kind}`} role="listitem">
+            <span className="step-icon" aria-hidden="true">
+              {kind === "in_progress" ? (
+                <Loader2 size={15} strokeWidth={1.85} className="step-spin" />
+              ) : kind === "pending" ? (
+                <Circle size={15} strokeWidth={1.75} />
+              ) : kind === "failed" ? (
+                <XCircle size={15} strokeWidth={1.85} />
+              ) : kind === "skipped" ? (
+                <MinusCircle size={15} strokeWidth={1.85} />
+              ) : (
+                <CheckCircle2 size={15} strokeWidth={1.85} />
+              )}
+            </span>
+            <span className="step-title">{t.subject}</span>
+          </div>
+        );
+      })}
+    </div>
+  );
+});
+
+const StandaloneStepsCard = memo(function StandaloneStepsCard({
+  tasks,
+  streaming,
+}: {
+  tasks: Todo[];
+  streaming: boolean;
 }) {
   const lang = useLang();
-  const [showReasoning, setShowReasoning] = useState(false);
-  const b = props.block;
-  const toolGroups = useMemo(() => groupTools(b.tools), [b.tools]);
-  const thinking = b.streaming && !b.text && b.tools.length === 0;
+  const completed = useMemo(
+    () => tasks.filter((t) => t.status === "completed").length,
+    [tasks],
+  );
+  const hasActive = useMemo(
+    () => tasks.some((t) => t.status === "in_progress" || t.status === "pending"),
+    [tasks],
+  );
+  const finished = tasks.length > 0 && !hasActive && !streaming;
+  const [userOpen, setUserOpen] = useState<boolean | null>(null);
+  const prevFinishedRef = useRef(finished);
+  useEffect(() => {
+    if (prevFinishedRef.current !== finished) {
+      prevFinishedRef.current = finished;
+      setUserOpen(null);
+    }
+  }, [finished]);
+
+  const open = userOpen ?? hasActive;
+  if (tasks.length === 0) return null;
+
   return (
-    <div className="msg-assistant">
-      <span className="msg-avatar">
-        <ZerithMark size={24} />
-      </span>
-      <div className="msg-body">
-        {b.reasoning ? (
-          <div className={"think" + (showReasoning ? " open" : "") + (thinking ? " live" : "")}>
-            <button className="think-head" onClick={() => setShowReasoning(!showReasoning)} aria-expanded={showReasoning}>
-              <Brain size={14} strokeWidth={2} />
-              <span className="think-label">{thinking ? "Pensando…" : "Raciocínio"}</span>
-              <ChevronRight size={14} strokeWidth={2} className="chev" />
-            </button>
-            {showReasoning ? (
-              <div className="think-body">
-                <Markdown text={b.reasoning} streaming={b.streaming && !b.text} />
-              </div>
+    <div className="steps-standalone">
+      <div className="activity-bar">
+        <button
+          type="button"
+          className={
+            "steps-toggle" +
+            (open ? " open" : "") +
+            (completed === tasks.length ? " done" : "")
+          }
+          aria-expanded={open}
+          onClick={() => setUserOpen(!open)}
+        >
+          <StepRing completed={completed} total={tasks.length} />
+          <span className="steps-toggle-label">
+            {completed}/{tasks.length}{" "}
+            {tr(
+              lang,
+              tasks.length === 1 ? "etapa" : "etapas",
+              tasks.length === 1 ? "step" : "steps",
+            )}
+          </span>
+          <ChevronRight size={13} strokeWidth={2} className="chev" />
+        </button>
+      </div>
+      {open ? <StepsCardBody tasks={tasks} /> : null}
+    </div>
+  );
+});
+
+const ActivityDrawer = memo(function ActivityDrawer(props: {
+  block: Block & { kind: "assistant" };
+  tasks?: Todo[];
+  sessionId?: string | null;
+  showReasoning: boolean;
+  onToggleReasoning: () => void;
+  thinking: boolean;
+}) {
+  const lang = useLang();
+  const toolsView = useToolsView();
+  const b = props.block;
+  const stepList = props.tasks ?? [];
+  const hasTools = b.tools.length > 0;
+  const hasSteps = stepList.length > 0;
+
+  const [userDrawerOpen, setUserDrawerOpen] = useState<boolean | null>(null);
+  const [userStepsOpen, setUserStepsOpen] = useState<boolean | null>(null);
+  const [nowMs, setNowMs] = useState(() => Date.now());
+
+  useEffect(() => {
+    setUserDrawerOpen(null);
+  }, [toolsView]);
+
+  useEffect(() => {
+    if (!b.streaming || b.startedAt == null) return;
+    setNowMs(Date.now());
+    const id = window.setInterval(() => setNowMs(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, [b.streaming, b.startedAt]);
+
+  const completedSteps = useMemo(
+    () => stepList.filter((t) => t.status === "completed").length,
+    [stepList],
+  );
+  const hasActiveSteps = useMemo(
+    () => stepList.some((t) => t.status === "in_progress" || t.status === "pending"),
+    [stepList],
+  );
+  const stepsFinished = hasSteps && !hasActiveSteps && !b.streaming;
+  const prevStepsFinishedRef = useRef(stepsFinished);
+  useEffect(() => {
+    if (prevStepsFinishedRef.current !== stepsFinished) {
+      prevStepsFinishedRef.current = stepsFinished;
+      setUserStepsOpen(null);
+    }
+  }, [stepsFinished]);
+
+  const summary = useMemo(
+    () => summarizeTools(b.tools, hasSteps, lang),
+    [b.tools, hasSteps, lang],
+  );
+  const toolGroups = useMemo(() => groupTools(b.tools), [b.tools]);
+
+  const drawerOpen = userDrawerOpen ?? (toolsView === "detailed");
+  const stepsOpen = userStepsOpen ?? hasActiveSteps;
+  const elapsedMs =
+    b.startedAt != null
+      ? Math.max(0, (b.streaming ? nowMs : (b.finishedAt ?? nowMs)) - b.startedAt)
+      : null;
+
+  if (!hasTools && !hasSteps) return null;
+
+  const primaryLabel = b.streaming
+    ? elapsedMs != null
+      ? tr(lang, `Trabalhando · ${formatElapsed(elapsedMs)}`, `Working · ${formatElapsed(elapsedMs)}`)
+      : tr(lang, "Trabalhando…", "Working…")
+    : elapsedMs != null
+      ? tr(lang, `Trabalhou por ${formatElapsed(elapsedMs)}`, `Worked for ${formatElapsed(elapsedMs)}`)
+      : summary.totalCount === 1
+        ? tr(lang, "1 ação", "1 action")
+        : tr(lang, `${summary.totalCount} ações`, `${summary.totalCount} actions`);
+
+  const metaText = b.streaming ? summary.activeToolLabel : summary.categoryText;
+  const allStepsDone = hasSteps && completedSteps >= stepList.length;
+
+  return (
+    <div className="activity-wrap">
+      <div className="activity-bar">
+        {hasTools ? (
+          <button
+            type="button"
+            className={
+              "activity-toggle" +
+              (drawerOpen ? " open" : "") +
+              (b.streaming ? " live" : "")
+            }
+            aria-expanded={drawerOpen}
+            onClick={() => setUserDrawerOpen(!drawerOpen)}
+          >
+            {b.streaming ? <span className="activity-live-dot" aria-hidden="true" /> : null}
+            <span className="activity-primary">{primaryLabel}</span>
+            {metaText ? (
+              <span className="activity-meta" title={metaText}>
+                · {metaText}
+              </span>
             ) : null}
-          </div>
+            {summary.added > 0 || summary.removed > 0 ? (
+              <span
+                className="tool-diff-stats"
+                aria-label={`+${summary.added} -${summary.removed}`}
+              >
+                {summary.added > 0 ? <span className="tool-stat-add">+{summary.added}</span> : null}
+                {summary.removed > 0 ? <span className="tool-stat-del">−{summary.removed}</span> : null}
+              </span>
+            ) : null}
+            {summary.failedTools.length > 0 ? (
+              <span className="activity-fail-pill">
+                <AlertTriangle size={12} strokeWidth={2} aria-hidden="true" />
+                <span>
+                  {summary.failedTools.length === 1
+                    ? tr(lang, "1 erro", "1 error")
+                    : tr(
+                        lang,
+                        `${summary.failedTools.length} erros`,
+                        `${summary.failedTools.length} errors`,
+                      )}
+                </span>
+              </span>
+            ) : null}
+            <ChevronRight size={14} strokeWidth={2} className="chev" />
+          </button>
         ) : null}
-        {b.tools.length > 0 ? (
+        {hasTools && hasSteps ? (
+          <span className="activity-sep" aria-hidden="true">
+            ·
+          </span>
+        ) : null}
+        {hasSteps ? (
+          <button
+            type="button"
+            className={
+              "steps-toggle" +
+              (stepsOpen ? " open" : "") +
+              (allStepsDone ? " done" : "")
+            }
+            aria-expanded={stepsOpen}
+            onClick={() => setUserStepsOpen(!stepsOpen)}
+          >
+            <StepRing completed={completedSteps} total={stepList.length} />
+            <span className="steps-toggle-label">
+              {completedSteps}/{stepList.length}{" "}
+              {tr(
+                lang,
+                stepList.length === 1 ? "etapa" : "etapas",
+                stepList.length === 1 ? "step" : "steps",
+              )}
+            </span>
+            <ChevronRight size={13} strokeWidth={2} className="chev" />
+          </button>
+        ) : null}
+      </div>
+
+      {hasSteps && stepsOpen ? <StepsCardBody tasks={stepList} /> : null}
+
+      {hasTools && !drawerOpen && b.streaming && summary.liveLine ? (
+        <button
+          type="button"
+          className="activity-live-chip"
+          onClick={() => setUserDrawerOpen(true)}
+          title={summary.liveLine}
+        >
+          <Terminal size={12} strokeWidth={2} aria-hidden="true" />
+          <span>{summary.liveLine}</span>
+        </button>
+      ) : null}
+
+      {hasTools && !drawerOpen && summary.failedTools.length > 0 ? (
+        <div className="activity-fail-strip">
+          {summary.failedTools.map(({ tool, index }) => (
+            <ToolLine
+              key={`fail-${tool.id}-${index}`}
+              row={tool}
+              sessionId={props.sessionId}
+            />
+          ))}
+        </div>
+      ) : null}
+
+      {hasTools && drawerOpen ? (
+        <div className="activity-drawer-body">
+          {b.reasoning ? (
+            <div
+              className={
+                "think" +
+                (props.showReasoning ? " open" : "") +
+                (props.thinking ? " live" : "")
+              }
+            >
+              <button
+                type="button"
+                className="think-head"
+                onClick={props.onToggleReasoning}
+                aria-expanded={props.showReasoning}
+              >
+                <Brain size={14} strokeWidth={2} />
+                <span className="think-label">
+                  {props.thinking
+                    ? tr(lang, "Pensando…", "Thinking…")
+                    : tr(lang, "Raciocínio", "Reasoning")}
+                </span>
+                <ChevronRight size={14} strokeWidth={2} className="chev" />
+              </button>
+              {props.showReasoning ? (
+                <div className="think-body">
+                  <Markdown text={b.reasoning} streaming={b.streaming && !b.text} />
+                </div>
+              ) : null}
+            </div>
+          ) : null}
           <div className="tools">
             {toolGroups.map((g, gIdx) =>
               g.kind === "burst" ? (
@@ -2207,17 +2738,79 @@ const AssistantBlock = memo(function AssistantBlock(props: {
                   sessionId={props.sessionId}
                 />
               ) : (
-                <ToolLine key={`${g.tool.id}-${g.index}`} row={g.tool} sessionId={props.sessionId} />
+                <ToolLine
+                  key={`${g.tool.id}-${g.index}`}
+                  row={g.tool}
+                  sessionId={props.sessionId}
+                />
               ),
             )}
           </div>
+        </div>
+      ) : null}
+    </div>
+  );
+});
+
+const AssistantBlock = memo(function AssistantBlock(props: {
+  block: Block & { kind: "assistant" };
+  tasks?: Todo[];
+  sessionId?: string | null;
+  onBranch?: (id: number) => void;
+  /** Resends the last prompt (only on the newest failed answer). */
+  onRetry?: () => void;
+}) {
+  const lang = useLang();
+  const [showReasoning, setShowReasoning] = useState(false);
+  const toggleReasoning = useCallback(() => setShowReasoning((v) => !v), []);
+  const b = props.block;
+  const thinking = b.streaming && !b.text && b.tools.length === 0;
+  const hasActivity = b.tools.length > 0 || (props.tasks?.length ?? 0) > 0;
+  return (
+    <div className="msg-assistant">
+      <span className="msg-avatar">
+        <ZerithMark size={24} />
+      </span>
+      <div className="msg-body">
+        {b.reasoning && b.tools.length === 0 ? (
+          <div className={"think" + (showReasoning ? " open" : "") + (thinking ? " live" : "")}>
+            <button
+              type="button"
+              className="think-head"
+              onClick={toggleReasoning}
+              aria-expanded={showReasoning}
+            >
+              <Brain size={14} strokeWidth={2} />
+              <span className="think-label">
+                {thinking
+                  ? tr(lang, "Pensando…", "Thinking…")
+                  : tr(lang, "Raciocínio", "Reasoning")}
+              </span>
+              <ChevronRight size={14} strokeWidth={2} className="chev" />
+            </button>
+            {showReasoning ? (
+              <div className="think-body">
+                <Markdown text={b.reasoning} streaming={b.streaming && !b.text} />
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+        {hasActivity ? (
+          <ActivityDrawer
+            block={b}
+            tasks={props.tasks}
+            sessionId={props.sessionId}
+            showReasoning={showReasoning}
+            onToggleReasoning={toggleReasoning}
+            thinking={thinking}
+          />
         ) : null}
         {b.text ? (
           <Markdown text={b.text} streaming={b.streaming} />
-        ) : thinking && !b.reasoning ? (
+        ) : thinking && !b.reasoning && !(props.tasks?.length ?? 0) ? (
           <span className="thinking-live" role="status">
             <Brain size={14} strokeWidth={2} />
-            <span className="think-label">Pensando…</span>
+            <span className="think-label">{tr(lang, "Pensando…", "Thinking…")}</span>
           </span>
         ) : null}
         {b.error ? (
@@ -2364,6 +2957,7 @@ function goalStateLabel(sub: string, lang: Lang): { label: string; tone: string 
 
 export const Transcript = memo(function Transcript(props: {
   blocks: Block[];
+  tasks?: Todo[];
   tail?: React.ReactNode;
   sessionId?: string | null;
   /** A turn is running: no edit/branch until it lands. */
@@ -2455,26 +3049,45 @@ export const Transcript = memo(function Transcript(props: {
             let aOrd = 0;
             let uOrd = 0;
             let nOrd = 0;
-            const rendered = props.blocks.map((b, i) => {
+            const showBusyPlaceholder = Boolean(
+              props.busy && !props.blocks.some((b) => b.kind === "assistant" && b.streaming),
+            );
+            const activeTasks = props.tasks && props.tasks.length > 0 ? props.tasks : undefined;
+            const tasksOnIndex = showBusyPlaceholder ? -1 : lastAssistant;
+            const showStandaloneSteps =
+              Boolean(activeTasks) && !showBusyPlaceholder && lastAssistant < 0;
+
+            const rendered: ReactNode[] = [];
+            for (let i = 0; i < props.blocks.length; i++) {
+              const b = props.blocks[i];
               // A block the event did not touch keeps its reference, so `memo`
               // skips it: only the answer being written is re-rendered. Keying
               // by per-kind ordinal keeps keys stable across streaming→stored
               // transitions and borrowIds while preventing cross-kind collisions.
               if (b.kind === "user") {
-                return <UserRow key={`u-${uOrd++}`} block={b} onEdit={onEdit} />;
+                rendered.push(<UserRow key={`u-${uOrd++}`} block={b} onEdit={onEdit} />);
+                continue;
               }
               if (b.kind === "subagent") {
-                return <SubagentCard key={`sub-${b.id}`} block={b} />;
+                const group: SubagentBlock[] = [b];
+                while (i + 1 < props.blocks.length && props.blocks[i + 1].kind === "subagent") {
+                  i += 1;
+                  group.push(props.blocks[i] as SubagentBlock);
+                }
+                rendered.push(<SubagentGroup key={`subg-${group[0].id}`} blocks={group} />);
+                continue;
               }
               if (b.kind === "note" && b.btw) {
-                return <BtwNote key={`btw-${b.btw.id}`} btw={b.btw} />;
+                rendered.push(<BtwNote key={`btw-${b.btw.id}`} btw={b.btw} />);
+                continue;
               }
               if (b.kind === "note" && b.learned?.length) {
-                return <LearnedNote key={`n-${nOrd++}`} text={b.text} items={b.learned} />;
+                rendered.push(<LearnedNote key={`n-${nOrd++}`} text={b.text} items={b.learned} />);
+                continue;
               }
               if (b.kind === "note") {
                 const goalBadge = b.sub ? goalStateLabel(b.sub, lang) : null;
-                return (
+                rendered.push(
                   <div key={`n-${nOrd++}`} className="msg-note">
                     <Info size={14} strokeWidth={2} />
                     {goalBadge ? (
@@ -2483,19 +3096,21 @@ export const Transcript = memo(function Transcript(props: {
                       </span>
                     ) : null}
                     <Markdown text={b.text} streaming={false} />
-                  </div>
+                  </div>,
                 );
+                continue;
               }
-              return (
+              rendered.push(
                 <AssistantBlock
                   key={`a-${aOrd++}`}
                   block={b}
+                  tasks={i === tasksOnIndex ? activeTasks : undefined}
                   sessionId={props.sessionId}
                   onBranch={onBranch}
                   onRetry={i === lastAssistant && b.error ? onRetry : undefined}
-                />
+                />,
               );
-            });
+            }
             return (
               <>
                 {rendered}
@@ -2503,12 +3118,16 @@ export const Transcript = memo(function Transcript(props: {
                   The answer block is born on the first event, so a slow turn used to
                   look frozen: the dots stand in for it while the turn is running.
                 */}
-                {props.busy && !props.blocks.some((b) => b.kind === "assistant" && b.streaming) ? (
+                {showBusyPlaceholder ? (
                   <AssistantBlock
                     key={`a-${aOrd}`}
                     block={{ kind: "assistant", text: "", reasoning: "", tools: [], streaming: true }}
+                    tasks={activeTasks}
                     sessionId={props.sessionId}
                   />
+                ) : null}
+                {showStandaloneSteps && activeTasks ? (
+                  <StandaloneStepsCard tasks={activeTasks} streaming={Boolean(props.busy)} />
                 ) : null}
               </>
             );

@@ -1406,7 +1406,16 @@ mod tests {
 pub(crate) fn tool_guidance(tools: &zerith_tools::Registry) -> String {
     let has = |n: &str| tools.get(n).is_some();
     let mut out = String::new();
-    if has("task_create") {
+    if has("task_plan") {
+        out.push_str(
+            "\n\n# Lista de tarefas\nEm tarefas com 3 ou mais passos, prefira `task_plan` para criar e atualizar o checklist ordenado em uma única chamada (`steps: [{title, status}]`), chamando-o em paralelo com as ferramentas de trabalho para não adicionar turnos extras. Em geral, mantenha exatamente uma tarefa `in_progress` por vez (ou as etapas paralelas em andamento) e marque as finalizadas como `completed` (ou `skipped`/`failed` quando aplicável), sem acumular.",
+        );
+        if has("task_create") {
+            out.push_str(
+                " Use `task_create`/`task_update` apenas se precisar gerenciar itens individuais com dependências.",
+            );
+        }
+    } else if has("task_create") {
         out.push_str(
             "\n\n# Lista de tarefas\nEm trabalho com vários passos, crie as tarefas com `task_create` antes de começar e atualize-as com `task_update` conforme avança. Mantenha exatamente uma tarefa `in_progress` por vez; marque `completed` assim que terminar, sem acumular.",
         );

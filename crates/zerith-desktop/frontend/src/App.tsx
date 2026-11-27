@@ -2200,6 +2200,7 @@ export default function App() {
                   // transcript in the DOM under the hero after "Nova conversa".
                   key={"t:" + (selected ?? "new")}
                   blocks={surface}
+                  tasks={turn.tasks}
                   tail={tail}
                   sessionId={selected}
                   busy={turn.busy}

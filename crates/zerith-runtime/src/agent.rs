@@ -2547,6 +2547,7 @@ pub(crate) fn is_orchestrator_root_tool(name: &str) -> bool {
             | "view_image"
             | "web_search"
             | "web_fetch"
+            | "task_plan"
             | "task_create"
             | "task_update"
             | "task_list"
@@ -3126,6 +3127,7 @@ mod approval_grant_tests {
             "view_image",
             "web_search",
             "web_fetch",
+            "task_plan",
             "task_create",
             "skill",
             "memory",

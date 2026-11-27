@@ -17,6 +17,9 @@ export type Block =
       stored?: number;
       /** Tool calls already behind the text, so text after a new one starts a paragraph. */
       toolsAtText?: number;
+      /** Epoch ms when a live assistant block started/finished (omitted on history replay). */
+      startedAt?: number;
+      finishedAt?: number;
       /** Subtle per-reply telemetry captured during the live turn. */
       stats?: { ttftMs?: number; cacheHitPct?: number; outputTokens?: number };
     }
@@ -106,7 +109,14 @@ function assistant(state: TurnState): Block & { kind: "assistant" } {
     const b = blocks[i];
     if (b.kind === "assistant") return (blocks[i] = { ...b, tools: [...b.tools] }) as Block & { kind: "assistant" };
   }
-  const created = { kind: "assistant" as const, text: "", reasoning: "", tools: [], streaming: true };
+  const created = {
+    kind: "assistant" as const,
+    text: "",
+    reasoning: "",
+    tools: [],
+    streaming: true,
+    startedAt: Date.now(),
+  };
   blocks.push(created);
   return created;
 }
@@ -215,7 +225,11 @@ export function applyEvent(prev: TurnState, ev: TurnEvent): TurnState {
     case "goal": {
       // Uma rodada acabou: a resposta dela fecha, e a próxima abre outra.
       const last = state.blocks[state.blocks.length - 1];
-      if (last?.kind === "assistant" && last.streaming) assistant(state).streaming = false;
+      if (last?.kind === "assistant" && last.streaming) {
+        const a = assistant(state);
+        a.streaming = false;
+        a.finishedAt = Date.now();
+      }
       state.blocks = [...state.blocks, { kind: "note", text: ev.text, sub: ev.state }];
       return state;
     }
@@ -336,6 +350,7 @@ export function applyEvent(prev: TurnState, ev: TurnEvent): TurnState {
     case "done": {
       const a = assistant(state);
       a.streaming = false;
+      a.finishedAt = Date.now();
       // the turn's full saving: RTK plus the Ponytail/Caveman estimates
       state.saved = Math.max(state.saved, ev.savedTokens);
       if (!a.text && ev.text) a.text = ev.text;
@@ -365,6 +380,7 @@ export function applyEvent(prev: TurnState, ev: TurnEvent): TurnState {
     case "failed": {
       const a = assistant(state);
       a.streaming = false;
+      a.finishedAt = Date.now();
       a.error = ev.message;
       return state;
     }
@@ -381,13 +397,18 @@ export function finishTurn(prev: TurnState, cancelled = false): TurnState {
   const last = [...state.blocks].reverse().find((b) => b.kind === "assistant");
   // Stop pressed: not a failure. Close the partial answer and say so neutrally.
   if (cancelled) {
-    if (last?.streaming) assistant(state).streaming = false;
+    if (last?.streaming) {
+      const a = assistant(state);
+      a.streaming = false;
+      a.finishedAt = Date.now();
+    }
     state.blocks = [...state.blocks, { kind: "note", text: "Interrompido" }];
     return state;
   }
   if (!last || (last.streaming && !last.error)) {
     const a = assistant(state);
     a.streaming = false;
+    a.finishedAt = Date.now();
     a.error = "O turno terminou sem resposta.";
   }
   return state;

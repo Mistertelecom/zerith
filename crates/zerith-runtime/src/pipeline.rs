@@ -970,7 +970,13 @@ fn jobs_can_run_parallel(tools: &Registry, jobs: &[Prepared], todo: &[usize]) ->
 fn redacts_output(tool: &str) -> bool {
     !matches!(
         tool,
-        "write_file" | "edit_file" | "multi_edit" | "task_create" | "task_update" | "task_list"
+        "write_file"
+            | "edit_file"
+            | "multi_edit"
+            | "task_plan"
+            | "task_create"
+            | "task_update"
+            | "task_list"
     )
 }
 

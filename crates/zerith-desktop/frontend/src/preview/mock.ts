@@ -564,11 +564,14 @@ const messages: Record<
 > = {
   s1: [
     {"role": "user", "content": "Migre o cliente HTTP do provedor OpenAI e mantenha os testes passando.\n\nContexto:\n- hoje `openai.rs` cria um `ureq::Agent` a cada chamada\n- o *streaming* abre outra conexão por cima\n- o Codex usa o mesmo caminho\n\nRegras:\n1. **nada** muda na API pública\n2. um cliente só por processo\n3. timeout configurável\n\nDepois rode `cargo test -p zerith-providers` e me diga o que falhou.\nSe o teste de streaming quebrar, pare e pergunte antes de mexer no parser.\nNão toque no `codex.rs` nesta rodada.", "reasoning": null, "tool_name": null},
+    {"id": 2, "role": "assistant", "content": "", "reasoning": "Primeiro leio `openai.rs` e mapeio os usos de `ureq::Agent`; depois rodo os testes e aplico a edição.", "tool_calls": [{"id": "h0a", "name": "read_file", "arguments": "{\"path\": \"crates/zerith-providers/src/openai.rs\", \"offset\": 1, \"limit\": 80}"}, {"id": "h0b", "name": "grep", "arguments": "{\"pattern\": \"ureq::agent|AgentBuilder\", \"path\": \"crates/zerith-providers/src\"}"}], "tool_name": null},
+    {"id": 21, "role": "tool", "tool_name": "read_file", "tool_calls": {"tool_call_id": "h0a"}, "content": "[linhas 1-80 de 214]\n1\tuse crate::http;\n2\tpub struct Client {\n3\t    cfg: ProviderConfig,\n4\t    agent: ureq::Agent,\n5\t}", "reasoning": null},
+    {"id": 22, "role": "tool", "tool_name": "grep", "tool_calls": {"tool_call_id": "h0b"}, "content": "crates/zerith-providers/src/openai.rs:41: let agent = ureq::agent();\ncrates/zerith-providers/src/http.rs:12: ureq::AgentBuilder::new()", "reasoning": null},
     {"id": 3, "role": "assistant", "content": "", "reasoning": "Primeiro rodo os testes para ver o **estado atual**; depois edito `openai.rs`.\n\n- se `auth` faltar, o erro aparece no build\n- o `join` já existe em `http.rs`", "tool_calls": [{"id": "h1", "name": "shell", "arguments": "{\"command\": \"cargo test -p zerith-providers --lib 2>&1 | tail -n 5\"}"}], "tool_name": null},
-    {"id": 4, "role": "tool", "tool_name": "shell", "tool_calls": {"tool_call_id": "h1"}, "content": "exit 101\n[o comando FALHOU]\nerror[E0063]: missing field `auth` in initializer of `Client`\n  --> crates/zerith-providers/src/openai.rs:41:9\n   |\n41 |         Client { cfg, agent }\n   |         ^^^^^^ missing `auth`\nerror: could not compile `zerith-providers` (lib) due to 1 previous error", "reasoning": null},
-    {"id": 5, "role": "assistant", "content": "", "tool_calls": [{"id": "h2", "name": "edit_file", "arguments": "{\"path\": \"crates/zerith-providers/src/openai.rs\", \"old_string\": \"    let agent = ureq::agent();\\n    let url = format!(\\\"{base}{path}\\\");\", \"new_string\": \"    let client = http::client(timeout);\\n    let url = join(base, path);\\n    // um cliente s\\u00f3 por processo\"}"}, {"id": "h3", "name": "web_fetch", "arguments": "{\"url\": \"https://docs.rs/ureq/latest/ureq/struct.Agent.html\", \"max_chars\": 4000}"}], "reasoning": null, "tool_name": null},
+    {"id": 4, "role": "tool", "tool_name": "shell", "tool_calls": {"tool_call_id": "h1"}, "content": "erro: exit 101\n[o comando FALHOU]\nerror[E0063]: missing field `auth` in initializer of `Client`\n  --> crates/zerith-providers/src/openai.rs:41:9\n   |\n41 |         Client { cfg, agent }\n   |         ^^^^^^ missing `auth`\nerror: could not compile `zerith-providers` (lib) due to 1 previous error", "reasoning": null},
+    {"id": 5, "role": "assistant", "content": "", "tool_calls": [{"id": "h2", "name": "edit_file", "arguments": "{\"path\": \"crates/zerith-providers/src/openai.rs\", \"old_string\": \"    let agent = ureq::agent();\\n    let url = format!(\\\"{base}{path}\\\");\", \"new_string\": \"    let client = http::client(timeout);\\n    let url = join(base, path);\\n    // um cliente s\\u00f3 por processo\"}"}, {"id": "h3", "name": "net_broadcast", "arguments": "{\"hosts\": [\"edge-sp-01\", \"edge-rj-02\"], \"command\": \"show bgp summary\"}"}], "reasoning": null, "tool_name": null},
     {"id": 6, "role": "tool", "tool_name": "edit_file", "tool_calls": {"tool_call_id": "h2"}, "content": "1 ocorrência(s) substituída(s) em crates/zerith-providers/src/openai.rs", "reasoning": null},
-    {"id": 7, "role": "tool", "tool_name": "web_fetch", "tool_calls": {"tool_call_id": "h3"}, "content": "{\"status\": 200, \"title\": \"ureq 3.0 — Agent\", \"bytes\": 18422}", "reasoning": null},
+    {"id": 7, "role": "tool", "tool_name": "net_broadcast", "tool_calls": {"tool_call_id": "h3"}, "content": "2 hosts consultados em paralelo\n### edge-sp-01 (18 ms)\n```\nNeighbor 10.254.0.1 AS 65001 State/PfxRcd 412\n```\n### edge-rj-02 (24 ms)\n```\nNeighbor 10.254.0.2 AS 65002 State/PfxRcd 389\n```", "reasoning": null},
     {
       id: 8,
       role: "assistant",
@@ -761,8 +764,11 @@ let state = {
     : ([] as { id: string; command: string; session: string | null; secs: number }[]),
 };
 
+let chatSceneEnriched = false;
+
 export function installMock(theme: string) {
   state.theme = theme;
+  chatSceneEnriched = false;
   mockIPC(
     (cmd, args) => {
       const a = (args ?? {}) as Record<string, unknown>;
@@ -787,8 +793,52 @@ export function installMock(theme: string) {
           };
         case "list_sessions":
           return sessions;
-        case "session_messages":
+        case "session_messages": {
+          if (
+            a.id === "s1" &&
+            !chatSceneEnriched &&
+            new URLSearchParams(globalThis.location?.search ?? "").get("scene") === "chat"
+          ) {
+            chatSceneEnriched = true;
+            setTimeout(() => {
+              void emit("turn:event", [
+                "s1",
+                {
+                  type: "tasks",
+                  items: [
+                    ["Ler openai.rs e mapear os usos de ureq", "completed"],
+                    ["Extrair pool HTTP compartilhado em http.rs", "completed"],
+                    ["Validar compatibilidade da API pública", "completed"],
+                    ["Migrar chamadas de streaming mantendo timeout", "in_progress"],
+                    ["Rodar cargo test -p zerith-providers", "pending"],
+                  ].map(([subject, status], i) => ({
+                    id: i + 1,
+                    session_id: "s1",
+                    subject,
+                    description: "",
+                    status,
+                    blocks: [],
+                    blocked_by: [],
+                    created_at: 0,
+                    updated_at: 0,
+                  })),
+                },
+              ]);
+              void emit("turn:event", [
+                "s1",
+                {
+                  type: "subagent",
+                  id: "sa2",
+                  name: "reviewer: auditar contratos de timeout e retry",
+                  state: "done",
+                  summary: "API pública preservada; 3 testes de timeout verificados sem regressão.",
+                  model: "codex:gpt-5-codex",
+                },
+              ]);
+            }, 420);
+          }
           return messages[a.id as string] ?? [];
+        }
         case "providers":
           return providers;
         case "presets":

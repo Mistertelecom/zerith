@@ -13,6 +13,7 @@
 mod agent_tool;
 mod ask_user;
 mod authoring;
+mod blender;
 mod browser;
 mod builtin;
 mod desktop;
@@ -25,6 +26,8 @@ mod lint;
 pub mod lsp;
 mod media;
 mod net_api;
+mod net_grafana;
+mod net_master;
 mod net_snmp;
 mod net_zabbix;
 pub mod network;

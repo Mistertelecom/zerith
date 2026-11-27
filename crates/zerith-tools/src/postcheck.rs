@@ -63,8 +63,295 @@ fn checkers(path: &Path) -> &'static [Checker] {
     }
 }
 
-// `compile()` em vez de `python -m py_compile`: mesma checagem, sem gravar `.pyc`.
-const PY_SCRIPT: &str = "import sys\np=sys.argv[1]\ntry:\n    compile(open(p,'rb').read(),p,'exec',dont_inherit=True)\nexcept SyntaxError as e:\n    print(f'{e.lineno or 1}: {type(e).__name__}: {e.msg}')";
+// `compile()` em vez de `python -m py_compile`: mesma checagem de sintaxe sem gravar `.pyc`,
+// seguida de análise léxica de escopos via `ast` + `builtins` para pegar `NameError` (`F821`)
+// mesmo quando `ruff` não está instalado.
+const PY_SCRIPT: &str = r#"import ast, builtins, sys
+p = sys.argv[1]
+src = open(p, 'rb').read()
+try:
+    compile(src, p, 'exec', dont_inherit=True)
+except SyntaxError as e:
+    print(f'{e.lineno or 1}: {type(e).__name__}: {e.msg}')
+    sys.exit(0)
+tree = ast.parse(src, filename=p)
+for n in ast.walk(tree):
+    if isinstance(n, ast.ImportFrom) and any(a.name == '*' for a in n.names):
+        sys.exit(0)
+BUILTINS = set(dir(builtins)) | {'__file__', '__name__', '__doc__', '__package__', '__spec__', '__loader__', '__cached__', '__builtins__', '__annotations__'}
+TYPE_ALIAS_T = getattr(ast, 'TypeAlias', None)
+TRY_STAR_T = getattr(ast, 'TryStar', None)
+MATCH_T = getattr(ast, 'Match', None)
+def target_names(t, out):
+    if isinstance(t, ast.Name):
+        out.add(t.id)
+    elif isinstance(t, (ast.Tuple, ast.List)):
+        for e in t.elts:
+            target_names(e, out)
+    elif isinstance(t, ast.Starred):
+        target_names(t.value, out)
+def pattern_names(pat, out):
+    if isinstance(pat, ast.MatchAs):
+        if pat.name:
+            out.add(pat.name)
+        if pat.pattern:
+            pattern_names(pat.pattern, out)
+    elif isinstance(pat, ast.MatchStar):
+        if pat.name:
+            out.add(pat.name)
+    elif isinstance(pat, ast.MatchSequence):
+        for p2 in pat.patterns:
+            pattern_names(p2, out)
+    elif isinstance(pat, ast.MatchMapping):
+        if pat.rest:
+            out.add(pat.rest)
+        for p2 in pat.patterns:
+            pattern_names(p2, out)
+    elif isinstance(pat, ast.MatchClass):
+        for p2 in pat.patterns:
+            pattern_names(p2, out)
+        for p2 in pat.kwd_patterns:
+            pattern_names(p2, out)
+    elif isinstance(pat, ast.MatchOr):
+        for p2 in pat.patterns:
+            pattern_names(p2, out)
+def collect_walrus(node, out):
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            continue
+        if isinstance(child, ast.NamedExpr):
+            out.add(child.target.id)
+        collect_walrus(child, out)
+def is_type_checking_test(test):
+    return (isinstance(test, ast.Name) and test.id == 'TYPE_CHECKING') or (isinstance(test, ast.Attribute) and test.attr == 'TYPE_CHECKING')
+def catches_name_error(handlers):
+    for h in handlers:
+        t = h.type
+        if isinstance(t, ast.Name) and t.id == 'NameError':
+            return True
+        if isinstance(t, ast.Tuple) and any(isinstance(e, ast.Name) and e.id == 'NameError' for e in t.elts):
+            return True
+    return False
+def collect_bindings(stmts, names, globals_set, is_module=False):
+    for st in stmts:
+        if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(st.name)
+            if is_module:
+                for sub in ast.walk(st):
+                    if isinstance(sub, ast.Global):
+                        globals_set.update(sub.names)
+        elif TYPE_ALIAS_T is not None and isinstance(st, TYPE_ALIAS_T):
+            names.add(st.name.id)
+        elif isinstance(st, ast.Import):
+            for a in st.names:
+                names.add(a.asname or a.name.split('.')[0])
+        elif isinstance(st, ast.ImportFrom):
+            for a in st.names:
+                names.add(a.asname or a.name)
+        elif isinstance(st, ast.Assign):
+            for t in st.targets:
+                target_names(t, names)
+        elif isinstance(st, ast.AugAssign):
+            target_names(st.target, names)
+        elif isinstance(st, ast.AnnAssign):
+            if st.value is not None or not isinstance(st.target, ast.Name):
+                target_names(st.target, names)
+            elif st.simple:
+                names.add(st.target.id)
+        elif isinstance(st, (ast.For, ast.AsyncFor)):
+            target_names(st.target, names)
+            collect_bindings(st.body, names, globals_set, is_module)
+            collect_bindings(st.orelse, names, globals_set, is_module)
+        elif isinstance(st, ast.While):
+            collect_bindings(st.body, names, globals_set, is_module)
+            collect_bindings(st.orelse, names, globals_set, is_module)
+        elif isinstance(st, ast.If):
+            collect_bindings(st.body, names, globals_set, is_module)
+            collect_bindings(st.orelse, names, globals_set, is_module)
+        elif isinstance(st, (ast.With, ast.AsyncWith)):
+            for item in st.items:
+                if item.optional_vars is not None:
+                    target_names(item.optional_vars, names)
+            collect_bindings(st.body, names, globals_set, is_module)
+        elif isinstance(st, ast.Try) or (TRY_STAR_T is not None and isinstance(st, TRY_STAR_T)):
+            collect_bindings(st.body, names, globals_set, is_module)
+            for h in st.handlers:
+                if h.name:
+                    names.add(h.name)
+                collect_bindings(h.body, names, globals_set, is_module)
+            collect_bindings(st.orelse, names, globals_set, is_module)
+            collect_bindings(st.finalbody, names, globals_set, is_module)
+        elif MATCH_T is not None and isinstance(st, MATCH_T):
+            for c in st.cases:
+                pattern_names(c.pattern, names)
+                collect_bindings(c.body, names, globals_set, is_module)
+        elif isinstance(st, ast.Global):
+            globals_set.update(st.names)
+        if not isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            collect_walrus(st, names)
+class Checker(ast.NodeVisitor):
+    def __init__(self):
+        self.scopes = []
+        self.errors = []
+        self.module_globals = set()
+    def is_bound(self, name):
+        if name in BUILTINS:
+            return True
+        for _, names in reversed(self.scopes):
+            if name in names:
+                return True
+        return False
+    def check_module(self, node):
+        mod_names = set()
+        collect_bindings(node.body, mod_names, self.module_globals, is_module=True)
+        mod_names |= self.module_globals
+        self.scopes.append(('module', mod_names))
+        for st in node.body:
+            self.visit(st)
+        self.scopes.pop()
+    def visit_Name(self, node):
+        if isinstance(node.ctx, (ast.Load, ast.Del)) and not self.is_bound(node.id):
+            self.errors.append((node.lineno, node.id))
+    def visit_AnnAssign(self, node):
+        if node.value is not None:
+            self.visit(node.value)
+        if not isinstance(node.target, ast.Name):
+            self.visit(node.target)
+    def visit_TypeAlias(self, node):
+        pass
+    def visit_If(self, node):
+        self.visit(node.test)
+        if not is_type_checking_test(node.test):
+            for s in node.body:
+                self.visit(s)
+        for s in node.orelse:
+            self.visit(s)
+    def visit_Try(self, node):
+        if not catches_name_error(node.handlers):
+            for s in node.body:
+                self.visit(s)
+        for h in node.handlers:
+            if h.type is not None:
+                self.visit(h.type)
+            for s in h.body:
+                self.visit(s)
+        for s in node.orelse:
+            self.visit(s)
+        for s in node.finalbody:
+            self.visit(s)
+    def visit_TryStar(self, node):
+        self.visit_Try(node)
+    def _arg_names(self, args):
+        out = set()
+        for a in list(args.posonlyargs) + list(args.args) + list(args.kwonlyargs):
+            out.add(a.arg)
+        if args.vararg:
+            out.add(args.vararg.arg)
+        if args.kwarg:
+            out.add(args.kwarg.arg)
+        return out
+    def _visit_func(self, node):
+        for d in node.decorator_list:
+            self.visit(d)
+        for d in node.args.defaults:
+            self.visit(d)
+        for d in node.args.kw_defaults:
+            if d is not None:
+                self.visit(d)
+        fn_names = self._arg_names(node.args)
+        for tp in getattr(node, 'type_params', ()):
+            fn_names.add(tp.name)
+        g = set()
+        collect_bindings(node.body, fn_names, g, is_module=False)
+        saved = self.scopes
+        self.scopes = [(k, n) for (k, n) in saved if k != 'class'] + [('func', fn_names)]
+        for s in node.body:
+            self.visit(s)
+        self.scopes = saved
+    def visit_FunctionDef(self, node):
+        self._visit_func(node)
+    def visit_AsyncFunctionDef(self, node):
+        self._visit_func(node)
+    def visit_Lambda(self, node):
+        for d in node.args.defaults:
+            self.visit(d)
+        for d in node.args.kw_defaults:
+            if d is not None:
+                self.visit(d)
+        fn_names = self._arg_names(node.args)
+        saved = self.scopes
+        self.scopes = [(k, n) for (k, n) in saved if k != 'class'] + [('func', fn_names)]
+        self.visit(node.body)
+        self.scopes = saved
+    def visit_ClassDef(self, node):
+        for d in node.decorator_list:
+            self.visit(d)
+        for b in node.bases:
+            self.visit(b)
+        for kw in node.keywords:
+            self.visit(kw.value)
+        cls_names = set()
+        for tp in getattr(node, 'type_params', ()):
+            cls_names.add(tp.name)
+        g = set()
+        collect_bindings(node.body, cls_names, g, is_module=False)
+        self.scopes.append(('class', cls_names))
+        for s in node.body:
+            self.visit(s)
+        self.scopes.pop()
+    def _visit_comp(self, generators, exprs):
+        saved = self.scopes
+        comp_names = set()
+        self.scopes = saved + [('comp', comp_names)]
+        for i, gen in enumerate(generators):
+            if i == 0:
+                self.scopes = saved
+                self.visit(gen.iter)
+                self.scopes = saved + [('comp', comp_names)]
+            else:
+                self.visit(gen.iter)
+            target_names(gen.target, comp_names)
+            for cond in gen.ifs:
+                self.visit(cond)
+        for e in exprs:
+            self.visit(e)
+        self.scopes = saved
+    def visit_ListComp(self, node):
+        self._visit_comp(node.generators, [node.elt])
+    def visit_SetComp(self, node):
+        self._visit_comp(node.generators, [node.elt])
+    def visit_GeneratorExp(self, node):
+        self._visit_comp(node.generators, [node.elt])
+    def visit_DictComp(self, node):
+        self._visit_comp(node.generators, [node.key, node.value])
+    def visit_MatchClass(self, node):
+        self.visit(node.cls)
+        for p2 in node.patterns:
+            self.visit(p2)
+        for p2 in node.kwd_patterns:
+            self.visit(p2)
+    def visit_MatchValue(self, node):
+        self.visit(node.value)
+    def visit_MatchSingleton(self, node):
+        pass
+    def visit_MatchAs(self, node):
+        if node.pattern is not None:
+            self.visit(node.pattern)
+    def visit_MatchMapping(self, node):
+        for k in node.keys:
+            self.visit(k)
+        for p2 in node.patterns:
+            self.visit(p2)
+    def visit_MatchSequence(self, node):
+        for p2 in node.patterns:
+            self.visit(p2)
+    def visit_MatchOr(self, node):
+        for p2 in node.patterns:
+            self.visit(p2)
+c = Checker()
+c.check_module(tree)
+for ln, nm in c.errors:
+    print(f"{ln}: F821: undefined name '{nm}'")"#;
 
 impl Checker {
     fn program(self) -> Option<PathBuf> {
@@ -507,5 +794,85 @@ mod tests {
             // Arquivo limpo em Python e em shell (`echo = 1` é SC2283 no shellcheck).
             assert_eq!(run(Some(broken), "# ok\n"), "", "{name}");
         }
+    }
+
+    #[test]
+    fn python_fallback_catches_undefined_names_without_false_positives() {
+        assert_eq!(
+            Checker::Python.parse("2: F821: undefined name 'UNREACHABLE_PATTERNS'\n"),
+            vec![d(2, "F821: undefined name 'UNREACHABLE_PATTERNS'")]
+        );
+        let Some(prog) = Checker::Python.program() else {
+            eprintln!("python ausente, pulando teste AST");
+            return;
+        };
+        let dir =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-scratch");
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::Builder::new().tempdir_in(dir).unwrap();
+        let run_py = |name: &str, code: &str| -> Vec<Diag> {
+            let file = dir.path().join(name);
+            std::fs::write(&file, code).unwrap();
+            let out = Checker::Python
+                .command(&prog, &file)
+                .current_dir(dir.path())
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            let combined = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            Checker::Python.parse(&combined)
+        };
+
+        let errs = run_py("undef.py", "def f():\n    return UNREACHABLE_PATTERNS\n");
+        assert_eq!(
+            errs,
+            vec![d(2, "F821: undefined name 'UNREACHABLE_PATTERNS'")],
+            "expected F821 on undefined name"
+        );
+
+        let valid_code = r#"
+from __future__ import annotations
+import math as m
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from nonexistent_mod import GhostType
+
+def outer(items: list[GhostType]) -> int:
+    acc = len(items)
+    def inner(v):
+        return v + int(m.pi) + LATE_CONST
+    try:
+        alias = maybe_missing_symbol
+    except NameError:
+        alias = 0
+    vals = [last := x * 2 for x in items if x > 0]
+    try:
+        with open("x.txt") as fh:
+            acc += len(fh.read())
+    except Exception as exc:
+        print(exc)
+    return inner(alias) + len(vals) + (last if vals else 0) + acc
+
+class Box:
+    SCALE = 2
+    DOUBLE = SCALE * 2
+    def measure(self, factor: int) -> int:
+        return self.SCALE + Box.DOUBLE * factor
+
+LATE_CONST = 7
+"#;
+        assert!(
+            run_py("valid.py", valid_code).is_empty(),
+            "valid Python must not trigger F821"
+        );
+        assert!(
+            run_py("star.py", "from math import *\nprint(sin(1), ANYTHING)\n").is_empty(),
+            "star import must not trigger false-positive F821"
+        );
     }
 }

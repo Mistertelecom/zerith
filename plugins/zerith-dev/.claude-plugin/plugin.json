@@ -1,7 +1,7 @@
 {
   "name": "zerith-dev",
-  "version": "0.4.19",
-  "description": "Engenharia de software e interfaces gráficas: debug sistemático, criação e auditoria visual de UIs Web e Desktop, revisão de código, verificação real e CI no loop com gh.",
+  "version": "0.4.20",
+  "description": "Engenharia de software, interfaces gráficas e 3D CAD: debug sistemático, criação e auditoria visual de UIs Web e Desktop, engenharia 3D paramétrica com Blender, revisão de código, verificação real e CI no loop com gh.",
   "author": {
     "name": "Joao Pedro Mota (Mistertelecom)"
   },

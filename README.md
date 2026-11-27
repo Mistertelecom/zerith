@@ -13,7 +13,7 @@
 
   <p>
     <a href="https://github.com/Mistertelecom/zerith/releases">
-      <img alt="Release v0.4.19" src="https://img.shields.io/badge/version-v0.4.19-111827?style=flat-square" />
+      <img alt="Release v0.4.20" src="https://img.shields.io/badge/version-v0.4.20-111827?style=flat-square" />
     </a>
     <a href="https://github.com/Mistertelecom/zerith/actions/workflows/zerith.yml">
       <img alt="CI Status" src="https://github.com/Mistertelecom/zerith/actions/workflows/zerith.yml/badge.svg" />

@@ -1555,8 +1555,13 @@ fn turn_body(
                         images.push(msg);
                     }
                 } else if outcome.ok
-                    && matches!(call.name.as_str(), "browser" | "desktop_inspect")
-                    && p_args(&call.arguments)["action"].as_str() == Some("screenshot")
+                    && ((matches!(call.name.as_str(), "browser" | "desktop_inspect")
+                        && p_args(&call.arguments)["action"].as_str() == Some("screenshot"))
+                        || (call.name == "blender"
+                            && matches!(
+                                p_args(&call.arguments)["action"].as_str(),
+                                Some("render_views" | "batch")
+                            )))
                 {
                     if let Some(msg) = outcome.output.lines().next().and_then(image_message) {
                         images.push(msg);
@@ -2642,7 +2647,7 @@ fn request(
 fn orchestrator_block(model: &str, exec_label: &str) -> String {
     format!(
     "# Modo Orquestrador Ativo (Pensamento: `{model}` → Execução: `{exec_label}`)\n\
-     Você é o **Modelo de Pensamento (Arquiteto/Orquestrador)**. Você tem acesso direto somente-leitura (`list_dir`, `read_file`, `grep`, `glob`, `repo_map`, `lsp`, `diagnostics`, `view_image`, `web_search`, `web_fetch`, `skill`, `net_inventory`, `net_zabbix`) para inspecionar o projeto antes de agir; as ferramentas de mutação e execução (`shell`, `edit_file`, `write_file`, `multi_edit`, `net_connect`, `terminal_batch`) rodam nos subagentes executores (**`{exec_label}`**).\n\
+     Você é o **Modelo de Pensamento (Arquiteto/Orquestrador)**. Você tem acesso direto somente-leitura (`list_dir`, `read_file`, `grep`, `glob`, `repo_map`, `lsp`, `diagnostics`, `view_image`, `web_search`, `web_fetch`, `skill`, `net_inventory`, `net_audit`, `net_zabbix`, `net_grafana`) para inspecionar o projeto antes de agir; as ferramentas de mutação e execução (`shell`, `edit_file`, `write_file`, `multi_edit`, `net_connect`, `terminal_batch`) rodam nos subagentes executores (**`{exec_label}`**).\n\
      Regras obrigatórias de segurança e fluxo:\n\
      1. **Inspecione antes de delegar:** Use `list_dir`/`read_file` para verificar se já existem arquivos do usuário no destino. NUNCA mande sobrescrever um arquivo existente sem antes ler o atual e pedir ao Executor para preservá-lo/fazer backup ou editar incrementalmente.\n\
      2. **Delegue o objetivo, não o conteúdo:** Chame `agent` (`\"executor\"`, `\"explore\"`, etc.) com um `prompt` autossuficiente que diga o que fazer, quais arquivos ler, as regras e como saber que terminou (ex.: o comando de teste que deve passar). NÃO escreva no prompt o código, o documento ou o diagnóstico prontos: o executor lê os arquivos e escreve. Pensar tudo aqui e ditar gasta sua saída inteira e o executor só copia. Para tarefas independentes, dispare em paralelo.\n\
@@ -2683,7 +2688,9 @@ pub(crate) fn is_orchestrator_root_tool(name: &str) -> bool {
             | "memory"
             | "session_search"
             | "net_inventory"
+            | "net_audit"
             | "net_zabbix"
+            | "net_grafana"
             | "workflow_list"
             | "channel_list"
             | "enter_plan_mode"
@@ -2698,6 +2705,8 @@ pub(crate) fn is_orchestrator_root_tool(name: &str) -> bool {
 pub(crate) fn tool_group(name: &str) -> Option<&'static str> {
     if name.starts_with("net_") || name.starts_with("terminal_") || name == "serial_ports" {
         Some("rede")
+    } else if name == "blender" {
+        Some("blender")
     } else if name == "browser" || name.starts_with("browser_") {
         Some("browser")
     } else if name == "desktop_inspect" {
@@ -2869,8 +2878,59 @@ pub(crate) fn should_include_tool_schema(name: &str, context_lower: &str) -> boo
             "máquina virtual",
             "noc",
             "zabbix",
+            "grafana",
             "snmp",
             "netflow",
+            "datacom",
+            "dmos",
+            "dmswitch",
+            "asr",
+            "asr1001",
+            "ios-xe",
+            "iosxe",
+            "qfp",
+            "copp",
+            "airos",
+            "airmax",
+            "uisp",
+            "unifi",
+            "eaps",
+            "erps",
+            "qinq",
+            "topologia",
+            "topology",
+            "conntrack",
+            "systemd",
+            "firewall",
+        ]
+        .iter()
+        .any(|kw| context_lower.contains(kw))
+            || (name == "net_grafana"
+                && ["dashboard", "painel"]
+                    .iter()
+                    .any(|kw| context_lower.contains(kw)));
+    }
+    if name == "blender" {
+        return [
+            "blender",
+            "bpy",
+            "bmesh",
+            "3d",
+            "stl",
+            "3mf",
+            "glb",
+            "gltf",
+            "fbx",
+            "cad",
+            "mesh",
+            "malha",
+            "modelagem",
+            "peça",
+            "peca",
+            "impressão 3d",
+            "impressao 3d",
+            "manifold",
+            "render",
         ]
         .iter()
         .any(|kw| context_lower.contains(kw));
@@ -3287,7 +3347,9 @@ mod approval_grant_tests {
             "skill",
             "memory",
             "net_inventory",
+            "net_audit",
             "net_zabbix",
+            "net_grafana",
             "generate_image",
             "generate_video",
         ] {

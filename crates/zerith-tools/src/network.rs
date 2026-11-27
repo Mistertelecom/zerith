@@ -21,6 +21,8 @@ use crate::{CallCtx, Exec, Permission, Result, Tool, ToolError};
 #[serde(rename_all = "snake_case")]
 pub enum Vendor {
     CiscoIos,
+    #[serde(rename = "cisco_iosxe")]
+    CiscoIosXe,
     CiscoNxos,
     CiscoXr,
     HuaweiVrp,
@@ -28,7 +30,10 @@ pub enum Vendor {
     ZteOlt,
     #[serde(rename = "fiberhome_olt")]
     FiberHomeOlt,
+    ParksOlt,
     Datacom,
+    DatacomDmos,
+    DatacomDmswitch,
     #[serde(rename = "vyos")]
     VyOS,
     AristaEos,
@@ -36,6 +41,9 @@ pub enum Vendor {
     JuniperJunos,
     MikrotikRouterOs,
     FortinetFortiOs,
+    #[serde(rename = "ubiquiti_airos")]
+    UbiquitiAirOs,
+    UbiquitiUnifi,
     Linux,
     #[default]
     Generic,
@@ -45,19 +53,25 @@ impl Vendor {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::CiscoIos => "cisco_ios",
+            Self::CiscoIosXe => "cisco_iosxe",
             Self::CiscoNxos => "cisco_nxos",
             Self::CiscoXr => "cisco_xr",
             Self::HuaweiVrp => "huawei_vrp",
             Self::HuaweiOlt => "huawei_olt",
             Self::ZteOlt => "zte_olt",
             Self::FiberHomeOlt => "fiberhome_olt",
+            Self::ParksOlt => "parks_olt",
             Self::Datacom => "datacom",
+            Self::DatacomDmos => "datacom_dmos",
+            Self::DatacomDmswitch => "datacom_dmswitch",
             Self::VyOS => "vyos",
             Self::AristaEos => "arista_eos",
             Self::Proxmox => "proxmox",
             Self::JuniperJunos => "juniper_junos",
             Self::MikrotikRouterOs => "mikrotik_router_os",
             Self::FortinetFortiOs => "fortinet_forti_os",
+            Self::UbiquitiAirOs => "ubiquiti_airos",
+            Self::UbiquitiUnifi => "ubiquiti_unifi",
             Self::Linux => "linux",
             Self::Generic => "generic",
         }
@@ -65,7 +79,9 @@ impl Vendor {
 
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().replace('-', "_").as_str() {
-            "cisco" | "ios" | "cisco_ios" | "iosxe" | "cisco_iosxe" => Some(Self::CiscoIos),
+            "cisco" | "ios" | "cisco_ios" => Some(Self::CiscoIos),
+            "cisco_iosxe" | "ios_xe" | "iosxe" | "asr1001" | "asr1001x" | "asr1001hx"
+            | "asr1002x" | "asr1000" => Some(Self::CiscoIosXe),
             "nxos" | "cisco_nxos" => Some(Self::CiscoNxos),
             "iosxr" | "xr" | "cisco_xr" | "cisco_iosxr" => Some(Self::CiscoXr),
             "huawei" | "vrp" | "huawei_vrp" => Some(Self::HuaweiVrp),
@@ -76,7 +92,14 @@ impl Vendor {
             "fiberhome" | "fiberhome_olt" | "fiber_home_olt" | "an5516" | "an6000" | "fh_olt" => {
                 Some(Self::FiberHomeOlt)
             }
-            "datacom" | "dmos" | "dmswitch" | "datacom_dmos" => Some(Self::Datacom),
+            "parks" | "parks_olt" | "fiberlink" => Some(Self::ParksOlt),
+            "datacom" | "dmos" | "dmswitch" => Some(Self::Datacom),
+            "datacom_dmos" | "dm4050" | "dm4170" | "dm4360" | "dm4370" | "dm4610" => {
+                Some(Self::DatacomDmos)
+            }
+            "datacom_dmswitch" | "dm2104" | "dm2104g2" | "dm3000" | "dm4000" | "dm4100" => {
+                Some(Self::DatacomDmswitch)
+            }
             "vyos" | "vy_os" | "vyatta" | "edgeos" => Some(Self::VyOS),
             "arista" | "eos" | "arista_eos" => Some(Self::AristaEos),
             "proxmox" | "pve" | "proxmox_ve" => Some(Self::Proxmox),
@@ -87,6 +110,10 @@ impl Vendor {
             "fortinet" | "fortios" | "fortigate" | "fortinet_forti_os" | "fortinet_fortios" => {
                 Some(Self::FortinetFortiOs)
             }
+            "ubiquiti_airos" | "airos" | "airmax" | "airmax_ac" | "airfiber" | "ltu" | "ubnt" => {
+                Some(Self::UbiquitiAirOs)
+            }
+            "ubiquiti_unifi" | "unifi" | "uisp" => Some(Self::UbiquitiUnifi),
             "linux" | "frr" => Some(Self::Linux),
             "generic" | "other" => Some(Self::Generic),
             _ => None,
@@ -96,19 +123,25 @@ impl Vendor {
     pub fn disable_paging_cmd(self) -> Option<&'static str> {
         match self {
             Self::CiscoIos
+            | Self::CiscoIosXe
             | Self::CiscoNxos
             | Self::CiscoXr
             | Self::ZteOlt
             | Self::FiberHomeOlt
+            | Self::ParksOlt
             | Self::AristaEos => Some("terminal length 0"),
             Self::HuaweiVrp => Some("screen-length 0 temporary"),
             Self::HuaweiOlt => Some("scroll"),
-            Self::Datacom => Some("paginate false"),
+            Self::Datacom | Self::DatacomDmos | Self::DatacomDmswitch => Some("paginate false"),
             Self::VyOS => Some("set terminal length 0"),
             Self::Proxmox => Some("export SYSTEMCTL_PAGER=cat"),
             Self::JuniperJunos => Some("set cli screen-length 0"),
             Self::FortinetFortiOs => Some("config system console\nset output standard\nend"),
-            Self::MikrotikRouterOs | Self::Linux | Self::Generic => None,
+            Self::MikrotikRouterOs
+            | Self::UbiquitiAirOs
+            | Self::UbiquitiUnifi
+            | Self::Linux
+            | Self::Generic => None,
         }
     }
 }
@@ -931,7 +964,7 @@ fn classify_single_segment(vendor: Vendor, seg: &str) -> NetCmdRisk {
             }
             NetCmdRisk::Mutation
         }
-        Vendor::Linux | Vendor::Proxmox => {
+        Vendor::Linux | Vendor::Proxmox | Vendor::UbiquitiAirOs | Vendor::UbiquitiUnifi => {
             const LINUX_RO: &[&str] = &[
                 "ip addr",
                 "ip -br ",
@@ -979,12 +1012,25 @@ fn classify_single_segment(vendor: Vendor, seg: &str) -> NetCmdRisk {
                 "ceph df",
                 "export systemctl_pager=cat",
             ];
+            const UBIQUITI_RO: &[&str] = &[
+                "mca-status",
+                "wstalist",
+                "iwconfig",
+                "iwlist ",
+                "athstats",
+                "ubntbox ",
+                "mca-cli-op info",
+            ];
             if !low.contains('>')
                 && (LINUX_RO
                     .iter()
                     .any(|p| low == p.trim() || low.starts_with(p))
                     || (vendor == Vendor::Proxmox
                         && PROXMOX_RO
+                            .iter()
+                            .any(|p| low == p.trim() || low.starts_with(p)))
+                    || (matches!(vendor, Vendor::UbiquitiAirOs | Vendor::UbiquitiUnifi)
+                        && UBIQUITI_RO
                             .iter()
                             .any(|p| low == p.trim() || low.starts_with(p))))
             {
@@ -1161,7 +1207,7 @@ pub fn prepare_network_command(
                 ));
             }
         }
-        Vendor::Linux | Vendor::Proxmox => {
+        Vendor::Linux | Vendor::Proxmox | Vendor::UbiquitiAirOs | Vendor::UbiquitiUnifi => {
             if low.starts_with("ping ") && !words.iter().any(|w| w.starts_with("-c")) {
                 return Ok((
                     format!("ping -c 4 {}", cmd.trim()[4..].trim_start()),
@@ -1248,7 +1294,7 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
                 "transport": {"type": "string", "description": "ssh | telnet | serial"},
                 "serial_port": {"type": "string"},
                 "baud_rate": {"type": "integer"},
-                "vendor": {"type": "string", "description": "cisco_ios|cisco_nxos|cisco_xr|huawei_vrp|huawei_olt|zte_olt|fiberhome_olt|datacom|vyos|arista_eos|proxmox|juniper_junos|mikrotik_router_os|fortinet_forti_os|linux|generic"},
+                "vendor": {"type": "string", "description": "cisco_ios|cisco_iosxe|cisco_nxos|cisco_xr|huawei_vrp|huawei_olt|zte_olt|fiberhome_olt|parks_olt|datacom|datacom_dmos|datacom_dmswitch|vyos|arista_eos|proxmox|juniper_junos|mikrotik_router_os|fortinet_forti_os|ubiquiti_airos|ubiquiti_unifi|linux|generic"},
                 "role": {"type": "string"},
                 "jump_host": {"type": "string"},
                 "legacy_ssh": {"type": "boolean"},
@@ -1313,7 +1359,7 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
                 "baud_rate": {"type": "integer", "description": "velocidade da serial (ex.: 9600, 115200), padrão 9600"},
                 "user": {"type": "string"},
                 "port": {"type": "integer", "description": "padrão 22 para SSH, 23 para Telnet"},
-                "vendor": {"type": "string", "description": "cisco_ios|cisco_nxos|cisco_xr|huawei_vrp|huawei_olt|zte_olt|fiberhome_olt|datacom|vyos|arista_eos|proxmox|juniper_junos|mikrotik_router_os|fortinet_forti_os|linux|generic"},
+                "vendor": {"type": "string", "description": "cisco_ios|cisco_iosxe|cisco_nxos|cisco_xr|huawei_vrp|huawei_olt|zte_olt|fiberhome_olt|parks_olt|datacom|datacom_dmos|datacom_dmswitch|vyos|arista_eos|proxmox|juniper_junos|mikrotik_router_os|fortinet_forti_os|ubiquiti_airos|ubiquiti_unifi|linux|generic"},
                 "role": {"type": "string", "description": "core|border|distribution|access|firewall|lab|server"},
                 "secret_ref": {"type": "string", "description": "chave no cofre (zerith secret set <nome>)"},
                 "password": {"type": "string", "description": "senha direta (vai para o cofre se remember=true)"},
@@ -2790,12 +2836,16 @@ fn detect_config_vendor(before: &str, after: &str) -> Vendor {
         || lower.contains("set whitelist phy_addr")
     {
         Vendor::FiberHomeOlt
+    } else if lower.contains("parks") || lower.contains("fiberlink") {
+        Vendor::ParksOlt
     } else if lower.contains("dmos")
         || lower.contains("dmswitch")
         || lower.contains("datacom")
         || lower.contains("dot1q vlan ")
     {
         Vendor::Datacom
+    } else if lower.contains("radio.1.mode=") || lower.contains("wireless.1.ssid=") {
+        Vendor::UbiquitiAirOs
     } else if lower.contains("pve-cluster")
         || lower.contains("pveversion")
         || lower.contains("proxmox")
@@ -2842,6 +2892,8 @@ fn detect_config_vendor(before: &str, after: &str) -> Vendor {
         || lower.contains("set security ")
     {
         Vendor::JuniperJunos
+    } else if lower.contains("platform hardware qfp") || lower.contains("ios-xe") {
+        Vendor::CiscoIosXe
     } else {
         Vendor::CiscoIos
     }
@@ -3874,6 +3926,19 @@ pub fn fingerprint_probed_host(
             ],
         ));
     }
+    if banners.contains("parks") || banners.contains("fiberlink") {
+        return Some((
+            Vendor::ParksOlt,
+            DeviceRole::Access,
+            if has_port(22) {
+                DeviceTransport::Ssh
+            } else {
+                DeviceTransport::Telnet
+            },
+            if has_port(22) { 22 } else { 23 },
+            vec!["parks_olt".into(), "olt".into(), "auto-discovered".into()],
+        ));
+    }
     if banners.contains("datacom") || banners.contains("dmos") || banners.contains("dmswitch") {
         return Some((
             Vendor::Datacom,
@@ -3931,6 +3996,19 @@ pub fn fingerprint_probed_host(
             vec!["juniper".into(), "auto-discovered".into()],
         ));
     }
+    if banners.contains("ios-xe") || banners.contains("ios xe") || banners.contains("asr100") {
+        return Some((
+            Vendor::CiscoIosXe,
+            DeviceRole::Core,
+            if has_port(22) {
+                DeviceTransport::Ssh
+            } else {
+                DeviceTransport::Telnet
+            },
+            if has_port(22) { 22 } else { 23 },
+            vec!["cisco_iosxe".into(), "auto-discovered".into()],
+        ));
+    }
     if banners.contains("cisco") {
         return Some((
             Vendor::CiscoIos,
@@ -3955,6 +4033,33 @@ pub fn fingerprint_probed_host(
             DeviceTransport::Ssh,
             22,
             vec!["fortigate".into(), "auto-discovered".into()],
+        ));
+    }
+    if banners.contains("unifi") || banners.contains("uisp") {
+        return Some((
+            Vendor::UbiquitiUnifi,
+            DeviceRole::Access,
+            DeviceTransport::Ssh,
+            22,
+            vec!["ubiquiti_unifi".into(), "auto-discovered".into()],
+        ));
+    }
+    if banners.contains("airos")
+        || banners.contains("airmax")
+        || banners.contains("airfiber")
+        || banners.contains("ubnt")
+        || banners.contains("ubiquiti")
+    {
+        return Some((
+            Vendor::UbiquitiAirOs,
+            DeviceRole::Access,
+            DeviceTransport::Ssh,
+            22,
+            vec![
+                "ubiquiti_airos".into(),
+                "rf".into(),
+                "auto-discovered".into(),
+            ],
         ));
     }
     if has_port(22) {
@@ -4533,13 +4638,17 @@ fn net_probe(args: &Value, _ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String
                 match vendor {
                     Vendor::MikrotikRouterOs => "mk",
                     Vendor::HuaweiVrp => "huawei",
-                    Vendor::HuaweiOlt | Vendor::ZteOlt | Vendor::FiberHomeOlt => "olt",
-                    Vendor::Datacom => "dm",
+                    Vendor::HuaweiOlt
+                    | Vendor::ZteOlt
+                    | Vendor::FiberHomeOlt
+                    | Vendor::ParksOlt => "olt",
+                    Vendor::Datacom | Vendor::DatacomDmos | Vendor::DatacomDmswitch => "dm",
                     Vendor::VyOS => "vyos",
                     Vendor::AristaEos => "arista",
                     Vendor::Proxmox => "pve",
-                    Vendor::CiscoIos => "cisco",
+                    Vendor::CiscoIos | Vendor::CiscoIosXe => "cisco",
                     Vendor::FortinetFortiOs => "fw",
+                    Vendor::UbiquitiAirOs | Vendor::UbiquitiUnifi => "ubnt",
                     Vendor::Linux => "vm",
                     _ => "host",
                 }
@@ -4549,6 +4658,8 @@ fn net_probe(args: &Value, _ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String
             let default_user = opt_str(args, "user")
                 .unwrap_or(if matches!(vendor, Vendor::Linux | Vendor::Proxmox) {
                     "root"
+                } else if matches!(vendor, Vendor::UbiquitiAirOs | Vendor::UbiquitiUnifi) {
+                    "ubnt"
                 } else {
                     "admin"
                 })
@@ -4868,11 +4979,15 @@ fn default_backup_command_for_vendor(vendor_str: Option<&str>) -> &'static str {
         .unwrap_or(Vendor::Generic)
     {
         Vendor::CiscoIos
+        | Vendor::CiscoIosXe
         | Vendor::CiscoNxos
         | Vendor::CiscoXr
         | Vendor::ZteOlt
         | Vendor::FiberHomeOlt
+        | Vendor::ParksOlt
         | Vendor::Datacom
+        | Vendor::DatacomDmos
+        | Vendor::DatacomDmswitch
         | Vendor::AristaEos => "show running-config",
         Vendor::HuaweiVrp | Vendor::HuaweiOlt => "display current-configuration",
         Vendor::JuniperJunos => "show configuration",
@@ -4880,6 +4995,8 @@ fn default_backup_command_for_vendor(vendor_str: Option<&str>) -> &'static str {
         Vendor::MikrotikRouterOs => "/export",
         Vendor::FortinetFortiOs => "show full-configuration",
         Vendor::Proxmox => "pvesh get /nodes/$(hostname)/status",
+        Vendor::UbiquitiAirOs => "cat /tmp/system.cfg",
+        Vendor::UbiquitiUnifi => "mca-cli-op info && cat /tmp/system.cfg",
         Vendor::Linux => "uname -a && ip -br addr && ip route",
         Vendor::Generic => "show running-config",
     }
@@ -8094,5 +8211,118 @@ add chain=forward action=drop comment=\"drop-all\"
         assert!(has_cli_error("% Unknown command, the error locates at '^'").is_some());
         assert!(has_cli_error("% Parameter error").is_some());
         assert!(has_cli_error("bash: pvesh: command not found").is_some());
+    }
+
+    #[test]
+    fn master_vendors_parse_serialize_paging_risk_and_detection() {
+        let cases = [
+            (
+                Vendor::CiscoIosXe,
+                "cisco_iosxe",
+                &[
+                    "cisco_iosxe",
+                    "ios_xe",
+                    "iosxe",
+                    "asr1001",
+                    "asr1001x",
+                    "asr1000",
+                ][..],
+                Some("terminal length 0"),
+                "show running-config",
+            ),
+            (
+                Vendor::DatacomDmos,
+                "datacom_dmos",
+                &[
+                    "datacom_dmos",
+                    "dm4050",
+                    "dm4170",
+                    "dm4360",
+                    "dm4370",
+                    "dm4610",
+                ][..],
+                Some("paginate false"),
+                "show running-config",
+            ),
+            (
+                Vendor::DatacomDmswitch,
+                "datacom_dmswitch",
+                &["datacom_dmswitch", "dm2104", "dm3000", "dm4000", "dm4100"][..],
+                Some("paginate false"),
+                "show running-config",
+            ),
+            (
+                Vendor::ParksOlt,
+                "parks_olt",
+                &["parks", "parks_olt", "fiberlink"][..],
+                Some("terminal length 0"),
+                "show running-config",
+            ),
+            (
+                Vendor::UbiquitiAirOs,
+                "ubiquiti_airos",
+                &["ubiquiti_airos", "airos", "airmax_ac", "ltu", "ubnt"][..],
+                None,
+                "cat /tmp/system.cfg",
+            ),
+            (
+                Vendor::UbiquitiUnifi,
+                "ubiquiti_unifi",
+                &["ubiquiti_unifi", "unifi", "uisp"][..],
+                None,
+                "mca-cli-op info && cat /tmp/system.cfg",
+            ),
+        ];
+
+        for (vendor, canon, aliases, paging, backup_cmd) in cases {
+            assert_eq!(vendor.as_str(), canon);
+            for a in aliases {
+                assert_eq!(Vendor::parse(a), Some(vendor), "alias {a}");
+            }
+            assert_eq!(vendor.disable_paging_cmd(), paging, "{canon}");
+            assert_eq!(
+                default_backup_command_for_vendor(Some(canon)),
+                backup_cmd,
+                "{canon}"
+            );
+            let json_val = serde_json::to_string(&vendor).unwrap();
+            assert_eq!(json_val, format!("\"{canon}\""), "{canon}");
+            let back: Vendor = serde_json::from_str(&json_val).unwrap();
+            assert_eq!(back, vendor);
+        }
+
+        assert_eq!(
+            classify_network_command(
+                Vendor::CiscoIosXe,
+                "show platform hardware qfp active datapath utilization"
+            ),
+            NetCmdRisk::ReadOnly
+        );
+        assert_eq!(
+            classify_network_command(Vendor::DatacomDmos, "show erps"),
+            NetCmdRisk::ReadOnly
+        );
+        assert_eq!(
+            classify_network_command(Vendor::DatacomDmswitch, "paginate false"),
+            NetCmdRisk::ReadOnly
+        );
+        assert_eq!(
+            classify_network_command(Vendor::UbiquitiAirOs, "mca-status"),
+            NetCmdRisk::ReadOnly
+        );
+        assert_eq!(
+            classify_network_command(Vendor::UbiquitiAirOs, "wstalist"),
+            NetCmdRisk::ReadOnly
+        );
+        assert_eq!(
+            classify_network_command(Vendor::UbiquitiAirOs, "reboot"),
+            NetCmdRisk::Dangerous
+        );
+        assert_eq!(
+            prepare_network_command(Vendor::UbiquitiAirOs, "ping 10.0.0.1")
+                .unwrap()
+                .0,
+            "ping -c 4 10.0.0.1"
+        );
     }
 }

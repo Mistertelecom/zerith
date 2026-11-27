@@ -1,6 +1,7 @@
 //! Ferramenta `net_snmp`: consultas SNMPv2c puras em Rust (UDP + BER, zero crates
 //! externos), presets ISP (`if_table`, `dom_optical`, `bgp_peers`, `cpu_mem`,
-//! `gpon_onu`) e suporte a SNMPv3 USM via `net-snmp` (`snmpget`/`snmpwalk`/`snmpbulkwalk`).
+//! `gpon_onu`, `ubiquiti_rf`, `cisco_asr_health`) e suporte a SNMPv3 USM via
+//! `net-snmp` (`snmpget`/`snmpwalk`/`snmpbulkwalk`).
 
 use std::collections::BTreeMap;
 use std::io::ErrorKind;
@@ -37,7 +38,7 @@ impl NetSnmpTool {
                     com `get`, `walk`, `bulkwalk` e presets ISP; SNMPv3 USM via CLI `net-snmp`). \
                     Suporta lookup no inventário (`device`/`client`) ou `host`+`port` (161), \
                     `community_secret_ref` no cofre e presets: `if_table`, `dom_optical`, `bgp_peers`, \
-                    `cpu_mem`, `gpon_onu`."
+                    `cpu_mem`, `gpon_onu`, `ubiquiti_rf`, `cisco_asr_health`."
                     .into(),
                 parameters: json!({
                     "type": "object",
@@ -78,7 +79,15 @@ impl NetSnmpTool {
                         },
                         "preset": {
                             "type": "string",
-                            "enum": ["if_table", "dom_optical", "bgp_peers", "cpu_mem", "gpon_onu"],
+                            "enum": [
+                                "if_table",
+                                "dom_optical",
+                                "bgp_peers",
+                                "cpu_mem",
+                                "gpon_onu",
+                                "ubiquiti_rf",
+                                "cisco_asr_health"
+                            ],
                             "description": "preset ISP pré-configurado com resumo formatado + OIDs"
                         },
                         "oids": {
@@ -1148,6 +1157,8 @@ pub(crate) enum IspPresetKind {
     BgpPeers,
     CpuMem,
     GponOnu,
+    UbiquitiRf,
+    CiscoAsrHealth,
 }
 
 pub(crate) struct IspPreset {
@@ -1217,8 +1228,52 @@ pub(crate) fn resolve_preset(name: &str) -> Result<IspPreset> {
                 "1.3.6.1.4.1.5875.800.3.10.1.1.11",     // FiberHome onuStatus
             ],
         }),
+        "ubiquiti_rf" => Ok(IspPreset {
+            kind: IspPresetKind::UbiquitiRf,
+            title: "Ubiquiti RF / airMAX / airFiber (UBNT-AirMAX-MIB)",
+            oids: &[
+                "1.3.6.1.4.1.41112.1.4.1.1.4",  // ubntRadioFreq (MHz)
+                "1.3.6.1.4.1.41112.1.4.1.1.6",  // ubntRadioTxPower (dBm)
+                "1.3.6.1.4.1.41112.1.4.5.1.5",  // ubntWlStatSignal (dBm)
+                "1.3.6.1.4.1.41112.1.4.5.1.7",  // ubntWlStatCcq (%)
+                "1.3.6.1.4.1.41112.1.4.5.1.8",  // ubntWlStatNoiseFloor (dBm)
+                "1.3.6.1.4.1.41112.1.4.5.1.9",  // ubntWlStatTxRate
+                "1.3.6.1.4.1.41112.1.4.5.1.10", // ubntWlStatRxRate
+                "1.3.6.1.4.1.41112.1.4.6.1.3",  // ubntAirMaxQuality (%)
+                "1.3.6.1.4.1.41112.1.4.6.1.4",  // ubntAirMaxCapacity (%)
+                "1.3.6.1.4.1.41112.1.4.7.1.3",  // ubntStaSignal (dBm)
+                "1.3.6.1.4.1.41112.1.4.7.1.4",  // ubntStaNoiseFloor (dBm)
+                "1.3.6.1.4.1.41112.1.4.7.1.5",  // ubntStaDistance (m)
+                "1.3.6.1.4.1.41112.1.4.7.1.6",  // ubntStaCcq (%)
+                "1.3.6.1.4.1.41112.1.4.7.1.11", // ubntStaTxRate
+                "1.3.6.1.4.1.41112.1.4.7.1.12", // ubntStaRxRate
+                "1.3.6.1.4.1.41112.1.4.7.1.17", // ubntStaTxAirtime
+                "1.3.6.1.4.1.41112.1.4.7.1.18", // ubntStaRxAirtime
+                "1.3.6.1.4.1.41112.1.3.2.1",    // ubntAirFiber status/capacity
+            ],
+        }),
+        "cisco_asr_health" => Ok(IspPreset {
+            kind: IspPresetKind::CiscoAsrHealth,
+            title: "Cisco ASR / IOS-XE Health (CPU, MemPool, EnvMon, QFP, NAT)",
+            oids: &[
+                "1.3.6.1.4.1.9.9.109.1.1.1.1.6",  // cpmCPUTotal5secRev
+                "1.3.6.1.4.1.9.9.109.1.1.1.1.7",  // cpmCPUTotal1minRev
+                "1.3.6.1.4.1.9.9.109.1.1.1.1.8",  // cpmCPUTotal5minRev
+                "1.3.6.1.4.1.9.9.221.1.1.1.1.3",  // cempMemPoolName
+                "1.3.6.1.4.1.9.9.221.1.1.1.1.18", // cempMemPoolHCUsed
+                "1.3.6.1.4.1.9.9.221.1.1.1.1.20", // cempMemPoolHCFree
+                "1.3.6.1.4.1.9.9.13.1.3.1.2",     // ciscoEnvMonTemperatureStatusDescr
+                "1.3.6.1.4.1.9.9.13.1.3.1.3",     // ciscoEnvMonTemperatureStatusValue
+                "1.3.6.1.4.1.9.9.13.1.3.1.6",     // ciscoEnvMonTemperatureState
+                "1.3.6.1.4.1.9.9.13.1.4.1.3",     // ciscoEnvMonFanState
+                "1.3.6.1.4.1.9.9.13.1.5.1.3",     // ciscoEnvMonSupplyState
+                "1.3.6.1.4.1.9.9.715.1.1.1",      // CISCO-QFP-MIB utilization
+                "1.3.6.1.4.1.9.9.532.1.1",        // CISCO-NAT-EXT-MIB stats
+                "1.3.6.1.4.1.9.10.14.1",          // CISCO-AAA-SESSION-MIB BNG
+            ],
+        }),
         other => Err(ToolError::BadArguments(format!(
-            "preset SNMP desconhecido: '{other}' (use if_table, dom_optical, bgp_peers, cpu_mem, gpon_onu)"
+            "preset SNMP desconhecido: '{other}' (use if_table, dom_optical, bgp_peers, cpu_mem, gpon_onu, ubiquiti_rf, cisco_asr_health)"
         ))),
     }
 }
@@ -1240,6 +1295,8 @@ fn format_preset_output(
         IspPresetKind::IfTable => summarize_if_table(vbs),
         IspPresetKind::BgpPeers => summarize_bgp_peers(vbs),
         IspPresetKind::CpuMem => summarize_cpu_mem(vbs),
+        IspPresetKind::UbiquitiRf => summarize_ubiquiti_rf(vbs),
+        IspPresetKind::CiscoAsrHealth => summarize_cisco_asr_health(vbs),
         IspPresetKind::DomOptical | IspPresetKind::GponOnu => summarize_grouped_table(vbs),
     };
 
@@ -1465,6 +1522,210 @@ fn summarize_grouped_table(vbs: &[(Vec<u32>, SnmpValue)]) -> String {
         ));
     }
     lines.join("\n")
+}
+
+fn summarize_ubiquiti_rf(vbs: &[(Vec<u32>, SnmpValue)]) -> String {
+    let mut freq_mhz: Option<i64> = None;
+    let mut tx_power: Option<i64> = None;
+    let mut signal: Option<i64> = None;
+    let mut noise: Option<i64> = None;
+    let mut ccq: Option<i64> = None;
+    let mut airmax_qual: Option<i64> = None;
+    let mut airmax_cap: Option<i64> = None;
+    let mut tx_rate: Option<u64> = None;
+    let mut rx_rate: Option<u64> = None;
+    let mut sta_count: usize = 0;
+
+    for (oid, val) in vbs {
+        if oid.starts_with(&[1, 3, 6, 1, 4, 1, 41112, 1, 4, 1, 1, 4]) {
+            freq_mhz = val.as_i64();
+        } else if oid.starts_with(&[1, 3, 6, 1, 4, 1, 41112, 1, 4, 1, 1, 6]) {
+            tx_power = val.as_i64();
+        } else if oid.starts_with(&[1, 3, 6, 1, 4, 1, 41112, 1, 4, 5, 1, 5]) {
+            signal = val.as_i64();
+        } else if oid.starts_with(&[1, 3, 6, 1, 4, 1, 41112, 1, 4, 5, 1, 7]) {
+            ccq = val.as_i64();
+        } else if oid.starts_with(&[1, 3, 6, 1, 4, 1, 41112, 1, 4, 5, 1, 8]) {
+            noise = val.as_i64();
+        } else if oid.starts_with(&[1, 3, 6, 1, 4, 1, 41112, 1, 4, 5, 1, 9]) {
+            tx_rate = val.as_u64();
+        } else if oid.starts_with(&[1, 3, 6, 1, 4, 1, 41112, 1, 4, 5, 1, 10]) {
+            rx_rate = val.as_u64();
+        } else if oid.starts_with(&[1, 3, 6, 1, 4, 1, 41112, 1, 4, 6, 1, 3]) {
+            airmax_qual = val.as_i64();
+        } else if oid.starts_with(&[1, 3, 6, 1, 4, 1, 41112, 1, 4, 6, 1, 4]) {
+            airmax_cap = val.as_i64();
+        } else if oid.starts_with(&[1, 3, 6, 1, 4, 1, 41112, 1, 4, 7, 1, 3]) {
+            sta_count += 1;
+        }
+    }
+
+    let mut out = Vec::new();
+    if let Some(f) = freq_mhz {
+        out.push(format!("- **Frequência:** {f} MHz"));
+    }
+    if let Some(p) = tx_power {
+        out.push(format!("- **TX Power:** {p} dBm"));
+    }
+    if let Some(s) = signal {
+        let snr_note = noise
+            .map(|n| format!(" (Noise Floor: {n} dBm, SNR: {} dB)", s - n))
+            .unwrap_or_default();
+        out.push(format!("- **Signal (RSSI):** {s} dBm{snr_note}"));
+    } else if let Some(n) = noise {
+        out.push(format!("- **Noise Floor:** {n} dBm"));
+    }
+    if let Some(c) = ccq {
+        out.push(format!("- **CCQ:** {c}%"));
+    }
+    if airmax_qual.is_some() || airmax_cap.is_some() {
+        out.push(format!(
+            "- **airMAX Quality/Capacity:** {}% / {}%",
+            airmax_qual.map_or("-".into(), |v| v.to_string()),
+            airmax_cap.map_or("-".into(), |v| v.to_string())
+        ));
+    }
+    if tx_rate.is_some() || rx_rate.is_some() {
+        out.push(format!(
+            "- **Data Rate TX/RX:** {} / {}",
+            tx_rate.map_or("-".into(), |v| v.to_string()),
+            rx_rate.map_or("-".into(), |v| v.to_string())
+        ));
+    }
+    if sta_count > 0 {
+        out.push(format!("- **Stations associadas:** {sta_count}"));
+    }
+    if out.is_empty() {
+        summarize_grouped_table(vbs)
+    } else {
+        out.join("\n")
+    }
+}
+
+fn summarize_cisco_asr_health(vbs: &[(Vec<u32>, SnmpValue)]) -> String {
+    #[derive(Default)]
+    struct CpuRow {
+        s5: Option<u64>,
+        m1: Option<u64>,
+        m5: Option<u64>,
+    }
+    #[derive(Default)]
+    struct MemRow {
+        name: String,
+        used: Option<u64>,
+        free: Option<u64>,
+    }
+    #[derive(Default)]
+    struct TempRow {
+        descr: String,
+        celsius: Option<i64>,
+        state: Option<i64>,
+    }
+
+    let env_state = |n: i64| match n {
+        1 => "normal",
+        2 => "warning",
+        3 => "critical",
+        4 => "shutdown",
+        5 => "notPresent",
+        _ => "notFunctioning",
+    };
+
+    let mut cpus: BTreeMap<u32, CpuRow> = BTreeMap::new();
+    let mut mems: BTreeMap<u32, MemRow> = BTreeMap::new();
+    let mut temps: BTreeMap<u32, TempRow> = BTreeMap::new();
+    let mut fan_alerts = Vec::new();
+    let mut psu_alerts = Vec::new();
+    let mut qfp_entries = 0usize;
+    let mut nat_entries = 0usize;
+    let mut bng_entries = 0usize;
+
+    for (oid, val) in vbs {
+        let Some(&idx) = oid.last() else { continue };
+        if oid.starts_with(&[1, 3, 6, 1, 4, 1, 9, 9, 109, 1, 1, 1, 1, 6]) {
+            cpus.entry(idx).or_default().s5 = val.as_u64();
+        } else if oid.starts_with(&[1, 3, 6, 1, 4, 1, 9, 9, 109, 1, 1, 1, 1, 7]) {
+            cpus.entry(idx).or_default().m1 = val.as_u64();
+        } else if oid.starts_with(&[1, 3, 6, 1, 4, 1, 9, 9, 109, 1, 1, 1, 1, 8]) {
+            cpus.entry(idx).or_default().m5 = val.as_u64();
+        } else if oid.starts_with(&[1, 3, 6, 1, 4, 1, 9, 9, 221, 1, 1, 1, 1, 3]) {
+            mems.entry(idx).or_default().name = val.as_display();
+        } else if oid.starts_with(&[1, 3, 6, 1, 4, 1, 9, 9, 221, 1, 1, 1, 1, 18]) {
+            mems.entry(idx).or_default().used = val.as_u64();
+        } else if oid.starts_with(&[1, 3, 6, 1, 4, 1, 9, 9, 221, 1, 1, 1, 1, 20]) {
+            mems.entry(idx).or_default().free = val.as_u64();
+        } else if oid.starts_with(&[1, 3, 6, 1, 4, 1, 9, 9, 13, 1, 3, 1, 2]) {
+            temps.entry(idx).or_default().descr = val.as_display();
+        } else if oid.starts_with(&[1, 3, 6, 1, 4, 1, 9, 9, 13, 1, 3, 1, 3]) {
+            temps.entry(idx).or_default().celsius = val.as_i64();
+        } else if oid.starts_with(&[1, 3, 6, 1, 4, 1, 9, 9, 13, 1, 3, 1, 6]) {
+            temps.entry(idx).or_default().state = val.as_i64();
+        } else if oid.starts_with(&[1, 3, 6, 1, 4, 1, 9, 9, 13, 1, 4, 1, 3]) {
+            if let Some(st) = val.as_i64().filter(|&s| s != 1 && s != 5) {
+                fan_alerts.push(format!("fan#{idx}={}", env_state(st)));
+            }
+        } else if oid.starts_with(&[1, 3, 6, 1, 4, 1, 9, 9, 13, 1, 5, 1, 3]) {
+            if let Some(st) = val.as_i64().filter(|&s| s != 1 && s != 5) {
+                psu_alerts.push(format!("psu#{idx}={}", env_state(st)));
+            }
+        } else if oid.starts_with(&[1, 3, 6, 1, 4, 1, 9, 9, 715, 1, 1, 1]) {
+            qfp_entries += 1;
+        } else if oid.starts_with(&[1, 3, 6, 1, 4, 1, 9, 9, 532, 1, 1]) {
+            nat_entries += 1;
+        } else if oid.starts_with(&[1, 3, 6, 1, 4, 1, 9, 10, 14, 1]) {
+            bng_entries += 1;
+        }
+    }
+
+    let mut out = Vec::new();
+    for (idx, c) in &cpus {
+        out.push(format!(
+            "- **CPU #{idx} (5s/1m/5m):** {}% / {}% / {}%",
+            c.s5.map_or("-".into(), |v| v.to_string()),
+            c.m1.map_or("-".into(), |v| v.to_string()),
+            c.m5.map_or("-".into(), |v| v.to_string()),
+        ));
+    }
+    for (idx, m) in &mems {
+        let name = if m.name.is_empty() {
+            format!("pool#{idx}")
+        } else {
+            m.name.clone()
+        };
+        if let (Some(used), Some(free)) = (m.used, m.free) {
+            let total = used.saturating_add(free);
+            let pct = used.saturating_mul(100).checked_div(total).unwrap_or(0);
+            out.push(format!(
+                "- **Memória `{name}`:** {pct}% usada ({used} / {total} bytes)"
+            ));
+        }
+    }
+    for (idx, t) in &temps {
+        let label = if t.descr.is_empty() {
+            format!("sensor#{idx}")
+        } else {
+            t.descr.clone()
+        };
+        let deg = t.celsius.map_or("-".into(), |c| format!("{c}°C"));
+        let st = t.state.map_or("unknown", env_state);
+        out.push(format!("- **Temp `{label}`:** {deg} ({st})"));
+    }
+    if !fan_alerts.is_empty() {
+        out.push(format!("- **Alerta Fans:** {}", fan_alerts.join(", ")));
+    }
+    if !psu_alerts.is_empty() {
+        out.push(format!("- **Alerta Fontes:** {}", psu_alerts.join(", ")));
+    }
+    if qfp_entries > 0 || nat_entries > 0 || bng_entries > 0 {
+        out.push(format!(
+            "- **Tabelas ASR (QFP/NAT/BNG OIDs):** {qfp_entries} / {nat_entries} / {bng_entries}"
+        ));
+    }
+    if out.is_empty() {
+        summarize_grouped_table(vbs)
+    } else {
+        out.join("\n")
+    }
 }
 
 // --- SNMPv3 USM via system net-snmp CLI -------------------------------------
@@ -1729,6 +1990,8 @@ mod tests {
             "bgp_peers",
             "cpu_mem",
             "gpon_onu",
+            "ubiquiti_rf",
+            "cisco_asr_health",
         ] {
             let p = resolve_preset(name).unwrap();
             assert!(!p.oids.is_empty(), "{name}");
@@ -1737,6 +2000,91 @@ mod tests {
             }
         }
         assert!(resolve_preset("desconhecido").is_err());
+    }
+
+    #[test]
+    fn ubiquiti_rf_and_cisco_asr_health_formatters_render_metrics() {
+        let rf_preset = resolve_preset("ubiquiti_rf").unwrap();
+        let rf_vbs = vec![
+            (
+                vec![1, 3, 6, 1, 4, 1, 41112, 1, 4, 1, 1, 4, 1],
+                SnmpValue::Integer(5580),
+            ),
+            (
+                vec![1, 3, 6, 1, 4, 1, 41112, 1, 4, 1, 1, 6, 1],
+                SnmpValue::Integer(21),
+            ),
+            (
+                vec![1, 3, 6, 1, 4, 1, 41112, 1, 4, 5, 1, 5, 1],
+                SnmpValue::Integer(-54),
+            ),
+            (
+                vec![1, 3, 6, 1, 4, 1, 41112, 1, 4, 5, 1, 8, 1],
+                SnmpValue::Integer(-91),
+            ),
+            (
+                vec![1, 3, 6, 1, 4, 1, 41112, 1, 4, 5, 1, 7, 1],
+                SnmpValue::Integer(99),
+            ),
+            (
+                vec![1, 3, 6, 1, 4, 1, 41112, 1, 4, 6, 1, 4, 1],
+                SnmpValue::Integer(88),
+            ),
+        ];
+        let rf_out = format_preset_output(&rf_preset, "10.0.0.10", 161, &rf_vbs);
+        assert!(rf_out.contains("5580 MHz"), "{rf_out}");
+        assert!(rf_out.contains("-54 dBm"), "{rf_out}");
+        assert!(rf_out.contains("SNR: 37 dB"), "{rf_out}");
+        assert!(rf_out.contains("CCQ:** 99%"), "{rf_out}");
+
+        let asr_preset = resolve_preset("cisco_asr_health").unwrap();
+        let asr_vbs = vec![
+            (
+                vec![1, 3, 6, 1, 4, 1, 9, 9, 109, 1, 1, 1, 1, 6, 1],
+                SnmpValue::Gauge32(18),
+            ),
+            (
+                vec![1, 3, 6, 1, 4, 1, 9, 9, 109, 1, 1, 1, 1, 7, 1],
+                SnmpValue::Gauge32(22),
+            ),
+            (
+                vec![1, 3, 6, 1, 4, 1, 9, 9, 109, 1, 1, 1, 1, 8, 1],
+                SnmpValue::Gauge32(25),
+            ),
+            (
+                vec![1, 3, 6, 1, 4, 1, 9, 9, 221, 1, 1, 1, 1, 3, 1],
+                SnmpValue::OctetString(b"Processor".to_vec()),
+            ),
+            (
+                vec![1, 3, 6, 1, 4, 1, 9, 9, 221, 1, 1, 1, 1, 18, 1],
+                SnmpValue::Counter64(6_000_000_000),
+            ),
+            (
+                vec![1, 3, 6, 1, 4, 1, 9, 9, 221, 1, 1, 1, 1, 20, 1],
+                SnmpValue::Counter64(2_000_000_000),
+            ),
+            (
+                vec![1, 3, 6, 1, 4, 1, 9, 9, 13, 1, 3, 1, 2, 1],
+                SnmpValue::OctetString(b"R0 Temp: ESP".to_vec()),
+            ),
+            (
+                vec![1, 3, 6, 1, 4, 1, 9, 9, 13, 1, 3, 1, 3, 1],
+                SnmpValue::Gauge32(52),
+            ),
+            (
+                vec![1, 3, 6, 1, 4, 1, 9, 9, 13, 1, 3, 1, 6, 1],
+                SnmpValue::Integer(1),
+            ),
+            (
+                vec![1, 3, 6, 1, 4, 1, 9, 9, 13, 1, 4, 1, 3, 2],
+                SnmpValue::Integer(3),
+            ),
+        ];
+        let asr_out = format_preset_output(&asr_preset, "10.0.0.1", 161, &asr_vbs);
+        assert!(asr_out.contains("18% / 22% / 25%"), "{asr_out}");
+        assert!(asr_out.contains("Processor`:** 75% usada"), "{asr_out}");
+        assert!(asr_out.contains("52°C (normal)"), "{asr_out}");
+        assert!(asr_out.contains("fan#2=critical"), "{asr_out}");
     }
 
     #[test]

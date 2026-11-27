@@ -104,6 +104,10 @@
   border-color: var(--line-strong);
   box-shadow: var(--shadow-2);
 }
+.dg-node.dg-decision {
+  margin-top: 12px;
+  width: 100%;
+}
 .dg-node-head {
   display: flex;
   align-items: flex-start;

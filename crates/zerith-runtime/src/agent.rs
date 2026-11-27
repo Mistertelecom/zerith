@@ -798,6 +798,8 @@ fn turn_body(
         hist.push(ChatMessage::synthetic_user(rem.to_string()), id);
     }
 
+    let decision = crate::decision::DecisionClient::from_settings(ctx.settings, client.config());
+
     let context_probe = {
         let mut s = prompt.to_lowercase();
         if let Some(rem) = &dynamic_reminder {
@@ -822,7 +824,7 @@ fn turn_body(
             let large_registry = specs.len() > 20;
             // Groups that stay once offered, or that the session needs
             // whatever the last lines say (see `sticky_groups`).
-            let sticky = if large_registry && !is_root_orchestrator {
+            let mut sticky = if large_registry && !is_root_orchestrator {
                 let devices = zerith_tools::network::load_inventory(
                     &cwd,
                     Some(zerith_core::Paths::resolve().root()),
@@ -832,6 +834,22 @@ fn turn_body(
             } else {
                 HashSet::new()
             };
+            if large_registry && !is_root_orchestrator {
+                if let Some(d) = decision.as_ref() {
+                    let already_matched = ["rede", "workflows", "browser"].iter().any(|g| {
+                        sticky.contains(g)
+                            || specs.iter().any(|s| {
+                                tool_group(&s.name) == Some(*g)
+                                    && should_include_tool_schema(&s.name, &context_probe)
+                            })
+                    });
+                    if !already_matched {
+                        if let Some(extra) = d.suggest_extra_tool_group(prompt, cancel) {
+                            sticky.insert(extra);
+                        }
+                    }
+                }
+            }
             specs
                 .into_iter()
                 // Deferred tools run through `mcp_call`: no schema per request.
@@ -874,6 +892,32 @@ fn turn_body(
         remember_groups(session_id, &offered);
     }
 
+    let resolved_effort: Option<String> = match agent
+        .reasoning_effort
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("off"))
+    {
+        Some(raw) if raw.eq_ignore_ascii_case("auto") => {
+            let recent_summary = recent_turn_summary(&rows);
+            let chosen = decision
+                .as_ref()
+                .map(|d| d.decide_effort(prompt, &recent_summary, cancel))
+                .unwrap_or_else(|| crate::decision::heuristic_effort(prompt));
+            log.emit(
+                "turn/effort",
+                json!({
+                    "requested": "auto",
+                    "resolved": chosen,
+                    "decision_model": decision.as_ref().map(|d| d.model()),
+                }),
+            );
+            Some(chosen.to_string())
+        }
+        Some(explicit) => Some(explicit.to_string()),
+        None => None,
+    };
+
     let pipe = Pipeline {
         core: agent.tools.zip(agent.policy),
         memory: ctx.memory,
@@ -887,6 +931,7 @@ fn turn_body(
         cancel,
         orchestrator_root: is_root_orchestrator,
         offered: &offered,
+        decision: decision.as_ref(),
     };
 
     let (mut prompt_tokens, mut completion_tokens) = (0u64, 0u64);
@@ -958,16 +1003,15 @@ fn turn_body(
 
         log.emit(
             "step/start",
-            json!({"n": step, "tokens_estimate": hist.tokens()}),
+            json!({
+                "n": step,
+                "tokens_estimate": hist.tokens(),
+                "reasoning_effort": resolved_effort.as_deref(),
+            }),
         );
         let chat_msgs = hist.chat();
         let mut req = ChatRequest::new(model, chat_msgs).prompt_cache_key(session_id);
-        if let Some(effort) = agent
-            .reasoning_effort
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("off"))
-        {
+        if let Some(effort) = resolved_effort.as_deref() {
             req = req.reasoning_effort(effort);
         }
         if !defs.is_empty() {
@@ -2544,6 +2588,30 @@ pub(crate) fn tool_group(name: &str) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// Compact excerpt of the last few prior user/assistant turns for auxiliary
+/// `"auto"` effort scoring (never includes the current prompt itself).
+fn recent_turn_summary(rows: &[zerith_sessions::Message]) -> String {
+    let prior = rows.len().saturating_sub(1);
+    let mut parts: Vec<String> = rows[..prior]
+        .iter()
+        .rev()
+        .filter(|r| matches!(r.role, Role::User | Role::Assistant))
+        .filter(|r| !r.content.trim().is_empty())
+        .take(3)
+        .map(|r| {
+            let role = match r.role {
+                Role::User => "user",
+                Role::Assistant => "assistant",
+                _ => "msg",
+            };
+            let snippet: String = r.content.trim().chars().take(160).collect();
+            format!("{role}: {snippet}")
+        })
+        .collect();
+    parts.reverse();
+    parts.join("\n")
 }
 
 /// Groups offered once in a session, by session id: a group stays for the

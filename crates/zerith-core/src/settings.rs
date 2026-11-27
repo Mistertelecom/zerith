@@ -391,6 +391,8 @@ pub struct RoutingSettings {
     pub plan_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compact_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_model: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub role_models: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -840,6 +842,7 @@ pub const ENV_KEYS: &[(&str, &str)] = &[
     ("ZERITH_MODE", "permissions.default_mode"),
     ("ZERITH_PROFILE", "profile"),
     ("ZERITH_SUBAGENT_MODEL", "routing.subagent_model"),
+    ("ZERITH_DECISION_MODEL", "routing.decision_model"),
     ("ZERITH_PONYTAIL", "token_saver.ponytail"),
     ("ZERITH_CAVEMAN", "token_saver.caveman"),
 ];
@@ -1891,5 +1894,53 @@ provider = "openai"
         let back: Settings = toml::from_str(&text).unwrap();
         assert!(!back.learning.enabled);
         assert!(toml::from_str::<Settings>("").unwrap().learning.enabled);
+    }
+
+    #[test]
+    fn decision_model_defaults_empty_round_trips_toml_and_reads_env() {
+        let def = Settings::default();
+        assert_eq!(def.routing.decision_model, None);
+        let serialized_def = toml::to_string(&def).unwrap();
+        assert!(
+            !serialized_def.contains("decision_model"),
+            "{serialized_def}"
+        );
+
+        let mut configured = Settings::default();
+        configured.routing.decision_model =
+            Some("openrouter/microsoft/microsoft-decision-1.1".into());
+        let text = toml::to_string(&configured).unwrap();
+        assert!(
+            text.contains("decision_model = \"openrouter/microsoft/microsoft-decision-1.1\""),
+            "{text}"
+        );
+        let back: Settings = toml::from_str(&text).unwrap();
+        assert_eq!(
+            back.routing.decision_model.as_deref(),
+            Some("openrouter/microsoft/microsoft-decision-1.1")
+        );
+
+        let dir = scratch();
+        let paths = Paths::with_root(dir.path().join("data"));
+        write(
+            &paths.settings(),
+            "[routing]\ndecision_model = \"from-file\"\n",
+        );
+        let env = |k: &str| match k {
+            "ZERITH_DECISION_MODEL" => Some("openrouter/microsoft/microsoft-decision-1.1".into()),
+            _ => None,
+        };
+        let loaded = Settings::load_with_env(&paths, None, env);
+        assert!(loaded.errors.is_empty(), "{:?}", loaded.errors);
+        assert_eq!(
+            loaded.settings.routing.decision_model.as_deref(),
+            Some("openrouter/microsoft/microsoft-decision-1.1")
+        );
+        let entries = loaded.entries();
+        let src = entries
+            .iter()
+            .find(|e| e.0 == "routing.decision_model")
+            .map(|e| e.2.as_str());
+        assert_eq!(src, Some("env"));
     }
 }

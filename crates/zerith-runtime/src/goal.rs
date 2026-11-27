@@ -115,11 +115,13 @@ pub trait Judge {
 pub struct ClientJudge<'a> {
     routed: Option<Client>,
     fallback: &'a Client,
+    decision: Option<crate::decision::DecisionClient>,
     pub model: String,
 }
 
 impl<'a> ClientJudge<'a> {
     pub fn new(settings: Option<&zerith_core::Settings>, client: &'a Client, model: &str) -> Self {
+        let decision = crate::decision::DecisionClient::from_settings(settings, client.config());
         let routed = settings.and_then(|s| {
             let spec = s.routing.resolve_subagent_model("goal", None, None, model);
             if spec == model {
@@ -136,19 +138,55 @@ impl<'a> ClientJudge<'a> {
             Some((c, m)) => Self {
                 routed: Some(c),
                 fallback: client,
+                decision,
                 model: m,
             },
             None => Self {
                 routed: None,
                 fallback: client,
+                decision,
                 model: model.to_string(),
             },
         }
     }
 }
 
+fn extract_tag<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = text.find(&open)? + open.len();
+    let end = text[start..].find(&close)? + start;
+    Some(text[start..end].trim())
+}
+
+fn evidence_has_failed_commands(evidence: &str) -> bool {
+    evidence.lines().any(|line| {
+        line.rsplit_once("→ exit ")
+            .and_then(|(_, code)| code.trim().parse::<i64>().ok())
+            .is_some_and(|code| code != 0)
+    })
+}
+
 impl Judge for ClientJudge<'_> {
     fn ask(&self, system: &str, user: &str, cancel: &Cancel) -> Result<String, String> {
+        if let Some(decision) = &self.decision {
+            if let (Some(goal_text), Some(answer_text), Some(evidence_text)) = (
+                extract_tag(user, "objetivo"),
+                extract_tag(user, "resposta_do_assistente"),
+                extract_tag(user, "evidencias"),
+            ) {
+                if !evidence_has_failed_commands(evidence_text)
+                    && decision
+                        .score_goal_done(goal_text, answer_text, evidence_text, cancel)
+                        .is_some_and(|prob| prob >= 0.92)
+                {
+                    return Ok(
+                        r#"{"verdict":"done","reason":"Evidências confirmam objetivo concluído (decisão calibrada >= 92%)."}"#
+                            .into(),
+                    );
+                }
+            }
+        }
         let req = ChatRequest::new(
             &self.model,
             vec![
@@ -775,5 +813,45 @@ mod tests {
             (out.end, out.reason.as_str()),
             (End::Failed, "provider: 500")
         );
+    }
+
+    #[test]
+    fn goal_evidence_failure_detection_and_tag_extraction() {
+        let mut ev_ok = Evidence::default();
+        ev_ok.commands.push(Command {
+            line: "cargo test".into(),
+            exit: Some(0),
+        });
+        let input_ok = judge_input(
+            "testes passarem",
+            1,
+            &Round {
+                answer: "tudo verde".into(),
+                evidence: ev_ok,
+            },
+        );
+        assert_eq!(extract_tag(&input_ok, "objetivo"), Some("testes passarem"));
+        assert_eq!(
+            extract_tag(&input_ok, "resposta_do_assistente"),
+            Some("tudo verde")
+        );
+        let ev_txt_ok = extract_tag(&input_ok, "evidencias").unwrap();
+        assert!(!evidence_has_failed_commands(ev_txt_ok));
+
+        let mut ev_fail = Evidence::default();
+        ev_fail.commands.push(Command {
+            line: "cargo test".into(),
+            exit: Some(101),
+        });
+        let input_fail = judge_input(
+            "testes passarem",
+            2,
+            &Round {
+                answer: "quase".into(),
+                evidence: ev_fail,
+            },
+        );
+        let ev_txt_fail = extract_tag(&input_fail, "evidencias").unwrap();
+        assert!(evidence_has_failed_commands(ev_txt_fail));
     }
 }

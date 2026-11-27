@@ -2251,6 +2251,27 @@ const AssistantBlock = memo(function AssistantBlock(props: {
                 <span>Ramificar daqui</span>
               </button>
             ) : null}
+            {b.stats && (b.stats.ttftMs != null || b.stats.cacheHitPct != null) ? (
+              <span
+                className="msg-stats"
+                title={[
+                  b.stats.ttftMs != null ? `TTFT ${b.stats.ttftMs} ms` : null,
+                  b.stats.cacheHitPct != null ? `cache ${b.stats.cacheHitPct}%` : null,
+                  b.stats.outputTokens != null
+                    ? `${b.stats.outputTokens.toLocaleString("pt-BR")} tokens`
+                    : null,
+                ]
+                  .filter(Boolean)
+                  .join(" · ")}
+              >
+                {[
+                  b.stats.ttftMs != null ? `${(b.stats.ttftMs / 1000).toFixed(1)}s` : null,
+                  b.stats.cacheHitPct != null ? `cache ${b.stats.cacheHitPct}%` : null,
+                ]
+                  .filter(Boolean)
+                  .join(" · ")}
+              </span>
+            ) : null}
           </div>
         ) : null}
       </div>

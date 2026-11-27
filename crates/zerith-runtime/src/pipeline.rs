@@ -122,6 +122,9 @@ pub(crate) struct Pipeline<'a> {
     /// Tool names sent to the model this turn: what an unknown name is
     /// answered with. Empty: every tool of the registry that is listed.
     pub offered: &'a [String],
+    /// Optional auxiliary calibrated decision client used only for non-blocking
+    /// risk advisories on mutating/dangerous approval prompts.
+    pub decision: Option<&'a crate::decision::DecisionClient>,
 }
 
 impl Pipeline<'_> {
@@ -389,6 +392,7 @@ impl Pipeline<'_> {
                     .unwrap_or_else(|| inv.name.clone());
                 need = Some((format!("⚠️ COMANDO DESTRUTIVO DE REDE: {summary}"), true));
                 if let Some((why, forced)) = need {
+                    let why = self.maybe_prepend_risk_advisory(&inv, &grant_override, forced, why);
                     if let Err(refusal) =
                         self.approve(&inv.name, &grant_override, why, forced, None, on_event)
                     {
@@ -415,6 +419,7 @@ impl Pipeline<'_> {
                 .flatten();
             let grant_key =
                 net_grant.unwrap_or_else(|| crate::agent::approval_grant_key(&inv.name, &inv.args));
+            let why = self.maybe_prepend_risk_advisory(&inv, &grant_key, forced, why);
             if let Err(refusal) = self.approve(&inv.name, &grant_key, why, forced, always, on_event)
             {
                 return settle(inv, false, refusal);
@@ -424,6 +429,33 @@ impl Pipeline<'_> {
             inv,
             settled: None,
             rewritten_from,
+        }
+    }
+
+    /// Prepends an informative, non-blocking risk banner from `decision_model`
+    /// when a mutating or dangerous command is about to prompt the user.
+    fn maybe_prepend_risk_advisory(
+        &self,
+        inv: &ToolInvocation,
+        grant_key: &str,
+        forced: bool,
+        why: String,
+    ) -> String {
+        let Some(decision) = self.decision else {
+            return why;
+        };
+        if !self
+            .approvals
+            .is_some_and(|g| forced || !g.granted(grant_key))
+        {
+            return why;
+        }
+        let Some((cmd, vendor)) = command_for_risk_advisory(&inv.name, &inv.args) else {
+            return why;
+        };
+        match decision.assess_command_risk(&inv.name, &cmd, vendor.as_deref(), self.cancel) {
+            Some(advisory) => format!("{}\n{why}", advisory.banner()),
+            None => why,
         }
     }
 
@@ -1332,6 +1364,126 @@ fn classify_terminal_call(
     Some((worst, critical, grant_key))
 }
 
+/// Extracts `(command_text, optional_vendor)` when a tool call is a mutating or
+/// dangerous network/terminal/shell operation eligible for a non-blocking
+/// calibrated risk advisory. Returns `None` for read-only calls or calls
+/// carrying a secret payload.
+fn command_for_risk_advisory(tool: &str, args: &Value) -> Option<(String, Option<String>)> {
+    if tool == "terminal_send" && args.get("secret").and_then(Value::as_str).is_some() {
+        return None;
+    }
+    if let Some((risk, _, _)) = classify_terminal_call(tool, args) {
+        if risk == zerith_tools::network::NetCmdRisk::ReadOnly {
+            return None;
+        }
+        let cmd = match tool {
+            "terminal_send" => args
+                .get("input")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_default(),
+            "terminal_batch" => args
+                .get("commands")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                })
+                .unwrap_or_default(),
+            "net_broadcast" => {
+                let mut parts: Vec<&str> = Vec::new();
+                if let Some(c) = args.get("command").and_then(Value::as_str) {
+                    if !c.trim().is_empty() {
+                        parts.push(c);
+                    }
+                }
+                if let Some(arr) = args.get("commands").and_then(Value::as_array) {
+                    parts.extend(
+                        arr.iter()
+                            .filter_map(Value::as_str)
+                            .filter(|s| !s.trim().is_empty()),
+                    );
+                }
+                parts.join("; ")
+            }
+            "net_api" => {
+                let method = args.get("method").and_then(Value::as_str).unwrap_or("POST");
+                let target = args
+                    .get("path")
+                    .or_else(|| args.get("url"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                format!("{method} {target}").trim().to_string()
+            }
+            "net_snmp" => {
+                let action = args
+                    .get("action")
+                    .or_else(|| args.get("op"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("set");
+                let oid = args.get("oid").and_then(Value::as_str).unwrap_or("");
+                format!("snmp {action} {oid}").trim().to_string()
+            }
+            "net_zabbix" => {
+                let action = args
+                    .get("action")
+                    .and_then(Value::as_str)
+                    .unwrap_or("mutate");
+                let method = args
+                    .get("method")
+                    .or_else(|| args.get("rpc_method"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                format!("zabbix {action} {method}").trim().to_string()
+            }
+            _ => String::new(),
+        };
+        if cmd.trim().is_empty() {
+            return None;
+        }
+        let vendor = match tool {
+            "terminal_send" | "terminal_batch" => args
+                .get("id")
+                .and_then(Value::as_str)
+                .and_then(zerith_tools::terminal_meta)
+                .and_then(|m| m.0),
+            _ => args
+                .get("vendor")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        };
+        return Some((cmd, vendor));
+    }
+
+    if matches!(
+        tool,
+        "shell" | "monitor" | "terminal_send" | "terminal_batch" | "remote_exec"
+    ) {
+        let cmd = args
+            .get("command")
+            .or_else(|| args.get("input"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                args.get("commands").and_then(Value::as_array).map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                })
+            })
+            .unwrap_or_default();
+        if cmd.trim().is_empty() || zerith_core::shellparse::all_read_only(&cmd) {
+            return None;
+        }
+        return Some((cmd, None));
+    }
+
+    None
+}
+
 /// The allow rule "sempre neste projeto" saves for this call, or `None` when
 /// the choice must not be offered. Like opencode (`git status *` per project)
 /// and Codex's execpolicy prefix rules: a simple command becomes
@@ -1886,6 +2038,7 @@ mod remote_tests {
             cancel: &cancel,
             orchestrator_root: false,
             offered: &[],
+            decision: None,
         };
 
         let run_prepare = |name: &str, args: serde_json::Value, reply: Approval| -> (bool, bool) {
@@ -2046,6 +2199,7 @@ mod parallel_panic_tests {
             cancel: &cancel,
             orchestrator_root: false,
             offered: &[],
+            decision: None,
         };
         let calls = [
             ToolCall {
@@ -2161,6 +2315,7 @@ mod parallel_panic_tests {
             cancel: &cancel,
             orchestrator_root: false,
             offered: &[],
+            decision: None,
         };
 
         // 1. Serial batch: two calls to the same tool name correlate to their exact call IDs.
@@ -2418,6 +2573,7 @@ mod parallel_panic_tests {
             cancel: &cancel,
             orchestrator_root: false,
             offered: &[],
+            decision: None,
         };
         let offered = |name: &str, args: Value| {
             let mut got = None;
@@ -2508,6 +2664,7 @@ mod parallel_panic_tests {
             cancel: &cancel,
             orchestrator_root: false,
             offered: &[],
+            decision: None,
         };
         let in_ws_call = ToolCall {
             id: "w1".into(),
@@ -2635,6 +2792,7 @@ mod parallel_panic_tests {
                     cancel: cancel_ref,
                     orchestrator_root: false,
                     offered: &[],
+                    decision: None,
                 };
                 let c1 = ToolCall {
                     id: "w1".into(),
@@ -2667,6 +2825,7 @@ mod parallel_panic_tests {
                     cancel: cancel_ref,
                     orchestrator_root: false,
                     offered: &[],
+                    decision: None,
                 };
                 let _ = second_entered_tx.send(());
                 let c2 = ToolCall {
@@ -2712,6 +2871,7 @@ mod parallel_panic_tests {
             cancel: &cancel,
             orchestrator_root: false,
             offered: &[],
+            decision: None,
         };
         let mut forced_prompted = false;
         let res = p_forced.approve(
@@ -2790,6 +2950,7 @@ mod parallel_panic_tests {
             cancel: &cancel,
             orchestrator_root: true,
             offered: &[],
+            decision: None,
         };
 
         for blocked in ["shell", "write_file", "edit_file"] {
@@ -2879,6 +3040,7 @@ mod external_tests {
             cancel: &cancel,
             orchestrator_root: false,
             offered: &[],
+            decision: None,
         };
         let call = ToolCall {
             id: "c1".into(),
@@ -3068,6 +3230,7 @@ mod external_tests {
             cancel: &Cancel::default(),
             orchestrator_root: false,
             offered: &[],
+            decision: None,
         };
         let call = |name: &str, args: Value| ToolCall {
             id: "1".into(),
@@ -3134,6 +3297,7 @@ mod external_tests {
             cancel: &Cancel::default(),
             orchestrator_root: false,
             offered: &[],
+            decision: None,
         };
         let call = |name: &str, args: Value| ToolCall {
             id: "1".into(),
@@ -3198,5 +3362,42 @@ mod external_tests {
             call("net_api", json!({"method": "POST", "device": "core-01"})),
         ];
         assert_eq!(pipe.plan_batch(&batch), 4);
+    }
+
+    #[test]
+    fn risk_advisory_extractor_skips_read_only_and_secrets_and_captures_mutations() {
+        // Read-only calls are never sent to the decision model
+        assert_eq!(
+            command_for_risk_advisory("shell", &json!({"command": "git status"})),
+            None
+        );
+        assert_eq!(
+            command_for_risk_advisory("net_api", &json!({"method": "GET", "path": "/v1/status"})),
+            None
+        );
+        assert_eq!(
+            command_for_risk_advisory("net_snmp", &json!({"action": "walk", "oid": "1.3.6.1"})),
+            None
+        );
+        assert_eq!(
+            command_for_risk_advisory(
+                "terminal_send",
+                &json!({"id": "t1", "secret": "router-pass", "input": "pw"})
+            ),
+            None
+        );
+
+        // Mutating shell and network calls are captured cleanly
+        assert_eq!(
+            command_for_risk_advisory("shell", &json!({"command": "rm -rf build/"})),
+            Some(("rm -rf build/".into(), None))
+        );
+        assert_eq!(
+            command_for_risk_advisory(
+                "net_api",
+                &json!({"method": "POST", "path": "/rest/system/reboot"})
+            ),
+            Some(("POST /rest/system/reboot".into(), None))
+        );
     }
 }

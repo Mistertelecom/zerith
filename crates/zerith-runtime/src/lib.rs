@@ -20,6 +20,7 @@ mod budget;
 mod code_exec;
 pub mod compact;
 pub mod cost;
+pub mod decision;
 pub mod events;
 pub mod goal;
 pub mod guards;

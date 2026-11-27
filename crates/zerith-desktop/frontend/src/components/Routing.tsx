@@ -21,6 +21,7 @@ import {
   Plug,
   Route,
   Save,
+  Scale,
   Search,
   Telescope,
   Workflow,
@@ -46,7 +47,8 @@ type Key =
   | "subagent_model"
   | "explore_model"
   | "plan_model"
-  | "compact_model";
+  | "compact_model"
+  | "decision_model";
 type Opt = { spec: string; model: string; name: string };
 type Group = {
   key: string;
@@ -61,6 +63,7 @@ type Shown = {
   sub: string;
   logo: string | null;
   combo?: boolean;
+  off?: boolean;
 };
 
 const CONV: Shown = {
@@ -69,9 +72,16 @@ const CONV: Shown = {
   logo: null,
 };
 
+const OFF: Shown = {
+  name: "desligado (opcional)",
+  sub: "nenhuma chamada extra",
+  logo: null,
+  off: true,
+};
+
 const ROLES: Record<
   Key,
-  { label: string; hint: string; icon: LucideIcon; from: Key | null }
+  { label: string; hint: string; icon: LucideIcon; from: Key | null; optional?: boolean }
 > = {
   main_model: {
     label: "Principal",
@@ -102,6 +112,13 @@ const ROLES: Record<
     hint: "Resume históricos longos preservando entidades.",
     icon: Minimize2,
     from: "explore_model",
+  },
+  decision_model: {
+    label: "Decisão",
+    hint: "Modelo calibrado rápido (ex.: microsoft/microsoft-decision-1.1) para esforço Auto, alerta de risco e /goal. Opcional; nunca limita a resposta.",
+    icon: Scale,
+    from: null,
+    optional: true,
   },
 };
 
@@ -236,7 +253,7 @@ function describe(
 
 function Mark({ s, size }: { s: Shown; size: number }) {
   if (s.logo && !s.combo) return <Logo id={s.logo} size={size} />;
-  const Icon = s.combo ? Layers : MessageSquare;
+  const Icon = s.combo ? Layers : s.off ? Scale : MessageSquare;
   return (
     <span className="dg-tile" style={{ width: size, height: size }}>
       <Icon size={14} strokeWidth={2} />
@@ -250,6 +267,7 @@ function Picker(p: {
   value: string;
   groups: Group[];
   inherit: Shown;
+  emptyLabel?: string;
   show: (v: string) => Shown;
   onPick: (v: string) => void;
   end?: boolean;
@@ -376,7 +394,13 @@ function Picker(p: {
         aria-haspopup="listbox"
         aria-expanded={open}
         aria-label={`Modelo: ${p.label}`}
-        title={cur ? `${cur.name} · ${cur.sub}` : `Herdar: ${p.inherit.name}`}
+        title={
+          cur
+            ? `${cur.name} · ${cur.sub}`
+            : p.emptyLabel
+              ? `${p.inherit.name} · ${p.inherit.sub}`
+              : `Herdar: ${p.inherit.name}`
+        }
         onClick={() => {
           if (open) return close();
           setAt(Math.max(0, flat.indexOf(p.value)));
@@ -391,10 +415,14 @@ function Picker(p: {
           </span>
         )}
         <span className="dg-text">
-          <span className="dg-model">{cur ? cur.name : "Herdar"}</span>
+          <span className="dg-model">
+            {cur ? cur.name : p.emptyLabel ? p.inherit.name : "Herdar"}
+          </span>
           <span className="dg-sub">
             {cur ? (
               cur.sub
+            ) : p.emptyLabel ? (
+              p.inherit.sub
             ) : (
               <>
                 <ArrowRight size={11} strokeWidth={2} />
@@ -434,15 +462,23 @@ function Picker(p: {
               i++,
               !p.value,
               () => pick(""),
-              <>
-                <CornerLeftUp
-                  size={14}
-                  strokeWidth={2}
-                  className="dg-opt-icon"
-                />
-                <span className="dg-opt-name">Herdar</span>
-                <code>{p.inherit.name}</code>
-              </>,
+              p.emptyLabel ? (
+                <>
+                  <Scale size={14} strokeWidth={2} className="dg-opt-icon" />
+                  <span className="dg-opt-name">{p.emptyLabel}</span>
+                  <code>{p.inherit.sub}</code>
+                </>
+              ) : (
+                <>
+                  <CornerLeftUp
+                    size={14}
+                    strokeWidth={2}
+                    className="dg-opt-icon"
+                  />
+                  <span className="dg-opt-name">Herdar</span>
+                  <code>{p.inherit.name}</code>
+                </>
+              ),
             )}
             {groups.map((g) => (
               <div
@@ -540,10 +576,10 @@ export function RoutingTab(p: {
   const show = (v: string) =>
     describe(v, groups, p.accounts, p.presets, r.combos);
   const val = (k: Key) => (r[k] ?? "").trim();
-  // Empty = inherit: main from the chat, subagents from main, explore/plan from subagents.
+  // Empty = inherit: main from the chat, subagents from main, explore/plan from subagents; decision is optional (off).
   const eff = (k: Key): string =>
     val(k) ||
-    (k === "main_model"
+    (k === "main_model" || k === "decision_model"
       ? ""
       : eff(k === "subagent_model" ? "main_model" : "subagent_model"));
   const shown = (spec: string) => (spec ? show(spec) : CONV);
@@ -584,10 +620,16 @@ export function RoutingTab(p: {
               {d.label}
               {v ? null : (
                 <span className="badge">
-                  <CornerLeftUp size={11} strokeWidth={2} />
-                  {d.from
-                    ? "herda de " + ROLES[d.from].label
-                    : "herda da conversa"}
+                  {d.optional ? (
+                    "opcional"
+                  ) : (
+                    <>
+                      <CornerLeftUp size={11} strokeWidth={2} />
+                      {d.from
+                        ? "herda de " + ROLES[d.from].label
+                        : "herda da conversa"}
+                    </>
+                  )}
                 </span>
               )}
             </span>
@@ -599,7 +641,8 @@ export function RoutingTab(p: {
           value={v}
           groups={groups}
           show={show}
-          inherit={shown(d.from ? eff(d.from) : "")}
+          inherit={d.optional ? OFF : shown(d.from ? eff(d.from) : "")}
+          emptyLabel={d.optional ? "Desligado (opcional)" : undefined}
           onPick={(x) => setKey(k, x)}
           end={end}
         />
@@ -643,6 +686,7 @@ export function RoutingTab(p: {
             {node("plan_model")}
             {node("compact_model", "", true)}
           </div>
+          {node("decision_model", "dg-decision")}
 
           <div className="dg-agents">
             <div className="dg-agents-head">

@@ -686,6 +686,10 @@ export const CATALOG: CatalogEntry[] = [
     featured: true,
     models: [
       {
+        id: "microsoft/microsoft-decision-1.1",
+        name: "Microsoft Decision 1.1",
+      },
+      {
         id: "openai/text-embedding-3-large",
         name: "OpenAI Text Embedding 3 Large",
       },

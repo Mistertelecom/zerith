@@ -9,6 +9,7 @@ pub(super) enum RoutingField {
     Explore,
     Plan,
     Compact,
+    Decision,
 }
 
 impl RoutingField {
@@ -19,6 +20,7 @@ impl RoutingField {
             Self::Explore => "explore_model",
             Self::Plan => "plan_model",
             Self::Compact => "compact_model",
+            Self::Decision => "decision_model",
         }
     }
 
@@ -29,6 +31,7 @@ impl RoutingField {
             Self::Explore => &mut r.explore_model,
             Self::Plan => &mut r.plan_model,
             Self::Compact => &mut r.compact_model,
+            Self::Decision => &mut r.decision_model,
         }
     }
 }
@@ -78,13 +81,14 @@ pub(super) fn parse_routing(args: &[String]) -> Result<RoutingAction, String> {
             }
             Ok(RoutingAction::Show)
         }
-        "main" | "subagent" | "explore" | "plan" | "compact" => {
+        "main" | "subagent" | "explore" | "plan" | "compact" | "decision" => {
             let field = match sub {
                 "main" => RoutingField::Main,
                 "subagent" => RoutingField::Subagent,
                 "explore" => RoutingField::Explore,
                 "plan" => RoutingField::Plan,
                 "compact" => RoutingField::Compact,
+                "decision" => RoutingField::Decision,
                 _ => unreachable!(),
             };
             let raw = args
@@ -182,6 +186,10 @@ pub fn format_routing(r: &RoutingSettings) -> String {
     out.push_str(&format!(
         "compact_model   {}\n",
         r.compact_model.as_deref().unwrap_or("(padrão)")
+    ));
+    out.push_str(&format!(
+        "decision_model  {}\n",
+        r.decision_model.as_deref().unwrap_or("(padrão)")
     ));
     if r.role_models.is_empty() {
         out.push_str("role_models     (nenhum)\n");
@@ -405,4 +413,40 @@ pub fn tokensaver_cmd(paths: &Paths, args: &[String]) -> Res {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod decision_routing_tests {
+    use super::*;
+
+    fn args(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn parses_and_formats_decision_model_role() {
+        assert_eq!(
+            parse_routing(&args(&[
+                "routing",
+                "decision",
+                "openrouter/microsoft/microsoft-decision-1.1",
+            ])),
+            Ok(RoutingAction::SetField {
+                field: RoutingField::Decision,
+                value: Some("openrouter/microsoft/microsoft-decision-1.1".into()),
+            })
+        );
+        assert_eq!(
+            parse_routing(&args(&["routing", "decision", "clear"])),
+            Ok(RoutingAction::SetField {
+                field: RoutingField::Decision,
+                value: None,
+            })
+        );
+        let mut r = RoutingSettings::default();
+        assert!(format_routing(&r).contains("decision_model  (padrão)"));
+        r.decision_model = Some("openrouter/microsoft/microsoft-decision-1.1".into());
+        assert!(format_routing(&r)
+            .contains("decision_model  openrouter/microsoft/microsoft-decision-1.1"));
+    }
 }

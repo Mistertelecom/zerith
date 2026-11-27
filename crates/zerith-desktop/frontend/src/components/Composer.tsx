@@ -30,6 +30,7 @@ import {
   Paperclip,
   RotateCcw,
   ShieldCheck,
+  SlidersHorizontal,
   Sparkles,
   Square,
   SquarePen,
@@ -51,10 +52,48 @@ type Attached = {
   url?: string;
   kind: "image" | "video" | "file";
 };
+type PastedSnippet = {
+  id: string;
+  text: string;
+  lines: number;
+  chars: number;
+  preview: string;
+};
 const IMAGE_CAP = 20 * 1024 * 1024;
 const FILE_CAP = 50 * 1024 * 1024;
+const PASTE_LINE_THRESHOLD = 40;
+const PASTE_CHAR_THRESHOLD = 4000;
 const isImagePath = (p: string) => /\.(png|jpe?g|webp|gif)$/i.test(p);
 const isVideoPath = (p: string) => /\.(mp4|m4v|webm|mov)$/i.test(p);
+
+function shouldChipPaste(text: string): boolean {
+  if (text.length >= PASTE_CHAR_THRESHOLD) return true;
+  let lines = 1;
+  for (let i = 0; i < text.length; i++) {
+    if (text.charCodeAt(i) === 10) {
+      lines++;
+      if (lines >= PASTE_LINE_THRESHOLD) return true;
+    }
+  }
+  return false;
+}
+
+function makePastedSnippet(text: string): PastedSnippet {
+  const split = text.split(/\r?\n/);
+  const lines = split.length;
+  const preview = split
+    .slice(0, 3)
+    .map((l) => l.trimEnd())
+    .join("\n")
+    .slice(0, 260);
+  return {
+    id: `paste-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    text,
+    lines,
+    chars: text.length,
+    preview,
+  };
+}
 
 /// What `/` offers. The names are the old window's, so muscle memory carries
 /// over; `run` is handled by App, which owns the state each one touches.
@@ -119,6 +158,14 @@ function tokenAt(draft: string, caret: number): Trigger | null {
   return null;
 }
 
+/** Compact display name for a model pill: strips redundant `org/` prefix
+ * since the provider logo is already rendered right beside it. */
+function shortModelName(name: string): string {
+  const slash = name.lastIndexOf("/");
+  if (slash > 0 && slash < name.length - 1) return name.slice(slash + 1);
+  return name;
+}
+
 export const Composer = memo(function Composer(props: {
   draft: string;
   onDraft: (v: string) => void;
@@ -133,6 +180,7 @@ export const Composer = memo(function Composer(props: {
   effort?: string;
   onEffort?: (v: string) => void;
   lastUserText?: string;
+  userHistory?: string[];
   contextGauge?: { used: number; limit: number; cacheHitPct?: number } | null;
   model: string;
   models: { value: string; label: string }[];
@@ -154,6 +202,7 @@ export const Composer = memo(function Composer(props: {
   // Every level is offered; a provider that lacks one gets the strongest it
   // accepts (`max` becomes `high` on OpenAI-compatible servers).
   const effortOptions = [
+    { value: "auto", label: tr(lang, "Auto (ajusta esforço conforme a tarefa sem quebrar cache)", "Auto (adapts effort to task without breaking cache)"), short: "Auto" },
     { value: "off", label: tr(lang, "Off (padrão)", "Off (default)"), short: "Off" },
     { value: "low", label: tr(lang, "Baixo", "Low"), short: tr(lang, "Baixo", "Low") },
     { value: "medium", label: tr(lang, "Médio", "Medium"), short: tr(lang, "Médio", "Medium") },
@@ -176,10 +225,13 @@ export const Composer = memo(function Composer(props: {
   const [active, setActive] = useState(0);
   const [dismissed, setDismissed] = useState<string | null>(null);
   const [images, setImages] = useState<Attached[]>([]);
+  const [pasted, setPasted] = useState<PastedSnippet[]>([]);
   const [note, setNote] = useState<string | null>(null);
   const [dropping, setDropping] = useState(false);
   const [queued, setQueued] = useState(false);
   const picker = useRef<HTMLInputElement>(null);
+  const histIdxRef = useRef<number>(-1);
+  const savedDraftRef = useRef<string>("");
 
   // Saved on attach, not on send: a bad file is refused while the user is
   // still looking at it, and sending stays a plain text prompt.
@@ -263,9 +315,16 @@ export const Composer = memo(function Composer(props: {
       el.focus();
       el.setSelectionRange(el.value.length, el.value.length);
       const text = e.clipboardData.getData("text/plain");
-      // insertText keeps Ctrl+Z working and fires React's onChange
-      if (text) document.execCommand("insertText", false, text);
-      else pasteFiles(e.clipboardData.files);
+      if (text) {
+        if (shouldChipPaste(text)) {
+          setPasted((prev) => [...prev, makePastedSnippet(text)]);
+        } else {
+          // insertText keeps Ctrl+Z working and fires React's onChange
+          document.execCommand("insertText", false, text);
+        }
+      } else {
+        pasteFiles(e.clipboardData.files);
+      }
     };
     document.addEventListener("paste", onPaste);
     return () => document.removeEventListener("paste", onPaste);
@@ -344,14 +403,29 @@ export const Composer = memo(function Composer(props: {
   // App sends its own draft, so the lines go in first and the send waits one
   // render for them.
   const send = () => {
+    histIdxRef.current = -1;
+    savedDraftRef.current = "";
     if (props.busy) {
-      const t = props.draft.trim();
+      const t = [props.draft.trim(), ...pasted.map((p) => p.text)]
+        .filter(Boolean)
+        .join("\n\n");
       // `/btw` não direciona o turno: vai à parte, com o turno rodando.
-      if (/^\/btw(\s|$)/.test(t)) return props.onSend();
-      if (t && props.onSteer) props.onSteer(t);
+      if (/^\/btw(\s|$)/.test(t)) {
+        if (pasted.length) {
+          props.onDraft(t);
+          setPasted([]);
+          setQueued(true);
+          return;
+        }
+        return props.onSend();
+      }
+      if (t && props.onSteer) {
+        if (pasted.length) setPasted([]);
+        props.onSteer(t);
+      }
       return;
     }
-    if (!images.length) return props.onSend();
+    if (!images.length && !pasted.length) return props.onSend();
     const lines = images.map((i) => {
       const cleanName = i.name.replace(/[[\]\n]/g, "");
       if (i.kind === "image" || i.kind === "video") {
@@ -359,8 +433,12 @@ export const Composer = memo(function Composer(props: {
       }
       return `[Arquivo anexado: ${cleanName}](<${i.path}>)`;
     });
-    props.onDraft([props.draft.trim(), ...lines].filter(Boolean).join("\n"));
+    const textPart = [props.draft.trim(), ...pasted.map((p) => p.text)]
+      .filter(Boolean)
+      .join("\n\n");
+    props.onDraft([textPart, ...lines].filter(Boolean).join("\n"));
     setImages([]);
+    setPasted([]);
     setNote(null);
     setQueued(true);
   };
@@ -503,7 +581,14 @@ export const Composer = memo(function Composer(props: {
   const execName =
     execCurrent?.label.split(" · ")[1] ??
     (execVal || tr(lang, "Escolha o executor", "Choose executor"));
-  const canSend = !props.busy && (!!props.draft.trim() || images.length > 0);
+  const historyList = props.userHistory?.length
+    ? props.userHistory
+    : props.lastUserText
+      ? [props.lastUserText]
+      : [];
+  const isBtw = /^\/btw(\s|$)/.test(props.draft.trim());
+  const canSend =
+    !props.busy && (!!props.draft.trim() || images.length > 0 || pasted.length > 0);
 
   return (
     <div className="composer">
@@ -525,7 +610,7 @@ export const Composer = memo(function Composer(props: {
             addFiles(e.dataTransfer.files);
           }}
         >
-          {images.length ? (
+          {images.length || pasted.length ? (
             <div className="attach-row" aria-label="Anexos">
               {images.map((im, i) => {
                 const isImage = im.kind === "image" && Boolean(im.url);
@@ -550,6 +635,36 @@ export const Composer = memo(function Composer(props: {
                       title="Remover"
                       onClick={() =>
                         setImages((l) => l.filter((_, j) => j !== i))
+                      }
+                    >
+                      <X size={12} strokeWidth={2.25} />
+                    </button>
+                  </div>
+                );
+              })}
+              {pasted.map((snip) => {
+                const label = tr(
+                  lang,
+                  `Trecho colado · ${snip.lines} linhas`,
+                  `Pasted snippet · ${snip.lines} lines`,
+                );
+                return (
+                  <div
+                    className="attach-chip is-file is-paste"
+                    key={snip.id}
+                    title={snip.preview || label}
+                  >
+                    <span className="attach-file-label">
+                      <FileText size={14} strokeWidth={2} />
+                      <span>{label}</span>
+                    </span>
+                    <button
+                      type="button"
+                      className="attach-x"
+                      aria-label={tr(lang, `Remover ${label}`, `Remove ${label}`)}
+                      title={tr(lang, "Remover", "Remove")}
+                      onClick={() =>
+                        setPasted((l) => l.filter((x) => x.id !== snip.id))
                       }
                     >
                       <X size={12} strokeWidth={2.25} />
@@ -623,8 +738,17 @@ export const Composer = memo(function Composer(props: {
             rows={1}
             value={props.draft}
             aria-label={tr(lang, "Mensagem", "Message")}
-            placeholder={tr(lang, "Pergunte algo ao Zerith…", "Ask Zerith anything…")}
+            placeholder={
+              props.busy
+                ? tr(
+                    lang,
+                    "Direcionar resposta atual ou /btw para pergunta paralela…",
+                    "Steer current turn or /btw for a side question…",
+                  )
+                : tr(lang, "Pergunte algo ao Zerith…", "Ask Zerith anything…")
+            }
             onChange={(e) => {
+              histIdxRef.current = -1;
               props.onDraft(e.target.value);
               setCaret(e.target.selectionStart ?? e.target.value.length);
               setDismissed(null);
@@ -645,9 +769,17 @@ export const Composer = memo(function Composer(props: {
               )
             }
             onPaste={(e) => {
-              // Word/Excel put a picture of the copied text beside it: text wins
               const data = e.clipboardData;
-              if (!data.files.length || data.getData("text/plain")) return;
+              const text = data.getData("text/plain");
+              if (text) {
+                if (shouldChipPaste(text)) {
+                  e.preventDefault();
+                  setPasted((prev) => [...prev, makePastedSnippet(text)]);
+                }
+                return;
+              }
+              // Word/Excel put a picture of the copied text beside it: text wins
+              if (!data.files.length) return;
               e.preventDefault();
               pasteFiles(data.files);
             }}
@@ -695,13 +827,66 @@ export const Composer = memo(function Composer(props: {
               }
               if (
                 e.key === "ArrowUp" &&
-                !props.draft.trim() &&
-                props.lastUserText &&
+                historyList.length > 0 &&
                 !(rows.length && trigger)
               ) {
-                e.preventDefault();
-                props.onDraft(props.lastUserText);
-                return;
+                const el = e.currentTarget;
+                const pos = el.selectionStart ?? 0;
+                const onFirstLine =
+                  el.selectionEnd === pos && !el.value.slice(0, pos).includes("\n");
+                if (onFirstLine && (histIdxRef.current >= 0 || !props.draft.trim())) {
+                  e.preventDefault();
+                  if (histIdxRef.current < 0) {
+                    savedDraftRef.current = props.draft;
+                    histIdxRef.current = historyList.length - 1;
+                  } else if (histIdxRef.current > 0) {
+                    histIdxRef.current = Math.min(
+                      histIdxRef.current - 1,
+                      historyList.length - 1,
+                    );
+                  } else {
+                    return;
+                  }
+                  const next = historyList[histIdxRef.current];
+                  const targetCaret = next.includes("\n") ? 0 : next.length;
+                  props.onDraft(next);
+                  setCaret(targetCaret);
+                  requestAnimationFrame(() =>
+                    box.current?.setSelectionRange(targetCaret, targetCaret),
+                  );
+                  return;
+                }
+              }
+              if (
+                e.key === "ArrowDown" &&
+                histIdxRef.current >= 0 &&
+                !(rows.length && trigger)
+              ) {
+                const el = e.currentTarget;
+                const pos = el.selectionEnd ?? el.value.length;
+                const onLastLine =
+                  el.selectionStart === pos && !el.value.slice(pos).includes("\n");
+                if (onLastLine) {
+                  e.preventDefault();
+                  if (histIdxRef.current < historyList.length - 1) {
+                    histIdxRef.current += 1;
+                    const next = historyList[histIdxRef.current];
+                    props.onDraft(next);
+                    setCaret(next.length);
+                    requestAnimationFrame(() =>
+                      box.current?.setSelectionRange(next.length, next.length),
+                    );
+                  } else {
+                    histIdxRef.current = -1;
+                    const restored = savedDraftRef.current;
+                    props.onDraft(restored);
+                    setCaret(restored.length);
+                    requestAnimationFrame(() =>
+                      box.current?.setSelectionRange(restored.length, restored.length),
+                    );
+                  }
+                  return;
+                }
               }
               if (e.key === "Enter" && !e.shiftKey) {
                 e.preventDefault();
@@ -709,133 +894,16 @@ export const Composer = memo(function Composer(props: {
               }
             }}
           />
-          <div className="draft-row">
-            <button
-              type="button"
-              className="icon-btn sm"
-              aria-label={tr(lang, "Anexar arquivo, imagem ou vídeo", "Attach file, image or video")}
-              title={tr(
-                lang,
-                "Anexar imagem, vídeo, config (.conf/.cfg/.rsc), log ou arquivo (ou cole / arraste)",
-                "Attach image, video, config, log or file (or paste / drag)",
-              )}
-              onClick={() => picker.current?.click()}
-            >
-              <Paperclip size={16} strokeWidth={2} />
-            </button>
-            <input
-              ref={picker}
-              type="file"
-              multiple
-              hidden
-              onChange={(e) => {
-                addFiles(e.target.files ?? []);
-                e.target.value = "";
-              }}
-            />
-            {/* Native selects under a pill: the pill shows the choice, the
-                transparent select on top keeps the real control and its menu. */}
-            {/* Own menus, not native <select>: WebView2 draws that popup as a
-                white OS window that spills out of the frame (and down). */}
-            {props.folder}
-            <PillMenu
-              label={tr(lang, "Permissões", "Permissions")}
-              icon={<ShieldCheck size={14} strokeWidth={2} />}
-              text={modeLabel}
-              value={props.mode}
-              options={props.modes.map(([v, label]) => ({ value: v, label }))}
-              onPick={props.onMode}
-            />
-            {props.onEffort ? (
-              <PillMenu
-                label={tr(lang, "Esforço", "Effort")}
-                icon={<Brain size={14} strokeWidth={2} />}
-                text={effortOptions.find((o) => o.value === (props.effort ?? "off"))?.short ?? "Off"}
-                value={props.effort ?? "off"}
-                options={effortOptions}
-                onPick={props.onEffort}
-              />
-            ) : null}
-            {props.onToggleOrchestrator ? (
-              <button
-                type="button"
-                className={"pill" + (props.orchestrator ? " open orch-on" : "")}
-                aria-pressed={!!props.orchestrator}
-                title={tr(
-                  lang,
-                  "Modo Orquestrador 100%: o modelo de Pensamento planeja/coordena e o modelo de Execução roda todas as ferramentas",
-                  "100% Orchestrator Mode: Thinking model plans/coordinates and Execution model runs all tools",
-                )}
-                onClick={props.onToggleOrchestrator}
-              >
-                <Layers size={14} strokeWidth={2} />
-                <span className="pill-text">
-                  {tr(lang, "Orquestrador", "Orchestrator")}
-                </span>
-              </button>
-            ) : null}
-            {!props.orchestrator ? (
-              <PillMenu
-                label={tr(lang, "Modelo", "Model")}
-                icon={
-                  provider === "Perfil" ? (
-                    <Layers size={16} strokeWidth={1.75} />
-                  ) : (
-                    <Logo id={provider || null} size={16} />
-                  )
-                }
-                text={brainName}
-                value={props.model}
-                options={props.models}
-                onPick={props.onModel}
-                hidden={props.hidden}
-                onToggleHidden={props.onToggleHidden}
-                search
-                wide
-              />
-            ) : null}
-            <span className="spacer" />
-            {props.busy ? (
-              <div className="send-busy-group">
-                {props.draft.trim() && props.onSteer ? (
-                  <button
-                    className="btn btn-primary send ready steer"
-                    onClick={send}
-                    aria-label={tr(lang, "Direcionar", "Steer")}
-                    title={tr(lang, "Direcionar o turno atual", "Steer current turn")}
-                  >
-                    <ArrowUp size={16} strokeWidth={2.25} />
-                  </button>
-                ) : null}
-                <button
-                  className="send stop"
-                  onClick={props.onCancel}
-                  aria-label={tr(lang, "Parar", "Stop")}
-                  title={tr(lang, "Parar", "Stop")}
-                >
-                  <Square size={12} strokeWidth={2} fill="currentColor" />
-                </button>
-              </div>
-            ) : (
-              <button
-                className={"btn btn-primary send" + (canSend ? " ready" : "")}
-                disabled={!canSend}
-                onClick={send}
-                aria-label={tr(lang, "Enviar", "Send")}
-                title={tr(lang, "Enviar", "Send")}
-              >
-                <ArrowUp size={16} strokeWidth={2.25} />
-              </button>
-            )}
-          </div>
           {props.orchestrator && props.onExecutorModel ? (
             <div className="orch-bar" role="group" aria-label={tr(lang, "Modelos do Orquestrador", "Orchestrator Models")}>
               <span className="orch-tag">
                 <Brain size={13} strokeWidth={2} />
-                {tr(lang, "Pensamento:", "Thinking:")}
+                {tr(lang, "Pensamento", "Thinking")}
               </span>
               <PillMenu
+                className="pill-model"
                 label={tr(lang, "Modelo de Pensamento (Cérebro)", "Thinking Model (Brain)")}
+                titleText={brainName}
                 icon={
                   provider === "Perfil" ? (
                     <Layers size={15} strokeWidth={1.75} />
@@ -843,7 +911,7 @@ export const Composer = memo(function Composer(props: {
                     <Logo id={provider || null} size={15} />
                   )
                 }
-                text={brainName}
+                text={shortModelName(brainName)}
                 value={props.model}
                 options={props.models}
                 onPick={props.onModel}
@@ -855,14 +923,16 @@ export const Composer = memo(function Composer(props: {
               <span className="orch-arrow" aria-hidden>→</span>
               <span className="orch-tag">
                 <Cpu size={13} strokeWidth={2} />
-                {tr(lang, "Execução:", "Execution:")}
+                {tr(lang, "Execução", "Execution")}
               </span>
               <PillMenu
+                className="pill-model"
                 label={tr(
                   lang,
                   "Modelo de Execução (Subagentes / Ferramentas)",
                   "Execution Model (Subagents / Tools)",
                 )}
+                titleText={execName}
                 icon={
                   execProvider === "Perfil" ? (
                     <Cpu size={15} strokeWidth={1.75} />
@@ -870,7 +940,7 @@ export const Composer = memo(function Composer(props: {
                     <Logo id={execProvider || null} size={15} />
                   )
                 }
-                text={execName}
+                text={shortModelName(execName)}
                 value={execVal}
                 options={props.models}
                 onPick={props.onExecutorModel}
@@ -879,44 +949,319 @@ export const Composer = memo(function Composer(props: {
                 search
                 wide
               />
+              {props.onToggleOrchestrator ? (
+                <button
+                  type="button"
+                  className="icon-btn sm orch-close"
+                  onClick={props.onToggleOrchestrator}
+                  aria-label={tr(lang, "Sair do Modo Orquestrador", "Exit Orchestrator Mode")}
+                  title={tr(lang, "Sair do Modo Orquestrador", "Exit Orchestrator Mode")}
+                >
+                  <X size={13} strokeWidth={2} />
+                </button>
+              ) : null}
             </div>
           ) : null}
-        </div>
-        <div className="hint">
-          <span className="hint-text">{note ?? props.hint}</span>
-          {props.contextGauge && props.contextGauge.used > 0 ? (() => {
-            const pct = Math.min(
-              100,
-              Math.round((100 * props.contextGauge.used) / Math.max(1, props.contextGauge.limit)),
-            );
-            const cls = pct >= 85 ? "danger" : pct >= 70 ? "warn" : "";
-            return (
-              <span
-                className={`ctx-gauge ${cls}`}
-                title={`${props.contextGauge.used.toLocaleString("pt-BR")} / ${props.contextGauge.limit.toLocaleString("pt-BR")} tokens`}
+          <div className="draft-row">
+            <div className="draft-left">
+              <button
+                type="button"
+                className="icon-btn sm draft-attach"
+                aria-label={tr(lang, "Anexar arquivo, imagem ou vídeo", "Attach file, image or video")}
+                title={tr(
+                  lang,
+                  "Anexar imagem, vídeo, config (.conf/.cfg/.rsc), log ou arquivo (ou cole / arraste)",
+                  "Attach image, video, config, log or file (or paste / drag)",
+                )}
+                onClick={() => picker.current?.click()}
               >
-                <Gauge size={12} strokeWidth={2} />
-                {pct}% ({Math.round(props.contextGauge.used / 1000)}k/{Math.round(props.contextGauge.limit / 1000)}k)
-                {props.contextGauge.cacheHitPct ? ` · cache ${props.contextGauge.cacheHitPct}%` : ""}
-              </span>
-            );
-          })() : null}
-          <span className="hint-keys">
-            <kbd className="kbd">Shift</kbd>
-            <kbd className="kbd">Tab</kbd> {tr(lang, "modo", "mode")}
-            <span className="hint-sep" />
-            <kbd className="kbd">Ctrl</kbd>
-            <kbd className="kbd">K</kbd> {tr(lang, "comandos", "commands")}
-          </span>
+                <Paperclip size={16} strokeWidth={2} />
+              </button>
+              <input
+                ref={picker}
+                type="file"
+                multiple
+                hidden
+                onChange={(e) => {
+                  addFiles(e.target.files ?? []);
+                  e.target.value = "";
+                }}
+              />
+              {!props.orchestrator ? (
+                <PillMenu
+                  className="pill-model"
+                  label={tr(lang, "Modelo", "Model")}
+                  titleText={brainName}
+                  icon={
+                    provider === "Perfil" ? (
+                      <Layers size={15} strokeWidth={1.75} />
+                    ) : (
+                      <Logo id={provider || null} size={15} />
+                    )
+                  }
+                  text={shortModelName(brainName)}
+                  value={props.model}
+                  options={props.models}
+                  onPick={props.onModel}
+                  hidden={props.hidden}
+                  onToggleHidden={props.onToggleHidden}
+                  search
+                  wide
+                />
+              ) : null}
+              {props.onEffort || props.onToggleOrchestrator ? (
+                <TurnOptionsMenu
+                  lang={lang}
+                  effort={props.effort ?? "off"}
+                  effortOptions={effortOptions}
+                  onEffort={props.onEffort}
+                  orchestrator={!!props.orchestrator}
+                  onToggleOrchestrator={props.onToggleOrchestrator}
+                />
+              ) : null}
+            </div>
+            <div className="draft-right">
+              <PillMenu
+                className={props.mode === "bypass" ? "pill-mode-bypass" : undefined}
+                label={tr(lang, "Permissões", "Permissions")}
+                icon={<ShieldCheck size={14} strokeWidth={2} />}
+                text={modeLabel}
+                value={props.mode}
+                options={props.modes.map(([v, label]) => ({ value: v, label }))}
+                onPick={props.onMode}
+              />
+              {props.busy ? (
+                <div className="send-busy-group">
+                  {(props.draft.trim() || pasted.length > 0) && (isBtw || props.onSteer) ? (
+                    <button
+                      type="button"
+                      className="btn btn-primary send ready steer"
+                      onClick={send}
+                      aria-label={
+                        isBtw
+                          ? tr(lang, "Enviar pergunta paralela (/btw)", "Send side question (/btw)")
+                          : tr(lang, "Direcionar", "Steer")
+                      }
+                      title={
+                        isBtw
+                          ? tr(lang, "Enviar pergunta paralela (/btw)", "Send side question (/btw)")
+                          : tr(lang, "Direcionar o turno atual", "Steer current turn")
+                      }
+                    >
+                      {isBtw ? (
+                        <MessageCircleQuestionMark size={16} strokeWidth={2} />
+                      ) : (
+                        <ArrowUp size={16} strokeWidth={2.25} />
+                      )}
+                    </button>
+                  ) : null}
+                  <button
+                    type="button"
+                    className="send stop"
+                    onClick={props.onCancel}
+                    aria-label={tr(lang, "Parar", "Stop")}
+                    title={tr(lang, "Parar", "Stop")}
+                  >
+                    <Square size={12} strokeWidth={2} fill="currentColor" />
+                  </button>
+                </div>
+              ) : (
+                <button
+                  className={"btn btn-primary send" + (canSend ? " ready" : "")}
+                  disabled={!canSend}
+                  onClick={send}
+                  aria-label={tr(lang, "Enviar", "Send")}
+                  title={tr(lang, "Enviar", "Send")}
+                >
+                  <ArrowUp size={16} strokeWidth={2.25} />
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+        <div className="hint composer-meta">
+          <div className="composer-meta-left">
+            {props.folder ? <div className="composer-folder">{props.folder}</div> : null}
+            {props.folder && (note ?? props.hint) ? (
+              <span className="composer-meta-dot" aria-hidden>·</span>
+            ) : null}
+            <span className={"hint-text" + (note ? " is-note" : "")}>{note ?? props.hint}</span>
+          </div>
+          <div className="composer-meta-right">
+            {props.contextGauge && props.contextGauge.used > 0 ? (() => {
+              const pct = Math.min(
+                100,
+                Math.round((100 * props.contextGauge.used) / Math.max(1, props.contextGauge.limit)),
+              );
+              const cls = pct >= 85 ? "danger" : pct >= 70 ? "warn" : "";
+              return (
+                <button
+                  type="button"
+                  className={`ctx-gauge${cls ? " " + cls : ""}`}
+                  disabled={props.busy}
+                  onClick={() => props.onRun("compact")}
+                  title={
+                    `${props.contextGauge.used.toLocaleString("pt-BR")} / ${props.contextGauge.limit.toLocaleString("pt-BR")} tokens` +
+                    tr(lang, " — clique para compactar (/compact)", " — click to compact (/compact)")
+                  }
+                >
+                  <Gauge size={12} strokeWidth={2} />
+                  {pct}% ({Math.round(props.contextGauge.used / 1000)}k/{Math.round(props.contextGauge.limit / 1000)}k)
+                  {props.contextGauge.cacheHitPct ? ` · cache ${props.contextGauge.cacheHitPct}%` : ""}
+                </button>
+              );
+            })() : null}
+            <span className="hint-keys">
+              <kbd className="kbd">Shift</kbd>
+              <kbd className="kbd">Tab</kbd> {tr(lang, "modo", "mode")}
+              <span className="hint-sep" />
+              <kbd className="kbd">Ctrl</kbd>
+              <kbd className="kbd">K</kbd> {tr(lang, "comandos", "commands")}
+            </span>
+          </div>
         </div>
       </div>
     </div>
   );
 });
 
+/** Compact popover grouping turn-execution controls (reasoning effort +
+ * 100% Orchestrator mode) so the composer bar stays single-row and uncluttered. */
+function TurnOptionsMenu(props: {
+  lang: ReturnType<typeof useLang>;
+  effort: string;
+  effortOptions: { value: string; label: string; short: string }[];
+  onEffort?: (v: string) => void;
+  orchestrator: boolean;
+  onToggleOrchestrator?: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [alignEnd, setAlignEnd] = useState(false);
+  const root = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const away = (e: MouseEvent) =>
+      !root.current?.contains(e.target as Node) && setOpen(false);
+    const esc = (e: KeyboardEvent) =>
+      e.key === "Escape" && (e.stopPropagation(), setOpen(false));
+    window.addEventListener("mousedown", away);
+    window.addEventListener("keydown", esc, true);
+    return () => {
+      window.removeEventListener("mousedown", away);
+      window.removeEventListener("keydown", esc, true);
+    };
+  }, [open]);
+
+  const activeEffort =
+    props.effort && props.effort !== "off"
+      ? props.effortOptions.find((o) => o.value === props.effort)?.short ?? props.effort
+      : null;
+  const badges: string[] = [];
+  if (activeEffort) badges.push(activeEffort);
+  if (props.orchestrator) badges.push(tr(props.lang, "Orq", "Orch"));
+  const hasActive = badges.length > 0;
+  const label = tr(props.lang, "Opções de raciocínio e orquestrador", "Reasoning and orchestrator options");
+
+  return (
+    <div className="pill-menu" ref={root}>
+      <button
+        type="button"
+        className={
+          "pill turn-opts-trigger" +
+          (open ? " open" : "") +
+          (hasActive ? " has-active" : "")
+        }
+        title={label}
+        aria-label={label}
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        onClick={(e) => {
+          if (!open) {
+            const layout = measurePillPopover(e.currentTarget, false);
+            setAlignEnd(layout.alignEnd);
+          }
+          setOpen((o) => !o);
+        }}
+      >
+        <SlidersHorizontal size={14} strokeWidth={2} />
+        {hasActive ? (
+          <span className="pill-text">{badges.join(" · ")}</span>
+        ) : null}
+      </button>
+      {open ? (
+        <div
+          className={"popover turn-opts-pop" + (alignEnd ? " align-end" : "")}
+          role="dialog"
+          aria-label={label}
+        >
+          {props.onEffort ? (
+            <div className="turn-opts-sec">
+              <div className="turn-opts-head">
+                <Brain size={13} strokeWidth={2} />
+                <span>{tr(props.lang, "Esforço de raciocínio", "Reasoning effort")}</span>
+              </div>
+              <div className="turn-opts-grid" role="radiogroup" aria-label={tr(props.lang, "Esforço", "Effort")}>
+                {props.effortOptions.map((o) => {
+                  const on = o.value === props.effort;
+                  return (
+                    <button
+                      key={o.value}
+                      type="button"
+                      role="radio"
+                      aria-checked={on}
+                      title={o.label}
+                      className={
+                        "turn-opts-chip" +
+                        (on ? " on" : "") +
+                        (o.value === "auto" ? " span-all" : "")
+                      }
+                      onClick={() => props.onEffort?.(o.value)}
+                    >
+                      {o.short}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          ) : null}
+          {props.onToggleOrchestrator ? (
+            <button
+              type="button"
+              className={"turn-opts-toggle" + (props.orchestrator ? " on" : "")}
+              role="switch"
+              aria-checked={props.orchestrator}
+              onClick={props.onToggleOrchestrator}
+            >
+              <span className="turn-opts-toggle-info">
+                <span className="turn-opts-toggle-title">
+                  <Layers size={13} strokeWidth={2} />
+                  {tr(props.lang, "Modo Orquestrador", "Orchestrator Mode")}
+                </span>
+                <span className="turn-opts-toggle-desc">
+                  {tr(
+                    props.lang,
+                    "Um modelo planeja e outro executa ferramentas",
+                    "One model plans and another executes tools",
+                  )}
+                </span>
+              </span>
+              <span className={"switch" + (props.orchestrator ? " on" : "")} aria-hidden>
+                <span className="switch-knob" />
+              </span>
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 /** A pill that opens a list above itself. Search filters long lists (models). */
 function PillMenu(props: {
+  className?: string;
   label: string;
+  titleText?: string;
   icon: ReactNode;
   text: string;
   value: string;
@@ -960,11 +1305,11 @@ function PillMenu(props: {
       (!needle || o.label.toLowerCase().includes(needle)),
   );
   return (
-    <div className="pill-menu" ref={root}>
+    <div className={"pill-menu" + (props.className ? " " + props.className : "")} ref={root}>
       <button
         type="button"
         className={"pill" + (open ? " open" : "")}
-        title={props.label}
+        title={props.titleText ? `${props.label}: ${props.titleText}` : props.label}
         aria-label={props.label}
         aria-haspopup="listbox"
         aria-expanded={open}

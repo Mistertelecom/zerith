@@ -17,6 +17,8 @@ export type Block =
       stored?: number;
       /** Tool calls already behind the text, so text after a new one starts a paragraph. */
       toolsAtText?: number;
+      /** Subtle per-reply telemetry captured during the live turn. */
+      stats?: { ttftMs?: number; cacheHitPct?: number; outputTokens?: number };
     }
   /** `learned`: what the background review saved after the turn (with undo). */
   | {
@@ -230,15 +232,33 @@ export function applyEvent(prev: TurnState, ev: TurnEvent): TurnState {
     case "question":
       state.question = { id: ev.id, questions: ev.questions };
       return state;
-    case "usage":
+    case "usage": {
+      const cacheRead = ev.cacheRead ?? 0;
       state.usage = {
         input: ev.input,
         output: ev.output,
-        cacheRead: ev.cacheRead ?? 0,
+        cacheRead,
         cacheWrite: ev.cacheWrite ?? 0,
         ttftMs: ev.ttftMs ?? 0,
       };
+      const a = assistant(state);
+      const prevStats = a.stats ?? {};
+      const ttftMs =
+        prevStats.ttftMs ?? (ev.ttftMs && ev.ttftMs > 0 ? ev.ttftMs : undefined);
+      const cacheHitPct =
+        cacheRead > 0 && ev.input + cacheRead > 0
+          ? Math.min(100, Math.round((100 * cacheRead) / (ev.input + cacheRead)))
+          : prevStats.cacheHitPct;
+      const outputTokens = ev.output > 0 ? ev.output : prevStats.outputTokens;
+      if (ttftMs !== undefined || cacheHitPct !== undefined || outputTokens !== undefined) {
+        a.stats = {
+          ...(ttftMs !== undefined ? { ttftMs } : {}),
+          ...(cacheHitPct !== undefined ? { cacheHitPct } : {}),
+          ...(outputTokens !== undefined ? { outputTokens } : {}),
+        };
+      }
       return state;
+    }
     case "tasks":
       state.tasks = ev.items;
       return state;
@@ -320,6 +340,23 @@ export function applyEvent(prev: TurnState, ev: TurnEvent): TurnState {
       state.saved = Math.max(state.saved, ev.savedTokens);
       if (!a.text && ev.text) a.text = ev.text;
       if (ev.stored != null) a.stored = ev.stored;
+      const prevStats = a.stats ?? {};
+      const doneCacheRead = ev.cacheReadTokens ?? 0;
+      const donePrompt = ev.promptTokens ?? 0;
+      const doneCachePct =
+        doneCacheRead > 0 && donePrompt + doneCacheRead > 0
+          ? Math.min(100, Math.round((100 * doneCacheRead) / (donePrompt + doneCacheRead)))
+          : prevStats.cacheHitPct;
+      const doneOutput = ev.completionTokens > 0 ? ev.completionTokens : prevStats.outputTokens;
+      const doneTtft =
+        prevStats.ttftMs ?? (state.usage?.ttftMs && state.usage.ttftMs > 0 ? state.usage.ttftMs : undefined);
+      if (doneTtft !== undefined || doneCachePct !== undefined || doneOutput !== undefined) {
+        a.stats = {
+          ...(doneTtft !== undefined ? { ttftMs: doneTtft } : {}),
+          ...(doneCachePct !== undefined ? { cacheHitPct: doneCachePct } : {}),
+          ...(doneOutput !== undefined ? { outputTokens: doneOutput } : {}),
+        };
+      }
       if (ev.userMessageId != null) {
         state.blocks = attachUserMessageId(state.blocks, ev.userMessageId);
       }

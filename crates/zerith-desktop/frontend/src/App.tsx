@@ -9,13 +9,10 @@ import {
 } from "react";
 import {
   Bot,
-  Bug,
   CheckCircle2,
   CircleDashed,
   Download,
-  FolderTree,
   Gauge,
-  GitPullRequest,
   Import,
   ListChecks,
   Loader,
@@ -26,7 +23,6 @@ import {
   Search,
   Sparkles,
   Workflow as WorkflowIcon,
-  type LucideIcon,
 } from "lucide-react";
 import {
   api,
@@ -117,34 +113,6 @@ const MODES = [
   ["plan", "Plano"],
   ["bypass", "Bypass"],
 ] as const;
-
-// Starters on the empty conversation; a click puts the prompt in the draft.
-const SUGGESTIONS: readonly [LucideIcon, string, string, string][] = [
-  [
-    FolderTree,
-    "Explicar o projeto",
-    "Estrutura, módulos e pontos de entrada",
-    "Explique a estrutura deste projeto: módulos principais, pontos de entrada e como as peças se conectam.",
-  ],
-  [
-    Bug,
-    "Caçar um bug",
-    "Rodar os testes e achar a causa raiz",
-    "Rode os testes, encontre a primeira falha e investigue a causa raiz antes de propor a correção.",
-  ],
-  [
-    ListChecks,
-    "Planejar uma mudança",
-    "Quebrar a tarefa em passos pequenos",
-    "Antes de editar qualquer arquivo, monte um plano em passos pequenos para esta mudança: ",
-  ],
-  [
-    GitPullRequest,
-    "Revisar o diff",
-    "Apontar riscos antes do commit",
-    "Revise o diff atual e aponte riscos, regressões e o que falta testar antes do commit.",
-  ],
-];
 
 const num = (n: number) => n.toLocaleString("pt-BR");
 
@@ -1377,13 +1345,15 @@ export default function App() {
     return [...out, ...turn.blocks];
   }, [messages, turn.blocks]);
 
-  const lastUserText = useMemo(() => {
-    for (let i = surface.length - 1; i >= 0; i--) {
-      const b = surface[i];
-      if (b.kind === "user") return b.text;
+  const userHistory = useMemo(() => {
+    const out: string[] = [];
+    for (const b of surface) {
+      if (b.kind === "user" && b.text.trim()) out.push(b.text);
     }
-    return undefined;
+    return out.slice(-25);
   }, [surface]);
+
+  const lastUserText = userHistory.length ? userHistory[userHistory.length - 1] : undefined;
 
   const contextGauge = useMemo(() => {
     const used = turn.usage?.input ?? 0;
@@ -2255,6 +2225,7 @@ export default function App() {
                 effort={effort}
                 onEffort={setEffort}
                 lastUserText={lastUserText}
+                userHistory={userHistory}
                 contextGauge={contextGauge}
                 model={model}
                 models={models}
@@ -2269,25 +2240,6 @@ export default function App() {
                 files={fetchFiles}
                 folder={folderNode}
               />
-              {hero && !activeBotSpec ? (
-                <div className="hero-grid">
-                  {SUGGESTIONS.map(([Icon, title, text, prompt]) => (
-                    <button
-                      key={title}
-                      className="hero-card"
-                      onClick={() => setDraft(prompt)}
-                    >
-                      <span className="hero-card-icon">
-                        <Icon size={16} strokeWidth={1.75} />
-                      </span>
-                      <span className="hero-card-text">
-                        <strong>{title}</strong>
-                        <span>{text}</span>
-                      </span>
-                    </button>
-                  ))}
-                </div>
-              ) : null}
             </div>
             {selected && inspector ? (
               <aside className="inspector" aria-label="Detalhes da conversa">

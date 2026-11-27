@@ -15,6 +15,7 @@ mod ask_user;
 mod authoring;
 mod browser;
 mod builtin;
+mod desktop;
 mod diagnostics;
 mod fntool;
 mod host;

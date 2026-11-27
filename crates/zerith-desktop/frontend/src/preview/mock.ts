@@ -943,6 +943,8 @@ export function installMock(theme: string) {
             subagent_model: "codex:gpt-5-codex",
             explore_model: "deepseek-trabalho:deepseek-chat",
             plan_model: null,
+            decision_model: null,
+            vision_model: "claude-assinatura:claude-sonnet-5-5",
             role_models: { reviewer: "claude-assinatura:claude-opus-5-5" },
             combos: [
               {

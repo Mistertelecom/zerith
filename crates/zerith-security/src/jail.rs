@@ -514,6 +514,34 @@ pub fn bwrap_exec(level: Sandbox, workspace: &Path, inner: &Command) -> Command 
     c
 }
 
+/// Summary of a visible top-level desktop window (Windows).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowInfo {
+    pub pid: u32,
+    pub class: String,
+    pub title: String,
+    pub modal_text: String,
+    pub is_modal: bool,
+}
+
+/// Lists visible top-level desktop windows (filtered optionally by case-insensitive
+/// title substring or PID). Modal `#32770` dialogs are listed first with their
+/// child `Static` text extracted. Returns empty on non-Windows platforms.
+pub fn list_visible_windows(
+    title_filter: Option<&str>,
+    pid_filter: Option<u32>,
+) -> Vec<WindowInfo> {
+    #[cfg(windows)]
+    {
+        win::list_visible_windows(title_filter, pid_filter)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (title_filter, pid_filter);
+        Vec::new()
+    }
+}
+
 #[cfg(windows)]
 pub use win::{contain, JobHandle};
 
@@ -672,6 +700,78 @@ mod win {
             );
         }
         state.found
+    }
+
+    struct ListSearch<'a> {
+        title_filter: Option<String>,
+        pid_filter: Option<u32>,
+        out: &'a mut Vec<super::WindowInfo>,
+    }
+
+    unsafe extern "system" fn list_windows_cb(hwnd: HWND, lparam: LPARAM) -> i32 {
+        let state = &mut *(lparam as *mut ListSearch<'_>);
+        if IsWindowVisible(hwnd) == 0 {
+            return 1;
+        }
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        if state.pid_filter.is_some_and(|want| want != pid) {
+            return 1;
+        }
+        let class = window_class(hwnd);
+        let title = window_text(hwnd);
+        let is_modal = class == "#32770";
+        if title.is_empty() && !is_modal {
+            return 1;
+        }
+        if let Some(needle) = state.title_filter.as_deref() {
+            if !title.to_lowercase().contains(needle) && !class.to_lowercase().contains(needle) {
+                return 1;
+            }
+        }
+        let modal_text = if is_modal {
+            let mut lines: Vec<String> = Vec::new();
+            EnumChildWindows(
+                hwnd,
+                Some(collect_static_children),
+                &mut lines as *mut Vec<String> as LPARAM,
+            );
+            lines.join(" | ").chars().take(400).collect()
+        } else {
+            String::new()
+        };
+        state.out.push(super::WindowInfo {
+            pid,
+            class,
+            title,
+            modal_text,
+            is_modal,
+        });
+        1
+    }
+
+    pub fn list_visible_windows(
+        title_filter: Option<&str>,
+        pid_filter: Option<u32>,
+    ) -> Vec<super::WindowInfo> {
+        let mut out = Vec::new();
+        let mut state = ListSearch {
+            title_filter: title_filter
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_lowercase),
+            pid_filter,
+            out: &mut out,
+        };
+        // SAFETY: `state` outlives the synchronous `EnumWindows` call.
+        unsafe {
+            EnumWindows(
+                Some(list_windows_cb),
+                &mut state as *mut ListSearch<'_> as LPARAM,
+            );
+        }
+        out.sort_by_key(|w| (!w.is_modal, w.title.to_lowercase()));
+        out
     }
 
     impl Drop for JobHandle {

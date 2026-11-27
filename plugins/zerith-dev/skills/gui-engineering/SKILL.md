@@ -26,6 +26,7 @@ Toda tela funcional deve cobrir os 4 estados:
 - **Testes automatizados de GUI:**
   - Sempre injete/mocke hosts de rede para `127.0.0.1` e **mocke diálogos modais bloqueantes** (`messagebox.showerror`, `askyesno`, `QMessageBox`) para o teste nunca congelar esperando clique humano.
   - Rode testes de GUI com `timeout_secs` curto (`20`–`30`s) e **sem** `| tail`.
+  - Se uma janela Desktop travar ou você precisar conferir o que está na tela do PC, use `desktop_inspect{action: "windows"}` (lista janelas e textos de diálogos modais `#32770` em texto puro) ou `desktop_inspect{action: "screenshot", title: "..."}` (captura PNG analisado por visão).
   - Para abrir a janela de verdade para o usuário usar, execute com `shell{run_in_background: true}` uma única vez.
 
 ## 4. Verificação visual obrigatória em interfaces Web

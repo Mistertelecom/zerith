@@ -398,6 +398,11 @@ pub struct RoutingSettings {
     pub compact_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision_model: Option<String>,
+    /// Optional fallback vision model used automatically to inspect screenshots
+    /// and user-attached images when the active chat model lacks native vision
+    /// (e.g. DeepSeek text models).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision_model: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub role_models: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -848,6 +853,7 @@ pub const ENV_KEYS: &[(&str, &str)] = &[
     ("ZERITH_PROFILE", "profile"),
     ("ZERITH_SUBAGENT_MODEL", "routing.subagent_model"),
     ("ZERITH_DECISION_MODEL", "routing.decision_model"),
+    ("ZERITH_VISION_MODEL", "routing.vision_model"),
     ("ZERITH_PONYTAIL", "token_saver.ponytail"),
     ("ZERITH_CAVEMAN", "token_saver.caveman"),
 ];
@@ -1940,15 +1946,24 @@ provider = "openai"
         let mut configured = Settings::default();
         configured.routing.decision_model =
             Some("openrouter/microsoft/microsoft-decision-1.1".into());
+        configured.routing.vision_model = Some("openrouter:google/gemini-2.5-flash".into());
         let text = toml::to_string(&configured).unwrap();
         assert!(
             text.contains("decision_model = \"openrouter/microsoft/microsoft-decision-1.1\""),
+            "{text}"
+        );
+        assert!(
+            text.contains("vision_model = \"openrouter:google/gemini-2.5-flash\""),
             "{text}"
         );
         let back: Settings = toml::from_str(&text).unwrap();
         assert_eq!(
             back.routing.decision_model.as_deref(),
             Some("openrouter/microsoft/microsoft-decision-1.1")
+        );
+        assert_eq!(
+            back.routing.vision_model.as_deref(),
+            Some("openrouter:google/gemini-2.5-flash")
         );
 
         let dir = scratch();

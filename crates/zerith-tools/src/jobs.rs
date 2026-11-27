@@ -84,6 +84,29 @@ struct Job {
     /// A plain job's end needs no notice: already told, read through
     /// `process output`, or stopped on purpose.
     notified: bool,
+    /// Last blocking modal dialog banner already surfaced via `monitor_notices`,
+    /// so we alert the turn once per modal without spamming.
+    modal_notified: Option<String>,
+}
+
+fn modal_banner(j: &Job) -> Option<String> {
+    if j.exit.is_some() {
+        return None;
+    }
+    let (title, body) = j.jailed.blocking_modal_dialog()?;
+    let shown_title = if title.is_empty() {
+        "sem título"
+    } else {
+        title.as_str()
+    };
+    let shown_body = if body.is_empty() {
+        "(sem texto visível)"
+    } else {
+        body.as_str()
+    };
+    Some(format!(
+        "⚠ diálogo modal bloqueante (\"{shown_title}\"): {shown_body}"
+    ))
 }
 
 /// What a `monitor` job adds to a background job: who is told, until when,
@@ -345,6 +368,7 @@ impl Jobs {
                     started: Instant::now(),
                     watch,
                     notified: false,
+                    modal_notified: None,
                 },
             ));
             id
@@ -383,6 +407,12 @@ impl Jobs {
             Some(code) => format!("{id}: terminou ({code})\n"),
             None => format!("{id}: em execução\n"),
         };
+        if let Some(banner) = modal_banner(j) {
+            j.modal_notified = Some(banner.clone());
+            text.push_str(&format!(
+                "[{banner} — o processo está travado esperando clique humano; encerre com process action=kill id={id} e corrija a causa]\n"
+            ));
+        }
         if fresh.is_empty() {
             text.push_str("[sem saída nova]\n");
         } else {
@@ -414,7 +444,10 @@ impl Jobs {
                     None => format!("em execução há {}s", j.started.elapsed().as_secs()),
                 };
                 let kind = if j.watch.is_some() { " [monitor]" } else { "" };
-                lines.push(format!("{id}: {state}{kind} — {}", j.command));
+                let modal = modal_banner(j)
+                    .map(|b| format!(" [{b}]"))
+                    .unwrap_or_default();
+                lines.push(format!("{id}: {state}{kind}{modal} — {}", j.command));
             }
             if lines.is_empty() {
                 "nenhum job em segundo plano".to_string()
@@ -489,6 +522,15 @@ impl Jobs {
                     if j.exit.is_some() {
                         j.notified = true;
                         out.extend(done_notice(id, j));
+                    } else if j.started.elapsed() >= Duration::from_secs(2) {
+                        if let Some(banner) = modal_banner(j) {
+                            if j.modal_notified.as_deref() != Some(banner.as_str()) {
+                                j.modal_notified = Some(banner.clone());
+                                out.push(format!(
+                                    "[Job {id}] {banner}. O processo em segundo plano travou esperando clique humano; encerre com process action=kill id={id} e corrija o erro exibido."
+                                ));
+                            }
+                        }
                     }
                 }
                 continue;
@@ -616,7 +658,20 @@ impl Drop for Jobs {
 fn has_news(j: &mut Job) -> bool {
     let exited = j.exit.is_some() || matches!(j.jailed.child.try_wait(), Ok(Some(_)));
     match j.watch.as_ref() {
-        None => !j.notified && exited,
+        None => {
+            if j.notified {
+                return false;
+            }
+            if exited {
+                return true;
+            }
+            if j.started.elapsed() >= Duration::from_secs(2) {
+                if let Some(banner) = modal_banner(j) {
+                    return j.modal_notified.as_deref() != Some(banner.as_str());
+                }
+            }
+            false
+        }
         Some(w) if w.closed => false,
         Some(w) => {
             let (sent, deadline) = (w.sent, w.deadline);

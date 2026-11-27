@@ -34,6 +34,7 @@ pub mod subagent;
 mod tasks;
 pub mod tokensaver;
 mod verify;
+pub mod vision;
 
 pub use agent::{
     approval_channel, approval_channel_with_grants, approval_grant_key, inbox_channel,
@@ -470,12 +471,85 @@ fn ponytail_applies(dir: Option<&std::path::Path>) -> bool {
         .any(|d| CODE_MARKERS.iter().any(|m| d.join(m).is_file()))
 }
 
+/// Builds the effective query used for skill discovery: short follow-up
+/// messages (`"continue"`, `"travou"`, `"tenta de novo"`) inherit the last
+/// two substantive user messages from the session so BM25 skill matching does
+/// not drop to zero on continuation turns.
+pub fn effective_skill_query(prompt: &str, prior_user_msgs: &[String]) -> String {
+    let trimmed = prompt.trim();
+    let word_count = trimmed.split_whitespace().count();
+    let lower = trimmed.to_ascii_lowercase();
+    let is_short_followup = word_count <= 6
+        || matches!(
+            lower.as_str(),
+            "continue"
+                | "continua"
+                | "continuar"
+                | "prossegue"
+                | "prossiga"
+                | "sim"
+                | "ok"
+                | "faz"
+                | "faça"
+                | "faca"
+                | "tenta de novo"
+                | "tente de novo"
+                | "travou"
+                | "mesmo erro"
+        );
+    if !is_short_followup || prior_user_msgs.is_empty() {
+        return trimmed.to_string();
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for msg in prior_user_msgs.iter().rev() {
+        let m = msg.trim();
+        if m.is_empty() || m.starts_with("<system-reminder>") {
+            continue;
+        }
+        if m.split_whitespace().count() <= 2 && m.len() < 16 {
+            continue;
+        }
+        parts.push(m);
+        if parts.len() >= 2 {
+            break;
+        }
+    }
+    if parts.is_empty() {
+        return trimmed.to_string();
+    }
+    parts.reverse();
+    let mut out = String::new();
+    for p in parts {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        let clip: String = p.chars().take(200).collect();
+        out.push_str(&clip);
+    }
+    if !trimmed.is_empty() {
+        out.push(' ');
+        out.push_str(trimmed);
+    }
+    out
+}
+
 pub fn build_prompt_context(
     _title: &str,
     ctx: TurnContext<'_>,
     skill_tool: bool,
     session_id: &str,
     prompt: &str,
+) -> PromptContext {
+    build_prompt_context_with_skill_query(_title, ctx, skill_tool, session_id, prompt, prompt)
+}
+
+pub fn build_prompt_context_with_skill_query(
+    _title: &str,
+    ctx: TurnContext<'_>,
+    skill_tool: bool,
+    session_id: &str,
+    prompt: &str,
+    skill_query: &str,
 ) -> PromptContext {
     let paths = zerith_core::Paths::resolve();
     let dir = ctx
@@ -558,10 +632,10 @@ pub fn build_prompt_context(
                             zerith_tools::network::load_inventory(d, Some(paths.root())).ok()
                         })
                         .unwrap_or_default();
-                    let likely = likely_skills(lib, prompt, &devices);
+                    let likely = likely_skills(lib, skill_query, &devices);
                     if !likely.is_empty() {
                         dyn_parts.push(format!(
-                            "Skills mais prováveis para este pedido: {}",
+                            "Skills mais prováveis para este pedido: {}\nAntes de agir ou rodar comandos, chame `skill(name=\"...\")` para a skill mais relevante acima e siga o procedimento dela.",
                             likely.join(", ")
                         ));
                     }
@@ -576,7 +650,7 @@ pub fn build_prompt_context(
                         "\n\n{header}\nHá {} skills instaladas; use `skill_search` para achar ou consulte as mais relevantes no lembrete da mensagem.",
                         catalog.len()
                     ));
-                    let ranked = skills_index(lib, prompt, SKILLS_BUDGET_CHARS);
+                    let ranked = skills_index(lib, skill_query, SKILLS_BUDGET_CHARS);
                     if !ranked.is_empty() {
                         dyn_parts.push(ranked);
                     }
@@ -585,7 +659,7 @@ pub fn build_prompt_context(
                         dyn_parts.push(inlined);
                     }
                 } else {
-                    let block = skills_block(lib, prompt, SKILLS_BUDGET_CHARS);
+                    let block = skills_block(lib, skill_query, SKILLS_BUDGET_CHARS);
                     if !block.is_empty() {
                         dyn_parts.push(block);
                     }

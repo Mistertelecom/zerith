@@ -669,7 +669,31 @@ fn turn_body(
 
     // The model has the skill tool exactly when the registry offers it.
     let skill_tool = agent.tools.is_some_and(|r| r.get("skill").is_some());
-    let mut prompt_ctx = crate::build_prompt_context(title, ctx, skill_tool, session_id, prompt);
+    // Pull recent user messages so short follow-ups ("continue", "travou") keep
+    // matching the conversation's relevant skills.
+    let prior_user_msgs: Vec<String> = store
+        .history_rows(session_id, 16)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|m| m.role == Role::User && m.id != prompt_row_id)
+        .filter(|m| {
+            m.raw.as_ref().is_none_or(|r| {
+                r.get("dynamic_reminder").is_none()
+                    && r.get("tool_context").is_none()
+                    && r.get("hook_context").is_none()
+            })
+        })
+        .map(|m| m.content)
+        .collect();
+    let skill_query = crate::effective_skill_query(prompt, &prior_user_msgs);
+    let mut prompt_ctx = crate::build_prompt_context_with_skill_query(
+        title,
+        ctx,
+        skill_tool,
+        session_id,
+        prompt,
+        &skill_query,
+    );
     if let Some(r) = prompt_ctx.dynamic_reminder.as_deref() {
         let names = crate::preloaded_skill_names(r);
         if !names.is_empty() {
@@ -799,6 +823,41 @@ fn turn_body(
     }
 
     let decision = crate::decision::DecisionClient::from_settings(ctx.settings, client.config());
+    let active_model_id = first.map_or(model, |c| c.model.as_str());
+    let active_supports_vision =
+        crate::vision::model_supports_vision(routed_cfg.kind, active_model_id);
+    let vision = (!active_supports_vision)
+        .then(|| crate::vision::VisionClient::from_settings(ctx.settings, client.config()))
+        .flatten();
+
+    // If the user attached screenshot(s)/image(s) while chatting on a text-only
+    // model (e.g. DeepSeek), analyze them via the configured fallback vision model.
+    if !active_supports_vision && crate::vision::has_local_image_ref(prompt) {
+        let note = match vision.as_ref() {
+            Some(v) => match v.describe_images(prompt, prompt, cancel) {
+                Some(desc) => {
+                    log.emit(
+                        "turn/vision",
+                        json!({"source": "user_prompt", "vision_model": v.model()}),
+                    );
+                    format!("[Análise visual via {}]\n{desc}", v.model())
+                }
+                None => format!(
+                    "[aviso: o modelo de visão ({}) não conseguiu analisar a imagem anexada]",
+                    v.model()
+                ),
+            },
+            None => "[aviso: o modelo principal atual não suporta visão nativa; configure um Modelo de visão (fallback) em Ajustes › Delegação para analisar imagens/prints automaticamente]".to_string(),
+        };
+        let id = store.append(
+            session_id,
+            &NewMessage {
+                raw: Some(json!({"tool_context": true, "vision_fallback": true})),
+                ..NewMessage::new(Role::User, note.clone())
+            },
+        )?;
+        hist.push(ChatMessage::synthetic_user(note), id);
+    }
 
     let context_probe = {
         let mut s = prompt.to_lowercase();
@@ -1009,7 +1068,19 @@ fn turn_body(
                 "reasoning_effort": resolved_effort.as_deref(),
             }),
         );
-        let chat_msgs = hist.chat();
+        let mut chat_msgs = hist.chat();
+        if !active_supports_vision {
+            // Prevent text-only providers (e.g. DeepSeek) from rejecting user
+            // messages that reference local images with HTTP 400.
+            for m in &mut chat_msgs {
+                if m.role == zerith_providers::Role::User
+                    && !m.synthetic
+                    && crate::vision::has_local_image_ref(&m.content)
+                {
+                    m.synthetic = true;
+                }
+            }
+        }
         let mut req = ChatRequest::new(model, chat_msgs).prompt_cache_key(session_id);
         if let Some(effort) = resolved_effort.as_deref() {
             req = req.reasoning_effort(effort);
@@ -1478,7 +1549,7 @@ fn turn_body(
                         images.push(msg);
                     }
                 } else if outcome.ok
-                    && call.name == "browser"
+                    && matches!(call.name.as_str(), "browser" | "desktop_inspect")
                     && p_args(&call.arguments)["action"].as_str() == Some("screenshot")
                 {
                     if let Some(msg) = outcome.output.lines().next().and_then(image_message) {
@@ -1559,15 +1630,42 @@ fn turn_body(
             hist.push(ChatMessage::synthetic_user(text), id);
         }
         for text in images {
-            let id = store.append(
-                session_id,
-                &NewMessage {
-                    raw: Some(json!({"view_image": true})),
-                    ..NewMessage::new(Role::User, text.clone())
-                },
-            )?;
-            log.emit("tool/image", json!({"message_id": id}));
-            hist.push(ChatMessage::user(text), id);
+            if active_supports_vision {
+                let id = store.append(
+                    session_id,
+                    &NewMessage {
+                        raw: Some(json!({"view_image": true})),
+                        ..NewMessage::new(Role::User, text.clone())
+                    },
+                )?;
+                log.emit("tool/image", json!({"message_id": id}));
+                hist.push(ChatMessage::user(text), id);
+            } else {
+                let note = match vision.as_ref() {
+                    Some(v) => match v.describe_images(prompt, &text, cancel) {
+                        Some(desc) => {
+                            log.emit(
+                                "tool/vision",
+                                json!({"vision_model": v.model(), "chars": desc.chars().count()}),
+                            );
+                            format!("[Análise visual via {}]\n{desc}", v.model())
+                        }
+                        None => format!(
+                            "[aviso: o modelo de visão ({}) não conseguiu analisar a captura anexada]",
+                            v.model()
+                        ),
+                    },
+                    None => "[aviso: captura gerada, mas o modelo atual não tem visão nativa e nenhum Modelo de visão (fallback) está configurado em Ajustes › Delegação]".to_string(),
+                };
+                let id = store.append(
+                    session_id,
+                    &NewMessage {
+                        raw: Some(json!({"tool_context": true, "vision_fallback": true})),
+                        ..NewMessage::new(Role::User, note.clone())
+                    },
+                )?;
+                hist.push(ChatMessage::synthetic_user(note), id);
+            }
         }
         if cancel.is_cancelled() {
             return Err(ProviderError::Cancelled.into());
@@ -2582,6 +2680,8 @@ pub(crate) fn tool_group(name: &str) -> Option<&'static str> {
         Some("rede")
     } else if name == "browser" || name.starts_with("browser_") {
         Some("browser")
+    } else if name == "desktop_inspect" {
+        Some("desktop")
     } else if name == "lsp" || name.starts_with("lsp_") {
         Some("lsp")
     } else if name.starts_with("workflow_") || name == "channel_list" {
@@ -2751,6 +2851,34 @@ pub(crate) fn should_include_tool_schema(name: &str, context_lower: &str) -> boo
             "zabbix",
             "snmp",
             "netflow",
+        ]
+        .iter()
+        .any(|kw| context_lower.contains(kw));
+    }
+    if name == "desktop_inspect" {
+        return [
+            "desktop_inspect",
+            "tela",
+            "screen",
+            "janela",
+            "window",
+            "gui",
+            "tkinter",
+            "pyqt",
+            "pyside",
+            "wpf",
+            "winforms",
+            "desktop",
+            "print",
+            "screenshot",
+            "captura",
+            "dialog",
+            "diálogo",
+            "dialogo",
+            "modal",
+            "messagebox",
+            "travou",
+            "interface",
         ]
         .iter()
         .any(|kw| context_lower.contains(kw));

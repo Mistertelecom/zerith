@@ -214,6 +214,7 @@ export interface Routing {
   plan_model?: string | null;
   compact_model?: string | null;
   decision_model?: string | null;
+  vision_model?: string | null;
   role_models?: Record<string, string>;
   /** With `subagent_model` set, a combo is a delegation profile the chat can pick. */
   combos?: { name: string; models: string[]; subagent_model?: string | null }[];

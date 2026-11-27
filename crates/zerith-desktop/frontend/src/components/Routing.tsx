@@ -13,6 +13,7 @@ import {
   Check,
   ChevronDown,
   CornerLeftUp,
+  Eye,
   Layers,
   ListChecks,
   MessageSquare,
@@ -23,6 +24,7 @@ import {
   Save,
   Scale,
   Search,
+  Sparkles,
   Telescope,
   Workflow,
   Zap,
@@ -49,7 +51,8 @@ type Key =
   | "explore_model"
   | "plan_model"
   | "compact_model"
-  | "decision_model";
+  | "decision_model"
+  | "vision_model";
 type Opt = { spec: string; model: string; name: string };
 type Group = {
   key: string;
@@ -65,6 +68,7 @@ type Shown = {
   logo: string | null;
   combo?: boolean;
   off?: boolean;
+  icon?: LucideIcon;
 };
 
 const CONV: Shown = {
@@ -73,16 +77,33 @@ const CONV: Shown = {
   logo: null,
 };
 
-const OFF: Shown = {
-  name: "desligado (opcional)",
-  sub: "nenhuma chamada extra",
+const OFF_DECISION: Shown = {
+  name: "desligado",
+  sub: "usa heurística local",
   logo: null,
   off: true,
+  icon: Scale,
+};
+
+const OFF_VISION: Shown = {
+  name: "desligado",
+  sub: "usa a visão do modelo ativo",
+  logo: null,
+  off: true,
+  icon: Eye,
 };
 
 const ROLES: Record<
   Key,
-  { label: string; hint: string; icon: LucideIcon; from: Key | null; optional?: boolean }
+  {
+    label: string;
+    hint: string;
+    icon: LucideIcon;
+    from: Key | null;
+    optional?: boolean;
+    offShown?: Shown;
+    emptyLabel?: string;
+  }
 > = {
   main_model: {
     label: "Principal",
@@ -116,10 +137,21 @@ const ROLES: Record<
   },
   decision_model: {
     label: "Decisão",
-    hint: "Modelo calibrado rápido (ex.: microsoft/microsoft-decision-1.1) para esforço Auto, alerta de risco e /goal. Opcional; nunca limita a resposta.",
+    hint: "Classificador rápido para esforço Auto, alerta de risco e /goal. Nunca substitui a resposta principal.",
     icon: Scale,
     from: null,
     optional: true,
+    offShown: OFF_DECISION,
+    emptyLabel: "Desligado (usa heurística local)",
+  },
+  vision_model: {
+    label: "Visão (fallback)",
+    hint: "Analisa prints e imagens automaticamente quando o modelo ativo não tem visão (ex.: DeepSeek).",
+    icon: Eye,
+    from: null,
+    optional: true,
+    offShown: OFF_VISION,
+    emptyLabel: "Desligado (usa a visão do modelo ativo)",
   },
 };
 
@@ -262,7 +294,7 @@ function describe(
 
 function Mark({ s, size }: { s: Shown; size: number }) {
   if (s.logo && !s.combo) return <Logo id={s.logo} size={size} />;
-  const Icon = s.combo ? Layers : s.off ? Scale : MessageSquare;
+  const Icon = s.icon ?? (s.combo ? Layers : s.off ? Scale : MessageSquare);
   return (
     <span className="dg-tile" style={{ width: size, height: size }}>
       <Icon size={14} strokeWidth={2} />
@@ -473,7 +505,12 @@ function Picker(p: {
               () => pick(""),
               p.emptyLabel ? (
                 <>
-                  <Scale size={14} strokeWidth={2} className="dg-opt-icon" />
+                  {(() => {
+                    const EmptyIcon = p.inherit.icon ?? Scale;
+                    return (
+                      <EmptyIcon size={14} strokeWidth={2} className="dg-opt-icon" />
+                    );
+                  })()}
                   <span className="dg-opt-name">{p.emptyLabel}</span>
                   <code>{p.inherit.sub}</code>
                 </>
@@ -585,10 +622,10 @@ export function RoutingTab(p: {
   const show = (v: string) =>
     describe(v, groups, p.accounts, p.presets, r.combos);
   const val = (k: Key) => (r[k] ?? "").trim();
-  // Empty = inherit: main from the chat, subagents from main, explore/plan from subagents; decision is optional (off).
+  // Empty = inherit: main from the chat, subagents from main, explore/plan from subagents; auxiliary models are optional (off).
   const eff = (k: Key): string =>
     val(k) ||
-    (k === "main_model" || k === "decision_model"
+    (k === "main_model" || k === "decision_model" || k === "vision_model"
       ? ""
       : eff(k === "subagent_model" ? "main_model" : "subagent_model"));
   const shown = (spec: string) => (spec ? show(spec) : CONV);
@@ -650,8 +687,12 @@ export function RoutingTab(p: {
           value={v}
           groups={groups}
           show={show}
-          inherit={d.optional ? OFF : shown(d.from ? eff(d.from) : "")}
-          emptyLabel={d.optional ? "Desligado (opcional)" : undefined}
+          inherit={
+            d.optional
+              ? (d.offShown ?? OFF_DECISION)
+              : shown(d.from ? eff(d.from) : "")
+          }
+          emptyLabel={d.optional ? (d.emptyLabel ?? "Desligado (opcional)") : undefined}
           onPick={(x) => setKey(k, x)}
           end={end}
         />
@@ -695,7 +736,6 @@ export function RoutingTab(p: {
             {node("plan_model")}
             {node("compact_model", "", true)}
           </div>
-          {node("decision_model", "dg-decision")}
 
           <div className="dg-agents">
             <div className="dg-agents-head">
@@ -786,6 +826,19 @@ export function RoutingTab(p: {
                 />
               </div>
             ))}
+          </div>
+        </div>
+
+        <div className="dg-aux">
+          <span className="dg-section-title">
+            <Sparkles size={14} strokeWidth={2} /> Modelos auxiliares (opcionais)
+            <span>
+              ativados só quando necessário; vazios ficam desligados
+            </span>
+          </span>
+          <div className="dg-aux-grid">
+            {node("decision_model", "dg-aux-node")}
+            {node("vision_model", "dg-aux-node", true)}
           </div>
         </div>
 

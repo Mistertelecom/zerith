@@ -7,6 +7,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::Instant;
 
 use regex::Regex;
@@ -34,8 +35,117 @@ struct Plan {
     command: String,
 }
 
-fn args_of(args: &Value, ctx: &CallCtx<'_>) -> Result<(Vec<Plan>, Vec<String>)> {
-    let files: Vec<String> = args["files"]
+fn git_cmd(dir: &Path) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.current_dir(dir)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
+/// Extracts non-deleted repository-relative paths from `git status --porcelain`.
+fn parse_git_status_porcelain(out: &str) -> Vec<String> {
+    let mut files = Vec::new();
+    let mut seen = HashSet::new();
+    for raw in out.lines() {
+        let line = raw.trim_end_matches('\r');
+        if line.len() < 4 {
+            continue;
+        }
+        let bytes = line.as_bytes();
+        let x = bytes[0] as char;
+        let y = bytes[1] as char;
+        let path_part = line[3..].trim();
+        if path_part.is_empty() {
+            continue;
+        }
+        // Skip pure deletions (the file no longer exists to lint/compile).
+        if (x == 'D' && y == ' ') || (x == ' ' && y == 'D') || (x == 'D' && y == 'D') {
+            continue;
+        }
+        let target = if matches!(x, 'R' | 'C') {
+            path_part
+                .split_once(" -> ")
+                .map_or(path_part, |(_, new_p)| new_p)
+        } else {
+            path_part
+        };
+        let cleaned = target.trim().trim_matches('"').replace('\\', "/");
+        if !cleaned.is_empty() && seen.insert(cleaned.clone()) {
+            files.push(cleaned);
+        }
+    }
+    files
+}
+
+fn git_changed_files(start: &Path) -> Result<Vec<String>> {
+    let dir = if start.is_file() {
+        start.parent().unwrap_or(start)
+    } else {
+        start
+    };
+    let root_out = git_cmd(dir)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .map_err(|e| ToolError::Failed(format!("falha ao rodar git para changed=true: {e}")))?;
+    if !root_out.status.success() {
+        return Err(ToolError::Failed(
+            "changed=true requer um repositório git acessível a partir desta pasta".into(),
+        ));
+    }
+    let repo_root = PathBuf::from(String::from_utf8_lossy(&root_out.stdout).trim());
+    let status_out = git_cmd(&repo_root)
+        .args([
+            "-c",
+            "core.quotepath=false",
+            "status",
+            "--porcelain",
+            "-uall",
+        ])
+        .output()
+        .map_err(|e| ToolError::Failed(format!("falha ao consultar git status: {e}")))?;
+    if !status_out.status.success() {
+        let stderr = String::from_utf8_lossy(&status_out.stderr);
+        return Err(ToolError::Failed(format!(
+            "git status falhou: {}",
+            stderr.trim()
+        )));
+    }
+    let rels = parse_git_status_porcelain(&String::from_utf8_lossy(&status_out.stdout));
+    let mut out = Vec::new();
+    for r in rels {
+        let abs = repo_root.join(&r);
+        if abs.is_file() {
+            out.push(abs.to_string_lossy().into_owned());
+        }
+    }
+    Ok(out)
+}
+
+fn path_in_dir(file: &str, dir: &Path) -> bool {
+    let f = file.replace('\\', "/");
+    let d = dir.to_string_lossy().replace('\\', "/");
+    let d = d.trim_end_matches('/');
+    if d.is_empty() {
+        return true;
+    }
+    if cfg!(windows) {
+        f.len() > d.len() && f[..d.len()].eq_ignore_ascii_case(d) && f.as_bytes()[d.len()] == b'/'
+    } else {
+        f.len() > d.len() && f.starts_with(d) && f.as_bytes()[d.len()] == b'/'
+    }
+}
+
+fn args_of(args: &Value, ctx: &CallCtx<'_>) -> Result<(Vec<Plan>, Vec<String>, bool)> {
+    let mut files: Vec<String> = args["files"]
         .as_array()
         .map(|a| {
             a.iter()
@@ -48,7 +158,35 @@ fn args_of(args: &Value, ctx: &CallCtx<'_>) -> Result<(Vec<Plan>, Vec<String>)> 
     let start = opt_str(args, "path")
         .map(|p| ctx.resolve(p))
         .unwrap_or_else(|| ctx.workspace.to_path_buf());
-    Ok((plans(&start, &files, opt_str(args, "command"))?, files))
+    let changed = args["changed"].as_bool().unwrap_or(false);
+    if changed {
+        for f in git_changed_files(&start)? {
+            if !files.contains(&f) {
+                files.push(f);
+            }
+        }
+        if files.is_empty() {
+            return Ok((Vec::new(), files, true));
+        }
+    }
+    let mut detected = plans(&start, &files, opt_str(args, "command"))?;
+    // When scoped to specific files in a monorepo, skip subproject checkers
+    // that contain none of the target files.
+    if !files.is_empty() && detected.len() > 1 && opt_str(args, "command").is_none() {
+        let relevant: Vec<Plan> = detected
+            .iter()
+            .filter(|p| files.iter().any(|f| path_in_dir(f, &p.dir)))
+            .map(|p| Plan {
+                dir: p.dir.clone(),
+                label: p.label.clone(),
+                command: p.command.clone(),
+            })
+            .collect();
+        if !relevant.is_empty() {
+            detected = relevant;
+        }
+    }
+    Ok((detected, files, changed))
 }
 
 fn is_skipped_monorepo_dir(name: &str) -> bool {
@@ -201,11 +339,37 @@ fn detect_all(
         push(&mut out, "tsc", cmd);
     }
 
+    let has_biome_cfg = has("biome.json") || has("biome.jsonc");
+    let mut added_biome = false;
+    if has_biome_cfg {
+        let local_biome = dir.join("node_modules").join(".bin").join("biome");
+        let local_biome_cmd = dir.join("node_modules").join(".bin").join("biome.cmd");
+        if local_biome.is_file() || local_biome_cmd.is_file() {
+            push(
+                &mut out,
+                "biome",
+                "./node_modules/.bin/biome check --colors=off --reporter=github .".to_string(),
+            );
+            added_biome = true;
+        } else if on_path("biome") {
+            push(
+                &mut out,
+                "biome",
+                "biome check --colors=off --reporter=github .".to_string(),
+            );
+            added_biome = true;
+        }
+    }
+
     if has("package.json") {
         if let Ok(raw) = std::fs::read(dir.join("package.json")) {
             if let Ok(pkg) = serde_json::from_slice::<Value>(&raw) {
-                let candidates: &[&str] = if has_tsconfig {
+                let candidates: &[&str] = if has_tsconfig && added_biome {
+                    &[]
+                } else if has_tsconfig {
                     &["lint"]
+                } else if added_biome {
+                    &["typecheck"]
                 } else {
                     &["typecheck", "lint"]
                 };
@@ -296,9 +460,12 @@ fn on_path(name: &str) -> bool {
 /// (cargo short, go vet, ruff concise, eslint unix, mypy), `file(line,col):`
 /// (tsc) and Python's `File "x", line N` + `XxxError: msg`.
 fn parse(out: &str) -> Vec<Diag> {
-    let loc = Regex::new(r"^\s*(?:vet: )?((?:[A-Za-z]:)?[^:(\s][^:(]*?):(\d+):(?:(\d+):)?\s+(.+)$")
-        .unwrap();
+    let loc = Regex::new(
+        r"^\s*(?:vet:\s+|(?:⚠|✖)\s+)?((?:[A-Za-z]:)?[^:(\s][^:(]*?):(\d+):(?:(\d+):)?\s+(.+)$",
+    )
+    .unwrap();
     let tsc = Regex::new(r"^\s*(.+?)\((\d+),(\d+)\): (error|warning) (.+)$").unwrap();
+    let gh_ann = Regex::new(r"^::(error|warning)\s+([^:]*)::(.+)$").unwrap();
     let kind = Regex::new(r"(?i)^(error|warning|note|help)(?:\[([^\]]+)\])?:\s*(.*)$").unwrap();
     let py_at = Regex::new(r#"^\s*File "(.+)", line (\d+)"#).unwrap();
     let py_err = Regex::new(r"^(\w*(?:Error|Warning)): (.+)$").unwrap();
@@ -307,7 +474,37 @@ fn parse(out: &str) -> Vec<Diag> {
     let mut v = Vec::new();
     let mut py: Option<(String, u32)> = None;
     for line in out.lines().map(str::trim_end) {
-        if let Some(c) = py_sorry.captures(line) {
+        if let Some(c) = gh_ann.captures(line) {
+            let mut file = None;
+            let mut l: u32 = 1;
+            let mut col: u32 = 1;
+            let mut title = None;
+            for part in c[2].split(',') {
+                if let Some((k, val)) = part.trim().split_once('=') {
+                    match k.trim() {
+                        "file" => file = Some(val.trim().to_string()),
+                        "line" => l = val.trim().parse().unwrap_or(1),
+                        "col" => col = val.trim().parse().unwrap_or(1),
+                        "title" => title = Some(val.trim().to_string()),
+                        _ => {}
+                    }
+                }
+            }
+            if let Some(f) = file {
+                let msg = match title.filter(|t| !t.is_empty()) {
+                    Some(t) => format!("{t}: {}", c[3].trim()),
+                    None => c[3].trim().to_string(),
+                };
+                v.push(Diag {
+                    file: f,
+                    line: l,
+                    col,
+                    warn: &c[1] == "warning",
+                    msg,
+                });
+                py = None;
+            }
+        } else if let Some(c) = py_sorry.captures(line) {
             v.push(Diag {
                 file: c[3].into(),
                 line: num(c.get(4)),
@@ -325,6 +522,7 @@ fn parse(out: &str) -> Vec<Diag> {
                 msg: c[5].into(),
             });
         } else if let Some(c) = loc.captures(line) {
+            let biome_warn = line.trim_start().starts_with('⚠');
             let (warn, msg) = match kind.captures(&c[4]) {
                 Some(k) => match k[1].to_ascii_lowercase().as_str() {
                     "note" | "help" => continue,
@@ -336,7 +534,7 @@ fn parse(out: &str) -> Vec<Diag> {
                         },
                     ),
                 },
-                None => (false, c[4].to_string()),
+                None => (biome_warn, c[4].to_string()),
             };
             v.push(Diag {
                 file: c[1].into(),
@@ -521,7 +719,10 @@ fn report(
 }
 
 fn action(args: &Value, ctx: &CallCtx<'_>) -> Result<Option<Action>> {
-    let (plans, _) = args_of(args, ctx)?;
+    let (plans, _, _) = args_of(args, ctx)?;
+    if plans.is_empty() {
+        return Ok(None);
+    }
     let combined = plans
         .iter()
         .map(|p| p.command.as_str())
@@ -531,7 +732,10 @@ fn action(args: &Value, ctx: &CallCtx<'_>) -> Result<Option<Action>> {
 }
 
 fn run(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
-    let (plans, files) = args_of(args, ctx)?;
+    let (plans, files, changed) = args_of(args, ctx)?;
+    if changed && files.is_empty() {
+        return Ok("0 erros, 0 avisos (nenhum arquivo alterado no git)".into());
+    }
     let custom_cmd = args["command"].as_str().is_some();
     let started = Instant::now();
     let mut runs = Vec::with_capacity(plans.len());
@@ -575,10 +779,11 @@ fn run(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
 pub(crate) fn all() -> Vec<Box<dyn Tool>> {
     vec![make_with(
         "diagnostics",
-        "Roda o verificador do projeto (cargo check, tsc, go vet, ruff ou py_compile, detectado pela pasta) e devolve os erros e avisos como `arquivo:linha:coluna: erro|aviso: mensagem`, erros primeiro. Rode depois de editar código e antes de dizer que terminou; corrija e rode de novo até dar 0 erros.",
+        "Roda o verificador do projeto (cargo check, tsc, biome, dotnet build, go vet, ruff ou py_compile, detectado pela pasta) e devolve os erros e avisos como `arquivo:linha:coluna: erro|aviso: mensagem`, erros primeiro. Rode depois de editar código e antes de dizer que terminou; use `changed: true` em repositórios grandes para focar só nos arquivos modificados no git.",
         json!({"type": "object", "properties": {
             "path": {"type": "string", "description": "pasta ou arquivo de onde subir até achar o projeto (padrão: workspace)"},
             "files": {"type": "array", "items": {"type": "string"}, "description": "mostra só os diagnósticos destes arquivos"},
+            "changed": {"type": "boolean", "description": "quando true, detecta automaticamente os arquivos alterados/novos no git e filtra os diagnósticos só para eles"},
             "command": {"type": "string", "description": "verificador a rodar no lugar do detectado (ex.: \"mypy --show-column-numbers .\")"}
         }}),
         "contagem no topo (\"3 erros, 2 avisos (cargo check, 4.1 s)\") e uma linha arquivo:linha:coluna: erro|aviso: mensagem por diagnóstico",
@@ -891,5 +1096,67 @@ src\\main.rs:2:18: error[E0308]: mismatched types: expected `u32`, found `&str`\
         assert_eq!(got[0].line, 12);
         assert_eq!(got[0].col, 9);
         assert!(!got[0].warn);
+    }
+
+    #[test]
+    fn parses_git_status_porcelain_for_changed_mode() {
+        let out = " M src/app.ts\nA  src/new file.ts\n?? untracked.py\n D removed.rs\nD  staged_del.rs\nR  old.ts -> src/renamed.ts\n";
+        let got = parse_git_status_porcelain(out);
+        assert_eq!(
+            got,
+            vec![
+                "src/app.ts",
+                "src/new file.ts",
+                "untracked.py",
+                "src/renamed.ts"
+            ]
+        );
+    }
+
+    #[test]
+    fn detects_local_biome_and_parses_github_and_concise_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("biome.json"), "{}").unwrap();
+        std::fs::create_dir_all(tmp.path().join("node_modules/.bin")).unwrap();
+        std::fs::write(tmp.path().join("node_modules/.bin/biome"), "").unwrap();
+        std::fs::write(
+            tmp.path().join("package.json"),
+            r#"{"scripts":{"lint":"biome check ."}}"#,
+        )
+        .unwrap();
+
+        let all_plans = plans(tmp.path(), &[], None).unwrap();
+        assert_eq!(all_plans.len(), 1, "{all_plans:?}");
+        assert_eq!(all_plans[0].label, "biome");
+        assert!(all_plans[0].command.contains("--reporter=github"));
+
+        let gh = "::error title=lint/correctness/noUnusedVariables,file=src/a.ts,line=3,endLine=3,col=6::This variable is unused.\n\
+                  ::warning title=lint/style/useConst,file=src/b.ts,line=7,col=1::Use const.\n";
+        let parsed = parse(gh);
+        assert_eq!(parsed.len(), 2, "{parsed:?}");
+        assert_eq!(
+            parsed[0],
+            d(
+                "src/a.ts",
+                3,
+                6,
+                false,
+                "lint/correctness/noUnusedVariables: This variable is unused."
+            )
+        );
+        assert_eq!(
+            parsed[1],
+            d("src/b.ts", 7, 1, true, "lint/style/useConst: Use const.")
+        );
+
+        let concise = "✖ src/c.ts:9:4: lint/suspicious/noExplicitAny: Unexpected any.\n⚠ src/d.ts:2:1: lint/style/useConst: Prefer const.\n";
+        let parsed_c = parse(concise);
+        assert_eq!(parsed_c.len(), 2, "{parsed_c:?}");
+        assert_eq!(parsed_c[0].file, "src/c.ts");
+        assert_eq!(parsed_c[0].line, 9);
+        assert_eq!(parsed_c[0].col, 4);
+        assert!(!parsed_c[0].warn);
+        assert_eq!(parsed_c[1].file, "src/d.ts");
+        assert!(parsed_c[1].warn);
     }
 }

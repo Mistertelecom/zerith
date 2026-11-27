@@ -32,5 +32,6 @@ Toda tela funcional deve cobrir os 4 estados:
 1. Suba o dev server com `shell{run_in_background: true}` (se ainda não estiver rodando).
 2. Abra a URL com `browser{action: "navigate", url: "http://localhost:..."}`.
 3. Cheque erros de runtime com `browser{action: "console"}`.
-4. Tire print com `browser{action: "screenshot"}` (a imagem é anexada automaticamente para você inspecionar).
-5. Corrija qualquer corte, sobreposição, contraste fraco ou desalinhamento visível no print e tire um novo print confirmando a correção.
+4. Tire print com `browser{action: "screenshot"}` (use `full_page: true` para páginas longas com scroll; a imagem é anexada automaticamente para você inspecionar).
+5. Teste responsividade alternando o viewport com `browser{action: "viewport", width: 390, height: 844}` (mobile) e `browser{action: "viewport", width: 1440, height: 900}` (desktop) — ou `reset: true` para restaurar — e confira se há overflow horizontal, corte ou sobreposição.
+6. Corrija qualquer corte, sobreposição, contraste fraco ou desalinhamento visível no print e tire um novo print confirmando a correção.

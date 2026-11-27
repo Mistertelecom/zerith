@@ -244,7 +244,7 @@ pub fn translate_hook_matcher(raw: &str) -> Option<String> {
             "WebFetch" => vec!["web_fetch"],
             "WebSearch" => vec!["web_search"],
             "Task" | "Agent" => vec!["agent"],
-            "TodoWrite" => vec!["task_create", "task_update"],
+            "TodoWrite" => vec!["task_plan", "task_create", "task_update"],
             other => vec![other],
         }
     }
@@ -451,6 +451,10 @@ mod tests {
         assert_eq!(
             translate_hook_matcher("Bash(git commit *)|Read").as_deref(),
             Some("shell(git commit *)|read_file")
+        );
+        assert_eq!(
+            translate_hook_matcher("TodoWrite").as_deref(),
+            Some("task_plan|task_create|task_update")
         );
         assert_eq!(translate_hook_matcher("*"), None);
         assert_eq!(translate_hook_matcher("  "), None);

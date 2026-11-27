@@ -97,6 +97,7 @@ pub async fn plugin_action(
         let lib = zerith_plugins::Library::open(&root).map_err(|e| e.to_string())?;
         let done = match action.as_str() {
             "install" => market::install(&lib, &target).map(|_| ()),
+            "update" => market::update(&lib, &target).map(|_| ()),
             "enable" => lib.set_status(&target, Status::Enabled),
             "disable" => lib.set_status(&target, Status::Disabled),
             "trust" => lib.trust(&target),

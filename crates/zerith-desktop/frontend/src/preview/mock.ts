@@ -1084,11 +1084,12 @@ export function installMock(theme: string) {
         case "skills_plugins":
           return plugins;
         case "plugin_action": {
-          const o = offers.find((x) => x.name === a.target);
+          const targetName = String(a.target ?? "").split("@")[0];
+          const o = offers.find((x) => x.name === targetName);
           if (a.action === "install" && o && !plugins.installed.some((p) => p.name === o.name)) {
             plugins.installed.push({
               name: o.name,
-              version: "1.0.0",
+              version: o.version || "1.0.0",
               description: o.description,
               capabilities: [],
               trusted: false,
@@ -1097,6 +1098,9 @@ export function installMock(theme: string) {
               agents: 0,
               runsCode: false,
             });
+          } else if (a.action === "update" && o) {
+            const cur = plugins.installed.find((p) => p.name === o.name);
+            if (cur && o.version) cur.version = o.version;
           }
           return { ...plugins, installed: [...plugins.installed] };
         }

@@ -679,8 +679,12 @@ export function SkillsTab() {
               <div className="pn-list">
                 {plugins.offers.map((o) => {
                   const spec = `${o.name}@${o.market}`;
-                  const have = plugins.installed.some((p) => p.name === o.name);
+                  const installed = plugins.installed.find((p) => p.name === o.name);
+                  const hasUpdate = Boolean(
+                    installed && o.version && installed.version && o.version !== installed.version,
+                  );
                   const working = pluginBusy === "install:" + spec;
+                  const updating = pluginBusy === "update:" + spec;
                   return (
                     <div key={spec} className="pn-item">
                       <span className="pn-ico">
@@ -694,10 +698,28 @@ export function SkillsTab() {
                       </span>
                       <span className="pn-meta">
                         {o.category ? <span className="badge">{o.category}</span> : null}
-                        {have ? (
-                          <span className="badge ok">
-                            <Check size={12} strokeWidth={2} /> Instalado
-                          </span>
+                        {installed ? (
+                          hasUpdate ? (
+                            <button
+                              className="btn btn-sm"
+                              disabled={pluginBusy !== null}
+                              title={`Atualizar de v${installed.version} para v${o.version}`}
+                              onClick={() =>
+                                void plugin(
+                                  "update",
+                                  spec,
+                                  `${o.name} atualizado para v${o.version}.`,
+                                )
+                              }
+                            >
+                              {updating ? <span className="spinner" /> : <RefreshCw size={14} strokeWidth={2} />}
+                              {updating ? "Atualizando…" : `Atualizar (v${o.version})`}
+                            </button>
+                          ) : (
+                            <span className="badge ok">
+                              <Check size={12} strokeWidth={2} /> Instalado
+                            </span>
+                          )
                         ) : (
                           <button
                             className="btn btn-sm btn-primary"
@@ -757,72 +779,115 @@ export function SkillsTab() {
             ) : null}
             {plugins?.installed.length ? (
               <div className="pn-list">
-                {plugins.installed.map((p) => (
-                  <div key={p.name} className={"pn-item" + (p.enabled ? "" : " dim")}>
-                    <span className="pn-ico">
-                      <Plug size={16} strokeWidth={1.75} />
-                    </span>
-                    <span className="pn-body">
-                      <span className="pn-title">
-                        {p.name} {p.version && p.version !== "-" ? <span className="pn-num pn-hint">v{p.version}</span> : null}
+                {plugins.installed.map((p) => {
+                  const offer = plugins.offers.find((o) => o.name === p.name);
+                  const spec = offer ? `${offer.name}@${offer.market}` : p.name;
+                  const hasUpdate = Boolean(
+                    offer && offer.version && p.version && offer.version !== p.version,
+                  );
+                  const updating = pluginBusy === "update:" + spec;
+                  return (
+                    <div key={p.name} className={"pn-item" + (p.enabled ? "" : " dim")}>
+                      <span className="pn-ico">
+                        <Plug size={16} strokeWidth={1.75} />
                       </span>
-                      <span className="pn-sub" title={p.description}>
-                        {p.skills} {p.skills === 1 ? "skill" : "skills"}
-                        {p.agents ? ` · ${p.agents} ${p.agents === 1 ? "agente" : "agentes"}` : ""}
-                        {p.runsCode ? (p.trusted ? " · programas liberados" : " · programas bloqueados") : ""}
-                        {" · "}
-                        {p.description}
+                      <span className="pn-body">
+                        <span className="pn-title">
+                          {p.name} {p.version && p.version !== "-" ? <span className="pn-num pn-hint">v{p.version}</span> : null}
+                        </span>
+                        <span className="pn-sub" title={p.description}>
+                          {p.skills} {p.skills === 1 ? "skill" : "skills"}
+                          {p.agents ? ` · ${p.agents} ${p.agents === 1 ? "agente" : "agentes"}` : ""}
+                          {p.runsCode ? (p.trusted ? " · programas liberados" : " · programas bloqueados") : ""}
+                          {" · "}
+                          {p.description}
+                        </span>
                       </span>
-                    </span>
-                    <span className="pn-meta">
-                      {p.capabilities.map((c) => {
-                        const Icon = CAPABILITY[c] ?? Wrench;
-                        return (
-                          <span key={c} className="badge mono" title="Capacidade">
-                            <Icon size={12} strokeWidth={2} /> {c}
-                          </span>
-                        );
-                      })}
-                      {p.runsCode ? (
+                      <span className="pn-meta">
+                        {p.capabilities.map((c) => {
+                          const Icon = CAPABILITY[c] ?? Wrench;
+                          return (
+                            <span key={c} className="badge mono" title="Capacidade">
+                              <Icon size={12} strokeWidth={2} /> {c}
+                            </span>
+                          );
+                        })}
+                        {offer ? (
+                          hasUpdate ? (
+                            <button
+                              className="btn btn-sm"
+                              disabled={pluginBusy !== null}
+                              title={`Atualizar ${p.name} de v${p.version} para v${offer.version}`}
+                              onClick={() =>
+                                void plugin(
+                                  "update",
+                                  spec,
+                                  `${p.name} atualizado para v${offer.version}.`,
+                                )
+                              }
+                            >
+                              {updating ? <span className="spinner" /> : <RefreshCw size={14} strokeWidth={2} />}
+                              {updating ? "Atualizando…" : `Atualizar (v${offer.version})`}
+                            </button>
+                          ) : (
+                            <button
+                              className="btn-icon"
+                              aria-label={`Atualizar ${p.name}`}
+                              title={`Baixar a versão mais recente de ${p.name} (${spec})`}
+                              disabled={pluginBusy !== null}
+                              onClick={() =>
+                                void plugin(
+                                  "update",
+                                  spec,
+                                  `${p.name} atualizado a partir da loja ${offer.market}.`,
+                                )
+                              }
+                            >
+                              {updating ? <span className="spinner" /> : <RefreshCw size={14} strokeWidth={2} />}
+                            </button>
+                          )
+                        ) : null}
+                        {p.runsCode ? (
+                          <button
+                            className="btn-icon"
+                            disabled={pluginBusy !== null}
+                            aria-label={p.trusted ? `Bloquear programas de ${p.name}` : `Liberar programas de ${p.name}`}
+                            title={
+                              p.trusted
+                                ? "Servidores MCP/hooks dele estão ligados. Clique para bloquear."
+                                : "Ele também roda programas (MCP/hooks). Revise a pasta dele antes de liberar."
+                            }
+                            onClick={() => void plugin(p.trusted ? "untrust" : "trust", p.name)}
+                          >
+                            {p.trusted ? (
+                              <ShieldCheck size={14} strokeWidth={2} />
+                            ) : (
+                              <AlertTriangle size={14} strokeWidth={2} className="pn-warn" />
+                            )}
+                          </button>
+                        ) : null}
+                        <Switch
+                          checked={p.enabled}
+                          label={p.enabled ? `Desligar ${p.name}` : `Ligar ${p.name}`}
+                          disabled={pluginBusy !== null}
+                          onChange={(on) => void plugin(on ? "enable" : "disable", p.name)}
+                        />
                         <button
                           className="btn-icon"
+                          aria-label={`Remover ${p.name}`}
+                          title="Remover"
                           disabled={pluginBusy !== null}
-                          aria-label={p.trusted ? `Bloquear programas de ${p.name}` : `Liberar programas de ${p.name}`}
-                          title={
-                            p.trusted
-                              ? "Servidores MCP/hooks dele estão ligados. Clique para bloquear."
-                              : "Ele também roda programas (MCP/hooks). Revise a pasta dele antes de liberar."
-                          }
-                          onClick={() => void plugin(p.trusted ? "untrust" : "trust", p.name)}
+                          onClick={() => {
+                            if (window.confirm(`Remover o plugin ${p.name}?`))
+                              void plugin("remove", p.name, `${p.name} removido.`);
+                          }}
                         >
-                          {p.trusted ? (
-                            <ShieldCheck size={14} strokeWidth={2} />
-                          ) : (
-                            <AlertTriangle size={14} strokeWidth={2} className="pn-warn" />
-                          )}
+                          <Trash2 size={14} strokeWidth={2} />
                         </button>
-                      ) : null}
-                      <Switch
-                        checked={p.enabled}
-                        label={p.enabled ? `Desligar ${p.name}` : `Ligar ${p.name}`}
-                        disabled={pluginBusy !== null}
-                        onChange={(on) => void plugin(on ? "enable" : "disable", p.name)}
-                      />
-                      <button
-                        className="btn-icon"
-                        aria-label={`Remover ${p.name}`}
-                        title="Remover"
-                        disabled={pluginBusy !== null}
-                        onClick={() => {
-                          if (window.confirm(`Remover o plugin ${p.name}?`))
-                            void plugin("remove", p.name, `${p.name} removido.`);
-                        }}
-                      >
-                        <Trash2 size={14} strokeWidth={2} />
-                      </button>
-                    </span>
-                  </div>
-                ))}
+                      </span>
+                    </div>
+                  );
+                })}
               </div>
             ) : null}
           </Card>

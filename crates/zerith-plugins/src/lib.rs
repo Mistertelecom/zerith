@@ -276,6 +276,87 @@ impl Library {
         self.install_as(from, shell, Some(v))
     }
 
+    /// Replaces an already-installed Claude Code plugin in place while keeping
+    /// its enabled/disabled status. If the update introduces or modifies
+    /// executable entries (hooks, MCP servers, command/args), `trusted` is
+    /// reset to `false` so the user reviews the new code before it runs.
+    /// If staging or validation fails, the previous installation is restored.
+    pub(crate) fn replace_claude(&self, from: &Path, v: serde_json::Value) -> Result<Plugin> {
+        let name = v["name"].as_str().unwrap_or_default().to_string();
+        validate_name(&name)?;
+        let mut plugins = self.plugins()?;
+        let Some(pos) = plugins.iter().position(|p| p.manifest.name == name) else {
+            return self.install_claude(from, v);
+        };
+        let prev = plugins[pos].clone();
+        let installed_root = self.root.join("installed");
+        std::fs::create_dir_all(&installed_root)?;
+        let stamp = now_ms();
+        let dest = installed_root.join(&name);
+        let staging = installed_root.join(format!(".{name}-staging-{stamp}"));
+        let backup = installed_root.join(format!(".{name}-backup-{stamp}"));
+
+        if staging.exists() {
+            let _ = std::fs::remove_dir_all(&staging);
+        }
+        copy_dir(from, &staging)?;
+
+        let had_dest = dest.exists();
+        if had_dest {
+            if let Err(e) = std::fs::rename(&dest, &backup) {
+                let _ = std::fs::remove_dir_all(&staging);
+                return Err(e.into());
+            }
+        }
+        if let Err(e) = std::fs::rename(&staging, &dest) {
+            let _ = std::fs::remove_dir_all(&staging);
+            if had_dest && backup.exists() {
+                let _ = std::fs::rename(&backup, &dest);
+            }
+            return Err(e.into());
+        }
+
+        let abs = std::path::absolute(&dest)?;
+        let built = claude::manifest(&v, &abs).and_then(|m| {
+            validate_bundle(&m, &dest)?;
+            Ok(m)
+        });
+        let manifest = match built {
+            Ok(m) => m,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&dest);
+                if had_dest && backup.exists() {
+                    let _ = std::fs::rename(&backup, &dest);
+                }
+                return Err(e);
+            }
+        };
+
+        let same_code = prev.manifest.command == manifest.command
+            && prev.manifest.args == manifest.args
+            && prev.manifest.hooks == manifest.hooks
+            && prev.manifest.mcp == manifest.mcp;
+        let updated = Plugin {
+            manifest,
+            status: prev.status,
+            dir: dest,
+            installed_at: now_ms(),
+            trusted: prev.trusted && same_code,
+        };
+        plugins[pos] = updated.clone();
+        if let Err(e) = self.save(&plugins) {
+            let _ = std::fs::remove_dir_all(&updated.dir);
+            if had_dest && backup.exists() {
+                let _ = std::fs::rename(&backup, &updated.dir);
+            }
+            return Err(e);
+        }
+        if backup.exists() {
+            let _ = std::fs::remove_dir_all(&backup);
+        }
+        Ok(updated)
+    }
+
     fn install_as(
         &self,
         from: &Path,

@@ -1010,10 +1010,10 @@ fn external_origin(tool: &str, args: &Value) -> Option<String> {
             Some(format!("web_fetch {url}").trim_end().to_string())
         }
         "web_search" => Some("web_search".into()),
-        // A screenshot is a local file path; closing reads nothing.
+        // A screenshot is a local file path; viewport/close read no page text.
         "browser" => (!matches!(
             args.get("action").and_then(Value::as_str),
-            Some("screenshot" | "close")
+            Some("screenshot" | "viewport" | "close")
         ))
         .then(|| "navegador".into()),
         "mcp_search" => Some("servidores MCP (descrições de ferramentas)".into()),

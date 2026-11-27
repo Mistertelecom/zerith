@@ -40,14 +40,15 @@ const DEFAULT_KITESURF_URL: &str = "ws://127.0.0.1:8787/cdp";
 pub(crate) fn all() -> Vec<Box<dyn Tool>> {
     vec![make_with(
         "browser",
-        "Controla um navegador via Chrome DevTools Protocol (CDP): abre páginas, lê o conteúdo, clica, digita, roda JavaScript e tira prints. \
+        "Controla um navegador via Chrome DevTools Protocol (CDP): abre páginas, lê o conteúdo, clica, digita, roda JavaScript, ajusta viewport responsivo e tira prints. \
 Suporta motor híbrido (`engine`): `auto` (padrão: usa Cloudflare Kitesurf para páginas públicas quando configurado e Chromium local para IPs de LAN/CGNAT/localhost ou como fallback automático), `kitesurf` (motor leve Wasm/Blitz) ou `chromium` (Edge/Chrome local com perfil persistente). \
 Fluxo: navigate {url} → snapshot (título, texto visível e lista numerada de elementos [n]) → click/type com ref=n → snapshot de novo para ver o resultado. \
 Login em painel (OLT, roteador, firewall): type o usuário e use fill_secret {ref do campo de senha, secret} para a senha; nunca peça a senha ao usuário nem a escreva com type. \
-screenshot salva o PNG, anexa a imagem automaticamente para você inspecionar visualmente e devolve uma linha Markdown ![screenshot](caminho) para mostrar ao usuário. \
+screenshot salva o PNG (passe full_page=true para capturar páginas longas com scroll), anexa a imagem automaticamente para você inspecionar visualmente e devolve uma linha Markdown ![screenshot](caminho) para mostrar ao usuário. \
+viewport altera a resolução da página (ex.: width=390, height=844 para mobile ou width=1440, height=900 para desktop; reset=true restaura) para testar responsividade. \
 console lista erros/avisos de console JavaScript e exceções não tratadas capturadas desde o último navigate.",
         json!({"type": "object", "properties": {
-            "action": {"type": "string", "enum": ["navigate", "snapshot", "click", "type", "fill_secret", "press", "eval", "screenshot", "console", "back", "close"]},
+            "action": {"type": "string", "enum": ["navigate", "snapshot", "click", "type", "fill_secret", "press", "eval", "screenshot", "viewport", "console", "back", "close"]},
             "secret": {"type": "string", "description": "fill_secret: nome do segredo no cofre do sistema (zerith secret set <nome>) ou nome de um equipamento do inventário com secret_ref; o valor é digitado no campo de senha sem passar por você"},
             "engine": {"type": "string", "enum": ["auto", "kitesurf", "chromium"], "description": "motor CDP: auto (Kitesurf na web pública com fallback Chromium; Chromium direto em LAN/CGNAT/localhost), kitesurf ou chromium"},
             "url": {"type": "string", "description": "navigate: endereço http(s)"},
@@ -56,15 +57,74 @@ console lista erros/avisos de console JavaScript e exceções não tratadas capt
             "text": {"type": "string", "description": "type: texto a digitar (substitui o conteúdo do campo)"},
             "submit": {"type": "boolean", "description": "type: aperta Enter depois de digitar"},
             "key": {"type": "string", "description": "press: Enter, Tab, Escape, Backspace, Delete, ArrowUp/Down/Left/Right, PageUp, PageDown, Home, End, Space ou um caractere"},
-            "expression": {"type": "string", "description": "eval: expressão JavaScript; o valor volta como JSON (promises são aguardadas)"}
+            "expression": {"type": "string", "description": "eval: expressão JavaScript; o valor volta como JSON (promises são aguardadas)"},
+            "full_page": {"type": "boolean", "description": "screenshot: captura a página inteira além da área visível"},
+            "width": {"type": "integer", "description": "viewport: largura em pixels (160–4096, ex.: 390 mobile, 768 tablet, 1440 desktop)"},
+            "height": {"type": "integer", "description": "viewport: altura em pixels (160–4096, ex.: 844 mobile, 1024 tablet, 900 desktop)"},
+            "mobile": {"type": "boolean", "description": "viewport: emula dispositivo móvel (padrão: true quando width <= 640)"},
+            "device_scale_factor": {"type": "number", "description": "viewport: densidade de pixel / DPR (padrão: 2 em mobile, 1 em desktop)"},
+            "reset": {"type": "boolean", "description": "viewport: limpa a emulação de viewport e volta ao tamanho padrão"}
         }, "required": ["action"]}),
-        "navigate/click/type/press/back: título, motor ativo e URL da página; snapshot: texto visível e elementos numerados; eval: o valor; screenshot: caminho do PNG e linha Markdown",
+        "navigate/click/type/press/back: título, motor ativo e URL da página; snapshot: texto visível e elementos numerados; eval: o valor; screenshot: caminho do PNG e linha Markdown; viewport: dimensões aplicadas",
         Permission::Network,
         60,
         false,
         |a, _| Ok(Some(Action::Network(label(a)?))),
         run,
     )]
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum ViewportSpec {
+    Reset,
+    Set {
+        width: u32,
+        height: u32,
+        mobile: bool,
+        device_scale_factor: f64,
+    },
+}
+
+fn viewport_spec(args: &Value) -> Result<ViewportSpec> {
+    if args["reset"].as_bool() == Some(true) {
+        return Ok(ViewportSpec::Reset);
+    }
+    let width = args["width"]
+        .as_u64()
+        .and_then(|v| u32::try_from(v).ok())
+        .ok_or_else(|| {
+            ToolError::BadArguments(
+                "viewport precisa de width e height (160–4096) ou reset=true".into(),
+            )
+        })?;
+    let height = args["height"]
+        .as_u64()
+        .and_then(|v| u32::try_from(v).ok())
+        .ok_or_else(|| {
+            ToolError::BadArguments(
+                "viewport precisa de width e height (160–4096) ou reset=true".into(),
+            )
+        })?;
+    if !(160..=4096).contains(&width) || !(160..=4096).contains(&height) {
+        return Err(ToolError::BadArguments(format!(
+            "viewport fora do intervalo permitido (160–4096): {width}x{height}"
+        )));
+    }
+    let mobile = args["mobile"].as_bool().unwrap_or(width <= 640);
+    let dpr = args["device_scale_factor"]
+        .as_f64()
+        .unwrap_or(if mobile { 2.0 } else { 1.0 });
+    if !dpr.is_finite() || dpr <= 0.0 || dpr > 4.0 {
+        return Err(ToolError::BadArguments(format!(
+            "device_scale_factor inválido (use > 0 até 4): {dpr}"
+        )));
+    }
+    Ok(ViewportSpec::Set {
+        width,
+        height,
+        mobile,
+        device_scale_factor: dpr,
+    })
 }
 
 /// What the approval prompt shows: the action and what it targets.
@@ -79,7 +139,18 @@ fn label(args: &Value) -> Result<String> {
         "fill_secret" => format!("{} no campo ref {}", str_arg(args, "secret")?, args["ref"]),
         "press" => str_arg(args, "key")?.into(),
         "eval" => str_arg(args, "expression")?.chars().take(200).collect(),
-        "snapshot" | "screenshot" | "console" | "back" | "close" => String::new(),
+        "viewport" => match viewport_spec(args)? {
+            ViewportSpec::Reset => "reset".into(),
+            ViewportSpec::Set { width, height, .. } => format!("{width}x{height}"),
+        },
+        "screenshot" => {
+            if args["full_page"].as_bool() == Some(true) {
+                "full_page".into()
+            } else {
+                String::new()
+            }
+        }
+        "snapshot" | "console" | "back" | "close" => String::new(),
         other => return Err(bad_action(other)),
     };
     Ok(format!("navegador {action} {detail}")
@@ -89,7 +160,7 @@ fn label(args: &Value) -> Result<String> {
 
 fn bad_action(a: &str) -> ToolError {
     ToolError::BadArguments(format!(
-        "ação desconhecida: {a}; use navigate, snapshot, click, type, fill_secret, press, eval, screenshot, console, back ou close"
+        "ação desconhecida: {a}; use navigate, snapshot, click, type, fill_secret, press, eval, screenshot, viewport, console, back ou close"
     ))
 }
 
@@ -521,7 +592,17 @@ fn act(c: &mut Cdp, action: &str, args: &Value, root: &Path, exec: &Exec<'_>) ->
         }
         "screenshot" => {
             c.call("Page.bringToFront", json!({}), exec)?;
-            let r = c.call("Page.captureScreenshot", json!({"format": "png"}), exec)?;
+            let full_page = args["full_page"].as_bool().unwrap_or(false);
+            let params = if full_page {
+                json!({
+                    "format": "png",
+                    "captureBeyondViewport": true,
+                    "fromSurface": true
+                })
+            } else {
+                json!({"format": "png"})
+            };
+            let r = c.call("Page.captureScreenshot", params, exec)?;
             let png = r["data"]
                 .as_str()
                 .and_then(b64_decode)
@@ -535,13 +616,45 @@ fn act(c: &mut Cdp, action: &str, args: &Value, root: &Path, exec: &Exec<'_>) ->
             std::fs::write(&path, &png)?;
             let kb = png.len().div_ceil(1024);
             let shown = path.display().to_string().replace('\\', "/");
+            let kind = if full_page {
+                "Captura de página inteira"
+            } else {
+                "Captura"
+            };
             Ok(format!(
-                "{} png, {kb} KB: ![imagem](<{shown}>)\nCaptura salva em {} ({kb} KB).\n{}\nCole a linha Markdown acima na resposta para o usuário ver a imagem.",
+                "{} png, {kb} KB: ![imagem](<{shown}>)\n{kind} salva em {} ({kb} KB).\n{}\nCole a linha Markdown acima na resposta para o usuário ver a imagem.",
                 crate::IMAGE_MARKER,
                 path.display(),
                 md_image(&path)
             ))
         }
+        "viewport" => match viewport_spec(args)? {
+            ViewportSpec::Reset => {
+                c.call("Emulation.clearDeviceMetricsOverride", json!({}), exec)?;
+                Ok("Viewport restaurado ao tamanho padrão da janela.".into())
+            }
+            ViewportSpec::Set {
+                width,
+                height,
+                mobile,
+                device_scale_factor,
+            } => {
+                c.call(
+                    "Emulation.setDeviceMetricsOverride",
+                    json!({
+                        "width": width,
+                        "height": height,
+                        "deviceScaleFactor": device_scale_factor,
+                        "mobile": mobile,
+                    }),
+                    exec,
+                )?;
+                Ok(format!(
+                    "Viewport ajustado para {width}x{height} ({}, DPR {device_scale_factor}).",
+                    if mobile { "mobile" } else { "desktop" }
+                ))
+            }
+        },
         "console" => {
             // Pump pending CDP events briefly so recent console errors land in `console_errors`.
             let _ = c.eval("void 0", exec);
@@ -1576,6 +1689,48 @@ mod tests {
         assert_eq!(
             exc.as_deref(),
             Some("[exception] ReferenceError: foo is not defined (http://localhost:5183/src/App.tsx:42)")
+        );
+    }
+
+    #[test]
+    fn viewport_spec_and_labels_validate_bounds_and_defaults() {
+        assert_eq!(
+            viewport_spec(&json!({"width": 390, "height": 844})).unwrap(),
+            ViewportSpec::Set {
+                width: 390,
+                height: 844,
+                mobile: true,
+                device_scale_factor: 2.0,
+            }
+        );
+        assert_eq!(
+            viewport_spec(&json!({"width": 1440, "height": 900})).unwrap(),
+            ViewportSpec::Set {
+                width: 1440,
+                height: 900,
+                mobile: false,
+                device_scale_factor: 1.0,
+            }
+        );
+        assert_eq!(
+            viewport_spec(&json!({"reset": true})).unwrap(),
+            ViewportSpec::Reset
+        );
+        assert!(viewport_spec(&json!({"width": 100, "height": 800})).is_err());
+        assert!(
+            viewport_spec(&json!({"width": 800, "height": 600, "device_scale_factor": 0})).is_err()
+        );
+        assert_eq!(
+            label(&json!({"action": "viewport", "width": 390, "height": 844})).unwrap(),
+            "navegador viewport 390x844"
+        );
+        assert_eq!(
+            label(&json!({"action": "viewport", "reset": true})).unwrap(),
+            "navegador viewport reset"
+        );
+        assert_eq!(
+            label(&json!({"action": "screenshot", "full_page": true})).unwrap(),
+            "navegador screenshot full_page"
         );
     }
 }

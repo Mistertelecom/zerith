@@ -427,6 +427,7 @@ export interface PluginsView {
 
 export type PluginAction =
   | "install"
+  | "update"
   | "enable"
   | "disable"
   | "trust"

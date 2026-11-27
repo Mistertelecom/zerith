@@ -329,6 +329,43 @@ pub fn runs_code(p: &Plugin) -> bool {
 /// Installs `name@market` and enables it: its skills and agents are in use
 /// from the next turn. Code it runs ([`runs_code`]) waits for `trust`.
 pub fn install(lib: &Library, spec: &str) -> Result<Plugin> {
+    with_fetched_entry(lib, spec, false, |dir, v| {
+        let p = lib.install_claude(dir, v)?;
+        lib.set_status(&p.manifest.name, Status::Enabled)?;
+        lib.get(&p.manifest.name)
+    })
+}
+
+/// Updates an already-installed plugin from its marketplace (refreshing custom
+/// marketplace catalogs first when possible). Preserves enabled/disabled state
+/// and resets `trusted` if hooks, MCP servers or commands changed.
+pub fn update(lib: &Library, spec: &str) -> Result<Plugin> {
+    with_fetched_entry(lib, spec, true, |dir, v| lib.replace_claude(dir, v))
+}
+
+fn with_fetched_entry<F>(
+    lib: &Library,
+    spec: &str,
+    refresh_market: bool,
+    apply: F,
+) -> Result<Plugin>
+where
+    F: FnOnce(&Path, Value) -> Result<Plugin>,
+{
+    if refresh_market {
+        let want_market = spec.split_once('@').map(|(_, m)| m);
+        if let Ok(markets) = list(lib) {
+            for m in markets {
+                if m.name == BUILTIN {
+                    continue;
+                }
+                if want_market.is_some_and(|w| w != m.name) {
+                    continue;
+                }
+                let _ = add(lib, &m.source);
+            }
+        }
+    }
     let (m, cat, entry) = find(lib, spec)?;
     let (from, git_ref, sub) = locate(&m, &cat, &entry)?;
     let tmp = lib.root.join("cache").join(format!(
@@ -377,9 +414,7 @@ pub fn install(lib: &Library, spec: &str) -> Result<Plugin> {
                 v[k] = val.clone();
             }
         }
-        let p = lib.install_claude(&dir, v)?;
-        lib.set_status(&p.manifest.name, Status::Enabled)?;
-        lib.get(&p.manifest.name)
+        apply(&dir, v)
     })();
     let _ = std::fs::remove_dir_all(&tmp);
     done
@@ -441,5 +476,68 @@ mod tests {
         assert_eq!(locate(&m, &cat, &e).unwrap().2, "p/q");
         assert!(git_url("--upload-pack=x/y").is_err());
         assert!(git_url("dono/-x").is_err());
+    }
+
+    #[test]
+    fn update_refreshes_local_market_preserves_status_and_resets_trust_on_code_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mkt = tmp.path().join("mkt");
+        let plug = mkt.join("plugins/demo");
+        std::fs::create_dir_all(mkt.join(".claude-plugin")).unwrap();
+        std::fs::create_dir_all(plug.join(".claude-plugin")).unwrap();
+        std::fs::create_dir_all(plug.join("skills/hello")).unwrap();
+        std::fs::write(
+            mkt.join(".claude-plugin/marketplace.json"),
+            r#"{"name":"local-mkt","metadata":{"pluginRoot":"./plugins"},"plugins":[{"name":"demo","version":"1.0.0","description":"v1","source":"./demo"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            plug.join(".claude-plugin/plugin.json"),
+            r#"{"name":"demo","version":"1.0.0","description":"v1"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            plug.join("skills/hello/SKILL.md"),
+            "---\nname: hello\ndescription: v1\n---\n# v1\n",
+        )
+        .unwrap();
+
+        let lib = Library::open(&tmp.path().join("lib")).unwrap();
+        add(&lib, mkt.to_str().unwrap()).unwrap();
+        let installed = install(&lib, "demo@local-mkt").unwrap();
+        assert_eq!(installed.manifest.version, "1.0.0");
+        assert_eq!(installed.status, Status::Enabled);
+        lib.trust("demo").unwrap();
+        lib.set_status("demo", Status::Disabled).unwrap();
+
+        // Bump version without changing hooks/MCP: disabled status & trust stay intact.
+        std::fs::write(
+            mkt.join(".claude-plugin/marketplace.json"),
+            r#"{"name":"local-mkt","metadata":{"pluginRoot":"./plugins"},"plugins":[{"name":"demo","version":"1.1.0","description":"v1.1","source":"./demo"}]}"#,
+        )
+        .unwrap();
+        let updated = update(&lib, "demo@local-mkt").unwrap();
+        assert_eq!(updated.manifest.version, "1.1.0");
+        assert_eq!(updated.status, Status::Disabled);
+        assert!(
+            updated.trusted,
+            "trust should stay when code surface is unchanged"
+        );
+
+        // Bump version and add a hook: trust must reset to false for review.
+        std::fs::write(
+            mkt.join(".claude-plugin/marketplace.json"),
+            r#"{"name":"local-mkt","metadata":{"pluginRoot":"./plugins"},"plugins":[{"name":"demo","version":"1.2.0","description":"v1.2","source":"./demo"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            plug.join(".claude-plugin/plugin.json"),
+            r#"{"name":"demo","version":"1.2.0","hooks":{"SessionStart":[{"command":"echo hi"}]}}"#,
+        )
+        .unwrap();
+        let updated2 = update(&lib, "demo@local-mkt").unwrap();
+        assert_eq!(updated2.manifest.version, "1.2.0");
+        assert_eq!(updated2.manifest.hooks.len(), 1);
+        assert!(!updated2.trusted, "trust must reset when hooks change");
     }
 }

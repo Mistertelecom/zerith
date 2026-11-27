@@ -89,7 +89,12 @@ impl Stuck {
         let mut out = Vec::new();
         if ok && is_edit(name) {
             self.fails.clear();
-            self.execs.retain(|(n, _), _| n != "shell");
+            self.execs.retain(|(n, _), _| {
+                !matches!(
+                    n.as_str(),
+                    "shell" | "read_file" | "grep" | "glob" | "list_dir"
+                )
+            });
             self.calls.clear();
             self.seen = 0;
             self.cycle_warned = 0;
@@ -108,12 +113,28 @@ impl Stuck {
         }
         if ok {
             self.fails.remove(&s);
-            if name == "shell" || name == "agent" || is_edit(name) {
+            if matches!(
+                name,
+                "shell"
+                    | "agent"
+                    | "read_file"
+                    | "grep"
+                    | "glob"
+                    | "list_dir"
+                    | "desktop_inspect"
+                    | "browser"
+            ) || is_edit(name)
+            {
                 let n = self.execs.entry(s.clone()).or_insert(0);
                 *n = n.saturating_add(1);
                 if *n >= EXEC_WARN {
+                    let extra = if name == "read_file" {
+                        " Para ver outro trecho, passe `offset` e `limit` diferentes ou use `grep`."
+                    } else {
+                        ""
+                    };
                     out.push(format!(
-                        "[Loop Detectado] A ferramenta `{name}` foi executada {n}x com os mesmos argumentos neste turno sem nenhuma edição entre elas. NÃO repita a mesma ação: use o resultado anterior ou responda ao usuário."
+                        "[Loop Detectado] A ferramenta `{name}` foi executada {n}x com os mesmos argumentos neste turno sem nenhuma edição entre elas. NÃO repita a mesma ação: use o resultado anterior ou mude de estratégia.{extra}"
                     ));
                 }
             }
@@ -350,5 +371,25 @@ mod tests {
         let mut u = Stuck::default();
         u.observe_text("Vou ler.");
         assert!(u.observe_text("Vou ler.").is_none());
+    }
+
+    #[test]
+    fn identical_read_file_warns_at_three_and_resets_after_edit() {
+        let mut s = Stuck::default();
+        let r = r#"{"path":"app.py"}"#;
+        assert!(s.observe("read_file", r, true).is_empty());
+        assert!(s.observe("read_file", r, true).is_empty());
+        let w = s.observe("read_file", r, true);
+        assert!(
+            w[0].contains("read_file") && w[0].contains("offset"),
+            "{w:?}"
+        );
+        // Reading with a different offset is distinct and does not warn.
+        assert!(s
+            .observe("read_file", r#"{"path":"app.py","offset":200}"#, true)
+            .is_empty());
+        // Editing the file clears the repeat counter for read_file.
+        s.observe("edit_file", r#"{"path":"app.py"}"#, true);
+        assert!(s.observe("read_file", r, true).is_empty());
     }
 }

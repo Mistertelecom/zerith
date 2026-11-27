@@ -47,7 +47,7 @@ pub fn ponytail_prompt(level: PonytailLevel) -> Option<&'static str> {
             "[Token Saver: Ponytail Ultra]\n\
              Ultra: YAGNI extremist. Deletion before addition. Stdlib/native only when code is truly required. \
              Keep security, validation, and boundary checks intact. \
-             Ship the one-liner and challenge the rest of the requirement in the same response.",
+             Ship only the minimal working code and tests requested; skip speculative abstractions, unused helpers, and boilerplate.",
         ),
     }
 }

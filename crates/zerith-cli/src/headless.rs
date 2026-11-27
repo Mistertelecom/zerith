@@ -616,28 +616,29 @@ pub fn run(paths: &Paths, args: &[String]) -> Result<(), Boxed> {
             Err(e) => return Err(e.into()),
         };
 
-        // Learning pass, synchronous here (nothing else waits on a headless
-        // run); its event goes out before `result`, which stays the last line.
-        digest.answer = report.text.clone();
-        let learned = learn_after(
-            &settings,
-            &store,
-            &client,
-            &session_id,
-            &model,
-            memory.map(|m| (m, &scope)),
-            skills.as_ref(),
-            &digest,
-            &cancel,
-        );
-        if format == OutputFormat::StreamJson && !learned.is_empty() {
-            println!(
-                "{}",
-                serde_json::json!({"type": "learned", "items": learned})
-            );
-        }
-
         let stopped_at_limit = report.stop_reason == "max_steps";
+        // Skip synchronous learning on incomplete turns that hit max_steps so
+        // headless runs return immediately without polluting memory/skills.
+        if !stopped_at_limit {
+            digest.answer = report.text.clone();
+            let learned = learn_after(
+                &settings,
+                &store,
+                &client,
+                &session_id,
+                &model,
+                memory.map(|m| (m, &scope)),
+                skills.as_ref(),
+                &digest,
+                &cancel,
+            );
+            if format == OutputFormat::StreamJson && !learned.is_empty() {
+                println!(
+                    "{}",
+                    serde_json::json!({"type": "learned", "items": learned})
+                );
+            }
+        }
         let structured = schema
             .as_ref()
             .map(|s| match schema::extract_json(&report.text) {

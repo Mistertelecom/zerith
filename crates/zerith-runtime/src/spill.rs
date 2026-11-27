@@ -64,8 +64,19 @@ pub fn spill(
     std::fs::write(&path, full)?;
     let (head, tail) = zerith_tools::head_tail(full, SPILL_HEAD_CHARS);
     let lines = full.lines().count();
+    let head_lines = head.lines().count();
+    let tail_lines = tail.lines().count();
+    let skip_start = head_lines + 1;
+    let skip_end = lines.saturating_sub(tail_lines);
+    let range_note = if skip_start <= skip_end {
+        format!(
+            "linhas {skip_start}–{skip_end} omitidas; use read_file com offset={skip_start} e limit=200 ou grep"
+        )
+    } else {
+        "meio omitido; use read_file com offset/limit ou grep".to_string()
+    };
     let shown = format!(
-        "{head}\n\n[saída completa: {} ({lines} linhas), meio omitido; use read_file com offset/limit ou a ferramenta grep]\n\n{tail}",
+        "{head}\n\n[saída completa: {} ({lines} linhas), {range_note}]\n\n{tail}",
         path.display()
     );
     Ok((path, shown))
@@ -343,5 +354,23 @@ pub(crate) mod tests {
         let a = spill_path(Path::new("r"), "s", "call_0");
         let b = spill_path(Path::new("r"), "s", "call_0");
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn spill_reports_exact_omitted_line_range_with_offset_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut full = String::new();
+        for i in 1..=600 {
+            full.push_str(&format!(
+                "{i}\tlinha de teste com conteudo suficiente numero {i:04}\n"
+            ));
+        }
+        let (path, shown) = spill(dir.path(), "s1", "c1", &full).unwrap();
+        assert!(path.is_file());
+        assert!(shown.contains("600 linhas"), "{shown}");
+        assert!(
+            shown.contains("linhas ") && shown.contains("omitidas; use read_file com offset="),
+            "{shown}"
+        );
     }
 }

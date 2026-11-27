@@ -46,9 +46,11 @@ Fluxo: navigate {url} → snapshot (título, texto visível e lista numerada de 
 Login em painel (OLT, roteador, firewall): type o usuário e use fill_secret {ref do campo de senha, secret} para a senha; nunca peça a senha ao usuário nem a escreva com type. \
 screenshot salva o PNG (passe full_page=true para capturar páginas longas com scroll), anexa a imagem automaticamente para você inspecionar visualmente e devolve uma linha Markdown ![screenshot](caminho) para mostrar ao usuário. \
 viewport altera a resolução da página (ex.: width=390, height=844 para mobile ou width=1440, height=900 para desktop; reset=true restaura) para testar responsividade. \
-console lista erros/avisos de console JavaScript e exceções não tratadas capturadas desde o último navigate.",
+console lista erros/avisos de console JavaScript e exceções não tratadas capturadas desde o último navigate. \
+batch executa várias ações seguidas (`steps`: lista de objetos com o mesmo formato de `browser`, de 1 a 16 passos, ex.: navigate + console + viewport + screenshot + eval) numa única chamada.",
         json!({"type": "object", "properties": {
-            "action": {"type": "string", "enum": ["navigate", "snapshot", "click", "type", "fill_secret", "press", "eval", "screenshot", "viewport", "console", "back", "close"]},
+            "action": {"type": "string", "enum": ["navigate", "snapshot", "click", "type", "fill_secret", "press", "eval", "screenshot", "viewport", "console", "back", "close", "batch"]},
+            "steps": {"type": "array", "description": "batch: sequência de 1 a 16 ações do browser (exceto batch e fill_secret) executadas em ordem numa única chamada", "items": {"type": "object"}},
             "secret": {"type": "string", "description": "fill_secret: nome do segredo no cofre do sistema (zerith secret set <nome>) ou nome de um equipamento do inventário com secret_ref; o valor é digitado no campo de senha sem passar por você"},
             "engine": {"type": "string", "enum": ["auto", "kitesurf", "chromium"], "description": "motor CDP: auto (Kitesurf na web pública com fallback Chromium; Chromium direto em LAN/CGNAT/localhost), kitesurf ou chromium"},
             "url": {"type": "string", "description": "navigate: endereço http(s)"},
@@ -151,6 +153,14 @@ fn label(args: &Value) -> Result<String> {
             }
         }
         "snapshot" | "console" | "back" | "close" => String::new(),
+        "batch" => {
+            let steps = validate_batch_steps(args)?;
+            let mut parts = Vec::with_capacity(steps.len());
+            for step in steps {
+                parts.push(label(step)?);
+            }
+            format!("{} passos: {}", steps.len(), parts.join(" -> "))
+        }
         other => return Err(bad_action(other)),
     };
     Ok(format!("navegador {action} {detail}")
@@ -158,9 +168,36 @@ fn label(args: &Value) -> Result<String> {
         .to_string())
 }
 
+fn validate_batch_steps(args: &Value) -> Result<&Vec<Value>> {
+    const MAX_BATCH_STEPS: usize = 16;
+    let steps = args["steps"]
+        .as_array()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            ToolError::BadArguments("batch exige `steps` com 1 a 16 objetos de ação".into())
+        })?;
+    if steps.len() > MAX_BATCH_STEPS {
+        return Err(ToolError::BadArguments(format!(
+            "batch aceita no máximo {MAX_BATCH_STEPS} passos por chamada (recebido {})",
+            steps.len()
+        )));
+    }
+    for (idx, step) in steps.iter().enumerate() {
+        let act = step["action"].as_str().ok_or_else(|| {
+            ToolError::BadArguments(format!("steps[{idx}] precisa do campo string `action`"))
+        })?;
+        if matches!(act, "batch" | "fill_secret") {
+            return Err(ToolError::BadArguments(format!(
+                "steps[{idx}]: `{act}` não é permitido dentro de `batch`"
+            )));
+        }
+    }
+    Ok(steps)
+}
+
 fn bad_action(a: &str) -> ToolError {
     ToolError::BadArguments(format!(
-        "ação desconhecida: {a}; use navigate, snapshot, click, type, fill_secret, press, eval, screenshot, viewport, console, back ou close"
+        "ação desconhecida: {a}; use navigate, snapshot, click, type, fill_secret, press, eval, screenshot, viewport, console, back, close ou batch"
     ))
 }
 
@@ -370,8 +407,30 @@ fn resolve_browser_config(args: &Value) -> Result<(BrowserEngine, Option<String>
     Ok((engine, kitesurf_url, headless))
 }
 
-fn run(args: &Value, _: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
+fn run(args: &Value, _ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
     let action = str_arg(args, "action")?;
+    if action == "batch" {
+        let steps = validate_batch_steps(args)?;
+        let mut out = Vec::with_capacity(steps.len());
+        for (idx, step) in steps.iter().enumerate() {
+            let step_action = step["action"].as_str().unwrap_or("?");
+            match run(step, _ctx, exec) {
+                Ok(text) => out.push(format!("### passo {} ({step_action})\n{text}", idx + 1)),
+                Err(err) => {
+                    let prefix = if out.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{}\n\n", out.join("\n\n"))
+                    };
+                    return Err(ToolError::Failed(format!(
+                        "{prefix}passo {} ({step_action}) falhou: {err}",
+                        idx + 1
+                    )));
+                }
+            }
+        }
+        return Ok(out.join("\n\n"));
+    }
     let root = Paths::resolve().root;
     let profile = root.join("browser-profile");
     let mut slot = SESSION.lock().unwrap_or_else(|e| e.into_inner());
@@ -1731,6 +1790,37 @@ mod tests {
         assert_eq!(
             label(&json!({"action": "screenshot", "full_page": true})).unwrap(),
             "navegador screenshot full_page"
+        );
+    }
+
+    #[test]
+    fn batch_validates_steps_count_nesting_and_secrets() {
+        assert!(validate_batch_steps(&json!({"action": "batch"})).is_err());
+        assert!(validate_batch_steps(&json!({"action": "batch", "steps": []})).is_err());
+        let too_many: Vec<Value> = (0..17).map(|_| json!({"action": "console"})).collect();
+        assert!(validate_batch_steps(&json!({"action": "batch", "steps": too_many})).is_err());
+        assert!(validate_batch_steps(&json!({
+            "action": "batch",
+            "steps": [{"action": "batch", "steps": [{"action": "console"}]}]
+        }))
+        .is_err());
+        assert!(validate_batch_steps(&json!({
+            "action": "batch",
+            "steps": [{"action": "fill_secret", "ref": 1, "secret": "s"}]
+        }))
+        .is_err());
+        let lbl = label(&json!({
+            "action": "batch",
+            "steps": [
+                {"action": "navigate", "url": "http://127.0.0.1:8080/"},
+                {"action": "console"},
+                {"action": "screenshot", "full_page": true}
+            ]
+        }))
+        .unwrap();
+        assert!(
+            lbl.contains("3 passos:") && lbl.contains("console"),
+            "{lbl}"
         );
     }
 }

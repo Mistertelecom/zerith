@@ -5258,7 +5258,7 @@ dependencies = [
 
 [[package]]
 name = "zerith-cli"
-version = "0.4.18"
+version = "0.4.19"
 dependencies = [
  "getrandom 0.2.17",
  "rusqlite",
@@ -5284,7 +5284,7 @@ dependencies = [
 
 [[package]]
 name = "zerith-core"
-version = "0.4.18"
+version = "0.4.19"
 dependencies = [
  "keyring",
  "ring",
@@ -5298,7 +5298,7 @@ dependencies = [
 
 [[package]]
 name = "zerith-desktop"
-version = "0.4.18"
+version = "0.4.19"
 dependencies = [
  "base64 0.22.1",
  "ring",
@@ -5326,7 +5326,7 @@ dependencies = [
 
 [[package]]
 name = "zerith-importers"
-version = "0.4.18"
+version = "0.4.19"
 dependencies = [
  "md-5",
  "regex",
@@ -5350,7 +5350,7 @@ dependencies = [
 
 [[package]]
 name = "zerith-mcp"
-version = "0.4.18"
+version = "0.4.19"
 dependencies = [
  "base64 0.22.1",
  "ring",
@@ -5368,7 +5368,7 @@ dependencies = [
 
 [[package]]
 name = "zerith-memory"
-version = "0.4.18"
+version = "0.4.19"
 dependencies = [
  "rusqlite",
  "serde",
@@ -5381,7 +5381,7 @@ dependencies = [
 
 [[package]]
 name = "zerith-plugins"
-version = "0.4.18"
+version = "0.4.19"
 dependencies = [
  "serde",
  "serde_json",
@@ -5393,7 +5393,7 @@ dependencies = [
 
 [[package]]
 name = "zerith-providers"
-version = "0.4.18"
+version = "0.4.19"
 dependencies = [
  "base64 0.22.1",
  "image",
@@ -5407,7 +5407,7 @@ dependencies = [
 
 [[package]]
 name = "zerith-runtime"
-version = "0.4.18"
+version = "0.4.19"
 dependencies = [
  "serde_json",
  "tempfile",
@@ -5426,7 +5426,7 @@ dependencies = [
 
 [[package]]
 name = "zerith-security"
-version = "0.4.18"
+version = "0.4.19"
 dependencies = [
  "serde_json",
  "tempfile",
@@ -5437,7 +5437,7 @@ dependencies = [
 
 [[package]]
 name = "zerith-sessions"
-version = "0.4.18"
+version = "0.4.19"
 dependencies = [
  "rusqlite",
  "serde",
@@ -5449,7 +5449,7 @@ dependencies = [
 
 [[package]]
 name = "zerith-skills"
-version = "0.4.18"
+version = "0.4.19"
 dependencies = [
  "serde",
  "serde_json",
@@ -5461,7 +5461,7 @@ dependencies = [
 
 [[package]]
 name = "zerith-tools"
-version = "0.4.18"
+version = "0.4.19"
 dependencies = [
  "pdf-extract",
  "regex",
@@ -5483,7 +5483,7 @@ dependencies = [
 
 [[package]]
 name = "zerith-workflows"
-version = "0.4.18"
+version = "0.4.19"
 dependencies = [
  "base64 0.22.1",
  "chrono",

@@ -135,7 +135,13 @@ pub struct CallCtx<'a> {
 impl CallCtx<'_> {
     /// Relative paths resolve against the workspace; absolute ones are taken
     /// as given and still go through the policy, which is what bounds them.
+    /// On Windows, translates MSYS2/Git-Bash `/tmp/...` and `/c/...` paths so
+    /// native tools match `shell` commands instead of splitting across `C:\tmp`.
     pub fn resolve(&self, p: &str) -> PathBuf {
+        #[cfg(windows)]
+        if let Some(mapped) = normalize_msys_path(p, &std::env::temp_dir()) {
+            return mapped;
+        }
         let path = PathBuf::from(p);
         if path.is_absolute() {
             path
@@ -143,6 +149,33 @@ impl CallCtx<'_> {
             self.workspace.join(path)
         }
     }
+}
+
+/// Translates Git-Bash/MSYS2 Unix-style paths (`/tmp/...`, `/c/...`) to native
+/// Windows paths using `temp_dir` for `/tmp`.
+pub(crate) fn normalize_msys_path(p: &str, temp_dir: &Path) -> Option<PathBuf> {
+    let trimmed = p.trim();
+    if trimmed == "/tmp" || trimmed == "/tmp/" {
+        return Some(temp_dir.to_path_buf());
+    }
+    if let Some(rest) = trimmed.strip_prefix("/tmp/") {
+        return Some(
+            rest.split(['/', '\\'])
+                .filter(|s| !s.is_empty())
+                .fold(temp_dir.to_path_buf(), |acc, seg| acc.join(seg)),
+        );
+    }
+    let bytes = trimmed.as_bytes();
+    if bytes.len() == 2 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() {
+        let drive = (bytes[1] as char).to_ascii_uppercase();
+        return Some(PathBuf::from(format!("{drive}:\\")));
+    }
+    if bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b'/' {
+        let drive = (bytes[1] as char).to_ascii_uppercase();
+        let rest = trimmed[3..].replace('/', "\\");
+        return Some(PathBuf::from(format!("{drive}:\\{rest}")));
+    }
+    None
 }
 
 /// The running budget of one call: a deadline and the turn's cancel token.
@@ -193,6 +226,10 @@ pub trait Tool: Send + Sync {
 /// head and say how much was cut, so the model knows to narrow the request.
 pub const OUTPUT_CAP_CHARS: usize = 30_000;
 
+/// Cap for `read_file`: matches `builtin::READ_TOTAL_CHARS` (100k chars / ~2000
+/// lines) so reading a normal source file is never silently amputated by spill.
+pub const READ_OUTPUT_CAP_CHARS: usize = 100_000;
+
 /// The cap for device and terminal sessions (`terminal_*`, `net_*`,
 /// `ssh_command`): a firewall or a route table read in one batch has to
 /// arrive whole, or the model spends steps reading the spill file back.
@@ -205,7 +242,9 @@ pub const TERMINAL_OUTPUT_CAP_CHARS: usize = 60_000;
 
 /// The output cap for `tool`.
 pub fn output_cap(tool: &str) -> usize {
-    if tool.starts_with("terminal_") || tool.starts_with("net_") || tool == "ssh_command" {
+    if tool == "read_file" {
+        READ_OUTPUT_CAP_CHARS
+    } else if tool.starts_with("terminal_") || tool.starts_with("net_") || tool == "ssh_command" {
         TERMINAL_OUTPUT_CAP_CHARS
     } else {
         OUTPUT_CAP_CHARS

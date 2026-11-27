@@ -916,3 +916,24 @@ fn announced_schema_size() {
         .sum();
     println!("ferramentas: {} · schema: {chars} caracteres", specs.len());
 }
+
+#[test]
+fn read_file_cap_matches_100k_and_msys_paths_normalize() {
+    assert_eq!(crate::output_cap("read_file"), crate::READ_OUTPUT_CAP_CHARS);
+    assert_eq!(crate::output_cap("shell"), crate::OUTPUT_CAP_CHARS);
+
+    let tmp = Path::new("/win/temp");
+    assert_eq!(
+        crate::normalize_msys_path("/tmp/smoke.json", tmp),
+        Some(tmp.join("smoke.json"))
+    );
+    assert_eq!(
+        crate::normalize_msys_path("/tmp", tmp),
+        Some(tmp.to_path_buf())
+    );
+    assert_eq!(
+        crate::normalize_msys_path("/c/Users/Joao/app.py", tmp),
+        Some(PathBuf::from(r"C:\Users\Joao\app.py"))
+    );
+    assert_eq!(crate::normalize_msys_path("relative/file.py", tmp), None);
+}

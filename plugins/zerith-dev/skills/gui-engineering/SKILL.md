@@ -31,8 +31,7 @@ Toda tela funcional deve cobrir os 4 estados:
 
 ## 4. Verificação visual obrigatória em interfaces Web
 1. Suba o dev server com `shell{run_in_background: true}` (se ainda não estiver rodando).
-2. Abra a URL com `browser{action: "navigate", url: "http://localhost:..."}`.
-3. Cheque erros de runtime com `browser{action: "console"}`.
-4. Tire print com `browser{action: "screenshot"}` (use `full_page: true` para páginas longas com scroll; a imagem é anexada automaticamente para você inspecionar).
-5. Teste responsividade alternando o viewport com `browser{action: "viewport", width: 390, height: 844}` (mobile) e `browser{action: "viewport", width: 1440, height: 900}` (desktop) — ou `reset: true` para restaurar — e confira se há overflow horizontal, corte ou sobreposição.
-6. Corrija qualquer corte, sobreposição, contraste fraco ou desalinhamento visível no print e tire um novo print confirmando a correção.
+2. Prefira **`browser{action: "batch", steps: [...]}`** para juntar `navigate` → `console` → `viewport` → `screenshot` → `eval` em 1 ou 2 turnos em vez de uma chamada por ação:
+   - Abra a URL com `navigate`, cheque erros com `console`, tire print com `screenshot` (`full_page: true` quando necessário) e inspecione overflow/alinhamento com `eval`.
+   - Teste responsividade alternando `viewport` entre mobile (`width: 390, height: 844`) e desktop (`width: 1440, height: 900`), e `reset: true` ao terminar.
+3. Corrija qualquer corte, sobreposição, contraste fraco ou desalinhamento visível e faça uma nova verificação em lote confirmando a correção.

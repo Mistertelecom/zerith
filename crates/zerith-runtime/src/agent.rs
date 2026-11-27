@@ -1270,6 +1270,12 @@ fn turn_body(
             // say why not (after Hermes Agent's verify-on-stop, MIT).
             if step < max_steps
                 && !verify_nudged
+                && ctx.settings.is_none_or(|s| s.context.verify_on_stop)
+            {
+                retain_existing_unverified(&cwd, &mut unverified);
+            }
+            if step < max_steps
+                && !verify_nudged
                 && !unverified.is_empty()
                 && ctx.settings.is_none_or(|s| s.context.verify_on_stop)
             {
@@ -2029,6 +2035,20 @@ fn track_verification(
         "lsp" if ok && args["action"] == "diagnostics" => unverified.clear(),
         _ => {}
     }
+}
+
+/// Drops files that no longer exist on disk (e.g. temporary helper scripts
+/// deleted later in the same turn) before firing verify-on-stop.
+fn retain_existing_unverified(cwd: &Path, unverified: &mut Vec<String>) {
+    unverified.retain(|raw| {
+        let p = Path::new(raw);
+        let resolved = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            cwd.join(p)
+        };
+        resolved.exists()
+    });
 }
 
 /// What sends the model back to verify. Shown once per turn.
@@ -3716,5 +3736,20 @@ mod runtime_hardening_tests {
         let tool_msgs: Vec<_> = msgs.iter().filter(|m| m.role == Role::Tool).collect();
         assert_eq!(tool_msgs.len(), 3, "every tool call stays paired");
         assert!(tool_msgs.iter().all(|m| m.content == "[cancelado]"));
+    }
+
+    #[test]
+    fn deleted_helper_files_are_pruned_before_verify_nudge() {
+        let scratch = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let ws = tempfile::Builder::new().tempdir_in(&scratch).unwrap();
+        let keep = ws.path().join("app.py");
+        let gone = ws.path().join("_front.ps1");
+        std::fs::write(&keep, "print('ok')\n").unwrap();
+        std::fs::write(&gone, "echo 1\n").unwrap();
+        let mut unverified = vec!["_front.ps1".to_string(), "app.py".to_string()];
+        std::fs::remove_file(&gone).unwrap();
+        retain_existing_unverified(ws.path(), &mut unverified);
+        assert_eq!(unverified, vec!["app.py".to_string()]);
     }
 }

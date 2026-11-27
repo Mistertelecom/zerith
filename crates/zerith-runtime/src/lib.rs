@@ -595,6 +595,50 @@ pub fn build_prompt_context(
     build_prompt_context_with_skill_query(_title, ctx, skill_tool, session_id, prompt, prompt)
 }
 
+fn env_summary() -> &'static str {
+    static SUMMARY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SUMMARY
+        .get_or_init(|| {
+            let os = if cfg!(windows) {
+                "Windows"
+            } else if cfg!(target_os = "macos") {
+                "macOS"
+            } else {
+                "Linux"
+            };
+            let shell_name = if cfg!(windows) {
+                "Git Bash (use caminhos Windows ou /c/...; evite /tmp em scripts Python)"
+            } else {
+                "bash/sh"
+            };
+            let candidates = ["python", "python3", "node", "cargo", "go", "git", "ruff", "biome"];
+            let path_var = std::env::var_os("PATH");
+            let found: Vec<&str> = candidates
+                .into_iter()
+                .filter(|bin| {
+                    path_var.as_ref().is_some_and(|pv| {
+                        std::env::split_paths(pv).any(|d| {
+                            d.join(bin).is_file()
+                                || (cfg!(windows)
+                                    && (d.join(format!("{bin}.exe")).is_file()
+                                        || d.join(format!("{bin}.cmd")).is_file()))
+                        })
+                    })
+                })
+                .collect();
+            let tools_str = if found.is_empty() {
+                "nenhuma detectada".to_string()
+            } else {
+                found.join(", ")
+            };
+            format!(
+                "[Ambiente] SO: {os} | Shell: {shell_name} | PATH: {tools_str}. \
+                 Não gaste turnos checando versão/pwd; agrupe leituras, edições ou passos independentes em paralelo."
+            )
+        })
+        .as_str()
+}
+
 pub fn build_prompt_context_with_skill_query(
     _title: &str,
     ctx: TurnContext<'_>,
@@ -616,6 +660,8 @@ pub fn build_prompt_context_with_skill_query(
         }
         _ => zerith_core::system_prompt_base(),
     };
+    static_system.push_str("\n\n");
+    static_system.push_str(env_summary());
     if let Some(a) = ctx.agent {
         static_system.push_str(&format!("\n\n# Agente: {}\n\n{}", a.name, a.instructions));
     }
@@ -1646,10 +1692,9 @@ pub fn pinned_note(settings: Option<&Settings>, workspace: &std::path::Path) -> 
 /// prefix cache is not made worse.
 /// Skills that fit a task the model just read from a file, as one reminder
 /// line, or `None` when nothing fits better than the prompt already did.
-/// Only skills that match at least three distinct words of the text count:
-/// one shared word ("rede", "config") is noise.
-// ponytail: first 6000 chars of the file, fixed thresholds; tune with the
-// benchmark if hints fire on unrelated files.
+/// Requires at least 4 distinct matching tokens, a BM25 floor >= 4.0, and
+/// score >= 50% of the top hit so common English/config words never surface
+/// unrelated skills (e.g. `earnings-preview` on an OLT file).
 pub fn skill_hint(lib: &zerith_skills::Library, text: &str, prompt: &str) -> Option<String> {
     let head: String = text.chars().take(6000).collect();
     let already: Vec<String> = zerith_skills::search::search(lib, prompt, 3)
@@ -1660,7 +1705,12 @@ pub fn skill_hint(lib: &zerith_skills::Library, text: &str, prompt: &str) -> Opt
     let best = hits.first()?.score;
     let names: Vec<String> = hits
         .into_iter()
-        .filter(|h| h.matched.len() >= 3 && h.score >= best / 3.0 && !already.contains(&h.name))
+        .filter(|h| {
+            h.matched.len() >= 4
+                && h.score >= 4.0
+                && h.score >= best * 0.5
+                && !already.contains(&h.name)
+        })
         .take(3)
         .map(|h| format!("`{}`", h.name))
         .collect();
@@ -3351,5 +3401,27 @@ mod gateway_tests {
         assert!(note.contains("beta"), "{note}");
         // Next turn with same set emits nothing again.
         assert!(skill_delta_note(key, &["alpha".into(), "gamma".into()]).is_none());
+    }
+
+    #[test]
+    fn env_summary_mentions_os_and_skill_hint_ignores_weak_noise() {
+        let env_line = env_summary();
+        assert!(env_line.starts_with("[Ambiente] SO: "), "{env_line}");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("SKILL.md"),
+            "---\nname: earnings-preview\ndescription: Use when analyzing quarterly stock earnings consensus preview ticker EPS.\n---\nBody\n",
+        )
+        .unwrap();
+        let lib = zerith_skills::Library::open(tmp.path().join("skills")).unwrap();
+        lib.install(&src, "t").unwrap();
+        // Only 3 generic words overlapping should NOT trigger `earnings-preview`.
+        assert!(
+            skill_hint(&lib, "check stock ticker config preview", "olt parks ont").is_none(),
+            "weak 3-word overlap must not trigger noisy skill hint"
+        );
     }
 }

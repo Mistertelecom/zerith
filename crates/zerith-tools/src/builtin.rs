@@ -759,7 +759,6 @@ fn shell_exec(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>, snapshot: bool) 
     // fails closed: no jail, no process. What it does and does not confine is
     // in `zerith policy` and `docs/sandbox.md`.
     let mut jailed = jail.spawn_wrapped(command)?;
-    let child = &mut jailed.child;
     let started = std::time::Instant::now();
     let last_activity_ms = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     // Pipes are drained on threads: a child that fills a pipe buffer would
@@ -814,15 +813,27 @@ fn shell_exec(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>, snapshot: bool) 
         (buf, done)
     };
     let sink = exec.host.sink();
-    let (out, out_done) = drain(child.stdout.take().map(|s| Box::new(s) as _), sink.clone());
-    let (err, err_done) = drain(child.stderr.take().map(|s| Box::new(s) as _), sink.clone());
+    let (out, out_done) = drain(
+        jailed.child.stdout.take().map(|s| Box::new(s) as _),
+        sink.clone(),
+    );
+    let (err, err_done) = drain(
+        jailed.child.stderr.take().map(|s| Box::new(s) as _),
+        sink.clone(),
+    );
     let text_of = |b: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>| {
         let v = b.lock().unwrap_or_else(|e| e.into_inner());
         decode(&v)
     };
     let mut last_heartbeat = started;
+    let mut last_modal_check = started;
+    let mut modal_seen: Option<std::time::Instant> = None;
+    let has_tail_or_head_pipe = cmd.contains("| tail")
+        || cmd.contains("| head")
+        || cmd.contains("|tail")
+        || cmd.contains("|head");
     let status = loop {
-        if let Some(s) = child.try_wait()? {
+        if let Some(s) = jailed.child.try_wait()? {
             break s;
         }
         let now = std::time::Instant::now();
@@ -848,17 +859,62 @@ fn shell_exec(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>, snapshot: bool) 
                 other => other,
             });
         }
-        // Emit a quiet heartbeat every 15s of silence so long/blocked commands
-        // (e.g. GUI modal dialogs or `| tail` buffering stdout) never look frozen.
         let elapsed_ms = started.elapsed().as_millis() as u64;
         let last_io_ms = last_activity_ms.load(std::sync::atomic::Ordering::Relaxed);
-        if elapsed_ms.saturating_sub(last_io_ms) >= 15_000
-            && last_heartbeat.elapsed() >= Duration::from_secs(15)
-        {
+        let silent_ms = elapsed_ms.saturating_sub(last_io_ms);
+
+        // Detect blocking Win32 modal dialogs (#32770: MessageBox, tkinter.messagebox,
+        // QMessageBox, file dialogs) held open by a foreground command waiting for a
+        // human click. Require ~1.5s persistence to ignore any transient popup.
+        if silent_ms >= 2_000 && last_modal_check.elapsed() >= Duration::from_millis(750) {
+            last_modal_check = now;
+            if let Some((title, body)) = jailed.blocking_modal_dialog() {
+                match modal_seen {
+                    Some(since) if since.elapsed() >= Duration::from_millis(1_500) => {
+                        jailed.kill_tree();
+                        std::thread::sleep(Duration::from_millis(150));
+                        let shown_title = if title.is_empty() {
+                            "sem título"
+                        } else {
+                            title.as_str()
+                        };
+                        let shown_body = if body.is_empty() {
+                            "(sem texto visível)".to_string()
+                        } else {
+                            body
+                        };
+                        return Err(ToolError::Failed(format!(
+                            "bloqueado após {}s esperando clique humano na caixa de diálogo modal (\"{shown_title}\"): {shown_body}\nO comando e seus processos filhos foram encerrados automaticamente.\nDICA: Em testes automatizados de GUI (Tkinter/PyQt/WinForms), mocke diálogos modais (ex.: messagebox.showerror/showwarning/askyesno) e remova pipes como `| tail` para enxergar a saída completa. Se quiser abrir a janela real para o usuário interagir, execute com run_in_background: true.\n--- stdout (parcial)\n{}\n--- stderr (parcial)\n{}",
+                            elapsed_ms / 1000,
+                            text_of(&out),
+                            text_of(&err)
+                        )));
+                    }
+                    None => {
+                        modal_seen = Some(now);
+                    }
+                    _ => {}
+                }
+            } else {
+                modal_seen = None;
+            }
+        }
+
+        // Emit a quiet heartbeat every 15s of silence so long/blocked commands
+        // (e.g. GUI modal dialogs or `| tail` buffering stdout) never look frozen.
+        if silent_ms >= 15_000 && last_heartbeat.elapsed() >= Duration::from_secs(15) {
             last_heartbeat = now;
+            let hint = if has_tail_or_head_pipe {
+                " — pipes como `| tail` seguram a saída até o fim"
+            } else {
+                ""
+            };
             sink.push(crate::HostEvent::ToolProgress {
                 tool: "shell".into(),
-                chunk: format!("[executando há {}s sem nova saída…]\n", elapsed_ms / 1000),
+                chunk: format!(
+                    "[executando há {}s sem nova saída{hint}…]\n",
+                    elapsed_ms / 1000
+                ),
             });
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -1909,5 +1965,56 @@ mod ondav4_tests {
         assert!(!looks_like_detached_launch("python --version"));
         assert!(!looks_like_detached_launch("cargo test"));
         assert!(!looks_like_detached_launch("echo start"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires an interactive Windows desktop session (Win32 MessageBox)"]
+    fn shell_kills_blocking_modal_dialog_fast() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = zerith_security::Policy::new(
+            zerith_security::preset("workspace-write").unwrap(),
+            zerith_security::Mode::AcceptEdits,
+            dir.path(),
+        );
+        let ctx = CallCtx {
+            workspace: dir.path(),
+            policy: &policy,
+            memory: None,
+            scope: None,
+        };
+        let host = crate::Host::default();
+        let cancel = zerith_providers::Cancel::default();
+        let exec = crate::Exec {
+            host: &host,
+            cancel: &cancel,
+            timeout: std::time::Duration::from_secs(30),
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(30),
+        };
+        let shell_tool = super::all()
+            .into_iter()
+            .find(|t| t.spec().name == "shell")
+            .unwrap();
+        let started = std::time::Instant::now();
+        let err = shell_tool
+            .run(
+                &json!({
+                    "command": "python -c \"import tkinter as tk; from tkinter import messagebox; r=tk.Tk(); r.withdraw(); messagebox.showerror('Zerith Modal Test', 'Erro simulado de teste')\" | tail -10",
+                    "timeout_secs": 180
+                }),
+                &ctx,
+                &exec,
+            )
+            .unwrap_err()
+            .to_string();
+        let elapsed = started.elapsed();
+        eprintln!("Detected in {elapsed:?}:\n{err}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(12),
+            "should abort modal dialog fast, took {elapsed:?}: {err}"
+        );
+        assert!(err.contains("caixa de diálogo modal"), "{err}");
+        assert!(err.contains("Zerith Modal Test"), "{err}");
+        assert!(err.contains("Erro simulado de teste"), "{err}");
     }
 }

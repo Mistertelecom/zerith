@@ -365,6 +365,39 @@ impl Jailed {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+
+    /// Returns PIDs currently running inside this jailed process tree.
+    pub fn process_ids(&self) -> Vec<u32> {
+        #[cfg(windows)]
+        {
+            let mut pids = self._guard.process_ids();
+            let root = self.child.id();
+            if !pids.contains(&root) {
+                pids.push(root);
+            }
+            pids
+        }
+        #[cfg(not(windows))]
+        {
+            vec![self.child.id()]
+        }
+    }
+
+    /// Detects if any process in the jailed tree has opened a visible blocking
+    /// modal dialog (Win32 `#32770`, e.g. `MessageBox`, `tkinter.messagebox`,
+    /// `QMessageBox`, file dialogs) waiting for human clicks.
+    ///
+    /// Returns `Some((title, body))` when a visible modal dialog is present.
+    pub fn blocking_modal_dialog(&self) -> Option<(String, String)> {
+        #[cfg(windows)]
+        {
+            win::find_blocking_modal_dialog(&self.process_ids())
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
+    }
 }
 
 /// `sandbox-exec` profile for `level`. Public so it can be inspected and
@@ -491,10 +524,11 @@ mod win {
     use std::os::windows::io::AsRawHandle;
     use std::os::windows::process::CommandExt;
     use std::process::Command;
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM};
     use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicUIRestrictions,
-        JobObjectExtendedLimitInformation, SetInformationJobObject, TerminateJobObject,
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicProcessIdList,
+        JobObjectBasicUIRestrictions, JobObjectExtendedLimitInformation, QueryInformationJobObject,
+        SetInformationJobObject, TerminateJobObject, JOBOBJECT_BASIC_PROCESS_ID_LIST,
         JOBOBJECT_BASIC_UI_RESTRICTIONS, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
         JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_JOB_MEMORY,
         JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_UILIMIT_DESKTOP,
@@ -502,6 +536,10 @@ mod win {
         JOB_OBJECT_UILIMIT_GLOBALATOMS, JOB_OBJECT_UILIMIT_HANDLES,
         JOB_OBJECT_UILIMIT_READCLIPBOARD, JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS,
         JOB_OBJECT_UILIMIT_WRITECLIPBOARD,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumChildWindows, EnumWindows, GetClassNameW, GetWindowTextW, GetWindowThreadProcessId,
+        IsWindowVisible,
     };
 
     const CREATE_SUSPENDED: u32 = 0x0000_0004;
@@ -525,6 +563,115 @@ mod win {
             // SAFETY: the handle is valid until `drop`.
             unsafe { TerminateJobObject(self.0, 1) };
         }
+
+        pub fn process_ids(&self) -> Vec<u32> {
+            const MAX_PIDS: usize = 128;
+            let mut buf = vec![0usize; MAX_PIDS + 4];
+            let mut returned: u32 = 0;
+            // SAFETY: `buf` is naturally `usize`-aligned and sized for up to `MAX_PIDS`.
+            let ok = unsafe {
+                QueryInformationJobObject(
+                    self.0,
+                    JobObjectBasicProcessIdList,
+                    buf.as_mut_ptr() as *mut core::ffi::c_void,
+                    std::mem::size_of_val(buf.as_slice()) as u32,
+                    &mut returned,
+                )
+            };
+            if ok == 0 {
+                return Vec::new();
+            }
+            // SAFETY: `QueryInformationJobObject` populated the header and `count` IDs.
+            unsafe {
+                let hdr = &*(buf.as_ptr() as *const JOBOBJECT_BASIC_PROCESS_ID_LIST);
+                let count = (hdr.NumberOfProcessIdsInList as usize).min(MAX_PIDS);
+                let list_ptr = std::ptr::addr_of!(hdr.ProcessIdList) as *const usize;
+                let ids = std::slice::from_raw_parts(list_ptr, count);
+                ids.iter()
+                    .filter_map(|&id| u32::try_from(id).ok())
+                    .collect()
+            }
+        }
+    }
+
+    fn window_class(hwnd: HWND) -> String {
+        let mut buf = [0u16; 128];
+        // SAFETY: `buf` is valid writable memory.
+        let n = unsafe { GetClassNameW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
+        if n <= 0 {
+            String::new()
+        } else {
+            String::from_utf16_lossy(&buf[..n as usize])
+        }
+    }
+
+    fn window_text(hwnd: HWND) -> String {
+        let mut buf = [0u16; 512];
+        // SAFETY: `buf` is valid writable memory.
+        let n = unsafe { GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
+        if n <= 0 {
+            String::new()
+        } else {
+            String::from_utf16_lossy(&buf[..n as usize])
+                .trim()
+                .to_string()
+        }
+    }
+
+    unsafe extern "system" fn collect_static_children(hwnd: HWND, lparam: LPARAM) -> i32 {
+        let out = &mut *(lparam as *mut Vec<String>);
+        if window_class(hwnd).eq_ignore_ascii_case("Static") {
+            let t = window_text(hwnd);
+            if !t.is_empty() && !out.contains(&t) {
+                out.push(t);
+            }
+        }
+        1
+    }
+
+    struct DialogSearch<'a> {
+        pids: &'a [u32],
+        found: Option<(String, String)>,
+    }
+
+    unsafe extern "system" fn find_dialog_cb(hwnd: HWND, lparam: LPARAM) -> i32 {
+        let state = &mut *(lparam as *mut DialogSearch<'_>);
+        if IsWindowVisible(hwnd) == 0 {
+            return 1;
+        }
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        if !state.pids.contains(&pid) {
+            return 1;
+        }
+        if window_class(hwnd) != "#32770" {
+            return 1;
+        }
+        let title = window_text(hwnd);
+        let mut lines: Vec<String> = Vec::new();
+        EnumChildWindows(
+            hwnd,
+            Some(collect_static_children),
+            &mut lines as *mut Vec<String> as LPARAM,
+        );
+        let body: String = lines.join(" | ").chars().take(400).collect();
+        state.found = Some((title, body));
+        0
+    }
+
+    pub fn find_blocking_modal_dialog(pids: &[u32]) -> Option<(String, String)> {
+        if pids.is_empty() {
+            return None;
+        }
+        let mut state = DialogSearch { pids, found: None };
+        // SAFETY: `state` outlives the synchronous `EnumWindows` call.
+        unsafe {
+            EnumWindows(
+                Some(find_dialog_cb),
+                &mut state as *mut DialogSearch<'_> as LPARAM,
+            );
+        }
+        state.found
     }
 
     impl Drop for JobHandle {
@@ -872,6 +1019,28 @@ mod tests {
             j.kill_tree();
             assert!(t.elapsed() < Duration::from_secs(5));
             assert!(!alive(j.child.id()));
+        }
+
+        #[test]
+        fn process_ids_lists_root_and_descendants_inside_job() {
+            let _s = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+            let jail = Jail::new(Sandbox::WorkspaceWrite, ".");
+            let mut j = jail.spawn(cmd("ping -n 30 127.0.0.1 >nul")).unwrap();
+            std::thread::sleep(Duration::from_millis(600));
+            let pids = j.process_ids();
+            assert!(
+                pids.contains(&j.child.id()),
+                "root pid missing from {pids:?}"
+            );
+            assert!(
+                pids.len() >= 2,
+                "expected cmd + ping descendant in job object, got {pids:?}"
+            );
+            assert!(
+                j.blocking_modal_dialog().is_none(),
+                "plain ping must not report a modal dialog"
+            );
+            j.kill_tree();
         }
     }
 }

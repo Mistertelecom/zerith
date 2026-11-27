@@ -87,6 +87,9 @@ struct Job {
     /// Last blocking modal dialog banner already surfaced via `monitor_notices`,
     /// so we alert the turn once per modal without spamming.
     modal_notified: Option<String>,
+    /// Consecutive `process(output)` polls that returned zero new bytes while
+    /// the job remained alive (triggers anti-poll wait policy).
+    empty_polls: u8,
 }
 
 fn modal_banner(j: &Job) -> Option<String> {
@@ -369,6 +372,7 @@ impl Jobs {
                     watch,
                     notified: false,
                     modal_notified: None,
+                    empty_polls: 0,
                 },
             ));
             id
@@ -415,7 +419,17 @@ impl Jobs {
         }
         if fresh.is_empty() {
             text.push_str("[sem saída nova]\n");
+            if j.exit.is_none() {
+                j.empty_polls = j.empty_polls.saturating_add(1);
+                if j.empty_polls >= 2 {
+                    text.push_str(&format!(
+                        "[aviso anti-loop] {id} continua rodando sem nova saída há {} leituras seguidas. NÃO repita sleep nem process(output/list) em loop: use desktop_inspect{{action:\"windows\"}} se for GUI, faça outra tarefa ou encerre o turno (o aviso de término chegará automaticamente).\n",
+                        j.empty_polls
+                    ));
+                }
+            }
         } else {
+            j.empty_polls = 0;
             text.push_str(&fresh);
             if !fresh.ends_with('\n') {
                 text.push('\n');

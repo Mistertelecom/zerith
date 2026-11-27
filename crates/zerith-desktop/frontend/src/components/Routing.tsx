@@ -24,6 +24,7 @@ import {
   Save,
   Scale,
   Search,
+  SearchCheck,
   Sparkles,
   Telescope,
   Workflow,
@@ -52,7 +53,8 @@ type Key =
   | "plan_model"
   | "compact_model"
   | "decision_model"
-  | "vision_model";
+  | "vision_model"
+  | "review_model";
 type Opt = { spec: string; model: string; name: string };
 type Group = {
   key: string;
@@ -91,6 +93,14 @@ const OFF_VISION: Shown = {
   logo: null,
   off: true,
   icon: Eye,
+};
+
+const OFF_REVIEW: Shown = {
+  name: "automático",
+  sub: "usa Subagentes ou modelo ativo",
+  logo: null,
+  off: true,
+  icon: SearchCheck,
 };
 
 const ROLES: Record<
@@ -152,6 +162,15 @@ const ROLES: Record<
     optional: true,
     offShown: OFF_VISION,
     emptyLabel: "Desligado (usa a visão do modelo ativo)",
+  },
+  review_model: {
+    label: "Revisor (/review)",
+    hint: "Revisa git diff e alterações de forma independente ao rodar /review.",
+    icon: SearchCheck,
+    from: null,
+    optional: true,
+    offShown: OFF_REVIEW,
+    emptyLabel: "Automático (usa Subagentes ou modelo ativo)",
   },
 };
 
@@ -625,7 +644,10 @@ export function RoutingTab(p: {
   // Empty = inherit: main from the chat, subagents from main, explore/plan from subagents; auxiliary models are optional (off).
   const eff = (k: Key): string =>
     val(k) ||
-    (k === "main_model" || k === "decision_model" || k === "vision_model"
+    (k === "main_model" ||
+    k === "decision_model" ||
+    k === "vision_model" ||
+    k === "review_model"
       ? ""
       : eff(k === "subagent_model" ? "main_model" : "subagent_model"));
   const shown = (spec: string) => (spec ? show(spec) : CONV);
@@ -838,7 +860,8 @@ export function RoutingTab(p: {
           </span>
           <div className="dg-aux-grid">
             {node("decision_model", "dg-aux-node")}
-            {node("vision_model", "dg-aux-node", true)}
+            {node("vision_model", "dg-aux-node dg-end-md")}
+            {node("review_model", "dg-aux-node", true)}
           </div>
         </div>
 

@@ -215,6 +215,7 @@ export interface Routing {
   compact_model?: string | null;
   decision_model?: string | null;
   vision_model?: string | null;
+  review_model?: string | null;
   role_models?: Record<string, string>;
   /** With `subagent_model` set, a combo is a delegation profile the chat can pick. */
   combos?: { name: string; models: string[]; subagent_model?: string | null }[];
@@ -873,6 +874,9 @@ export const api = {
   /** `/btw`: pergunta paralela sem ferramentas; nada entra na conversa. */
   btwAsk: (sessionId: string, model: string, question: string, agent?: string | null) =>
     invoke<BtwAnswer>("btw_ask", { sessionId, model, question, agent: agent ?? null }),
+  /** `/review`: revisão independente do git diff e histórico recente em modelo dedicado. */
+  reviewRun: (sessionId: string, model: string, focus?: string | null) =>
+    invoke<BtwAnswer>("review_run", { sessionId, model, focus: focus ?? null }),
   steerTurn: (sessionId: string, prompt: string) =>
     invoke<boolean>("steer_turn", { sessionId, prompt }),
   cancelTurn: (sessionId: string) => invoke<void>("cancel_turn", { sessionId }),

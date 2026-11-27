@@ -64,6 +64,9 @@ pub(crate) struct Stuck {
     /// Chamadas vistas desde a última edição, e onde o último aviso de ciclo saiu.
     seen: usize,
     cycle_warned: usize,
+    /// Consecutive poll/wait calls (`sleep`, `process`, `shell_output`) without
+    /// productive work in between (Hermes `process_registry_wait_policy`).
+    poll_streak: u8,
     last_text: String,
     text_repeats: u8,
 }
@@ -90,6 +93,18 @@ impl Stuck {
             self.calls.clear();
             self.seen = 0;
             self.cycle_warned = 0;
+            self.poll_streak = 0;
+        }
+        if is_poll(name) {
+            self.poll_streak = self.poll_streak.saturating_add(1);
+            if self.poll_streak >= 3 {
+                out.push(format!(
+                    "[Loop de Espera Detectado] Você chamou ferramentas de espera/consulta (sleep/process) {}x seguidas sem avançar a tarefa. Pare de fazer sleep/poll em loop: se for app/teste GUI, use `desktop_inspect{{action: \"windows\"}}` ou encerre o job travado com `process(kill)`; se for um job legítimo longo, encerre o turno que o aviso chega sozinho quando terminar.",
+                    self.poll_streak
+                ));
+            }
+        } else {
+            self.poll_streak = 0;
         }
         if ok {
             self.fails.remove(&s);
@@ -290,7 +305,7 @@ mod tests {
     }
 
     #[test]
-    fn a_cycle_broken_by_an_edit_or_made_of_polls_does_not_warn() {
+    fn a_cycle_broken_by_an_edit_does_not_warn_and_poll_streak_warns_at_three() {
         let mut s = Stuck::default();
         for _ in 0..2 {
             s.observe("read_file", r#"{"path":"a"}"#, true);
@@ -300,11 +315,20 @@ mod tests {
         s.observe("read_file", r#"{"path":"a"}"#, true);
         assert!(s.observe("grep", r#"{"q":"x"}"#, true).is_empty());
 
+        // Up to 2 consecutive poll calls stay silent; the 3rd triggers the anti-loop warning.
         let mut p = Stuck::default();
-        for _ in 0..5 {
-            assert!(p.observe("sleep", r#"{"seconds":5}"#, true).is_empty());
-            assert!(p.observe("shell_output", r#"{"id":"1"}"#, true).is_empty());
-        }
+        assert!(p.observe("sleep", r#"{"seconds":5}"#, true).is_empty());
+        assert!(p.observe("shell_output", r#"{"id":"1"}"#, true).is_empty());
+        let w = p.observe("sleep", r#"{"seconds":15}"#, true);
+        assert!(
+            w.iter().any(|m| m.contains("[Loop de Espera Detectado]")),
+            "expected wait-loop warning on 3rd consecutive poll, got {w:?}"
+        );
+        // Any productive tool resets the streak.
+        assert!(p
+            .observe("read_file", r#"{"path":"a.py"}"#, true)
+            .is_empty());
+        assert!(p.observe("sleep", r#"{"seconds":5}"#, true).is_empty());
     }
 
     #[test]

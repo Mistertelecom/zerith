@@ -13,4 +13,5 @@ ureq.workspace = true
 # PKCE: SHA-256 and a CSPRNG. `ring` is already in the tree through ureq's TLS.
 ring = "0.17"
 base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 

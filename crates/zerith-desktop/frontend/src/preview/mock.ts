@@ -945,6 +945,7 @@ export function installMock(theme: string) {
             plan_model: null,
             decision_model: null,
             vision_model: "claude-assinatura:claude-sonnet-5-5",
+            review_model: "claude-assinatura:claude-opus-5-5",
             role_models: { reviewer: "claude-assinatura:claude-opus-5-5" },
             combos: [
               {
@@ -1282,6 +1283,14 @@ export function installMock(theme: string) {
             prompt_tokens: 1200,
             completion_tokens: 40,
             cache_read_tokens: 1100,
+          };
+        case "review_run":
+          return {
+            text: "## Revisão independente\n\n- **Sem bugs críticos** no diff atual.\n- **Sugestão**: validar caminho vazio antes de gravar.",
+            model: "claude-assinatura:claude-opus-5-5",
+            prompt_tokens: 2400,
+            completion_tokens: 95,
+            cache_read_tokens: 0,
           };
         case "subagent_stop":
           return true;

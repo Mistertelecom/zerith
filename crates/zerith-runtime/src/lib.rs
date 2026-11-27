@@ -28,6 +28,7 @@ pub mod learn;
 pub mod pipeline;
 pub mod plan;
 pub mod question;
+pub mod review;
 pub mod spill;
 mod stuck;
 pub mod subagent;
@@ -533,6 +534,57 @@ pub fn effective_skill_query(prompt: &str, prior_user_msgs: &[String]) -> String
     out
 }
 
+static SESSION_SKILLS: std::sync::Mutex<Option<std::collections::HashMap<String, Vec<String>>>> =
+    std::sync::Mutex::new(None);
+
+/// Compares the currently enabled skill names against the snapshot recorded on
+/// the previous turn of `session_id`. Returns a concise delta note only when
+/// skills were added/enabled or removed/disabled mid-conversation (inspired by
+/// OpenCode's `SkillInstructions` delta), keeping the static system prompt
+/// cache intact.
+pub fn skill_delta_note(session_id: &str, current_sorted: &[String]) -> Option<String> {
+    if session_id.trim().is_empty() {
+        return None;
+    }
+    let mut guard = SESSION_SKILLS.lock().ok()?;
+    let map = guard.get_or_insert_with(std::collections::HashMap::new);
+    let prev = match map.get(session_id) {
+        Some(p) => p.clone(),
+        None => {
+            map.insert(session_id.to_string(), current_sorted.to_vec());
+            return None;
+        }
+    };
+    if prev == current_sorted {
+        return None;
+    }
+    let added: Vec<&str> = current_sorted
+        .iter()
+        .filter(|s| !prev.contains(s))
+        .map(String::as_str)
+        .collect();
+    let removed: Vec<&str> = prev
+        .iter()
+        .filter(|s| !current_sorted.contains(s))
+        .map(String::as_str)
+        .collect();
+    map.insert(session_id.to_string(), current_sorted.to_vec());
+    let mut parts = Vec::new();
+    if !added.is_empty() {
+        parts.push(format!(
+            "Novas skills disponíveis nesta sessão: {} (use `skill(name=\"...\")` quando aplicável).",
+            added.join(", ")
+        ));
+    }
+    if !removed.is_empty() {
+        parts.push(format!(
+            "Skills removidas/desativadas nesta sessão (não chame mais): {}.",
+            removed.join(", ")
+        ));
+    }
+    (!parts.is_empty()).then(|| format!("[Skills atualizadas]\n{}", parts.join("\n")))
+}
+
 pub fn build_prompt_context(
     _title: &str,
     ctx: TurnContext<'_>,
@@ -613,6 +665,13 @@ pub fn build_prompt_context_with_skill_query(
         let pinned = ctx.agent.map_or(&[][..], |a| a.skills.as_slice());
         if let Ok(mut catalog) = lib.catalog() {
             catalog.sort_by(|a, b| a.0.cmp(&b.0));
+            let names_sorted: Vec<String> = catalog.iter().map(|(n, _)| n.clone()).collect();
+            if let Some(delta) = skill_delta_note(
+                &format!("{session_id}\0{}", lib.root().display()),
+                &names_sorted,
+            ) {
+                dyn_parts.push(delta);
+            }
             if !catalog.is_empty() {
                 let header = if skill_tool {
                     SKILLS_HEADER
@@ -3276,5 +3335,21 @@ mod gateway_tests {
                 "hydrate_oauth must observe the saved fresh token instead of refreshing again"
             );
         });
+    }
+
+    #[test]
+    fn skill_delta_note_reports_added_and_removed_skills_mid_session() {
+        let key = "skill-delta-unit-test-unique";
+        // First turn records baseline, emits nothing.
+        assert!(skill_delta_note(key, &["alpha".into(), "beta".into()]).is_none());
+        // Unchanged turn emits nothing.
+        assert!(skill_delta_note(key, &["alpha".into(), "beta".into()]).is_none());
+        // Mid-session add + remove emits concise delta.
+        let note = skill_delta_note(key, &["alpha".into(), "gamma".into()]).unwrap();
+        assert!(note.contains("[Skills atualizadas]"), "{note}");
+        assert!(note.contains("gamma"), "{note}");
+        assert!(note.contains("beta"), "{note}");
+        // Next turn with same set emits nothing again.
+        assert!(skill_delta_note(key, &["alpha".into(), "gamma".into()]).is_none());
     }
 }

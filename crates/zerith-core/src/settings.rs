@@ -64,6 +64,23 @@ pub struct Settings {
     pub secrets: SecretsSettings,
     #[serde(default, skip_serializing_if = "WebSearchSettings::is_default")]
     pub web_search: WebSearchSettings,
+    #[serde(default, skip_serializing_if = "CodingSettings::is_default")]
+    pub coding: CodingSettings,
+}
+
+/// `[coding]`: opções de fluxo de programação (ex.: auto-formatação pós-edição).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CodingSettings {
+    /// Quando `true`, executa o formatador do projeto (`rustfmt`, `biome`,
+    /// `prettier`, `ruff format`, `gofmt`) após `edit_file`/`write_file`.
+    pub auto_format: bool,
+}
+
+impl CodingSettings {
+    pub fn is_default(&self) -> bool {
+        !self.auto_format
+    }
 }
 
 /// `[web_search]`: o provedor de `web_search`. Vazio: DuckDuckGo (sem conta).
@@ -403,6 +420,9 @@ pub struct RoutingSettings {
     /// (e.g. DeepSeek text models).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vision_model: Option<String>,
+    /// Optional independent reviewer model used by `/review`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_model: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub role_models: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -854,6 +874,7 @@ pub const ENV_KEYS: &[(&str, &str)] = &[
     ("ZERITH_SUBAGENT_MODEL", "routing.subagent_model"),
     ("ZERITH_DECISION_MODEL", "routing.decision_model"),
     ("ZERITH_VISION_MODEL", "routing.vision_model"),
+    ("ZERITH_REVIEW_MODEL", "routing.review_model"),
     ("ZERITH_PONYTAIL", "token_saver.ponytail"),
     ("ZERITH_CAVEMAN", "token_saver.caveman"),
 ];
@@ -1947,6 +1968,7 @@ provider = "openai"
         configured.routing.decision_model =
             Some("openrouter/microsoft/microsoft-decision-1.1".into());
         configured.routing.vision_model = Some("openrouter:google/gemini-2.5-flash".into());
+        configured.routing.review_model = Some("anthropic:claude-opus-4-6".into());
         let text = toml::to_string(&configured).unwrap();
         assert!(
             text.contains("decision_model = \"openrouter/microsoft/microsoft-decision-1.1\""),
@@ -1954,6 +1976,10 @@ provider = "openai"
         );
         assert!(
             text.contains("vision_model = \"openrouter:google/gemini-2.5-flash\""),
+            "{text}"
+        );
+        assert!(
+            text.contains("review_model = \"anthropic:claude-opus-4-6\""),
             "{text}"
         );
         let back: Settings = toml::from_str(&text).unwrap();
@@ -1964,6 +1990,10 @@ provider = "openai"
         assert_eq!(
             back.routing.vision_model.as_deref(),
             Some("openrouter:google/gemini-2.5-flash")
+        );
+        assert_eq!(
+            back.routing.review_model.as_deref(),
+            Some("anthropic:claude-opus-4-6")
         );
 
         let dir = scratch();

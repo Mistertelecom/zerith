@@ -113,7 +113,7 @@
 }
 .dg-aux-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 12px;
 }
 .dg-node.dg-aux-node {
@@ -595,6 +595,9 @@
 /* ---- medium column (e.g. inside modal): 2x2 comfortable cards --------- */
 
 @container (max-width: 920px) {
+  .dg-aux-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
   .dg-fan {
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 16px;

@@ -3,12 +3,18 @@
 //! module turns the same refs into its own image parts. The text stays as is.
 
 use base64::Engine;
+use image::imageops::FilterType;
+use image::GenericImageView;
+use std::io::Cursor;
 use std::path::Path;
 
-/// Same ceiling the window applies when it shows a local image.
-// ponytail: one cap for all; Anthropic refuses images over 5 MB (400), so
-// downscale or per-protocol caps if big screenshots start failing there.
+/// Largest source image file read from disk before automatic normalization.
 const CAP: u64 = 20 * 1024 * 1024;
+/// Maximum pixel edge sent to multimodal providers (keeps tokens and latency tight).
+const MAX_DIM: u32 = 2_000;
+/// Maximum binary payload kept before downscaling/JPEG re-encoding (Anthropic
+/// rejects images above 5 MB with HTTP 400).
+const TARGET_MAX_BYTES: usize = 4_500_000;
 
 pub(crate) struct Image {
     pub mime: &'static str,
@@ -71,10 +77,62 @@ fn load(raw: &str) -> Option<Image> {
         return None;
     }
     let bytes = std::fs::read(path).ok()?;
+    let mime = sniff_mime(&bytes)?;
+    let (norm_bytes, norm_mime) = normalize_image(bytes, mime);
     Some(Image {
-        mime: sniff_mime(&bytes)?,
-        data: base64::engine::general_purpose::STANDARD.encode(bytes),
+        mime: norm_mime,
+        data: base64::engine::general_purpose::STANDARD.encode(norm_bytes),
     })
+}
+
+/// Downscales images larger than [`MAX_DIM`] on either edge or heavier than
+/// [`TARGET_MAX_BYTES`] so 4K screenshots never trigger Anthropic 5 MB HTTP 400
+/// rejections or waste vision tokens. Fails open on tiny/synthetic stubs.
+fn normalize_image(bytes: Vec<u8>, mime: &'static str) -> (Vec<u8>, &'static str) {
+    let dims = image::ImageReader::new(Cursor::new(&bytes))
+        .with_guessed_format()
+        .ok()
+        .and_then(|r| r.into_dimensions().ok());
+    let needs_resize = dims.is_some_and(|(w, h)| w > MAX_DIM || h > MAX_DIM);
+    let too_big = bytes.len() > TARGET_MAX_BYTES;
+    if !needs_resize && !too_big {
+        return (bytes, mime);
+    }
+    let Ok(mut img) = image::load_from_memory(&bytes) else {
+        return (bytes, mime);
+    };
+    let (w, h) = img.dimensions();
+    if w > MAX_DIM || h > MAX_DIM {
+        img = img.resize(MAX_DIM, MAX_DIM, FilterType::Triangle);
+    }
+    // Try PNG first when source was PNG/WebP/GIF to keep crisp UI text; fall
+    // back to JPEG if the encoded PNG still exceeds TARGET_MAX_BYTES.
+    if mime != "image/jpeg" {
+        let mut png_buf = Cursor::new(Vec::new());
+        if img.write_to(&mut png_buf, image::ImageFormat::Png).is_ok() {
+            let out = png_buf.into_inner();
+            if out.len() <= TARGET_MAX_BYTES {
+                return (out, "image/png");
+            }
+        }
+    }
+    let mut cur = img;
+    for _ in 0..3 {
+        let mut jpg_buf = Cursor::new(Vec::new());
+        let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpg_buf, 85);
+        if enc.encode_image(&cur.to_rgb8()).is_ok() {
+            let out = jpg_buf.into_inner();
+            if out.len() <= TARGET_MAX_BYTES {
+                return (out, "image/jpeg");
+            }
+        }
+        let (cw, ch) = cur.dimensions();
+        if cw <= 800 && ch <= 800 {
+            break;
+        }
+        cur = cur.resize((cw * 3) / 4, (ch * 3) / 4, FilterType::Triangle);
+    }
+    (bytes, mime)
 }
 
 /// What the bytes really are. The extension lies often enough (a webp saved as
@@ -98,6 +156,27 @@ pub fn sniff_mime(b: &[u8]) -> Option<&'static str> {
 // history window); strip refs from older turns if that cost starts to matter.
 pub(crate) fn local_images(text: &str) -> Vec<Image> {
     refs(text).into_iter().filter_map(load).collect()
+}
+
+/// Resolves existing local image file paths referenced via markdown `![...](path)`.
+pub fn local_image_paths(text: &str) -> Vec<std::path::PathBuf> {
+    refs(text)
+        .into_iter()
+        .filter_map(|raw| {
+            let p = match raw.strip_prefix("file://") {
+                Some(rest) if cfg!(windows) => rest.trim_start_matches('/'),
+                Some(rest) => rest,
+                None if raw.contains("://") || raw.starts_with("data:") => return None,
+                None => raw,
+            };
+            let path = Path::new(p);
+            let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+            if !matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp" | "gif") {
+                return None;
+            }
+            path.is_file().then(|| path.to_path_buf())
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -180,5 +259,19 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn oversized_screenshots_are_resized_below_2000px() {
+        let img = image::RgbaImage::from_pixel(2400, 1200, image::Rgba([20, 40, 80, 255]));
+        let mut raw = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut raw, image::ImageFormat::Png)
+            .unwrap();
+        let (norm, mime) = normalize_image(raw.into_inner(), "image/png");
+        assert_eq!(mime, "image/png");
+        let decoded = image::load_from_memory(&norm).unwrap();
+        assert_eq!(decoded.width(), 2000);
+        assert_eq!(decoded.height(), 1000);
     }
 }

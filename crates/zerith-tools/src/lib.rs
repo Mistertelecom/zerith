@@ -18,6 +18,7 @@ mod builtin;
 mod desktop;
 mod diagnostics;
 mod fntool;
+mod formatter;
 mod host;
 mod jobs;
 mod lint;

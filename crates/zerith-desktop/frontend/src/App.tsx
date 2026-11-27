@@ -853,6 +853,39 @@ export default function App() {
         .catch((e) => put(card({ error: String(e) })));
       return;
     }
+    // /review [foco]: revisão independente do git diff + conversa recente em
+    // modelo dedicado (routing.review_model → subagent_model → modelo ativo).
+    const reviewMatch = /^\/review(?:\s+([\s\S]*))?$/.exec(typed);
+    if (reviewMatch) {
+      const focus = (reviewMatch[1] ?? "").trim();
+      const sid = selectedRef.current;
+      if (!sid) return setStatus("/review precisa de uma conversa aberta");
+      if (!model) return setError("Escolha um modelo antes de revisar");
+      if (!overridePrompt) setDraft("");
+      const revId = Date.now();
+      const label = focus ? `/review ${focus}` : "/review (revisão independente)";
+      const mine = (x: Block) => x.kind === "note" && x.btw?.id === revId;
+      const swap = (list: Block[], b: Block) =>
+        list.some(mine) ? list.map((x) => (mine(x) ? b : x)) : list;
+      const put = (b: Block, first = false) => {
+        updateTurn(sid, (prev) => ({
+          ...prev,
+          blocks: first ? [...prev.blocks, b] : swap(prev.blocks, b),
+        }));
+        if (!first && selectedRef.current === sid) setMessages((prev) => swap(prev, b));
+      };
+      const card = (extra: Partial<NonNullable<Extract<Block, { kind: "note" }>["btw"]>>): Block => ({
+        kind: "note",
+        text: label,
+        btw: { id: revId, question: label, ...extra },
+      });
+      put(card({}), true);
+      api
+        .reviewRun(sid, model, focus || null)
+        .then((a) => put(card({ answer: a.text || "(sem achados)", model: a.model })))
+        .catch((e) => put(card({ error: String(e) })));
+      return;
+    }
     if (!prompt) return;
     const curSelected = selectedRef.current;
     const sendKey = curSelected ?? "__new__";
@@ -2519,6 +2552,11 @@ export default function App() {
                 label: "Compactar conversa atual",
                 hint: "/compact",
                 run: () => runCommand("compact"),
+              },
+              {
+                label: "Revisar alterações (/review)",
+                hint: "/review",
+                run: () => void send("/review"),
               },
               {
                 label: "Exportar relatório / conversa (.md)",

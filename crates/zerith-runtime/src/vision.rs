@@ -7,12 +7,52 @@
 //! description (exact error strings, window titles, UI layout issues) instead
 //! of crashing with HTTP 400 or leaving the main model blind.
 
+use std::sync::{Mutex, OnceLock};
 use zerith_core::Settings;
 use zerith_providers::{
     Cancel, ChatMessage, ChatRequest, Client, ProviderConfig, ProviderKind, RetryPolicy,
 };
 
 const VISION_TIMEOUT_MS: u64 = 45_000;
+const VISION_CACHE_MAX: usize = 64;
+
+static VISION_CACHE: OnceLock<Mutex<Vec<(String, String)>>> = OnceLock::new();
+
+fn vision_cache() -> &'static Mutex<Vec<(String, String)>> {
+    VISION_CACHE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn cache_key(model: &str, markdown_with_images: &str) -> Option<String> {
+    let paths = zerith_providers::images::local_image_paths(markdown_with_images);
+    if paths.is_empty() {
+        return None;
+    }
+    let mut payload = Vec::new();
+    payload.extend_from_slice(model.as_bytes());
+    for p in paths {
+        let bytes = std::fs::read(&p).ok()?;
+        payload.push(0);
+        payload.extend_from_slice(&bytes);
+    }
+    Some(zerith_providers::sha256_hex(&payload))
+}
+
+fn cache_get(key: &str) -> Option<String> {
+    let g = vision_cache().lock().ok()?;
+    g.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+}
+
+fn cache_put(key: String, val: String) {
+    if let Ok(mut g) = vision_cache().lock() {
+        if let Some(pos) = g.iter().position(|(k, _)| k == &key) {
+            g.remove(pos);
+        }
+        if g.len() >= VISION_CACHE_MAX {
+            g.remove(0);
+        }
+        g.push((key, val));
+    }
+}
 
 const VISION_SYSTEM_PROMPT: &str = "\
 Você é o módulo auxiliar de visão do Zerith. Analise a(s) imagem(ns) anexada(s) em português do Brasil \
@@ -26,6 +66,9 @@ de forma objetiva, fiel e técnica para o modelo principal que não possui visã
 /// custom endpoints (fail-open so native vision models keep receiving images
 /// directly without extra latency).
 pub fn model_supports_vision(provider: ProviderKind, model: &str) -> bool {
+    if let Some(known) = zerith_providers::models::catalog_supports_vision(model) {
+        return known;
+    }
     let m = model.trim().to_ascii_lowercase();
     let base = m.rsplit('/').next().unwrap_or(&m);
 
@@ -172,6 +215,12 @@ impl VisionClient {
         if cancel.is_cancelled() || !has_local_image_ref(markdown_with_images) {
             return None;
         }
+        let ckey = cache_key(&self.model, markdown_with_images);
+        if let Some(ref k) = ckey {
+            if let Some(hit) = cache_get(k) {
+                return Some(hit);
+            }
+        }
         let hint: String = context_hint.trim().chars().take(600).collect();
         let user_text = if hint.is_empty() || hint == markdown_with_images.trim() {
             format!(
@@ -193,7 +242,14 @@ impl VisionClient {
         .temperature(0.1);
         let comp = self.client.complete(&req, cancel).ok()?;
         let out = comp.text.trim();
-        (!out.is_empty()).then(|| out.to_string())
+        if out.is_empty() {
+            return None;
+        }
+        let result = out.to_string();
+        if let Some(k) = ckey {
+            cache_put(k, result.clone());
+        }
+        Some(result)
     }
 }
 

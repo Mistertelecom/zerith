@@ -1005,6 +1005,7 @@ fn chat(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>
         c.apply_hooks(&mut settings);
     }
     zerith_runtime::bili::attach(paths.root(), settings.context.billion_context);
+    zerith_providers::models::warm_catalog(paths.root().join("cache"));
     let cfg = provider_config(&settings)?;
     let model = resolve_model(model_flag, &settings, &cfg)
         .ok_or("sem modelo: use --model, routing.main_model ou ZERITH_MODEL")?;
@@ -1127,6 +1128,7 @@ enum ReplSlash<'a> {
     Rewind(Option<i64>),
     Goal(Option<&'a str>),
     Btw(Option<&'a str>),
+    Review(Option<&'a str>),
     Unknown(&'a str),
 }
 
@@ -1150,6 +1152,7 @@ fn parse_repl_slash(line: &str) -> Option<ReplSlash<'_>> {
         "/rewind" => ReplSlash::Rewind(rest.and_then(|s| s.parse().ok())),
         "/goal" => ReplSlash::Goal(rest),
         "/btw" => ReplSlash::Btw(rest),
+        "/review" => ReplSlash::Review(rest),
         other => ReplSlash::Unknown(other),
     })
 }
@@ -1168,6 +1171,7 @@ fn repl(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>
         c.apply_hooks(&mut settings);
     }
     zerith_runtime::bili::attach(paths.root(), settings.context.billion_context);
+    zerith_providers::models::warm_catalog(paths.root().join("cache"));
     let cfg = provider_config(&settings)?;
     let mut model = resolve_model(parsed.model, &settings, &cfg)
         .ok_or("sem modelo: use --model, routing.main_model ou ZERITH_MODEL")?;
@@ -1274,7 +1278,7 @@ fn repl(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>
                 ReplSlash::Help => eprintln!(
                     "/help  /model <id>  /mode <default|acceptEdits|plan|bypass>  \
                      /effort <off|low|medium|high|xhigh|max>  /compact  /rewind [N]  \
-                     /sessions [id]  /goal <objetivo>  /btw <pergunta>  /clear  /exit"
+                     /sessions [id]  /goal <objetivo>  /btw <pergunta>  /review [foco]  /clear  /exit"
                 ),
                 ReplSlash::Exit => break,
                 ReplSlash::Clear => {
@@ -1417,6 +1421,28 @@ fn repl(paths: &Paths, args: &[String]) -> Result<(), Box<dyn std::error::Error>
                     ) {
                         Ok(a) => println!("\n[pergunta paralela] {}\n", a.text),
                         Err(e) => eprintln!("zerith: /btw falhou: {}", redact(&e.to_string())),
+                    }
+                }
+                ReplSlash::Review(focus) => {
+                    let Some(sid) = session_id.as_deref() else {
+                        eprintln!("zerith: /review precisa de uma conversa ativa.");
+                        continue;
+                    };
+                    match zerith_runtime::review::run(
+                        &store,
+                        &client,
+                        TurnContext {
+                            settings: Some(&settings),
+                            project_dir: Some(&workspace),
+                            ..TurnContext::default()
+                        },
+                        sid,
+                        &model,
+                        focus.unwrap_or(""),
+                        &Cancel::default(),
+                    ) {
+                        Ok(a) => println!("\n[revisão · {}]\n{}\n", a.model, a.text),
+                        Err(e) => eprintln!("zerith: /review falhou: {}", redact(&e.to_string())),
                     }
                 }
                 ReplSlash::Unknown(other) => {

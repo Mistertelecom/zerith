@@ -32,6 +32,17 @@ pub use gateway::{
 pub use openai::{pooled_agent as shared_http_agent, Client, Completion, Probe, Usage};
 pub use retry::RetryPolicy;
 
+/// Lowercase hex SHA-256 digest (reuses `ring`, already in tree for TLS/PKCE).
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
+    let mut out = String::with_capacity(64);
+    for b in digest.as_ref() {
+        use std::fmt::Write;
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    out
+}
+
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

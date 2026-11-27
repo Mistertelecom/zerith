@@ -170,6 +170,7 @@ pub fn run() {
     tauri::Builder::default()
         .setup(move |app| {
             learn::bind(app.handle());
+            zerith_providers::models::warm_catalog(scheduler_root.join("cache"));
             chat::spawn_monitor_waker(app.handle().clone());
             servers::spawn_monitor(app.handle().clone(), scheduler_root.clone());
             workflows::spawn_scheduler(app.handle().clone(), scheduler_root);
@@ -232,6 +233,7 @@ pub fn run() {
             chat::cancel_turn,
             chat::steer_turn,
             chat::btw_ask,
+            chat::review_run,
             chat::answer_approval,
             chat::answer_question,
             commands::boot,

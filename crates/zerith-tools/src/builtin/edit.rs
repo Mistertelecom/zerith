@@ -41,12 +41,57 @@ pub(super) fn edit_file(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Res
     let (old, new) = (old.as_str(), new.as_str());
     let n = text.matches(old).count();
     if n == 0 && !all {
-        // Same tolerance as multi_edit: indentation lost in a copy is not a miss.
+        let raw_old = str_arg(args, "old_string")?;
         let raw_new = str_arg(args, "new_string")?;
-        return match find_unique_whitespace_span(&text, str_arg(args, "old_string")?) {
+        // Check backslash escape-drift (e.g. `C:\\Users\\...` doubled by JSON serialization)
+        // before falling back to whitespace/Unicode matching.
+        match detect_escape_drift(raw_old, raw_new, &text) {
+            EscapeDrift::Ambiguous => {
+                return Err(ToolError::Failed(format!(
+                    "escape-drift detectado em old_string (barras \\ duplicadas casam em {} ao dividir por 2), mas new_string também contém \\ e não pode ser corrigido sem ambiguidade: releia com read_file e reenvie com o escaping exato do arquivo",
+                    path.display()
+                )));
+            }
+            EscapeDrift::Corrected(fixed_old) => {
+                let rep = if text.contains("\r\n") {
+                    crlf(raw_new)
+                } else {
+                    raw_new.to_string()
+                };
+                let fixed_for_file = if text.contains("\r\n") && !text.contains(&fixed_old) {
+                    crlf(&fixed_old)
+                } else {
+                    fixed_old
+                };
+                if text.matches(&fixed_for_file).count() == 1 {
+                    let out = text.replacen(&fixed_for_file, &rep, 1);
+                    crate::lint::check(&path, out.as_bytes())?;
+                    let pc = crate::postcheck::before(ctx.workspace, &path);
+                    exec.host.before_write(&path)?;
+                    super::write_atomic(&path, out.as_bytes())?;
+                    let fmt_note = crate::formatter::format_if_enabled(ctx.workspace, &path);
+                    exec.host.note_read(&path);
+                    let mut msg = format!(
+                        "1 ocorrência substituída em {} (escape-drift de \\\\ corrigido)",
+                        path.display()
+                    );
+                    if let Some(n) = fmt_note {
+                        msg.push_str(&n);
+                    }
+                    if let Some(diags) = crate::lsp::warm_diagnostics_for_edit(ctx.workspace, &path)
+                    {
+                        msg.push_str(&format!("\n\n[diagnósticos LSP]\n{diags}"));
+                    }
+                    crate::postcheck::append(&mut msg, &path, pc);
+                    return Ok(msg);
+                }
+            }
+            EscapeDrift::None => {}
+        }
+        // Same tolerance as multi_edit: indentation or typographic Unicode drift is not a miss.
+        return match find_unique_whitespace_span(&text, raw_old) {
             WhitespaceFallback::Applied(start, end) => {
-                let reindented =
-                    reindent_replacement(&text[start..end], str_arg(args, "old_string")?, raw_new);
+                let reindented = reindent_replacement(&text[start..end], raw_old, raw_new);
                 let rep = if text.contains("\r\n") {
                     crlf(&reindented)
                 } else {
@@ -58,11 +103,15 @@ pub(super) fn edit_file(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Res
                 let pc = crate::postcheck::before(ctx.workspace, &path);
                 exec.host.before_write(&path)?;
                 super::write_atomic(&path, buf.as_bytes())?;
+                let fmt_note = crate::formatter::format_if_enabled(ctx.workspace, &path);
                 exec.host.note_read(&path);
                 let mut msg = format!(
                     "1 ocorrência substituída em {} (casada ignorando espaços)",
                     path.display()
                 );
+                if let Some(n) = fmt_note {
+                    msg.push_str(&n);
+                }
                 if let Some(diags) = crate::lsp::warm_diagnostics_for_edit(ctx.workspace, &path) {
                     msg.push_str(&format!("\n\n[diagnósticos LSP]\n{diags}"));
                 }
@@ -88,8 +137,12 @@ pub(super) fn edit_file(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Res
             let pc = crate::postcheck::before(ctx.workspace, &path);
             exec.host.before_write(&path)?;
             super::write_atomic(&path, out.as_bytes())?;
+            let fmt_note = crate::formatter::format_if_enabled(ctx.workspace, &path);
             exec.host.note_read(&path);
             let mut msg = format!("{n} ocorrência(s) substituída(s) em {}", path.display());
+            if let Some(n) = fmt_note {
+                msg.push_str(&n);
+            }
             if let Some(diags) = crate::lsp::warm_diagnostics_for_edit(ctx.workspace, &path) {
                 msg.push_str(&format!("\n\n[diagnósticos LSP]\n{diags}"));
             }
@@ -205,6 +258,81 @@ pub(crate) fn reindent_replacement(matched_slice: &str, raw_old: &str, raw_new: 
     out
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum EscapeDrift {
+    None,
+    Corrected(String),
+    Ambiguous,
+}
+
+/// Detects doubled-backslash serialization drift in `old` (Hermes
+/// `escape_drift_autocorrect`): halves even backslash runs only when the
+/// halved anchor appears verbatim in `content` and `new` carries no
+/// backslashes; raises `Ambiguous` when `new` also has backslashes.
+fn detect_escape_drift(old: &str, new: &str, content: &str) -> EscapeDrift {
+    if !old.contains('\\') || content.contains(old) {
+        return EscapeDrift::None;
+    }
+    let bytes = old.as_bytes();
+    let mut i = 0;
+    let mut halved = String::with_capacity(old.len());
+    let mut saw_run = false;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            let start = i;
+            while i < bytes.len() && bytes[i] == b'\\' {
+                i += 1;
+            }
+            let run_len = i - start;
+            if run_len % 2 != 0 {
+                return EscapeDrift::None;
+            }
+            saw_run = true;
+            for _ in 0..(run_len / 2) {
+                halved.push('\\');
+            }
+        } else {
+            let ch = old[i..].chars().next().unwrap();
+            halved.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    if !saw_run {
+        return EscapeDrift::None;
+    }
+    let crlf_halved = halved.replace("\r\n", "\n").replace('\n', "\r\n");
+    let matched =
+        content.contains(&halved) || (content.contains("\r\n") && content.contains(&crlf_halved));
+    if !matched {
+        return EscapeDrift::None;
+    }
+    if new.contains('\\') {
+        EscapeDrift::Ambiguous
+    } else {
+        EscapeDrift::Corrected(halved)
+    }
+}
+
+/// Maps typographic Unicode punctuation/spaces to ASCII equivalents so smart
+/// quotes or NBSP copied by an LLM still match source lines cleanly.
+fn normalize_unicode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\u{201c}' | '\u{201d}' => out.push('"'),
+            '\u{2018}' | '\u{2019}' => out.push('\''),
+            '\u{2014}' => out.push_str("--"),
+            '\u{2013}' | '\u{2212}' => out.push('-'),
+            '\u{2026}' => out.push_str("..."),
+            '\u{00a0}' | '\u{2000}'..='\u{200a}' | '\u{202f}' | '\u{205f}' | '\u{3000}' => {
+                out.push(' ')
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 #[derive(Clone, Copy)]
 enum WhitespaceFallback {
     Applied(usize, usize),
@@ -213,7 +341,12 @@ enum WhitespaceFallback {
 }
 
 fn find_unique_whitespace_span(buf: &str, old: &str) -> WhitespaceFallback {
-    let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let norm = |s: &str| {
+        normalize_unicode(s)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
     let old_lines: Vec<String> = old.lines().map(norm).collect();
     if old_lines.is_empty() || old_lines.iter().all(String::is_empty) {
         return WhitespaceFallback::None;
@@ -345,12 +478,16 @@ pub(super) fn multi_edit(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Re
     let pc = crate::postcheck::before(ctx.workspace, &path);
     exec.host.before_write(&path)?;
     super::write_atomic(&path, &out_bytes)?;
+    let fmt_note = crate::formatter::format_if_enabled(ctx.workspace, &path);
     exec.host.note_read(&path);
     let mut msg = format!(
         "{} edição(ões) atômica(s) ({applied_count} substituição(ões)) em {}",
         edits.len(),
         path.display()
     );
+    if let Some(n) = fmt_note {
+        msg.push_str(&n);
+    }
     if let Some(diags) = crate::lsp::warm_diagnostics_for_edit(ctx.workspace, &path) {
         msg.push_str(&format!("\n\n[diagnósticos LSP]\n{diags}"));
     }
@@ -403,5 +540,29 @@ mod tests {
         assert!(msg.contains("1\tdef alpha():"), "{msg}");
         assert!(msg.contains("2\t    x = compute_value(1)"), "{msg}");
         assert!(msg.contains("3\t    return x"), "{msg}");
+    }
+
+    #[test]
+    fn unicode_normalization_and_escape_drift_helpers_work() {
+        // Curly quotes & em-dash normalize to ASCII equivalents for fallback matching.
+        let file = "let msg = \"hello -- world\";\n";
+        let curly = "let msg = “hello — world”;";
+        assert!(matches!(
+            find_unique_whitespace_span(file, curly),
+            WhitespaceFallback::Applied(_, _)
+        ));
+
+        // Escape drift halves doubled backslashes when new_string has no backslashes.
+        let src = r#"let p = "C:\Users\Joao";"#;
+        let drifted_old = r#"let p = "C:\\Users\\Joao";"#;
+        assert_eq!(
+            detect_escape_drift(drifted_old, "let p = \"home\";", src),
+            EscapeDrift::Corrected(src.to_string())
+        );
+        // When new_string also contains backslashes, refuse silently mutating it.
+        assert_eq!(
+            detect_escape_drift(drifted_old, r#"let p = "D:\\Other";"#, src),
+            EscapeDrift::Ambiguous
+        );
     }
 }

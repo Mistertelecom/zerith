@@ -626,9 +626,13 @@ fn write_file(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String
         std::fs::create_dir_all(parent)?;
     }
     write_atomic(&path, content.as_bytes())?;
+    let fmt_note = crate::formatter::format_if_enabled(ctx.workspace, &path);
     // The model knows what it just wrote; a follow-up edit needs no re-read.
     exec.host.note_read(&path);
     let mut msg = format!("{} bytes escritos em {}", content.len(), path.display());
+    if let Some(n) = fmt_note {
+        msg.push_str(&n);
+    }
     if let Some(diags) = crate::lsp::warm_diagnostics_for_edit(ctx.workspace, &path) {
         msg.push_str(&format!("\n\n[diagnósticos LSP]\n{diags}"));
     } else {

@@ -513,6 +513,58 @@ pub async fn btw_ask(
     .map_err(|e| e.to_string())?
 }
 
+/// `/review [foco]`: revisão independente do `git diff` + histórico recente em
+/// modelo dedicado (`routing.review_model` -> `routing.subagent_model` -> modelo ativo).
+#[tauri::command]
+pub async fn review_run(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+    model: String,
+    focus: Option<String>,
+) -> Result<BtwAnswer, String> {
+    if model.trim().is_empty() {
+        return Err("Escolha um modelo antes de revisar".into());
+    }
+    let root = state.root().to_path_buf();
+    let db = state.db();
+    let focus = focus.unwrap_or_default();
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = zerith_sessions::Store::open(&db).map_err(|e| e.to_string())?;
+        let workspace = turn::session_workspace(&db, &session_id);
+        let paths = zerith_core::Paths::with_root(&root);
+        let settings = zerith_core::Settings::load(&paths, Some(&workspace)).settings;
+        let provider = crate::wire::configured_providers_from(&settings, &root)
+            .into_iter()
+            .next()
+            .ok_or("Nenhum provedor configurado")?;
+        let client = zerith_providers::Client::new(provider)
+            .map_err(|e| zerith_providers::explain::headline(&e))?;
+        let a = zerith_runtime::review::run(
+            &store,
+            &client,
+            zerith_runtime::TurnContext {
+                settings: Some(&settings),
+                project_dir: Some(&workspace),
+                ..Default::default()
+            },
+            &session_id,
+            &model,
+            &focus,
+            &Cancel::default(),
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(BtwAnswer {
+            text: a.text,
+            model: a.model,
+            prompt_tokens: a.prompt_tokens,
+            completion_tokens: a.completion_tokens,
+            cache_read_tokens: a.cache_read_tokens,
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

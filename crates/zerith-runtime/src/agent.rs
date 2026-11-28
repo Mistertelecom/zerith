@@ -2002,10 +2002,29 @@ fn track_verification(
     unverified: &mut Vec<String>,
 ) {
     match tool {
-        "write_file" | "edit_file" | "multi_edit" if ok => {
+        "write_file" | "edit_file" if ok => {
             if let Some(p) = args["path"].as_str().filter(|p| !is_prose(p)) {
                 if !unverified.iter().any(|u| u == p) {
                     unverified.push(p.to_string());
+                }
+            }
+        }
+        "multi_edit" if ok => {
+            if let Some(p) = args["path"].as_str().filter(|p| !is_prose(p)) {
+                if !unverified.iter().any(|u| u == p) {
+                    unverified.push(p.to_string());
+                }
+            }
+            if !unverified.is_empty() {
+                if let Some(cmd) = args["verify_cmd"].as_str().filter(|s| !s.trim().is_empty()) {
+                    if let Some(exit) = crate::verify::multi_edit_verification_exit(cmd, output) {
+                        let project = crate::verify::project_root(cwd)
+                            .map(|r| crate::verify::project_commands(&r))
+                            .unwrap_or_default();
+                        if crate::verify::is_verification(cmd, exit, &project, unverified) {
+                            unverified.clear();
+                        }
+                    }
                 }
             }
         }

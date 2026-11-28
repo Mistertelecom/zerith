@@ -1562,6 +1562,33 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
             },
             net_path,
         ),
+        make_with(
+            "net_change",
+            "Executor transacional de mudanças em rede (Pre-Check → Apply com rollback nativo → Post-Check → Confirm ou Rollback automático). \
+             Suporta Cisco IOS-XE (`configure terminal revert timer` / `configure confirm`), IOS-XR (`commit confirmed` / `commit`), \
+             Datacom DmOS e Juniper (`commit confirmed` / `rollback`), além de `rollback_commands` explícitos para DmSwitch/MikroTik/Linux. \
+             Com `dry_run: true`, devolve o plano exato antes de aplicar.",
+            json!({"type": "object", "properties": {
+                "id": {"type": "string", "description": "ID do terminal aberto via net_connect (ex.: term-1); opcional em dry_run"},
+                "vendor": {"type": "string", "description": "vendor explícito opcional (senão usa o do terminal)"},
+                "pre_checks": {"type": "array", "items": {"type": "string"}, "description": "comandos read-only de referência antes da mudança"},
+                "config_commands": {"type": "array", "items": {"type": "string"}, "description": "comandos de configuração a aplicar na transação"},
+                "post_checks": {"type": "array", "items": {"type": "string"}, "description": "comandos de verificação pós-mudança"},
+                "expect_patterns": {"type": "array", "items": {"type": "string"}, "description": "trechos obrigatórios nas saídas de post_checks (senão faz rollback)"},
+                "forbid_patterns": {"type": "array", "items": {"type": "string"}, "description": "trechos proibidos nas saídas de post_checks (ex.: Idle, Active, DOWN; disparam rollback)"},
+                "rollback_commands": {"type": "array", "items": {"type": "string"}, "description": "comandos explícitos de rollback (obrigatório quando vendor não possui commit-confirmed nativo ou use_vendor_rollback=false)"},
+                "revert_timer_secs": {"type": "integer", "description": "prazo do rollback automático do vendor em segundos (60..=600, padrão 180)"},
+                "use_vendor_rollback": {"type": "boolean", "description": "usa mecanismo nativo do vendor (revert timer / commit confirmed), padrão true"},
+                "dry_run": {"type": "boolean", "description": "true apenas monta e valida o plano transacional sem enviar comandos"},
+                "timeout_secs": {"type": "integer", "description": "prazo por comando em segundos, padrão 20 (2..=300)"}
+            }, "required": ["config_commands"]}),
+            "JSON com status (`dry_run`, `committed` ou `rolled_back`), plano, pré/pós-checks e motivos",
+            Permission::Shell,
+            600,
+            false,
+            net_change_action,
+            net_change,
+        ),
     ]
 }
 
@@ -1961,6 +1988,354 @@ fn batch_action(args: &Value, _: &CallCtx<'_>) -> Result<Option<Action>> {
         "[{id}: {prog}] batch: {}",
         cmds.join("; ")
     ))))
+}
+
+fn str_list(args: &Value, key: &str) -> Vec<String> {
+    args[key]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::trim))
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn net_change_action(args: &Value, _: &CallCtx<'_>) -> Result<Option<Action>> {
+    let cfg = str_list(args, "config_commands");
+    if cfg.is_empty() || args["dry_run"].as_bool().unwrap_or(false) {
+        return Ok(None);
+    }
+    let id = args["id"].as_str().unwrap_or("");
+    let prog = terminal::terminal_program(id).unwrap_or_else(|| "terminal".into());
+    Ok(Some(Action::Shell(format!(
+        "[{id}: {prog}] net_change ({} cmd): {}",
+        cfg.len(),
+        cfg.join("; ")
+    ))))
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct VendorTxPlan {
+    vendor: String,
+    rollback_mode: &'static str,
+    revert_timer_secs: u64,
+    pre_checks: Vec<String>,
+    apply_sequence: Vec<String>,
+    post_checks: Vec<String>,
+    confirm_sequence: Vec<String>,
+    rollback_sequence: Vec<String>,
+}
+
+fn build_tx_plan(
+    vendor: Vendor,
+    pre_checks: Vec<String>,
+    config_commands: Vec<String>,
+    post_checks: Vec<String>,
+    explicit_rollback: Vec<String>,
+    revert_secs: u64,
+    use_vendor_rollback: bool,
+) -> VendorTxPlan {
+    let revert_secs = revert_secs.clamp(60, 600);
+    let revert_mins = revert_secs.div_ceil(60).max(1);
+
+    let (rollback_mode, apply_sequence, confirm_sequence, rollback_sequence) =
+        if !use_vendor_rollback {
+            (
+                "explicit_rollback",
+                config_commands,
+                Vec::new(),
+                explicit_rollback,
+            )
+        } else {
+            match vendor {
+                Vendor::CiscoIosXe | Vendor::CiscoIos => {
+                    let mut seq = Vec::with_capacity(config_commands.len() + 2);
+                    seq.push(format!("configure terminal revert timer {revert_mins}"));
+                    seq.extend(config_commands);
+                    seq.push("end".into());
+                    let mut rb = vec!["configure revert now".to_string()];
+                    rb.extend(explicit_rollback);
+                    (
+                        "iosxe_revert_timer",
+                        seq,
+                        vec!["configure confirm".to_string()],
+                        rb,
+                    )
+                }
+                Vendor::CiscoXr => {
+                    let mut seq = Vec::with_capacity(config_commands.len() + 3);
+                    seq.push("configure".into());
+                    seq.extend(config_commands);
+                    seq.push(format!("commit confirmed {revert_secs}"));
+                    seq.push("end".into());
+                    let mut rb = vec!["rollback configuration last 1".to_string()];
+                    rb.extend(explicit_rollback);
+                    (
+                        "iosxr_commit_confirmed",
+                        seq,
+                        vec!["commit".to_string()],
+                        rb,
+                    )
+                }
+                Vendor::DatacomDmos | Vendor::Datacom => {
+                    let mut seq = Vec::with_capacity(config_commands.len() + 3);
+                    seq.push("config".into());
+                    seq.extend(config_commands);
+                    seq.push(format!("commit confirmed {revert_secs}"));
+                    seq.push("exit".into());
+                    let mut rb = vec!["rollback".to_string()];
+                    rb.extend(explicit_rollback);
+                    ("dmos_commit_confirmed", seq, vec!["commit".to_string()], rb)
+                }
+                Vendor::JuniperJunos => {
+                    let mut seq = Vec::with_capacity(config_commands.len() + 3);
+                    seq.push("configure".into());
+                    seq.extend(config_commands);
+                    seq.push(format!("commit confirmed {revert_mins}"));
+                    seq.push("exit".into());
+                    let mut rb = vec![
+                        "configure".into(),
+                        "rollback 1".into(),
+                        "commit".into(),
+                        "exit".into(),
+                    ];
+                    rb.extend(explicit_rollback);
+                    (
+                        "junos_commit_confirmed",
+                        seq,
+                        vec!["configure".into(), "commit".into(), "exit".into()],
+                        rb,
+                    )
+                }
+                _ => (
+                    "explicit_rollback",
+                    config_commands,
+                    Vec::new(),
+                    explicit_rollback,
+                ),
+            }
+        };
+
+    VendorTxPlan {
+        vendor: vendor.as_str().to_string(),
+        rollback_mode,
+        revert_timer_secs: revert_secs,
+        pre_checks,
+        apply_sequence,
+        post_checks,
+        confirm_sequence,
+        rollback_sequence,
+    }
+}
+
+fn evaluate_post_checks(
+    outputs: &[(String, String)],
+    expect: &[String],
+    forbid: &[String],
+) -> std::result::Result<(), Vec<String>> {
+    let mut reasons = Vec::new();
+    let mut combined = String::new();
+    for (cmd, out) in outputs {
+        if let Some(err_kind) = has_cli_error(out) {
+            reasons.push(format!("erro CLI em `{cmd}`: {err_kind}"));
+        }
+        if out.contains(terminal::UNSYNCED_NOTE) {
+            reasons.push(format!("sessão não sincronizou após `{cmd}`"));
+        }
+        combined.push_str(out);
+        combined.push('\n');
+    }
+    let low = combined.to_ascii_lowercase();
+    for pat in expect {
+        if !low.contains(&pat.to_ascii_lowercase()) {
+            reasons.push(format!("padrão esperado ausente nos post_checks: `{pat}`"));
+        }
+    }
+    for bad in forbid {
+        if low.contains(&bad.to_ascii_lowercase()) {
+            reasons.push(format!(
+                "padrão proibido detectado nos post_checks: `{bad}`"
+            ));
+        }
+    }
+    if reasons.is_empty() {
+        Ok(())
+    } else {
+        Err(reasons)
+    }
+}
+
+type ChangeBatchResult = (Vec<(String, String)>, Option<String>);
+
+fn run_change_commands(
+    id: &str,
+    vendor: Vendor,
+    cmds: &[String],
+    per_cmd_secs: u64,
+    stop_on_error: bool,
+    exec: &Exec<'_>,
+) -> Result<ChangeBatchResult> {
+    let mut rows = Vec::with_capacity(cmds.len());
+    for cmd in cmds {
+        exec.check()?;
+        let secs = slow_command_secs(vendor, cmd)
+            .unwrap_or(per_cmd_secs)
+            .clamp(2, 300);
+        let (out, alive) = terminal::send_session_command_with(
+            "net_change",
+            id,
+            Some(cmd),
+            None,
+            true,
+            None,
+            Duration::from_secs(secs),
+            true,
+            true,
+            exec,
+        )?;
+        let err = has_cli_error(&out);
+        rows.push((cmd.clone(), out.clone()));
+        if !alive {
+            return Ok((rows, Some(format!("sessão encerrou durante `{cmd}`"))));
+        }
+        if stop_on_error && err.is_some() {
+            return Ok((
+                rows,
+                Some(format!("erro CLI em `{cmd}`: {}", err.unwrap_or_default())),
+            ));
+        }
+    }
+    Ok((rows, None))
+}
+
+fn net_change(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
+    let config_commands = str_list(args, "config_commands");
+    if config_commands.is_empty() {
+        return Err(ToolError::BadArguments(
+            "config_commands precisa ter ao menos um comando".into(),
+        ));
+    }
+    let pre_checks = str_list(args, "pre_checks");
+    let post_checks = str_list(args, "post_checks");
+    let expect_patterns = str_list(args, "expect_patterns");
+    let forbid_patterns = str_list(args, "forbid_patterns");
+    let explicit_rollback = str_list(args, "rollback_commands");
+    let revert_secs = args["revert_timer_secs"].as_u64().unwrap_or(180);
+    let use_vendor_rollback = args["use_vendor_rollback"].as_bool().unwrap_or(true);
+    let dry_run = args["dry_run"].as_bool().unwrap_or(false);
+    let per_cmd_secs = args["timeout_secs"].as_u64().unwrap_or(20).clamp(2, 300);
+
+    let id = opt_str(args, "id");
+    let vendor = opt_str(args, "vendor")
+        .and_then(Vendor::parse)
+        .or_else(|| {
+            id.and_then(terminal::terminal_meta)
+                .and_then(|(v, _, _)| v)
+                .and_then(|v| Vendor::parse(&v))
+        })
+        .unwrap_or_default();
+
+    let plan = build_tx_plan(
+        vendor,
+        pre_checks,
+        config_commands,
+        post_checks,
+        explicit_rollback,
+        revert_secs,
+        use_vendor_rollback,
+    );
+
+    if dry_run {
+        return serde_json::to_string_pretty(&json!({
+            "status": "dry_run",
+            "plan": plan,
+        }))
+        .map_err(|e| ToolError::Failed(e.to_string()));
+    }
+
+    let id = id.ok_or_else(|| {
+        ToolError::BadArguments("`id` do terminal é obrigatório quando dry_run=false".into())
+    })?;
+    let reopened = reopen_if_dropped(id, ctx, exec)?;
+
+    let (pre_out, pre_err) =
+        run_change_commands(id, vendor, &plan.pre_checks, per_cmd_secs, false, exec)?;
+    if let Some(why) = pre_err {
+        return Err(ToolError::Failed(format!(
+            "pre_checks abortado antes de aplicar mudança: {why}"
+        )));
+    }
+
+    let (apply_out, apply_err) =
+        run_change_commands(id, vendor, &plan.apply_sequence, per_cmd_secs, true, exec)?;
+    let (post_out, post_err) = if apply_err.is_none() {
+        run_change_commands(id, vendor, &plan.post_checks, per_cmd_secs, false, exec)?
+    } else {
+        (Vec::new(), None)
+    };
+
+    let mut fail_reasons = Vec::new();
+    if let Some(e) = apply_err {
+        fail_reasons.push(e);
+    }
+    if let Some(e) = post_err {
+        fail_reasons.push(e);
+    }
+    if let Err(mut check_errs) = evaluate_post_checks(&post_out, &expect_patterns, &forbid_patterns)
+    {
+        fail_reasons.append(&mut check_errs);
+    }
+
+    if fail_reasons.is_empty() {
+        let (confirm_out, confirm_err) =
+            run_change_commands(id, vendor, &plan.confirm_sequence, per_cmd_secs, true, exec)?;
+        if let Some(why) = confirm_err {
+            return Err(ToolError::Failed(format!(
+                "mudança aplicada mas confirmação (`confirm`) falhou: {why} — timer de rollback automático deve atuar em {}s",
+                plan.revert_timer_secs
+            )));
+        }
+        return serde_json::to_string_pretty(&json!({
+            "status": "committed",
+            "reopened": reopened,
+            "plan": plan,
+            "pre_outputs": pre_out,
+            "apply_outputs": apply_out,
+            "post_outputs": post_out,
+            "confirm_outputs": confirm_out,
+        }))
+        .map_err(|e| ToolError::Failed(e.to_string()));
+    }
+
+    let (rb_out, rb_err) = run_change_commands(
+        id,
+        vendor,
+        &plan.rollback_sequence,
+        per_cmd_secs,
+        false,
+        exec,
+    )?;
+    if let Some(why) = rb_err {
+        return Err(ToolError::Failed(format!(
+            "mudança falhou ({}) E rollback encontrou erro ({why}); verifique acesso ao dispositivo imediatamente",
+            fail_reasons.join("; ")
+        )));
+    }
+
+    serde_json::to_string_pretty(&json!({
+        "status": "rolled_back",
+        "reasons": fail_reasons,
+        "reopened": reopened,
+        "plan": plan,
+        "pre_outputs": pre_out,
+        "apply_outputs": apply_out,
+        "post_outputs": post_out,
+        "rollback_outputs": rb_out,
+    }))
+    .map_err(|e| ToolError::Failed(e.to_string()))
 }
 
 fn inventory_target_path(args: &Value, workspace: &Path, global_root: &Path) -> std::path::PathBuf {
@@ -8324,5 +8699,94 @@ add chain=forward action=drop comment=\"drop-all\"
                 .0,
             "ping -c 4 10.0.0.1"
         );
+    }
+
+    #[test]
+    fn net_change_builds_vendor_tx_plans_evaluates_checks_and_respects_dry_run() {
+        let xe = build_tx_plan(
+            Vendor::CiscoIosXe,
+            vec!["show ip bgp summary".into()],
+            vec!["interface Lo99".into(), "description test".into()],
+            vec!["show ip bgp summary".into()],
+            vec![],
+            180,
+            true,
+        );
+        assert_eq!(xe.rollback_mode, "iosxe_revert_timer");
+        assert_eq!(xe.apply_sequence[0], "configure terminal revert timer 3");
+        assert_eq!(xe.confirm_sequence, vec!["configure confirm"]);
+        assert_eq!(xe.rollback_sequence, vec!["configure revert now"]);
+
+        let dmos = build_tx_plan(
+            Vendor::DatacomDmos,
+            vec![],
+            vec!["dot1q vlan 100".into()],
+            vec![],
+            vec![],
+            120,
+            true,
+        );
+        assert_eq!(dmos.rollback_mode, "dmos_commit_confirmed");
+        assert!(dmos.apply_sequence.contains(&"commit confirmed 120".into()));
+        assert_eq!(dmos.confirm_sequence, vec!["commit"]);
+        assert_eq!(dmos.rollback_sequence, vec!["rollback"]);
+
+        assert!(evaluate_post_checks(
+            &[("show bgp".into(), "192.0.2.1 Estab 120".into())],
+            &["Estab".into()],
+            &["Idle".into()],
+        )
+        .is_ok());
+
+        let errs = evaluate_post_checks(
+            &[("show bgp".into(), "192.0.2.1 Idle 0".into())],
+            &["Estab".into()],
+            &["Idle".into()],
+        )
+        .unwrap_err();
+        assert_eq!(errs.len(), 2);
+
+        let pol = zerith_security::Policy::new(
+            zerith_security::preset("workspace-write").unwrap(),
+            zerith_security::Mode::Default,
+            Path::new("."),
+        );
+        let ctx = CallCtx {
+            workspace: Path::new("."),
+            policy: &pol,
+            memory: None,
+            scope: None,
+        };
+        let cancel = zerith_providers::Cancel::default();
+        let host = crate::Host::default();
+        let exec = Exec {
+            cancel: &cancel,
+            deadline: std::time::Instant::now() + Duration::from_secs(5),
+            timeout: Duration::from_secs(5),
+            host: &host,
+        };
+        let out = net_change(
+            &json!({
+                "vendor": "cisco_iosxe",
+                "config_commands": ["interface Lo0", "description noc"],
+                "revert_timer_secs": 120,
+                "dry_run": true
+            }),
+            &ctx,
+            &exec,
+        )
+        .unwrap();
+        assert!(out.contains("\"status\": \"dry_run\""), "{out}");
+        assert!(out.contains("configure terminal revert timer 2"), "{out}");
+
+        let action = net_change_action(
+            &json!({
+                "id": "term-1",
+                "config_commands": ["interface Lo0"]
+            }),
+            &ctx,
+        )
+        .unwrap();
+        assert!(action.is_some());
     }
 }

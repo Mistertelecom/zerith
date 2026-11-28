@@ -4,27 +4,28 @@
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::fntool::{make, opt_str, str_arg};
+use crate::fntool::{make_with, opt_str, str_arg};
 use crate::{CallCtx, Exec, Permission, Result, Tool, ToolError};
 
 pub(crate) fn all() -> Vec<Box<dyn Tool>> {
-    vec![make(
+    vec![make_with(
         "net_audit",
-        "Auditoria determinística e planejamento de mudança segura para Cisco ASR/IOS-XE/XR/NX-OS, \
-         Datacom (DmOS e DmSwitch), Ubiquiti RF (airOS/airMAX/LTU/UniFi), Linux SRE e \
-         construção de topologia com blast radius (`topology_build`). \
+        "Auditoria determinística, topologia persistente e planejamento de mudança segura para \
+         Cisco ASR/IOS-XE/XR/NX-OS, Datacom (DmOS e DmSwitch), Ubiquiti RF (airOS/airMAX/LTU/UniFi), \
+         Linux SRE e construção/persistência de topologia com diff e blast radius (`topology_build` / `topology_store`). \
          Em `mode=\"commands\"` (padrão sem `output`), gera lotes read-only por modelo; \
          em `mode=\"parse\"` (automático quando há `output`/`outputs`), analisa saídas sem regex \
          frágil e retorna JSON estruturado com achados (`critical`/`warning`/`ok`); \
          em `mode=\"plan_change\"`, gera receita transacional com rollback automático.",
-        json!({
-            "type": "object",
-            "required": ["action"],
-            "properties": {
+        {
+            let mut props = serde_json::Map::new();
+            let base = json!({
                 "action": {
                     "type": "string",
                     "enum": [
@@ -32,9 +33,10 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
                         "datacom_audit",
                         "ubiquiti_rf_audit",
                         "linux_sre_audit",
-                        "topology_build"
+                        "topology_build",
+                        "topology_store"
                     ],
-                    "description": "domínio da auditoria ou construção de topologia"
+                    "description": "domínio da auditoria, construção de topologia ou armazenamento persistente"
                 },
                 "mode": {
                     "type": "string",
@@ -85,43 +87,109 @@ pub(crate) fn all() -> Vec<Box<dyn Tool>> {
                 "rx_antenna_gain_dbi": {
                     "type": "number",
                     "description": "ubiquiti_rf_audit: ganho RX explícito em dBi"
-                },
+                }
+            });
+            let topo = json!({
                 "devices": {
                     "type": "array",
-                    "description": "topology_build: lista de nós/dispositivos"
+                    "description": "topology_build/store: lista de nós/dispositivos"
                 },
                 "lldp": {
-                    "description": "topology_build: vizinhos LLDP (array JSON ou texto CLI)"
+                    "description": "topology_build/store: vizinhos LLDP (array JSON ou texto CLI)"
                 },
                 "cdp": {
-                    "description": "topology_build: vizinhos CDP (array JSON ou texto CLI)"
+                    "description": "topology_build/store: vizinhos CDP (array JSON ou texto CLI)"
                 },
                 "bgp": {
-                    "description": "topology_build: sessões BGP (array JSON ou texto CLI)"
+                    "description": "topology_build/store: sessões BGP (array JSON ou texto CLI)"
                 },
                 "ospf": {
-                    "description": "topology_build: vizinhos OSPF (array JSON ou texto CLI)"
+                    "description": "topology_build/store: vizinhos OSPF (array JSON ou texto CLI)"
                 },
                 "rf_links": {
                     "type": "array",
-                    "description": "topology_build: enlaces RF (array de objetos {from, to, ...})"
+                    "description": "topology_build/store: enlaces RF (array de objetos {from, to, ...})"
                 },
                 "target_node": {
                     "type": "string",
-                    "description": "topology_build: nó alvo para calcular blast_radius"
+                    "description": "topology_build/store: nó alvo para calcular blast_radius"
                 },
                 "target_interface": {
                     "type": "string",
-                    "description": "topology_build: interface opcional do nó alvo para blast_radius granular"
+                    "description": "topology_build/store: interface opcional do nó alvo para blast_radius granular"
+                },
+                "op": {
+                    "type": "string",
+                    "enum": ["save", "load", "list", "diff", "delete"],
+                    "description": "topology_store: operação de persistência por cliente (padrão load quando client informado, ou list)"
+                },
+                "client": {
+                    "type": "string",
+                    "description": "identificador do cliente/rede para persistência de topologia"
+                },
+                "save": {
+                    "type": "boolean",
+                    "description": "topology_build: se true (com client), grava a topologia persistente e devolve diff contra a anterior"
+                },
+                "store_dir": {
+                    "type": "string",
+                    "description": "diretório opcional de armazenamento de topologias (padrão ~/.zerith/topologies ou .zerith/topologies com scope=workspace)"
+                },
+                "scope": {
+                    "type": "string",
+                    "enum": ["global", "workspace"],
+                    "description": "escopo do armazenamento de topologias (global padrão ou workspace)"
                 }
+            });
+            if let Value::Object(m) = base {
+                props.extend(m);
             }
-        }),
-        "JSON estruturado com comandos de auditoria, achados (critical/warning/ok), métricas, Mermaid ou receita de mudança segura",
+            if let Value::Object(m) = topo {
+                props.extend(m);
+            }
+            json!({
+                "type": "object",
+                "required": ["action"],
+                "properties": Value::Object(props)
+            })
+        },
+        "JSON estruturado com comandos de auditoria, achados (critical/warning/ok), métricas, Mermaid, topologia persistente/diff ou receita de mudança segura",
         Permission::Read,
         30,
         true,
+        net_audit_action,
         run_net_audit,
     )]
+}
+
+fn is_topology_mutation(args: &Value) -> bool {
+    match opt_str(args, "action") {
+        Some("topology_build") => args["save"].as_bool().unwrap_or(false),
+        Some("topology_store") => {
+            let op = opt_str(args, "op").unwrap_or_else(|| {
+                if opt_str(args, "client").is_some() {
+                    "load"
+                } else {
+                    "list"
+                }
+            });
+            matches!(op, "save" | "delete")
+        }
+        _ => false,
+    }
+}
+
+fn net_audit_action(args: &Value, ctx: &CallCtx<'_>) -> Result<Option<zerith_security::Action>> {
+    if is_topology_mutation(args) {
+        let dir = if let Some(d) = opt_str(args, "store_dir") {
+            ctx.resolve(d)
+        } else {
+            ctx.workspace.join(".zerith/topologies")
+        };
+        Ok(Some(zerith_security::Action::Write(dir)))
+    } else {
+        Ok(None)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -213,7 +281,7 @@ fn pick_section<'a>(
     combined
 }
 
-fn run_net_audit(args: &Value, _ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
+fn run_net_audit(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<String> {
     exec.check()?;
     let action = str_arg(args, "action")?;
     let mode = resolve_mode(args, action)?;
@@ -247,9 +315,10 @@ fn run_net_audit(args: &Value, _ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Result<St
             "parse" => to_pretty_json(&linux_sre_parse(args)?),
             _ => unreachable!(),
         },
-        "topology_build" => to_pretty_json(&topology_build(args)?),
+        "topology_build" => to_pretty_json(&topology_build_and_maybe_save(args, ctx)?),
+        "topology_store" => to_pretty_json(&topology_store(args, ctx)?),
         other => Err(ToolError::BadArguments(format!(
-            "action desconhecida '{other}' (use cisco_asr_audit, datacom_audit, ubiquiti_rf_audit, linux_sre_audit ou topology_build)"
+            "action desconhecida '{other}' (use cisco_asr_audit, datacom_audit, ubiquiti_rf_audit, linux_sre_audit, topology_build ou topology_store)"
         ))),
     }
 }
@@ -2349,7 +2418,7 @@ fn linux_sre_parse(args: &Value) -> Result<Value> {
 // 5. Topology Build + Mermaid + Blast Radius
 // ============================================================================
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct TopoEdge {
     from: String,
     to: String,
@@ -2361,11 +2430,21 @@ struct TopoEdge {
     state: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TopoAnomaly {
-    severity: &'static str,
-    kind: &'static str,
+    severity: String,
+    kind: String,
     detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedTopology {
+    client: String,
+    saved_at_unix: u64,
+    nodes: Vec<String>,
+    edges: Vec<TopoEdge>,
+    anomalies: Vec<TopoAnomaly>,
+    mermaid: String,
 }
 
 fn sanitize_mermaid_id(raw: &str) -> String {
@@ -2612,8 +2691,8 @@ fn topology_build(args: &Value) -> Result<Value> {
         let a = &edges[i];
         if a.state.eq_ignore_ascii_case("down") || a.state.eq_ignore_ascii_case("idle") {
             anomalies.push(TopoAnomaly {
-                severity: "critical",
-                kind: "link_down",
+                severity: "critical".into(),
+                kind: "link_down".into(),
                 detail: format!(
                     "Enlace {} -> {} ({}) em estado `{}`",
                     a.from, a.to, a.kind, a.state
@@ -2626,8 +2705,8 @@ fn topology_build(args: &Value) -> Result<Value> {
                 if let (Some(ma), Some(mb)) = (a.metric, b.metric) {
                     if ma != mb {
                         anomalies.push(TopoAnomaly {
-                            severity: "warning",
-                            kind: "asymmetric_metric",
+                            severity: "warning".into(),
+                            kind: "asymmetric_metric".into(),
                             detail: format!(
                                 "Métrica {} assimétrica entre {} <-> {}: {} vs {}",
                                 a.kind, a.from, a.to, ma, mb
@@ -2638,8 +2717,8 @@ fn topology_build(args: &Value) -> Result<Value> {
                 if let (Some(ua), Some(ub)) = (a.mtu, b.mtu) {
                     if ua != ub {
                         anomalies.push(TopoAnomaly {
-                            severity: "critical",
-                            kind: "mtu_mismatch",
+                            severity: "critical".into(),
+                            kind: "mtu_mismatch".into(),
                             detail: format!(
                                 "MTU divergente entre {} <-> {}: {} vs {}",
                                 a.from, a.to, ua, ub
@@ -2659,8 +2738,8 @@ fn topology_build(args: &Value) -> Result<Value> {
                 let orphaned = is_connected_without(&nodes, &edges, Some(candidate.as_str()), None);
                 if !orphaned.is_empty() {
                     anomalies.push(TopoAnomaly {
-                        severity: "warning",
-                        kind: "single_point_of_failure",
+                        severity: "warning".into(),
+                        kind: "single_point_of_failure".into(),
                         detail: format!(
                             "Nó `{candidate}` é ponto único de falha (SPOF): sua queda isola {:?}",
                             orphaned
@@ -2693,8 +2772,25 @@ fn topology_build(args: &Value) -> Result<Value> {
         mermaid.push(format!("  {fid} -->|\"{lbl}\"| {tid}"));
     }
 
-    // Blast radius
-    let blast_radius = opt_str(args, "target_node").map(|target| {
+    let blast_radius = compute_blast_radius(&nodes, &edges, args);
+
+    let node_vec: Vec<String> = nodes.into_iter().collect();
+    Ok(json!({
+        "action": "topology_build",
+        "nodes": node_vec,
+        "edges": edges,
+        "anomalies": anomalies,
+        "mermaid": mermaid.join("\n"),
+        "blast_radius": blast_radius,
+    }))
+}
+
+fn compute_blast_radius(
+    nodes: &BTreeSet<String>,
+    edges: &[TopoEdge],
+    args: &Value,
+) -> Option<Value> {
+    opt_str(args, "target_node").map(|target| {
         let target_if = opt_str(args, "target_interface");
         let impacted_edges: Vec<&TopoEdge> = edges
             .iter()
@@ -2709,9 +2805,9 @@ fn topology_build(args: &Value) -> Result<Value> {
             })
             .collect();
         let isolated_nodes = if target_if.is_some() {
-            is_connected_without(&nodes, &edges, None, target_if)
+            is_connected_without(nodes, edges, None, target_if)
         } else {
-            is_connected_without(&nodes, &edges, Some(target), None)
+            is_connected_without(nodes, edges, Some(target), None)
         };
         json!({
             "target_node": target,
@@ -2720,16 +2816,292 @@ fn topology_build(args: &Value) -> Result<Value> {
             "impacted_links": impacted_edges,
             "isolated_downstream_nodes": isolated_nodes,
         })
+    })
+}
+
+fn resolve_topology_dir(args: &Value, ctx: &CallCtx<'_>) -> PathBuf {
+    if let Some(d) = opt_str(args, "store_dir") {
+        ctx.resolve(d)
+    } else if opt_str(args, "scope").is_some_and(|s| s.eq_ignore_ascii_case("workspace")) {
+        ctx.workspace.join(".zerith").join("topologies")
+    } else {
+        zerith_core::Paths::resolve().root().join("topologies")
+    }
+}
+
+fn sanitize_client_slug(raw: &str) -> Result<String> {
+    let slug: String = raw
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let clean = slug.trim_matches('-').to_string();
+    if clean.is_empty() || clean.contains("..") {
+        return Err(ToolError::BadArguments(format!(
+            "nome de cliente inválido para topologia: `{raw}`"
+        )));
+    }
+    Ok(clean)
+}
+
+fn edge_identity(e: &TopoEdge) -> (&str, &str, &str, Option<&str>, Option<&str>) {
+    (
+        e.from.as_str(),
+        e.to.as_str(),
+        e.kind.as_str(),
+        e.local_if.as_deref(),
+        e.remote_if.as_deref(),
+    )
+}
+
+type EdgeKey<'a> = (&'a str, &'a str, &'a str, Option<&'a str>, Option<&'a str>);
+type EdgeMap<'a> = BTreeMap<EdgeKey<'a>, &'a TopoEdge>;
+
+fn topology_diff_json(
+    prev: &PersistedTopology,
+    next_nodes: &[String],
+    next_edges: &[TopoEdge],
+) -> Value {
+    let prev_n: BTreeSet<&str> = prev.nodes.iter().map(String::as_str).collect();
+    let next_n: BTreeSet<&str> = next_nodes.iter().map(String::as_str).collect();
+    let added_nodes: Vec<&str> = next_n.difference(&prev_n).copied().collect();
+    let removed_nodes: Vec<&str> = prev_n.difference(&next_n).copied().collect();
+
+    let prev_e: EdgeMap<'_> = prev.edges.iter().map(|e| (edge_identity(e), e)).collect();
+    let next_e: EdgeMap<'_> = next_edges.iter().map(|e| (edge_identity(e), e)).collect();
+
+    let mut added_edges = Vec::new();
+    let mut removed_edges = Vec::new();
+    let mut state_changes = Vec::new();
+
+    for (k, e) in &next_e {
+        match prev_e.get(k) {
+            None => added_edges.push(*e),
+            Some(old) if old.state != e.state || old.metric != e.metric || old.mtu != e.mtu => {
+                state_changes.push(json!({
+                    "from": e.from,
+                    "to": e.to,
+                    "kind": e.kind,
+                    "before": {"state": old.state, "metric": old.metric, "mtu": old.mtu},
+                    "after": {"state": e.state, "metric": e.metric, "mtu": e.mtu},
+                }));
+            }
+            _ => {}
+        }
+    }
+    for (k, old) in &prev_e {
+        if !next_e.contains_key(k) {
+            removed_edges.push(*old);
+        }
+    }
+
+    let has_changes = !added_nodes.is_empty()
+        || !removed_nodes.is_empty()
+        || !added_edges.is_empty()
+        || !removed_edges.is_empty()
+        || !state_changes.is_empty();
+
+    json!({
+        "changed": has_changes,
+        "added_nodes": added_nodes,
+        "removed_nodes": removed_nodes,
+        "added_edges": added_edges,
+        "removed_edges": removed_edges,
+        "state_changes": state_changes,
+    })
+}
+
+fn persist_topology(
+    dir: &std::path::Path,
+    client: &str,
+    built: &Value,
+) -> Result<(PathBuf, Option<Value>)> {
+    let slug = sanitize_client_slug(client)?;
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(format!("{slug}.json"));
+    let nodes: Vec<String> = serde_json::from_value(built["nodes"].clone()).unwrap_or_default();
+    let edges: Vec<TopoEdge> = serde_json::from_value(built["edges"].clone()).unwrap_or_default();
+    let anomalies: Vec<TopoAnomaly> =
+        serde_json::from_value(built["anomalies"].clone()).unwrap_or_default();
+    let mermaid = built["mermaid"].as_str().unwrap_or("").to_string();
+
+    let prev = std::fs::read(&path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<PersistedTopology>(&b).ok());
+    let diff = prev.as_ref().map(|p| topology_diff_json(p, &nodes, &edges));
+
+    let saved_at_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let snap = PersistedTopology {
+        client: client.trim().to_string(),
+        saved_at_unix,
+        nodes,
+        edges,
+        anomalies,
+        mermaid,
+    };
+    let bytes = serde_json::to_vec_pretty(&snap)
+        .map_err(|e| ToolError::Failed(format!("erro serializando topologia: {e}")))?;
+    crate::builtin::write_atomic(&path, &bytes)?;
+    Ok((path, diff))
+}
+
+fn topology_build_and_maybe_save(args: &Value, ctx: &CallCtx<'_>) -> Result<Value> {
+    let mut built = topology_build(args)?;
+    if args["save"].as_bool().unwrap_or(false) {
+        let client = opt_str(args, "client").ok_or_else(|| {
+            ToolError::BadArguments("topology_build com save=true exige `client`".into())
+        })?;
+        let dir = resolve_topology_dir(args, ctx);
+        let (path, diff) = persist_topology(&dir, client, &built)?;
+        if let Some(obj) = built.as_object_mut() {
+            obj.insert("saved_path".into(), json!(path.display().to_string()));
+            if let Some(d) = diff {
+                obj.insert("diff_vs_previous".into(), d);
+            }
+        }
+    }
+    Ok(built)
+}
+
+fn topology_store(args: &Value, ctx: &CallCtx<'_>) -> Result<Value> {
+    let dir = resolve_topology_dir(args, ctx);
+    let op = opt_str(args, "op").unwrap_or_else(|| {
+        if opt_str(args, "client").is_some() {
+            "load"
+        } else {
+            "list"
+        }
     });
 
-    Ok(json!({
-        "action": "topology_build",
-        "nodes": nodes.into_iter().collect::<Vec<_>>(),
-        "edges": edges,
-        "anomalies": anomalies,
-        "mermaid": mermaid.join("\n"),
-        "blast_radius": blast_radius,
-    }))
+    match op {
+        "list" => {
+            let mut items = Vec::new();
+            if let Ok(rd) = std::fs::read_dir(&dir) {
+                for entry in rd.flatten() {
+                    let p = entry.path();
+                    if p.extension().and_then(|e| e.to_str()) != Some("json") {
+                        continue;
+                    }
+                    if let Ok(bytes) = std::fs::read(&p) {
+                        if let Ok(snap) = serde_json::from_slice::<PersistedTopology>(&bytes) {
+                            items.push(json!({
+                                "client": snap.client,
+                                "saved_at_unix": snap.saved_at_unix,
+                                "nodes_count": snap.nodes.len(),
+                                "edges_count": snap.edges.len(),
+                                "anomalies_count": snap.anomalies.len(),
+                                "path": p.display().to_string(),
+                            }));
+                        }
+                    }
+                }
+            }
+            Ok(json!({
+                "action": "topology_store",
+                "op": "list",
+                "store_dir": dir.display().to_string(),
+                "count": items.len(),
+                "topologies": items,
+            }))
+        }
+        "load" => {
+            let client = str_arg(args, "client")?;
+            let slug = sanitize_client_slug(client)?;
+            let path = dir.join(format!("{slug}.json"));
+            let bytes = std::fs::read(&path).map_err(|_| {
+                ToolError::Failed(format!(
+                    "nenhuma topologia salva para `{client}` em {}",
+                    path.display()
+                ))
+            })?;
+            let snap: PersistedTopology = serde_json::from_slice(&bytes).map_err(|e| {
+                ToolError::Failed(format!("topologia corrompida em {}: {e}", path.display()))
+            })?;
+            let node_set: BTreeSet<String> = snap.nodes.iter().cloned().collect();
+            let blast_radius = compute_blast_radius(&node_set, &snap.edges, args);
+            Ok(json!({
+                "action": "topology_store",
+                "op": "load",
+                "path": path.display().to_string(),
+                "client": snap.client,
+                "saved_at_unix": snap.saved_at_unix,
+                "nodes": snap.nodes,
+                "edges": snap.edges,
+                "anomalies": snap.anomalies,
+                "mermaid": snap.mermaid,
+                "blast_radius": blast_radius,
+            }))
+        }
+        "save" => {
+            let client = str_arg(args, "client")?;
+            let built = if has_topology_inputs(args) || opt_str(args, "output").is_some() {
+                topology_build(args)?
+            } else {
+                return Err(ToolError::BadArguments(
+                    "topology_store op=save exige dados da topologia (devices/lldp/cdp/bgp/ospf/rf_links/output)".into(),
+                ));
+            };
+            let (path, diff) = persist_topology(&dir, client, &built)?;
+            Ok(json!({
+                "action": "topology_store",
+                "op": "save",
+                "client": client,
+                "saved_path": path.display().to_string(),
+                "nodes_count": built["nodes"].as_array().map_or(0, Vec::len),
+                "edges_count": built["edges"].as_array().map_or(0, Vec::len),
+                "diff_vs_previous": diff,
+                "blast_radius": built["blast_radius"],
+            }))
+        }
+        "diff" => {
+            let client = str_arg(args, "client")?;
+            let slug = sanitize_client_slug(client)?;
+            let path = dir.join(format!("{slug}.json"));
+            let bytes = std::fs::read(&path).map_err(|_| {
+                ToolError::Failed(format!("nenhuma topologia salva para `{client}`"))
+            })?;
+            let prev: PersistedTopology = serde_json::from_slice(&bytes)
+                .map_err(|e| ToolError::Failed(format!("erro lendo topologia salva: {e}")))?;
+            let current = topology_build(args)?;
+            let nodes: Vec<String> =
+                serde_json::from_value(current["nodes"].clone()).unwrap_or_default();
+            let edges: Vec<TopoEdge> =
+                serde_json::from_value(current["edges"].clone()).unwrap_or_default();
+            Ok(json!({
+                "action": "topology_store",
+                "op": "diff",
+                "client": client,
+                "diff": topology_diff_json(&prev, &nodes, &edges),
+            }))
+        }
+        "delete" => {
+            let client = str_arg(args, "client")?;
+            let slug = sanitize_client_slug(client)?;
+            let path = dir.join(format!("{slug}.json"));
+            if path.is_file() {
+                std::fs::remove_file(&path)?;
+            }
+            Ok(json!({
+                "action": "topology_store",
+                "op": "delete",
+                "client": client,
+                "deleted": true,
+            }))
+        }
+        other => Err(ToolError::BadArguments(format!(
+            "op inválido em topology_store: `{other}` (use save, load, list, diff ou delete)"
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -3027,5 +3399,80 @@ cpu=0 found=10 invalid=0 insert=5 insert_failed=3 drop=12 early_drop=0
         assert_eq!(blast["impacted_links_count"], 3);
         let isolated = blast["isolated_downstream_nodes"].as_array().unwrap();
         assert!(isolated.contains(&json!("olt-01")));
+    }
+
+    #[test]
+    fn topology_store_saves_loads_diffs_lists_and_deletes_client_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().display().to_string();
+
+        let saved1 = call_tool(json!({
+            "action": "topology_build",
+            "client": "Alphan Net",
+            "save": true,
+            "store_dir": store_path,
+            "ospf": [
+                {"from": "core-01", "to": "dist-01", "local_if": "Te0/0/0", "remote_if": "Te0/0/1", "metric": 10, "mtu": 1500}
+            ]
+        }))
+        .unwrap();
+        assert!(saved1["saved_path"]
+            .as_str()
+            .unwrap()
+            .ends_with("alphan-net.json"));
+
+        // Save updated snapshot and verify diff vs previous
+        let saved2 = call_tool(json!({
+            "action": "topology_store",
+            "op": "save",
+            "client": "Alphan Net",
+            "store_dir": store_path,
+            "ospf": [
+                {"from": "core-01", "to": "dist-01", "local_if": "Te0/0/0", "remote_if": "Te0/0/1", "metric": 20, "mtu": 1500, "state": "down"},
+                {"from": "dist-01", "to": "olt-02", "local_if": "Gi0/0/2", "remote_if": "Gi1/1/1", "metric": 10}
+            ]
+        }))
+        .unwrap();
+        let diff = &saved2["diff_vs_previous"];
+        assert_eq!(diff["changed"], true);
+        assert!(diff["added_nodes"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("olt-02")));
+        assert_eq!(diff["added_edges"].as_array().unwrap().len(), 1);
+        assert_eq!(diff["state_changes"].as_array().unwrap().len(), 1);
+
+        // List & load + blast radius on persisted data
+        let listed = call_tool(json!({
+            "action": "topology_store",
+            "op": "list",
+            "store_dir": store_path
+        }))
+        .unwrap();
+        assert_eq!(listed["count"], 1);
+
+        let loaded = call_tool(json!({
+            "action": "topology_store",
+            "op": "load",
+            "client": "Alphan Net",
+            "store_dir": store_path,
+            "target_node": "dist-01"
+        }))
+        .unwrap();
+        assert_eq!(loaded["client"], "Alphan Net");
+        assert!(loaded["nodes"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("olt-02")));
+        assert_eq!(loaded["blast_radius"]["impacted_links_count"], 2);
+
+        let deleted = call_tool(json!({
+            "action": "topology_store",
+            "op": "delete",
+            "client": "Alphan Net",
+            "store_dir": store_path
+        }))
+        .unwrap();
+        assert_eq!(deleted["deleted"], true);
     }
 }

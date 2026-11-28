@@ -1,6 +1,6 @@
 {
   "name": "zerith-infra",
-  "version": "0.4.20",
+  "version": "0.4.21",
   "description": "Especialista único de infraestrutura para provedores e empresas: roteamento e borda (Cisco ASR 1001/1001-X IOS-XE, ASR 9000/IOS-XR, Nexus/NX-OS, Datacom DmOS/DmSwitch, Huawei, Juniper, MikroTik, BGP/OSPF/MPLS/CGNAT), rádios Ubiquiti RF (airOS/UISP/UniFi), OLTs GPON/XGS-PON (Huawei, ZTE, Fiberhome, Parks, VSOL), servidores Linux SRE, cluster Proxmox VE e NOC (Zabbix Pro, Grafana, LibreNMS, NetFlow). Mudança segura com rollback automático e proteção do link de gerência.",
   "author": {
     "name": "Joao Pedro Mota (Mistertelecom)"

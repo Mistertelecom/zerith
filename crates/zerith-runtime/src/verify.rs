@@ -484,6 +484,17 @@ pub(crate) fn exit_of(output: &str) -> Option<i64> {
         .ok()
 }
 
+/// Extracts the inline `verify_cmd` exit code appended by `multi_edit`
+/// (`[verificação: <cmd> (exit N)]`).
+pub(crate) fn multi_edit_verification_exit(cmd: &str, output: &str) -> Option<i64> {
+    let prefix = format!("[verificação: {} (exit ", cmd.trim());
+    output.lines().find_map(|l| {
+        let rest = l.trim().strip_prefix(&prefix)?;
+        let code = rest.strip_suffix(")]")?;
+        code.trim().parse().ok()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -615,5 +626,20 @@ mod tests {
             &p,
             &[]
         ));
+    }
+
+    #[test]
+    fn multi_edit_verification_exit_parses_inline_status() {
+        let out = "1 edição atômica\n\n[verificação: python -m unittest (exit 0)]\nexit 0\nOK";
+        assert_eq!(
+            multi_edit_verification_exit("python -m unittest", out),
+            Some(0)
+        );
+        let fail = "1 edição atômica\n\n[verificação: python -m unittest (exit 2)]\nFAILED";
+        assert_eq!(
+            multi_edit_verification_exit("python -m unittest", fail),
+            Some(2)
+        );
+        assert_eq!(multi_edit_verification_exit("pytest", out), None);
     }
 }

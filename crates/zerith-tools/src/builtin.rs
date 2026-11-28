@@ -137,18 +137,20 @@ pub(crate) fn all() -> Vec<Box<dyn crate::Tool>> {
         ),
         tool(
             "multi_edit",
-            "Aplica várias substituições atômicas num arquivo (tudo ou nada). Preserva CRLF/LF, Latin-1 e faz fallback único ignorando diferenças menores de indentação/espaços.",
+            "Aplica várias substituições atômicas num arquivo (tudo ou nada). Preserva CRLF/LF, Latin-1 e faz fallback único ignorando diferenças menores de indentação/espaços. Com `verify_cmd`, já executa o teste/checagem inline após gravar e devolve o resultado na mesma chamada.",
             json!({"type": "object", "properties": {
                 "path": {"type": "string"},
                 "edits": {"type": "array", "items": {"type": "object", "properties": {
                     "old_string": {"type": "string"},
                     "new_string": {"type": "string"},
                     "replace_all": {"type": "boolean"}
-                }, "required": ["old_string", "new_string"]}}
+                }, "required": ["old_string", "new_string"]}},
+                "verify_cmd": {"type": "string", "description": "comando de verificação/teste opcional executado inline após a gravação atômica (ex.: python -m unittest, cargo test -p x)"},
+                "verify_timeout_secs": {"type": "integer", "description": "timeout do verify_cmd em segundos (padrão 30, intervalo 5..=120)"}
             }, "required": ["path", "edits"]}),
-            "resumo atômico das edições aplicadas",
+            "resumo atômico das edições aplicadas (e resultado de verify_cmd, quando informado)",
             Permission::Write,
-            10,
+            130,
             write_action,
             multi_edit,
         ),
@@ -1638,6 +1640,80 @@ mod ondav4_tests {
         assert_eq!(
             std::fs::read(&latin_path).unwrap(),
             b"N\xfamero 1\nlinha B\n"
+        );
+    }
+
+    #[test]
+    fn multi_edit_inline_verify_cmd_passes_fails_and_obeys_policy() {
+        let dir = scratch();
+        let root = dir.path();
+        let file = root.join("calc.txt");
+        std::fs::write(&file, "valor = 1\n").unwrap();
+
+        let py = if cfg!(windows) { "python" } else { "python3" };
+        let pol_allow = Policy::new(preset("workspace-write").unwrap(), Mode::Bypass, root);
+        let ctx_allow = CallCtx {
+            workspace: pol_allow.workspace.as_path(),
+            policy: &pol_allow,
+            memory: None,
+            scope: None,
+        };
+        let reg = Registry::new();
+
+        let ok_cmd = format!("{py} -c \"import sys; sys.exit(0)\"");
+        let out_ok = reg
+            .call(
+                "multi_edit",
+                &json!({
+                    "path": "calc.txt",
+                    "edits": [{"old_string": "valor = 1", "new_string": "valor = 2"}],
+                    "verify_cmd": ok_cmd
+                }),
+                &ctx_allow,
+            )
+            .unwrap();
+        assert!(out_ok.contains("(exit 0)]"), "{out_ok}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "valor = 2\n");
+
+        // Failing verify_cmd keeps the valid edit and returns exit code inline.
+        let fail_cmd = format!("{py} -c \"import sys; print('boom'); sys.exit(3)\"");
+        let out_fail = reg
+            .call(
+                "multi_edit",
+                &json!({
+                    "path": "calc.txt",
+                    "edits": [{"old_string": "valor = 2", "new_string": "valor = 3"}],
+                    "verify_cmd": fail_cmd
+                }),
+                &ctx_allow,
+            )
+            .unwrap();
+        assert!(out_fail.contains("(exit 3)]"), "{out_fail}");
+        assert!(out_fail.contains("boom"), "{out_fail}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "valor = 3\n");
+
+        // Under Mode::AcceptEdits, edits run automatically while arbitrary shell still requires approval.
+        let pol_default = Policy::new(preset("workspace-write").unwrap(), Mode::AcceptEdits, root);
+        let ctx_default = CallCtx {
+            workspace: pol_default.workspace.as_path(),
+            policy: &pol_default,
+            memory: None,
+            scope: None,
+        };
+        let out_ask = reg
+            .call(
+                "multi_edit",
+                &json!({
+                    "path": "calc.txt",
+                    "edits": [{"old_string": "valor = 3", "new_string": "valor = 4"}],
+                    "verify_cmd": ok_cmd
+                }),
+                &ctx_default,
+            )
+            .unwrap();
+        assert!(
+            out_ask.contains("política exige aprovação para shell"),
+            "{out_ask}"
         );
     }
 

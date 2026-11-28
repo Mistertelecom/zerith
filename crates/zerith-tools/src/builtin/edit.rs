@@ -492,6 +492,50 @@ pub(super) fn multi_edit(args: &Value, ctx: &CallCtx<'_>, exec: &Exec<'_>) -> Re
         msg.push_str(&format!("\n\n[diagnósticos LSP]\n{diags}"));
     }
     crate::postcheck::append(&mut msg, &path, pc);
+    if let Some(cmd) = args["verify_cmd"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let timeout_secs = args["verify_timeout_secs"]
+            .as_u64()
+            .unwrap_or(30)
+            .clamp(5, 120);
+        let verdict = ctx
+            .policy
+            .check_tool("shell", &zerith_security::Action::Shell(cmd.to_string()));
+        if verdict != zerith_security::Verdict::Allow {
+            msg.push_str(&format!(
+                "\n\n[verificação: `{cmd}` não executado — política exige aprovação para shell]"
+            ));
+        } else {
+            let shell_args = serde_json::json!({
+                "command": cmd,
+                "timeout_secs": timeout_secs,
+            });
+            match super::shell_without_snapshot(&shell_args, ctx, exec) {
+                Ok(out) => {
+                    let trimmed: String = out.chars().take(4_000).collect();
+                    msg.push_str(&format!("\n\n[verificação: {cmd} (exit 0)]\n{trimmed}"));
+                }
+                Err(ToolError::Failed(err_out)) => {
+                    let exit_line = err_out
+                        .lines()
+                        .next()
+                        .map(str::trim)
+                        .filter(|l| !l.is_empty())
+                        .unwrap_or("exit 1");
+                    let trimmed: String = err_out.chars().take(4_000).collect();
+                    msg.push_str(&format!(
+                        "\n\n[verificação: {cmd} ({exit_line})]\n{trimmed}"
+                    ));
+                }
+                Err(e) => {
+                    msg.push_str(&format!("\n\n[verificação: {cmd} (erro)]\n{e}"));
+                }
+            }
+        }
+    }
     Ok(msg)
 }
 
